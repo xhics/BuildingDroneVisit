@@ -18,13 +18,19 @@ from datetime import date
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-#: Emprise au sol plausible par chambre, en mètres carrés. Un hôtel bas et
-#: étalé occupe davantage au sol qu'une tour à nombre de chambres égal : la
-#: fourchette est donc large, et sert à écarter l'absurde, non à trancher.
-FOOTPRINT_M2_PER_ROOM = (8.0, 40.0)
+#: Surface de plancher par chambre, circulation et services compris. C'est une
+#: grandeur par **étage**, non par bâtiment : le nombre de chambres seul ne dit
+#: rien de l'emprise au sol.
+FLOOR_AREA_M2_PER_ROOM = (25.0, 70.0)
+
+#: Nombre d'étages supposé quand le profil ne le déclare pas. La fourchette est
+#: volontairement large : une tour de 600 chambres sur vingt niveaux occupe au
+#: sol moins qu'un motel de 60 chambres de plain-pied, et une borne basse
+#: calculée sans les étages l'aurait écartée.
+ASSUMED_LEVELS = (1, 12)
 
 #: Bornes absolues, appliquées faute de toute indication de taille.
-FOOTPRINT_FALLBACK_M2 = (300.0, 30_000.0)
+FOOTPRINT_FALLBACK_M2 = (200.0, 40_000.0)
 
 
 class RenovationEvent(BaseModel):
@@ -32,15 +38,56 @@ class RenovationEvent(BaseModel):
 
     Remplace l'enum `pre_2024`/`post_2024` : un établissement peut n'avoir
     jamais été rénové, ou l'avoir été trois fois.
+
+    Trois dates distinctes, parce qu'elles ne disent pas la même chose. Le
+    dossier municipal du WelcomINNS porte une date d'**approbation** — le
+    23 septembre 2024 — qui ne prouve ni le début ni la fin des travaux. Une
+    photographie postérieure à l'approbation peut parfaitement montrer
+    l'ancienne entrée, ou un chantier.
+
+    L'apparence n'est donc réputée actuelle qu'à partir de `completed_on`,
+    et seulement si cette date est confirmée.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     event_id: str
-    occurred_on: date
     scope: str  # entrance, facade, roof, grounds, signage...
+
+    approved_on: date | None = None
+    started_on: date | None = None
+    completed_on: date | None = None
+
+    #: `completed_on` est-il attesté, ou seulement estimé ?
+    completion_confirmed: bool = False
+
     evidence: list[str] = Field(default_factory=list)
     note: str | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_date(self) -> "RenovationEvent":
+        if not any((self.approved_on, self.started_on, self.completed_on)):
+            raise ValueError(
+                f"événement {self.event_id!r} sans aucune date : "
+                "approved_on, started_on ou completed_on est requis"
+            )
+        for earlier, later, names in (
+            (self.approved_on, self.started_on, "approved_on/started_on"),
+            (self.started_on, self.completed_on, "started_on/completed_on"),
+        ):
+            if earlier and later and earlier > later:
+                raise ValueError(f"dates incohérentes : {names}")
+        return self
+
+    @property
+    def reference_date(self) -> date:
+        """Date la plus tardive connue, pour ordonner les événements."""
+        return max(d for d in (self.approved_on, self.started_on, self.completed_on) if d)
+
+    @property
+    def establishes_current_appearance(self) -> bool:
+        """Seule une fin de travaux confirmée fait référence d'apparence."""
+        return self.completed_on is not None and self.completion_confirmed
 
 
 class PropertyProfile(BaseModel):
@@ -64,6 +111,10 @@ class PropertyProfile(BaseModel):
     #: Indices de taille, facultatifs. Le nombre de chambres suffit à borner
     #: l'emprise sans coder une plage en dur.
     room_count: int | None = Field(default=None, gt=0)
+
+    #: Nombre d'étages, s'il est connu. Sans lui, l'emprise se borne sur une
+    #: plage d'étages supposée plutôt que sur un plain-pied implicite.
+    expected_levels: int | None = Field(default=None, gt=0)
     footprint_min_m2: float | None = Field(default=None, gt=0)
     footprint_max_m2: float | None = Field(default=None, gt=0)
 
@@ -99,17 +150,33 @@ class PropertyProfile(BaseModel):
     def footprint_range_m2(self) -> tuple[float, float]:
         """Emprise plausible, dérivée du profil et non d'une constante.
 
-        Priorité aux bornes explicites, puis au nombre de chambres, puis à des
-        bornes larges qui n'écartent que l'absurde.
+        Le nombre de chambres ne détermine pas l'emprise : il détermine une
+        **surface de plancher**, que le nombre d'étages divise. Ignorer les
+        niveaux revient à interdire les bâtiments hauts.
+
+        Cette fourchette **n'élimine jamais** un candidat : elle sert à
+        classer l'attention, et un bâtiment hors plage reste examinable.
         """
         if self.footprint_min_m2 is not None and self.footprint_max_m2 is not None:
             return self.footprint_min_m2, self.footprint_max_m2
 
-        if self.room_count is not None:
-            low, high = FOOTPRINT_M2_PER_ROOM
-            return self.room_count * low, self.room_count * high
+        if self.room_count is None:
+            return FOOTPRINT_FALLBACK_M2
 
-        return FOOTPRINT_FALLBACK_M2
+        area_low, area_high = FLOOR_AREA_M2_PER_ROOM
+        levels_low, levels_high = (
+            (self.expected_levels, self.expected_levels)
+            if self.expected_levels
+            else ASSUMED_LEVELS
+        )
+
+        # Emprise minimale : beaucoup d'étages et des chambres compactes.
+        # Emprise maximale : un seul niveau et des chambres généreuses.
+        low = self.room_count * area_low / levels_high
+        high = self.room_count * area_high / levels_low
+
+        absolute_low, absolute_high = FOOTPRINT_FALLBACK_M2
+        return max(low, absolute_low * 0.5), min(high, absolute_high)
 
     # -- temporalité -----------------------------------------------------
 
@@ -120,16 +187,31 @@ class PropertyProfile(BaseModel):
             for event in self.renovation_events
             if scope is None or event.scope == scope
         ]
-        return max(candidates, key=lambda e: e.occurred_on, default=None)
+        return max(candidates, key=lambda e: e.reference_date, default=None)
 
-    def is_after_latest_event(self, taken_on: date, scope: str | None = None) -> bool | None:
-        """Une prise de vue est-elle postérieure aux derniers travaux ?
+    def shows_current_appearance(self, taken_on: date, scope: str | None = None) -> bool | None:
+        """Une prise de vue montre-t-elle l'état actuel ?
 
-        Retourne `None` quand aucun événement n'est déclaré : sans travaux
-        connus, la question n'a pas de sens, et supposer « à jour » serait une
-        invention.
+        Trois réponses distinctes, et l'indécision en fait partie :
+
+        - `True`  : postérieure à une fin de travaux **confirmée** ;
+        - `False` : antérieure au début des travaux ;
+        - `None`  : entre les deux, ou fin de travaux non confirmée, ou aucun
+          événement déclaré.
+
+        La date d'approbation municipale ne suffit pas : approuver n'est ni
+        commencer ni achever, et une photographie postérieure à l'approbation
+        peut montrer l'ancienne entrée ou un chantier.
         """
         event = self.latest_event(scope)
         if event is None:
             return None
-        return taken_on >= event.occurred_on
+
+        first_change = event.started_on or event.approved_on
+        if first_change and taken_on < first_change:
+            return False
+
+        if event.establishes_current_appearance and taken_on >= event.completed_on:
+            return True
+
+        return None

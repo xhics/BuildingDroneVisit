@@ -19,15 +19,15 @@ from shapely import wkt as shapely_wkt
 from shapely.geometry import Point
 
 from .logging import get_logger
+from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 
 log = get_logger("visibility")
 
-#: Demi-angle de champ retenu. Les caméras d'imagerie de rue sont larges ;
-#: 45° de part et d'autre reste prudent pour un panorama recadré.
-HALF_FOV_DEG = 45.0
-
-#: Au-delà, le bâtiment est trop lointain pour porter du détail exploitable.
-MAX_DISTANCE_M = 200.0
+#: Valeurs de repli, égales à celles de la politique par défaut. Toute fonction
+#: publique accepte une `PipelinePolicy` : ces constantes ne servent qu'aux
+#: appels internes et aux tests unitaires.
+HALF_FOV_DEG = DEFAULT_POLICY.geometry.half_fov_deg
+MAX_DISTANCE_M = DEFAULT_POLICY.geometry.max_distance_m
 
 
 @dataclass
@@ -146,7 +146,12 @@ def obstacles_from(elements: list[dict], exclude_id: str) -> list:
     return obstacles
 
 
-def annotate(assets: list, building_wkt: str, obstacles: list | None = None) -> int:  # noqa: ANN001
+def annotate(
+    assets: list,  # noqa: ANN001
+    building_wkt: str,
+    obstacles: list | None = None,
+    policy: PipelinePolicy = DEFAULT_POLICY,
+) -> int:
     """Marque chaque asset géolocalisé. Retourne le nombre de vues du bâtiment."""
     from shapely import wkt as shapely_wkt
     from shapely.geometry import Point
@@ -160,7 +165,14 @@ def annotate(assets: list, building_wkt: str, obstacles: list | None = None) -> 
         if asset.camera_lat is None or asset.camera_lon is None:
             continue
 
-        result = assess(asset.camera_lat, asset.camera_lon, asset.heading_deg, building_wkt)
+        result = assess(
+            asset.camera_lat,
+            asset.camera_lon,
+            asset.heading_deg,
+            building_wkt,
+            half_fov_deg=policy.geometry.half_fov_deg,
+            max_distance_m=policy.geometry.max_distance_m,
+        )
         blocker = None
         if result.visible and obstacles:
             target = nearest_points(building, Point(asset.camera_lon, asset.camera_lat))[0]

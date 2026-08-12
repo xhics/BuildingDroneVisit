@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .logging import get_logger
+from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .schemas import (
     Asset,
     ClusterRole,
@@ -36,7 +37,9 @@ class RoleReport:
         return {"roles": self.counts, "reasons": self.reasons}
 
 
-def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
+def role_for(
+    asset: Asset, policy: PipelinePolicy = DEFAULT_POLICY
+) -> tuple[ReconstructionRole, str]:
     """Rôle d'un asset et sa justification.
 
     Porter de la géométrie exige **toutes** les conditions suivantes :
@@ -79,8 +82,16 @@ def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
         # créé avant la déduplication porte `None` et franchissait le Router.
         if asset.cluster_role not in (ClusterRole.CANONICAL, ClusterRole.OVERLAP):
             return ReconstructionRole.CONTEXT_LOCK, "point de vue non arbitré ou déjà couvert"
+        # La géométrie d'un volume change peu : une vue non datée reste
+        # exploitable pour la structure. L'apparence, non — mais c'est un
+        # usage distinct, exprimé par la politique et non par le rôle seul.
         if asset.temporal_status is TemporalStatus.BEFORE_EVENT:
-            return ReconstructionRole.TEXTURE_REFERENCE, "antérieur à la rénovation"
+            return ReconstructionRole.TEXTURE_REFERENCE, "antérieur aux travaux déclarés"
+        if (
+            asset.temporal_status is TemporalStatus.UNKNOWN
+            and not policy.temporal.allow_unknown_for_geometry
+        ):
+            return ReconstructionRole.CONTEXT_LOCK, "datation inconnue, exigée par la politique"
         return ReconstructionRole.PHOTO_GEOMETRY, "cible visible, située et arbitrée"
 
     if Subject.SIGN in asset.subjects or (asset.sign_text or "").strip():
@@ -92,12 +103,12 @@ def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
     return ReconstructionRole.REFERENCE_ONLY, "ni géométrie ni apparence exploitable"
 
 
-def assign(assets: list[Asset]) -> RoleReport:
+def assign(assets: list[Asset], policy: PipelinePolicy = DEFAULT_POLICY) -> RoleReport:
     """Affecte un rôle à chaque asset, en place."""
     report = RoleReport()
 
     for index, asset in enumerate(assets):
-        role, reason = role_for(asset)
+        role, reason = role_for(asset, policy)
         assets[index] = asset.model_copy(update={"reconstruction_role": role})
         report.counts[role.value] = report.counts.get(role.value, 0) + 1
         report.reasons[reason] = report.reasons.get(reason, 0) + 1

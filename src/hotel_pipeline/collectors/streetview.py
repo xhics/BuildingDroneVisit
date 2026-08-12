@@ -28,6 +28,7 @@ from ..config import secret
 from ..logging import get_logger
 from ..providers.cache import cached_call, ensure_online
 from ..visibility import bearing_deg, haversine_m
+from ..schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .base import CollectedImage
 
 log = get_logger("streetview")
@@ -46,13 +47,13 @@ WIDE_FOV = 110
 #: Pas d'échantillonnage du réseau. Un panorama Street View est espacé d'une
 #: dizaine de mètres : échantillonner plus finement multiplie les appels sans
 #: révéler de position nouvelle.
-SAMPLE_SPACING_M = 15.0
+SAMPLE_SPACING_M = DEFAULT_POLICY.collection.sample_spacing_m
 
 #: Rayon de recherche autour de chaque point échantillonné.
-SNAP_RADIUS_M = 25
+SNAP_RADIUS_M = DEFAULT_POLICY.collection.snap_radius_m
 
 #: Au-delà, un panorama est trop loin pour porter du détail de façade.
-MAX_PANORAMA_DISTANCE_M = 220.0
+MAX_PANORAMA_DISTANCE_M = DEFAULT_POLICY.collection.max_panorama_distance_m
 
 name = "street_view"
 
@@ -127,7 +128,8 @@ def collect(
     lon: float,
     building_wkt: str | None = None,
     road_elements: list[dict] | None = None,
-    radius_m: int = 350,
+    radius_m: int | None = None,
+    policy: PipelinePolicy = DEFAULT_POLICY,
 ) -> list[CollectedImage]:
     """Vues Street View depuis des positions indépendantes.
 
@@ -140,9 +142,9 @@ def collect(
     if road_elements is None:
         from ..providers.overpass import roads_around
 
-        road_elements = roads_around(lat, lon, radius_m)
+        road_elements = roads_around(lat, lon, radius_m or policy.collection.road_radius_m)
 
-    samples = sample_road_network(road_elements)
+    samples = sample_road_network(road_elements, policy.collection.sample_spacing_m)
     if not samples:
         samples = [(lat, lon)]
 
@@ -151,7 +153,9 @@ def collect(
     panoramas: dict[str, Panorama] = {}
     for sample_lat, sample_lon in samples:
         try:
-            panorama = panorama_at(sample_lat, sample_lon, key)
+            panorama = panorama_at(
+                sample_lat, sample_lon, key, policy.collection.snap_radius_m
+            )
         except requests.RequestException as exc:
             log.warning("métadonnées indisponibles en %.5f,%.5f : %s", sample_lat, sample_lon, exc)
             continue
@@ -170,7 +174,7 @@ def collect(
     for panorama in panoramas.values():
         target = nearest_points(building, Point(panorama.lon, panorama.lat))[0]
         distance = haversine_m(panorama.lat, panorama.lon, target.y, target.x)
-        if distance > MAX_PANORAMA_DISTANCE_M:
+        if distance > policy.collection.max_panorama_distance_m:
             too_far += 1
             continue
 

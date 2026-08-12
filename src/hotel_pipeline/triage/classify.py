@@ -15,6 +15,7 @@ from pathlib import Path
 
 from ..logging import get_logger
 from ..schemas import AssetCategory, ExteriorInterior
+from ..schemas.policy import DEFAULT_POLICY
 
 log = get_logger("classify")
 
@@ -120,8 +121,8 @@ SUBJECT_PROMPTS: dict[str, tuple[str, tuple[str, ...]]] = {
 #: des vues d'hôtel s'échelonnent de 0,57 à 0,92, tandis que intérieurs,
 #: maisons, routes et visuels promotionnels restent à 0,00–0,01. Le seuil haut
 #: est placé au milieu de cet intervalle vide, pas au bord d'une distribution.
-SUBJECT_ACCEPT = 0.50
-SUBJECT_REJECT = 0.20
+SUBJECT_ACCEPT = DEFAULT_POLICY.model.subject_accept
+SUBJECT_REJECT = DEFAULT_POLICY.model.subject_reject
 
 
 @dataclass
@@ -179,7 +180,8 @@ class Classification:
 class Classifier:
     """Enveloppe OpenCLIP. Charge le modèle une seule fois."""
 
-    def __init__(self, model_name: str = MODEL_NAME, pretrained: str = PRETRAINED) -> None:
+    def __init__(self, model_name: str = MODEL_NAME, pretrained: str = PRETRAINED,
+                 policy=DEFAULT_POLICY) -> None:  # noqa: ANN001
         import open_clip  # import différé : dépendance de la couche vision
         import torch
 
@@ -187,6 +189,9 @@ class Classifier:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         log.info("chargement d'OpenCLIP %s (%s) sur %s", model_name, pretrained, self.device)
 
+        self.policy = policy
+        model_name = policy.model.model_name or model_name
+        pretrained = policy.model.pretrained or pretrained
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(
             model_name, pretrained=pretrained, device=self.device
         )

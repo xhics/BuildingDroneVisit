@@ -19,19 +19,20 @@ from pathlib import Path
 
 from .logging import get_logger
 from .schemas import Asset, ClusterRole, Rights
+from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .visibility import angular_difference, bearing_deg, haversine_m
 
 log = get_logger("dedup-levels")
 
 #: Deux caméras distantes de moins de cela occupent la même position utile.
-POSITION_TOLERANCE_M = 10.0
+POSITION_TOLERANCE_M = DEFAULT_POLICY.dedup.position_tolerance_m
 
 #: Et regardent le bâtiment sous le même angle si leurs azimuts concordent.
-BEARING_TOLERANCE_DEG = 25.0
+BEARING_TOLERANCE_DEG = DEFAULT_POLICY.dedup.bearing_tolerance_deg
 
 #: Vues supplémentaires conservées par point de vue, au-delà de la canonique.
 #: Deux suffisent à porter un déplacement exploitable sans gonfler le compte.
-MAX_OVERLAP_PER_CLUSTER = 2
+MAX_OVERLAP_PER_CLUSTER = DEFAULT_POLICY.dedup.max_overlap_per_cluster
 
 #: Qualité de provenance, du meilleur au moins bon. Départage les canoniques
 #: à résolution égale : une source aux droits établis prime.
@@ -245,12 +246,17 @@ def measure_files(assets: list[Asset]) -> int:
     return measured
 
 
-def run(assets: list[Asset], building_lat: float, building_lon: float) -> DedupReport:
+def run(
+    assets: list[Asset],
+    building_lat: float,
+    building_lon: float,
+    policy: PipelinePolicy = DEFAULT_POLICY,
+) -> DedupReport:
     """Applique les quatre niveaux et produit le rapport du §5."""
     measure_files(assets)
 
     exact = exact_groups(assets)
-    perceptual = perceptual_groups(assets)
+    perceptual = perceptual_groups(assets, threshold=policy.dedup.phash_hamming_threshold)
 
     for index, asset in enumerate(assets):
         assets[index] = asset.model_copy(
@@ -260,7 +266,13 @@ def run(assets: list[Asset], building_lat: float, building_lon: float) -> DedupR
             }
         )
 
-    clusters, bearings = viewpoint_groups(assets, building_lat, building_lon)
+    clusters, bearings = viewpoint_groups(
+        assets,
+        building_lat,
+        building_lon,
+        position_tolerance_m=policy.dedup.position_tolerance_m,
+        bearing_tolerance_deg=policy.dedup.bearing_tolerance_deg,
+    )
     for index, asset in enumerate(assets):
         assets[index] = asset.model_copy(
             update={
@@ -269,7 +281,7 @@ def run(assets: list[Asset], building_lat: float, building_lon: float) -> DedupR
             }
         )
 
-    assign_roles(assets)
+    assign_roles(assets, max_overlap=policy.dedup.max_overlap_per_cluster)
 
     report = DedupReport(
         files=len(assets),

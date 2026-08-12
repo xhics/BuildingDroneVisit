@@ -2,21 +2,34 @@
   "property_id": "welcominns-boucherville",
   "address": "1195 rue Ampère, Boucherville, Québec J4B 7M6",
   "official_name": "Hôtel WelcomINNS",
-  "aliases": ["WelcomInns", "Welcom Inns", "Hôtel WelcomInns - Montréal/Boucherville"],
-  "competitor_names": ["Hôtel Mortagne"],
-  "ocr_languages": ["fr", "en"],
+  "aliases": [
+    "WelcomInns",
+    "Welcom Inns",
+    "Hôtel WelcomInns - Montréal/Boucherville"
+  ],
+  "competitor_names": [
+    "Hôtel Mortagne"
+  ],
+  "ocr_languages": [
+    "fr",
+    "en"
+  ],
   "renovation_events": [
     {
       "event_id": "piia-2024-70127",
-      "occurred_on": "2024-09-16",
       "scope": "entrance",
-      "evidence": ["https://www.boucherville.ca/wp-content/uploads/2024/09/PV_seance_240916.pdf"],
-      "note": "Rénovation de l'entrée principale approuvée par la Ville"
+      "approved_on": "2024-09-16",
+      "completion_confirmed": false,
+      "evidence": [
+        "https://www.boucherville.ca/wp-content/uploads/2024/09/PV_seance_240916.pdf"
+      ],
+      "note": "Approbation municipale du PIIA. Ni le début ni la fin des travaux ne sont attestés."
     }
   ],
   "room_count": 116,
   "lat": 45.574128,
   "lon": -73.443289,
   "website_url": "https://hotelwelcominns.com/fr/",
-  "place_query": "Hôtel WelcomINNS, 1195 rue Ampère, Boucherville, QC"
+  "place_query": "Hôtel WelcomINNS, 1195 rue Ampère, Boucherville, QC",
+  "expected_levels": 3
 }

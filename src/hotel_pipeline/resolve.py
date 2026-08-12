@@ -15,6 +15,8 @@ from shapely.geometry import Polygon, shape
 from shapely.ops import transform
 
 from .logging import get_logger
+from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
+from .schemas.profile import FOOTPRINT_FALLBACK_M2, PropertyProfile
 from .schemas.spatial import (
     BuildingCandidate,
     GeocodeResult,
@@ -25,7 +27,7 @@ from .schemas.spatial import (
 log = get_logger("resolve")
 
 #: Contiguïté franche : les polygones se touchent ou presque.
-ADJACENCY_STRONG_M = 8.0
+ADJACENCY_STRONG_M = DEFAULT_POLICY.geometry.adjacency_strong_m
 
 #: Association plausible : trottoir, aménagement paysager ou simple imprécision
 #: de numérisation OSM séparent le stationnement du bâtiment. Au-delà, le lien
@@ -35,7 +37,7 @@ ADJACENCY_STRONG_M = 8.0
 #: WelcomINNS, dont le stationnement OSM est numérisé à 21 m. Un lien à cette
 #: distance est donc rapporté comme *à confirmer*, jamais comme établi — plutôt
 #: que d'élargir le seuil franc jusqu'à ce que le bon résultat passe.
-ADJACENCY_MAX_M = 30.0
+ADJACENCY_MAX_M = DEFAULT_POLICY.geometry.adjacency_max_m
 
 #: Indices textuels d'un parc-o-bus, à distinguer du stationnement de l'hôtel.
 PARK_AND_RIDE_HINTS = ("incitatif", "park and ride", "park-and-ride", "stationnement incitatif")
@@ -94,11 +96,21 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # --- classement ----------------------------------------------------------
 
 
-def _score(candidate_tags: dict[str, str], distance_m: float, area_m2: float) -> tuple[float, list[str]]:
+def _score(
+    candidate_tags: dict[str, str],
+    distance_m: float,
+    area_m2: float,
+    footprint_range: tuple[float, float],
+) -> tuple[float, list[str]]:
     """Score heuristique, borné à [0, 1], avec ses justifications.
 
     Ce score ordonne l'attention humaine. Il ne décide rien : le §12 du plan
     directeur réserve la décision aux règles et à l'humain.
+
+    L'emprise **n'élimine jamais** : hors plage, elle n'apporte simplement
+    aucun point, et le candidat reste examinable. La plage vient du profil de
+    l'établissement, jamais d'une constante — 1 500 à 12 000 m² était calibré
+    sur un hôtel de 116 chambres et écartait tout motel comme toute tour.
     """
     score = 0.0
     reasons: list[str] = []
@@ -121,22 +133,27 @@ def _score(candidate_tags: dict[str, str], distance_m: float, area_m2: float) ->
         score += 0.07
         reasons.append(f"à {distance_m:.0f} m du géocodage")
 
-    # Un hôtel de 116 chambres occupe une emprise substantielle.
-    if 1_500 <= area_m2 <= 12_000:
+    low, high = footprint_range
+    if low <= area_m2 <= high:
         score += 0.25
-        reasons.append(f"emprise plausible ({area_m2:.0f} m²)")
-    elif area_m2 > 12_000:
-        reasons.append(f"emprise très grande ({area_m2:.0f} m²) — vérifier")
+        reasons.append(f"emprise plausible ({area_m2:.0f} m², attendu {low:.0f}–{high:.0f})")
+    elif area_m2 > high:
+        reasons.append(f"emprise plus grande qu'attendu ({area_m2:.0f} m²) — à vérifier")
     else:
-        reasons.append(f"emprise faible ({area_m2:.0f} m²)")
+        reasons.append(f"emprise plus petite qu'attendu ({area_m2:.0f} m²) — à vérifier")
 
     return min(score, 1.0), reasons
 
 
 def build_candidates(
-    elements: Iterable[dict[str, Any]], geocode: GeocodeResult
+    elements: Iterable[dict[str, Any]],
+    geocode: GeocodeResult,
+    profile: PropertyProfile | None = None,
 ) -> list[BuildingCandidate]:
     """Transforme les éléments Overpass en candidats classés."""
+    footprint_range = (
+        profile.footprint_range_m2() if profile is not None else FOOTPRINT_FALLBACK_M2
+    )
     candidates: list[BuildingCandidate] = []
 
     for element in elements:
@@ -151,7 +168,7 @@ def build_candidates(
         centroid = polygon.centroid
         area = _area_m2(polygon, geocode.lat)
         distance = _haversine_m(geocode.lat, geocode.lon, centroid.y, centroid.x)
-        score, reasons = _score(tags, distance, area)
+        score, reasons = _score(tags, distance, area, footprint_range)
 
         candidates.append(
             BuildingCandidate(
@@ -299,6 +316,7 @@ def resolve(
     radius_m: int = 500,
     lat: float | None = None,
     lon: float | None = None,
+    profile: PropertyProfile | None = None,
 ) -> SpatialManifest:
     """Construit le manifeste spatial. Effectue des appels réseau.
 
@@ -318,7 +336,7 @@ def resolve(
         )
 
     elements = features_around(position.lat, position.lon, radius_m)
-    candidates = build_candidates(elements, position)
+    candidates = build_candidates(elements, position, profile=profile)
     log.info("%d bâtiment(s) candidat(s) retenu(s)", len(candidates))
 
     return SpatialManifest(
