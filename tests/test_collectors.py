@@ -148,3 +148,21 @@ class TestQuality:
         path = tmp_path / "flat.jpg"
         Image.new("RGB", (64, 64), (128, 128, 128)).save(path)
         assert 0.0 <= normalised_quality(basic_scores(path)) <= 1.0
+
+
+class TestTinyImages:
+    """Les pixels de suivi ne doivent pas produire de NaN (§11, G3)."""
+
+    def test_one_pixel_image_scores_without_nan(self, tmp_path):
+        import math
+
+        path = tmp_path / "pixel.png"
+        Image.new("RGB", (1, 1), (255, 255, 255)).save(path)
+        scores = basic_scores(path)
+        assert not math.isnan(scores["sharpness"])
+        assert scores["sharpness"] == 0.0
+
+    def test_tiny_image_is_never_considered_sharp(self, tmp_path):
+        path = tmp_path / "tiny.png"
+        Image.new("RGB", (2, 2), (10, 200, 10)).save(path)
+        assert normalised_quality(basic_scores(path)) == 0.0

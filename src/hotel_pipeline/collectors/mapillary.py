@@ -23,6 +23,13 @@ GRAPH_URL = "https://graph.mapillary.com/images"
 TIMEOUT = 60
 FIELDS = "id,captured_at,compass_angle,geometry,thumb_2048_url,is_pano"
 
+#: Taille de page demandée à l'API.
+PAGE_SIZE = 200
+
+#: Plafond de sécurité : une zone urbaine dense peut contenir des milliers de
+#: clichés, dont l'immense majorité ne regarde pas le bâtiment.
+MAX_IMAGES = 1500
+
 name = "mapillary"
 
 
@@ -35,28 +42,52 @@ def _bbox(lat: float, lon: float, radius_m: int) -> str:
     return f"{lon - dlon},{lat - dlat},{lon + dlon},{lat + dlat}"
 
 
-def collect(lat: float, lon: float, radius_m: int = 300, limit: int = 200) -> list[CollectedImage]:
-    """Images Mapillary dans un rayon autour du bâtiment."""
+def collect(
+    lat: float,
+    lon: float,
+    radius_m: int = 300,
+    page_size: int = PAGE_SIZE,
+    max_images: int = MAX_IMAGES,
+) -> list[CollectedImage]:
+    """Images Mapillary dans un rayon autour du bâtiment.
+
+    La pagination est indispensable : l'API rend une page bornée, et sur un
+    rayon large elle est atteinte avant d'avoir couvert la zone. S'arrêter à la
+    première page tronque silencieusement le corpus — et écarte des vues
+    proches du bâtiment au profit d'images lointaines arrivées en tête.
+    """
     ensure_online("Mapillary")
     token = secret("MAPILLARY_TOKEN")
     bbox = _bbox(lat, lon, radius_m)
 
-    def fetch() -> dict:
-        response = requests.get(
-            GRAPH_URL,
-            params={"fields": FIELDS, "bbox": bbox, "limit": limit},
-            headers={"Authorization": f"OAuth {token}"},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.json()
+    def fetch_all() -> list[dict]:
+        entries: list[dict] = []
+        url = GRAPH_URL
+        params: dict | None = {"fields": FIELDS, "bbox": bbox, "limit": page_size}
+
+        while url and len(entries) < max_images:
+            response = requests.get(
+                url,
+                params=params,
+                headers={"Authorization": f"OAuth {token}"},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            entries.extend(payload.get("data", []))
+
+            # Le curseur `next` porte déjà tous ses paramètres.
+            url = ((payload.get("paging") or {}).get("next")) or ""
+            params = None
+
+        return entries[:max_images]
 
     # La clé de cache exclut le jeton : deux jetons différents ne doivent pas
     # produire deux entrées, et aucun secret ne doit atterrir sur le disque.
-    payload = cached_call(f"mapillary::{bbox}::{limit}", fetch)
+    data = cached_call(f"mapillary::{bbox}::{page_size}::{max_images}", fetch_all)
 
     images: list[CollectedImage] = []
-    for entry in payload.get("data", []):
+    for entry in data:
         url = entry.get("thumb_2048_url")
         if not url:
             continue

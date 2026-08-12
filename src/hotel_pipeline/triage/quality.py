@@ -69,6 +69,12 @@ def basic_scores(image_path: Path) -> dict[str, float]:
     with Image.open(image_path) as image:
         grey = np.asarray(image.convert("L"), dtype=float)
 
+    # Une image de moins de 3 pixels de côté — pixel de suivi, séparateur —
+    # ne laisse aucun intérieur au noyau : le laplacien serait vide et sa
+    # variance NaN.
+    if grey.shape[0] < 3 or grey.shape[1] < 3:
+        return {"sharpness": 0.0, "brightness": float(grey.mean()) if grey.size else 0.0}
+
     # Laplacien 3x3 par différences finies.
     laplacian = (
         -4 * grey[1:-1, 1:-1]
