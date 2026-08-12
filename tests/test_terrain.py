@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from shapely.geometry import Polygon
 
 from hotel_pipeline.geo.terrain import (
     aggregate_median,
@@ -19,7 +20,7 @@ from hotel_pipeline.geo.terrain import (
     block_cross_validation,
     interpolate_idw,
     interpolate_tin,
-    pseudo_building_validation,
+    pseudo_footprint_validation,
     support_distance,
 )
 
@@ -121,43 +122,115 @@ class TestBlockCrossValidation:
         assert scores.rmse is None
 
 
-class TestPseudoBuildingValidation:
-    def test_it_produces_trials_with_their_support_distances(self):
+SMALL_FOOTPRINT = Polygon([(0, 0), (16, 0), (16, 10), (0, 10)])
+HUGE_FOOTPRINT = Polygon([(0, 0), (200, 0), (200, 200), (0, 200)])
+
+
+#: Le jeu synthétique porte 0,7 point par mètre carré ; l'anneau réel en porte
+#: une quarantaine. Les essais utilisent donc des cellules de 2 m, ce qui teste
+#: la logique de couverture sans exiger une densité que la fixture n'a pas.
+TEST_CELL_M = 2.0
+
+
+class TestPseudoFootprintValidation:
+    """L'acceptation repose sur une couverture spatiale, non sur un compte.
+
+    Trente cellules masquées représenteraient moins de un pour cent d'une
+    empreinte de sept mille cellules : l'essai n'aurait rien reproduit.
+    """
+
+    def test_a_sparse_ground_cannot_meet_the_coverage_threshold(self):
+        """Le seuil est exigeant, et c'est voulu : à 0,7 pt/m² rien ne passe."""
         x, y, z = sloped_ground(n=2500)
-        trials = pseudo_building_validation(
-            x, y, z, width_m=16, height_m=10, ring_m=8.0, trials=3
+        trials, rejected = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, cell_m=0.5
+        )
+        assert trials == []
+        assert any("sol de référence" in reason for reason in rejected)
+
+    def test_trials_report_their_coverage_fractions(self):
+        x, y, z = sloped_ground(n=2500)
+        trials, _ = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, trials=3, cell_m=TEST_CELL_M
         )
 
         assert trials
         for trial in trials:
-            assert trial["masked_points"] > 0
-            assert trial["support_distance_max_m"] > 2
+            assert trial["truth_coverage_fraction"] > 0
+            assert trial["ring_coverage_fraction"] > 0
+            assert trial["reconstructed_fraction"] > 0
 
     def test_a_continuous_gap_is_harder_than_scattered_blocks(self):
-        """La validation par blocs reste optimiste : ses trous sont petits.
-
-        Un vide continu de dimensions réelles éloigne bien davantage les
-        cellules de leur appui, ce que cette comparaison rend visible.
-        """
         x, y, z = sloped_ground(n=2500)
         blocks = block_cross_validation(x, y, z, block_m=12.0)
-        trials = pseudo_building_validation(
-            x, y, z, width_m=16, height_m=10, ring_m=8.0, trials=2
+        trials, _ = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, trials=2, cell_m=TEST_CELL_M
         )
 
         assert trials, "aucun essai exploitable — la comparaison n'aurait aucun sens"
-        worst = max(t["support_distance_max_m"] for t in trials)
-        assert worst > blocks.rmse
+        assert max(t["support_distance_max_m"] for t in trials) > blocks.rmse
 
-    def test_no_trial_is_invented_when_the_ground_is_too_sparse(self):
+    def test_sparse_ground_yields_no_trial_but_states_why(self):
         x, y, z = sloped_ground(n=40)
-        assert pseudo_building_validation(x, y, z, width_m=16, height_m=10) == []
+        trials, rejected = pseudo_footprint_validation(x, y, z, SMALL_FOOTPRINT)
+        assert trials == []
+        assert rejected
 
-    def test_a_gap_larger_than_the_known_ground_is_refused(self):
-        """Sans pourtour, un essai serait dégénéré plutôt qu'informatif."""
+    def test_a_footprint_larger_than_the_known_ground_is_refused(self):
         x, y, z = sloped_ground(n=1200)
-        assert pseudo_building_validation(x, y, z, width_m=200, height_m=200) == []
+        trials, rejected = pseudo_footprint_validation(x, y, z, HUGE_FOOTPRINT)
+        assert trials == []
+        assert any("insuffisante" in reason for reason in rejected)
 
+    def test_the_threshold_comes_from_the_policy(self):
+        """Durcir la politique doit réduire le nombre d'essais retenus.
+
+        Le seuil n'est pas une constante du code : le changer change le
+        résultat, ce que vérifie cette comparaison.
+        """
+        from hotel_pipeline.schemas import DEFAULT_POLICY
+
+        x, y, z = sloped_ground(n=2500)
+        lenient = DEFAULT_POLICY.model_copy(deep=True)
+        lenient.terrain.min_truth_coverage = 0.10
+        lenient.terrain.min_ring_coverage = 0.10
+
+        strict = DEFAULT_POLICY.model_copy(deep=True)
+        strict.terrain.min_truth_coverage = 1.0
+        strict.terrain.min_ring_coverage = 0.10
+
+        loose_trials, _ = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, policy=lenient,
+            cell_m=0.5, trials=3,
+        )
+        tight_trials, rejected = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, policy=strict,
+            cell_m=0.5, trials=3,
+        )
+
+        assert len(loose_trials) > len(tight_trials)
+        assert any("sol de référence" in reason for reason in rejected)
+
+    def test_overlap_with_the_real_building_is_refused(self):
+        x, y, z = sloped_ground(n=2500)
+        everywhere = Polygon([(0, 0), (60, 0), (60, 60), (0, 60)])
+        trials, rejected = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, real_footprint=everywhere, cell_m=TEST_CELL_M
+        )
+        assert trials == []
+        assert any("bâtiment réel" in reason for reason in rejected)
+
+    def test_a_class_six_concentration_is_refused(self):
+        """Un autre bâtiment prive la zone de sol pour la même raison."""
+        x, y, z = sloped_ground(n=2500)
+        bx = np.random.default_rng(3).uniform(0, 60, 20000)
+        by = np.random.default_rng(4).uniform(0, 60, 20000)
+
+        trials, rejected = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, building_xy=(bx, by), cell_m=TEST_CELL_M
+        )
+        assert trials == []
+        assert any("autre bâtiment" in reason for reason in rejected)
 
 class TestComparisonDomain:
     """IDW est un contre-modèle de diagnostic, jamais un remplisseur.
@@ -236,21 +309,18 @@ class TestComparisonDomain:
         assert rejected.distance_max is None
 
 
-class TestPseudoBuildingFollowsTheSameRule:
+class TestPseudoFootprintFollowsTheSameRule:
     def test_unsupported_points_are_counted_apart_from_the_error(self):
         x, y, z = sloped_ground(n=2500)
-        trials = pseudo_building_validation(
-            x, y, z, width_m=16, height_m=10, ring_m=8.0, trials=2
+        trials, _ = pseudo_footprint_validation(
+            x, y, z, SMALL_FOOTPRINT, ring_m=8.0, trials=2, cell_m=TEST_CELL_M
         )
         assert trials
         for trial in trials:
             assert trial["reconstructed_points"] + trial["unsupported_points"] == (
                 trial["masked_points"]
             )
-            # L'erreur ne porte que sur ce qui a été reconstruit.
             assert trial["n"] == trial["reconstructed_points"]
-
-
 class TestAggregationDoesNotFoldTheOutside:
     """Un point de sol lointain ne doit pas devenir un appui contre la façade.
 

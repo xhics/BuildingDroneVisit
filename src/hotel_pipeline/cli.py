@@ -772,7 +772,7 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     from shapely import wkt as shapely_wkt
     from shapely.ops import transform as shapely_transform
 
-    from .geo.derive import derive, verify_written
+    from .geo.derive import derive, supersede_missing, verify_publication, verify_written
     from .geo.raster import GridSpec
 
     workspace = Workspace(hotel_id)
@@ -809,7 +809,7 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     )
 
     grid = GridSpec(**result.grid)
-    problems = verify_written(result, grid)
+    problems = verify_written(result, grid, result.expected_layers)
     if problems:
         typer.secho(f"{KO} contrôle des couches échoué :", fg=typer.colors.RED, err=True)
         for problem in problems:
@@ -844,6 +844,24 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         artifacts = {a.artifact_id: a for a in site.artifacts}
         artifacts.update({a.artifact_id: a for a in result.artifacts})
         site.artifacts = list(artifacts.values())
+
+        # Les productions antérieures restent au manifeste, mais celles dont le
+        # fichier a disparu ne peuvent plus passer pour courantes.
+        stale = supersede_missing(
+            site,
+            "fichier absent après réorganisation des publications ; produit "
+            "avant la correction du rabattement des indices d'agrégation",
+        )
+        if stale:
+            typer.secho(f"  · {stale} artefact(s) invalidé(s) — fichier absent",
+                        fg=typer.colors.YELLOW)
+
+        dead = verify_publication(site)
+        if dead:
+            for problem in dead:
+                typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=4)
+
         workspace.write_site(site)
 
     workspace.write_report(f"06_geo/derivation_report_{run_id}.json", result, context)

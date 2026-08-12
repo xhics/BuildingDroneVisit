@@ -72,6 +72,37 @@ class CollectionPolicy(BaseModel):
     wide_fov_deg: int = Field(default=110, gt=0, le=120)
 
 
+class TerrainPolicy(BaseModel):
+    """Seuils de la validation par pseudo-empreinte.
+
+    Ils portent sur une **couverture spatiale**, non sur un nombre de points :
+    trente cellules masquées représenteraient moins de un pour cent d'une
+    empreinte de sept mille cellules, et l'essai n'aurait rien reproduit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cell_m: float = Field(default=0.5, gt=0)
+    ring_m: float = Field(default=20.0, gt=0)
+    search_radius_m: float = Field(default=150.0, gt=0)
+
+    #: Part de l'empreinte translatée devant être couverte par du sol connu,
+    #: pour que l'essai reproduise réellement la situation.
+    min_truth_coverage: float = Field(default=0.60, ge=0.0, le=1.0)
+
+    #: Part de l'anneau devant porter des appuis.
+    min_ring_coverage: float = Field(default=0.50, ge=0.0, le=1.0)
+
+    #: Part de la vérité masquée que le TIN doit reconstruire.
+    min_reconstructed: float = Field(default=0.90, ge=0.0, le=1.0)
+
+    #: Densité de classe 6 au-delà de laquelle un emplacement est réputé
+    #: contenir un autre bâtiment.
+    max_building_points_per_m2: float = Field(default=0.5, ge=0.0)
+
+    min_trials: int = Field(default=3, ge=1)
+
+
 class TemporalPolicy(BaseModel):
     """Ce qu'une datation inconnue autorise, selon l'usage.
 
@@ -101,6 +132,7 @@ class PipelinePolicy(BaseModel):
     geometry: GeometryPolicy = Field(default_factory=GeometryPolicy)
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)
     collection: CollectionPolicy = Field(default_factory=CollectionPolicy)
+    terrain: TerrainPolicy = Field(default_factory=TerrainPolicy)
     temporal: TemporalPolicy = Field(default_factory=TemporalPolicy)
 
 

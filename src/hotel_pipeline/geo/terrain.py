@@ -248,9 +248,38 @@ def block_cross_validation(px, py, pz, block_m: float = BLOCK_M) -> ValidationSc
     return _scores(np.concatenate(truths), np.concatenate(predictions))
 
 
+def _coverage_fraction(px, py, polygon, cell_m: float) -> float:  # noqa: ANN001
+    """Part des cellules du polygone portant au moins un appui.
+
+    Un décompte de points ne dit rien de la répartition : mille points groupés
+    dans un coin couvrent moins qu'une centaine bien répartie.
+    """
+    from shapely import contains_xy
+
+    minx, miny, maxx, maxy = polygon.bounds
+    columns = max(1, int((maxx - minx) / cell_m))
+    rows = max(1, int((maxy - miny) / cell_m))
+
+    cx = minx + (np.arange(columns) + 0.5) * cell_m
+    cy = miny + (np.arange(rows) + 0.5) * cell_m
+    grid_x, grid_y = np.meshgrid(cx, cy, indexing="ij")
+    inside_grid = contains_xy(polygon, grid_x.ravel(), grid_y.ravel())
+    denominator = int(inside_grid.sum())
+    if denominator == 0:
+        return 0.0
+
+    ix = np.floor((px - minx) / cell_m).astype(np.int64)
+    iy = np.floor((py - miny) / cell_m).astype(np.int64)
+    valid = (ix >= 0) & (ix < columns) & (iy >= 0) & (iy < rows)
+    occupied = np.unique(ix[valid] * rows + iy[valid])
+    inside_keys = np.flatnonzero(inside_grid)
+    return round(np.intersect1d(occupied, inside_keys).size / denominator, 4)
+
+
 def pseudo_footprint_validation(
     px, py, pz, footprint, ring_m: float = RING_M, trials: int = 3,  # noqa: ANN001
     search_radius_m: float = 150.0, cell_m: float = CELL_M,
+    policy=None, real_footprint=None, building_xy=None,  # noqa: ANN001
 ) -> tuple[list[dict], list[str]]:
     """Déplacer la **forme réelle** de l'empreinte là où le sol est connu.
 
@@ -267,6 +296,9 @@ def pseudo_footprint_validation(
     from shapely import contains_xy
     from shapely.affinity import translate
 
+    from ..schemas.policy import DEFAULT_POLICY
+
+    limits = (policy or DEFAULT_POLICY).terrain
     results: list[dict] = []
     rejected: list[str] = []
     if px.size < 4:
@@ -302,20 +334,58 @@ def pseudo_footprint_validation(
             rejected.append(f"emplacement {cx:.0f},{cy:.0f} chevauche un essai précédent")
             continue
 
+        # Un emplacement chevauchant le vrai bâtiment n'a pas de sol connu.
+        if real_footprint is not None and moved.intersects(real_footprint):
+            rejected.append(f"emplacement {cx:.0f},{cy:.0f} chevauche le bâtiment réel")
+            continue
+
+        # Une concentration de classe 6 signale un autre bâtiment : le sol y
+        # est absent pour la même raison.
+        if building_xy is not None and len(building_xy[0]):
+            bx, by = building_xy
+            in_moved = contains_xy(moved, bx, by)
+            density = int(in_moved.sum()) / max(moved.area, 1.0)
+            if density > limits.max_building_points_per_m2:
+                rejected.append(
+                    f"emplacement {cx:.0f},{cy:.0f} : {density:.2f} pt/m² de classe 6 "
+                    "— un autre bâtiment s'y trouve"
+                )
+                continue
+
         masked = contains_xy(moved, px, py)
         ring = contains_xy(support_zone, px, py) & ~masked
-        if masked.sum() < 30 or ring.sum() < 50:
+
+        truth_coverage = _coverage_fraction(px[masked], py[masked], moved, cell_m)
+        ring_coverage = _coverage_fraction(
+            px[ring], py[ring], support_zone.difference(moved), cell_m
+        )
+        if truth_coverage < limits.min_truth_coverage:
             rejected.append(
-                f"emplacement {cx:.0f},{cy:.0f} : {int(masked.sum())} point(s) masqué(s), "
-                f"{int(ring.sum())} en anneau — trop peu"
+                f"emplacement {cx:.0f},{cy:.0f} : sol de référence couvrant "
+                f"{truth_coverage * 100:.0f} % de l'empreinte, minimum "
+                f"{limits.min_truth_coverage * 100:.0f} %"
+            )
+            continue
+        if ring_coverage < limits.min_ring_coverage:
+            rejected.append(
+                f"emplacement {cx:.0f},{cy:.0f} : anneau couvert à "
+                f"{ring_coverage * 100:.0f} %, minimum "
+                f"{limits.min_ring_coverage * 100:.0f} %"
             )
             continue
 
         predicted = interpolate_tin(px[ring], py[ring], pz[ring], px[masked], py[masked])
         scores = _scores(pz[masked], predicted)
         unsupported = int(np.isnan(predicted).sum())
-        distances = support_distance(px[ring], py[ring], px[masked], py[masked])
+        reconstructed = (int(masked.sum()) - unsupported) / max(int(masked.sum()), 1)
+        if reconstructed < limits.min_reconstructed:
+            rejected.append(
+                f"emplacement {cx:.0f},{cy:.0f} : {reconstructed * 100:.0f} % "
+                f"reconstruits, minimum {limits.min_reconstructed * 100:.0f} %"
+            )
+            continue
 
+        distances = support_distance(px[ring], py[ring], px[masked], py[masked])
         used.append(support_zone)
         results.append(
             {
@@ -323,6 +393,9 @@ def pseudo_footprint_validation(
                 "masked_points": int(masked.sum()),
                 "reconstructed_points": int(masked.sum()) - unsupported,
                 "unsupported_points": unsupported,
+                "truth_coverage_fraction": truth_coverage,
+                "ring_coverage_fraction": ring_coverage,
+                "reconstructed_fraction": round(reconstructed, 4),
                 **scores.as_dict(),
                 "support_distance_p95_m": round(float(np.percentile(distances, 95)), 2),
                 "support_distance_max_m": round(float(distances.max()), 2),
@@ -335,78 +408,6 @@ def pseudo_footprint_validation(
         len(rejected),
     )
     return results, rejected
-
-
-def pseudo_building_validation(
-    px, py, pz, width_m: float, height_m: float, ring_m: float = RING_M, trials: int = 5  # noqa: ANN001
-) -> list[dict]:
-    """Masquer un faux bâtiment là où le sol est connu, puis le reconstruire.
-
-    C'est la seule mesure qui reproduit la situation réelle : un vide continu,
-    de dimensions comparables, interpolé depuis son seul pourtour. La
-    validation par blocs reste optimiste parce que ses trous sont petits.
-    """
-    results: list[dict] = []
-    if px.size < 4:
-        return results
-
-    minx, maxx = float(px.min()), float(px.max())
-    miny, maxy = float(py.min()), float(py.max())
-
-    # Un faux bâtiment plus large que la zone de sol connue ne laisserait
-    # aucun pourtour : renoncer vaut mieux que produire un essai dégénéré.
-    needed_x = width_m + 2 * ring_m
-    needed_y = height_m + 2 * ring_m
-    if (maxx - minx) < needed_x or (maxy - miny) < needed_y:
-        log.info(
-            "zone de sol trop petite pour un faux bâtiment de %.0f × %.0f m",
-            width_m,
-            height_m,
-        )
-        return results
-
-    rng = np.random.default_rng(seed=1195)
-    attempts = 0
-    while len(results) < trials and attempts < trials * 6:
-        attempts += 1
-        cx = rng.uniform(minx + needed_x / 2, maxx - needed_x / 2)
-        cy = rng.uniform(miny + needed_y / 2, maxy - needed_y / 2)
-
-        masked = (
-            (np.abs(px - cx) <= width_m / 2) & (np.abs(py - cy) <= height_m / 2)
-        )
-        ring = (
-            (np.abs(px - cx) <= width_m / 2 + ring_m)
-            & (np.abs(py - cy) <= height_m / 2 + ring_m)
-            & ~masked
-        )
-        if masked.sum() < 30 or ring.sum() < 50:
-            continue
-
-        predicted = interpolate_tin(
-            px[ring], py[ring], pz[ring], px[masked], py[masked]
-        )
-        # Même règle que pour la production : l'erreur ne se mesure que là où
-        # le TIN reconstruit. Sinon une méthode extrapolant partout serait
-        # récompensée d'avoir répondu.
-        scores = _scores(pz[masked], predicted)
-        unsupported = int(np.isnan(predicted).sum())
-        distances = support_distance(px[ring], py[ring], px[masked], py[masked])
-
-        results.append(
-            {
-                "centre": [round(cx, 1), round(cy, 1)],
-                "masked_points": int(masked.sum()),
-                "reconstructed_points": int(masked.sum()) - unsupported,
-                "unsupported_points": unsupported,
-                **scores.as_dict(),
-                "support_distance_p95_m": round(float(np.percentile(distances, 95)), 2),
-                "support_distance_max_m": round(float(distances.max()), 2),
-            }
-        )
-
-    log.info("validation par faux bâtiment : %d essai(s) exploitable(s)", len(results))
-    return results
 
 
 # --- domaine de comparaison et masques ------------------------------------

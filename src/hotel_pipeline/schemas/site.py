@@ -183,6 +183,12 @@ class DerivedArtifact(BaseModel):
     #: dérivation réelle et rendrait la chaîne irreproductible.
     derived_from_artifacts: list[str] = Field(default_factory=list)
 
+    #: `active`, `superseded` ou `invalidated`. Conserver un artefact périmé est
+    #: utile ; le laisser passer pour courant ne l'est pas.
+    status: str = "active"
+    superseded_by: str | None = None
+    invalidation_reason: str | None = None
+
     produced_at: datetime | None = None
 
     @model_validator(mode="after")
@@ -217,12 +223,34 @@ class DerivedArtifact(BaseModel):
             raise ValueError(
                 f"artefact {self.artifact_id!r} se cite lui-même comme parent"
             )
+        if self.status not in ARTIFACT_STATUSES:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} : état {self.status!r} inconnu ; "
+                f"attendu l'un de {sorted(ARTIFACT_STATUSES)}"
+            )
+        if self.status == "invalidated" and not self.invalidation_reason:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} invalidé sans motif — "
+                "un rejet sans raison n'apprend rien"
+            )
+        if self.status == "superseded" and not self.superseded_by:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} déclaré remplacé sans successeur"
+            )
         return self
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "active"
 
     @property
     def nodata_fraction(self) -> float:
         return round(1.0 - self.measured_fraction - self.interpolated_fraction, 6)
 
+
+#: États d'un artefact. Un artefact périmé reste consultable, mais ne peut plus
+#: fonder une qualification.
+ARTIFACT_STATUSES: frozenset[str] = frozenset({"active", "superseded", "invalidated"})
 
 #: Domaines sur lesquels une fraction peut être calculée. Sans cette précision,
 #: `measured_fraction=0.97` ne veut rien dire : 97 % de quoi ?
@@ -398,6 +426,13 @@ class SiteManifest(BaseModel):
                     f"artefact {artifact.artifact_id!r} référence un masque "
                     f"absent : {mask_id!r}"
                 )
+            if artifact.superseded_by and artifact.superseded_by not in {
+                a.artifact_id for a in self.artifacts
+            }:
+                raise ValueError(
+                    f"artefact {artifact.artifact_id!r} remplacé par "
+                    f"{artifact.superseded_by!r}, absent du manifeste"
+                )
             missing_parents = [
                 a for a in artifact.derived_from_artifacts if a not in known_artifacts
             ]
@@ -450,6 +485,9 @@ class SiteManifest(BaseModel):
     def source(self, source_id: str) -> GeoSourceProvenance | None:
         return next((s for s in self.geo_sources if s.source_id == source_id), None)
 
+    def active_artifacts(self) -> list[DerivedArtifact]:
+        return [a for a in self.artifacts if a.is_active]
+
     def artifact(self, artifact_id: str) -> DerivedArtifact | None:
         return next((a for a in self.artifacts if a.artifact_id == artifact_id), None)
 
@@ -467,5 +505,6 @@ class SiteManifest(BaseModel):
             "relations": sum(len(o.relations) for o in self.objects),
             "geo_sources": len(self.geo_sources),
             "artifacts": len(self.artifacts),
+            "active_artifacts": len(self.active_artifacts()),
             "derived_objects": len(self.derived()),
         }

@@ -60,6 +60,10 @@ class DeriveResult:
     metrics: dict = field(default_factory=dict)
     qa_flags: list[str] = field(default_factory=list)
 
+    #: Couches telles que produites en mémoire, pour confronter le relu à
+    #: l'attendu. Exclues du rapport sérialisé.
+    expected_layers: dict = field(default_factory=dict, repr=False)
+
     def as_dict(self) -> dict:
         return {
             "grid": self.grid,
@@ -244,6 +248,7 @@ def derive(
     )
     search_within_tile = tile_covers(laz_bounds, footprint_projected, search_radius_m)
 
+    result.expected_layers = layers
     result.metrics = _metrics(
         grid, footprint_mask, dtm, dsm_roof, class1, ndsm, ndsm_valid,
         masks, disagreement, rejected, distances, px, py, pz, footprint_projected,
@@ -423,11 +428,15 @@ def _artifacts(
 _ELEVATION = {"dtm", "dsm_roof", "ndsm", "unclassified_roof_candidates"}
 
 
-def verify_written(result: DeriveResult, grid: GridSpec) -> list[str]:
-    """Rouvre chaque couche et confronte son en-tête à la grille.
+def verify_written(
+    result: DeriveResult, grid: GridSpec, expected: dict[str, np.ndarray] | None = None
+) -> list[str]:
+    """Rouvre chaque couche et la confronte à la grille **et aux valeurs**.
 
     Un manifeste ne doit jamais référencer un fichier qu'on n'a pas rouvert :
-    l'écriture peut réussir et produire un raster décalé ou mal projeté.
+    l'écriture peut réussir et produire un raster décalé, mal projeté, ou
+    rempli de mauvaises valeurs. Contrôler qu'il n'est pas vide ne suffit pas —
+    un raster corrompu est rarement vide.
     """
     import rasterio
 
@@ -447,10 +456,16 @@ def verify_written(result: DeriveResult, grid: GridSpec) -> list[str]:
 
             # Les six coefficients, pas seulement l'origine et le pas : une
             # rotation ou un cisaillement passerait autrement inaperçu.
-            actual = [source.transform[i] for i in range(6)]
-            expected = [expected_transform[i] for i in range(6)]
-            if not np.allclose(actual, expected):
-                problems.append(f"{name} : transformation {actual} au lieu de {expected}")
+            # Nom distinct du paramètre `expected` : une variable locale
+            # homonyme avait désactivé toute la comparaison de valeurs, en
+            # silence — `name not in [six flottants]` étant toujours vrai.
+            actual_transform = [source.transform[i] for i in range(6)]
+            wanted_transform = [expected_transform[i] for i in range(6)]
+            if not np.allclose(actual_transform, wanted_transform):
+                problems.append(
+                    f"{name} : transformation {actual_transform} au lieu de "
+                    f"{wanted_transform}"
+                )
 
             expected_dtype = "uint8" if role == "mask" else "float32"
             if source.dtypes[0] != expected_dtype:
@@ -464,13 +479,84 @@ def verify_written(result: DeriveResult, grid: GridSpec) -> list[str]:
                     f"{name} : nodata {source.nodata} au lieu de {expected_nodata}"
                 )
 
-            # Les valeurs elles-mêmes : un raster peut être conforme en tête et
-            # vide, ou saturé de valeurs sans donnée.
-            band = source.read(1, masked=(role != "mask"))
+            # Les valeurs elles-mêmes, comparées à ce qui devait être écrit.
+            band = source.read(1)
             if role == "mask":
                 if not np.isin(np.unique(band), (0, 1)).all():
                     problems.append(f"{name} : masque contenant autre chose que 0 et 1")
-            elif band.count() == 0:
+            elif np.ma.masked_equal(band, NODATA).count() == 0:
                 problems.append(f"{name} : aucune valeur exploitable")
 
+            if expected is None or name not in expected:
+                continue
+
+            problems.extend(_compare_values(name, role, band, expected[name], grid))
+
     return problems
+
+
+def _compare_values(name: str, role: str, band, target, grid: GridSpec) -> list[str]:  # noqa: ANN001
+    """Confronte cellule à cellule le raster relu à la couche attendue.
+
+    La comparaison se fait dans la précision **réellement écrite** — float32 —
+    sans quoi l'arrondi de sérialisation se lirait comme une corruption.
+    """
+    from .raster import to_raster
+
+    problems: list[str] = []
+    written = to_raster(np.asarray(target))
+
+    if role == "mask":
+        if not np.array_equal(band.astype(bool), written.astype(bool)):
+            differing = int((band.astype(bool) != written.astype(bool)).sum())
+            problems.append(f"{name} : {differing} cellule(s) de masque divergentes")
+        return problems
+
+    reference = np.where(np.isnan(written), NODATA, written).astype("float32")
+
+    defined_read = band != NODATA
+    defined_expected = reference != NODATA
+    if not np.array_equal(defined_read, defined_expected):
+        differing = int((defined_read != defined_expected).sum())
+        problems.append(
+            f"{name} : {differing} cellule(s) définies d'un côté seulement"
+        )
+
+    if not np.array_equal(band, reference, equal_nan=True):
+        differing = int((band != reference).sum())
+        problems.append(f"{name} : {differing} cellule(s) de valeurs divergentes")
+
+    return problems
+
+
+def verify_publication(site) -> list[str]:  # noqa: ANN001 — SiteManifest
+    """Refuse un manifeste dont un artefact actif pointe vers un fichier absent.
+
+    Conserver les productions antérieures est correct ; les laisser passer pour
+    courantes ne l'est pas. Un artefact actif dont le chemin n'existe plus est
+    une référence morte, et une qualification fondée dessus serait invérifiable.
+    """
+    problems: list[str] = []
+    for artifact in site.active_artifacts():
+        if not Path(artifact.path).is_file():
+            problems.append(
+                f"artefact actif {artifact.artifact_id!r} : fichier absent "
+                f"({artifact.path}) — le marquer superseded ou invalidated"
+            )
+    return problems
+
+
+def supersede_missing(site, reason: str) -> int:  # noqa: ANN001
+    """Marque comme invalidés les artefacts actifs sans fichier.
+
+    Le motif est obligatoire : un rejet sans raison n'apprend rien à qui relira
+    le manifeste dans six mois.
+    """
+    marked = 0
+    for index, artifact in enumerate(site.artifacts):
+        if artifact.is_active and not Path(artifact.path).is_file():
+            site.artifacts[index] = artifact.model_copy(
+                update={"status": "invalidated", "invalidation_reason": reason}
+            )
+            marked += 1
+    return marked
