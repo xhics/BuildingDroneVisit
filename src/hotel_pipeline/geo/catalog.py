@@ -14,9 +14,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from enum import StrEnum
+
 from ..logging import get_logger
+from ..schemas.critical_objects import EXCLUDED_KINDS, REQUIRED_OBJECTS
 
 log = get_logger("geo-catalog")
+
+#: Types connus du gabarit. Valider `establishes` contre eux empêche qu'une
+#: faute de frappe crée une capacité fantôme — une source déclarant établir
+#: `ROOFLINE_MAIN2` n'établirait rien, sans que rien ne le signale.
+KNOWN_KINDS: frozenset[str] = frozenset(REQUIRED_OBJECTS) | frozenset(EXCLUDED_KINDS)
+
+
+class CoverageState(StrEnum):
+    """Couverture réelle d'une source à un endroit donné.
+
+    Distincte de l'admissibilité territoriale : le LiDAR québécois est
+    pertinent partout au Québec, sans y être acquis partout. La documentation
+    officielle renvoie d'ailleurs à une carte de couverture.
+    """
+
+    UNKNOWN = "unknown"
+    COVERED = "covered"
+    NOT_COVERED = "not_covered"
+    DISCOVERY_ERROR = "discovery_error"
 
 
 @dataclass(frozen=True)
@@ -43,6 +65,18 @@ class GeoSource:
 
     licence: str | None = None
     notes: str | None = None
+
+    #: L'acquisition est-elle automatisée ? Le cadastre est territorialement
+    #: pertinent, mais sa géométrie officielle se consulte, elle ne se
+    #: télécharge pas encore ici.
+    acquisition_automated: bool = True
+
+    def __post_init__(self) -> None:
+        unknown = (set(self.establishes) | set(self.cannot_establish)) - KNOWN_KINDS
+        if unknown:
+            raise ValueError(
+                f"source {self.source_id!r} : types inconnus du gabarit {sorted(unknown)}"
+            )
 
     def serves(self, territories: set[str]) -> bool:
         if territories & set(self.excludes):
@@ -100,6 +134,7 @@ SOURCES: tuple[GeoSource, ...] = (
         covers=("QC",),
         establishes=("PROPERTY_PARCEL",),
         licence="consultation ; acquisition à formaliser",
+        acquisition_automated=False,
         notes=(
             "Seule source juridique de la limite de propriété. Le Référentiel "
             "québécois des adresses peut donner un numéro de lot, jamais la "
@@ -111,18 +146,41 @@ SOURCES: tuple[GeoSource, ...] = (
 
 @dataclass
 class Routing:
+    """Admissibilité territoriale — **pas** une couverture confirmée.
+
+    Une source retenue ici est pertinente pour ce territoire. Savoir si elle
+    couvre réellement l'empreinte demande d'interroger son index, ce qui est
+    l'objet de la découverte.
+    """
+
     territories: set[str] = field(default_factory=set)
-    available: list[GeoSource] = field(default_factory=list)
+    territorial_candidates: list[GeoSource] = field(default_factory=list)
     rejected: dict[str, str] = field(default_factory=dict)
 
+    #: État de couverture par source, renseigné par la découverte.
+    coverage: dict[str, CoverageState] = field(default_factory=dict)
+
     def for_object(self, kind: str) -> list[GeoSource]:
-        return [s for s in self.available if kind in s.establishes]
+        """Candidats territoriaux susceptibles d'établir ce type."""
+        return [s for s in self.territorial_candidates if kind in s.establishes]
+
+    def confirmed_for(self, kind: str) -> list[GeoSource]:
+        """Sources dont la couverture est **confirmée** pour ce type."""
+        return [
+            s
+            for s in self.for_object(kind)
+            if self.coverage.get(s.source_id) is CoverageState.COVERED
+        ]
+
+    def state_of(self, source_id: str) -> CoverageState:
+        return self.coverage.get(source_id, CoverageState.UNKNOWN)
 
     def as_dict(self) -> dict:
         return {
             "territories": sorted(self.territories),
-            "available": [s.source_id for s in self.available],
+            "territorial_candidates": [s.source_id for s in self.territorial_candidates],
             "rejected": self.rejected,
+            "coverage": {k: v.value for k, v in self.coverage.items()},
         }
 
 
@@ -155,7 +213,8 @@ def route(lat: float, lon: float) -> Routing:
 
     for source in SOURCES:
         if source.serves(territories):
-            routing.available.append(source)
+            routing.territorial_candidates.append(source)
+            routing.coverage[source.source_id] = CoverageState.UNKNOWN
         else:
             blocked = territories & set(source.excludes)
             routing.rejected[source.source_id] = (
@@ -165,9 +224,10 @@ def route(lat: float, lon: float) -> Routing:
             )
 
     log.info(
-        "routage géospatial : %s → %d source(s) disponible(s), %d écartée(s)",
+        "routage géospatial : %s → %d candidat(s) territorial(aux), %d écarté(s) ; "
+        "couverture réelle non encore vérifiée",
         sorted(territories),
-        len(routing.available),
+        len(routing.territorial_candidates),
         len(routing.rejected),
     )
     return routing

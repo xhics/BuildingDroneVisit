@@ -40,17 +40,27 @@ class TestRouting:
         assert "geomont-ortho-2023" in routing.rejected
         assert "QC-CMM" in routing.rejected["geomont-ortho-2023"]
 
-    def test_geomont_is_available_outside_the_cmm(self):
+    def test_geomont_is_a_candidate_outside_the_cmm(self):
         routing = route(*GRANBY)
-        assert any(s.source_id == "geomont-ortho-2023" for s in routing.available)
+        assert any(s.source_id == "geomont-ortho-2023" for s in routing.territorial_candidates)
 
-    def test_lidar_is_available_across_quebec(self):
+    def test_lidar_is_a_candidate_across_quebec_but_never_confirmed_by_routing(self):
+        """Pertinent partout au Québec n'est pas acquis partout au Québec.
+
+        La documentation officielle renvoie à une carte de couverture : le
+        routage ne peut donc établir qu'une admissibilité territoriale.
+        """
+        from hotel_pipeline.geo import CoverageState
+
         for position in (BOUCHERVILLE, GRANBY):
-            assert any(s.source_id == "lidar-quebec" for s in route(*position).available)
+            routing = route(*position)
+            assert any(s.source_id == "lidar-quebec" for s in routing.territorial_candidates)
+            assert routing.state_of("lidar-quebec") is CoverageState.UNKNOWN
+            assert routing.confirmed_for("TERRAIN_MAIN") == []
 
-    def test_cmm_orthophoto_is_available_in_boucherville(self):
+    def test_cmm_orthophoto_is_a_candidate_in_boucherville(self):
         routing = route(*BOUCHERVILLE)
-        assert any(s.source_id == "cmm-ortho" for s in routing.available)
+        assert any(s.source_id == "cmm-ortho" for s in routing.territorial_candidates)
 
 
 class TestWhatEachSourceCanEstablish:

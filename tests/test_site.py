@@ -239,6 +239,8 @@ class TestGeoProvenance:
     def _source(self, **overrides):
         from hotel_pipeline.schemas import GeoSourceProvenance
 
+        from datetime import datetime, timezone
+
         fields = dict(
             source_id="lidar-2023-31H05NE",
             dataset="Données LiDAR du Québec",
@@ -247,6 +249,9 @@ class TestGeoProvenance:
             crs_horizontal="EPSG:2950",
             crs_vertical="CGVD2013",
             point_density_per_m2=8.0,
+            licence="Licence ouverte du gouvernement du Québec",
+            retrieved_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+            file_digest="abc123",
         )
         fields.update(overrides)
         return GeoSourceProvenance(**fields)
@@ -292,10 +297,44 @@ class TestGeoProvenance:
         assert [o.kind for o in manifest.derived()] == ["ROOFLINE_MAIN"]
         assert manifest.source("lidar-2023-31H05NE").crs_vertical == "CGVD2013"
 
-    def test_vertical_datum_without_horizontal_is_rejected(self):
-        """Une altitude sans référentiel horizontal ne situe rien."""
+    def test_elevation_without_horizontal_datum_is_rejected(self):
+        """Une altitude qu'on ne sait pas situer n'est pas une altitude."""
         with pytest.raises(ValueError, match="ne situe rien"):
             self._source(crs_horizontal=None)
+
+    def test_elevation_without_vertical_datum_is_rejected(self):
+        """Un nuage avec densité et CRS horizontal était accepté sans datum."""
+        with pytest.raises(ValueError, match="ne réfèrent à rien"):
+            self._source(crs_vertical=None)
+
+    def test_duplicate_source_ids_are_rejected(self):
+        """Deux sources homonymes rendraient toute référence ambiguë."""
+        with pytest.raises(ValueError, match="dupliqués"):
+            SiteManifest(
+                hotel_id=HOTEL,
+                geo_sources=[self._source(), self._source(dataset="autre")],
+            )
+
+    def test_incomplete_provenance_cannot_be_cited(self):
+        """Une source consultée peut être incomplète ; une source citée, non."""
+        with pytest.raises(ValueError, match="provenance est incomplète"):
+            SiteManifest(
+                hotel_id=HOTEL,
+                geo_sources=[self._source(file_digest=None, licence=None)],
+                objects=[
+                    SiteObject(
+                        object_id="a", kind="TERRAIN_MAIN", state=ObjectState.INFERRED,
+                        derived_from_sources=["lidar-2023-31H05NE"],
+                        derivation_method="MNT",
+                    )
+                ],
+            )
+
+    def test_incomplete_provenance_is_allowed_when_uncited(self):
+        manifest = SiteManifest(
+            hotel_id=HOTEL, geo_sources=[self._source(file_digest=None)]
+        )
+        assert manifest.source("lidar-2023-31H05NE").is_citable() == ["file_digest"]
 
     def test_summary_counts_sources_and_derived_objects(self, spatial, elements, roads):
         site, _ = build(HOTEL, spatial, elements, roads)

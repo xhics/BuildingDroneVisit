@@ -60,14 +60,51 @@ class GeoSourceProvenance(BaseModel):
     retrieved_at: datetime | None = None
     notes: str | None = None
 
+    #: La source porte-t-elle de l'élévation ? Un nuage de points et un MNT
+    #: en portent ; une orthophoto, non.
+    carries_elevation: bool = False
+
     @model_validator(mode="after")
-    def _elevation_needs_a_vertical_datum(self) -> "GeoSourceProvenance":
-        if (self.point_density_per_m2 or self.crs_vertical) and not self.crs_horizontal:
+    def _elevation_needs_both_datums(self) -> "GeoSourceProvenance":
+        """Une élévation exige **les deux** référentiels.
+
+        Un nuage de points avec densité et référentiel horizontal, mais sans
+        référentiel vertical, était accepté : ses altitudes n'auraient référé
+        à rien.
+        """
+        elevation = self.carries_elevation or self.point_density_per_m2 is not None
+
+        if elevation and not self.crs_horizontal:
             raise ValueError(
-                f"source {self.source_id!r} : un référentiel vertical sans "
-                "référentiel horizontal ne situe rien"
+                f"source {self.source_id!r} : source d'élévation sans référentiel "
+                "horizontal — elle ne situe rien"
+            )
+        if elevation and not self.crs_vertical:
+            raise ValueError(
+                f"source {self.source_id!r} : source d'élévation sans référentiel "
+                "vertical — ses altitudes ne réfèrent à rien"
+            )
+        if self.crs_vertical and not self.crs_horizontal:
+            raise ValueError(
+                f"source {self.source_id!r} : référentiel vertical sans référentiel "
+                "horizontal"
             )
         return self
+
+    def is_citable(self) -> list[str]:
+        """Champs manquants pour qu'un objet dérivé puisse s'y référer.
+
+        Une source consultée peut rester incomplète ; une source **citée** par
+        une dérivation doit être identifiable et rejouable.
+        """
+        required = {
+            "tile_id": self.tile_id,
+            "vintage": self.vintage,
+            "licence": self.licence,
+            "retrieved_at": self.retrieved_at,
+            "file_digest": self.file_digest,
+        }
+        return sorted(name for name, value in required.items() if not value)
 
 
 class SiteRelation(BaseModel):
@@ -166,7 +203,16 @@ class SiteManifest(BaseModel):
                         f"{relation.target_id!r}"
                     )
 
-        sources = {s.source_id for s in self.geo_sources}
+        source_ids = [s.source_id for s in self.geo_sources]
+        duplicates = {i for i in source_ids if source_ids.count(i) > 1}
+        if duplicates:
+            raise ValueError(
+                f"identifiants de source dupliqués : {sorted(duplicates)} — "
+                "une référence de dérivation serait ambiguë"
+            )
+
+        sources = set(source_ids)
+        by_id = {s.source_id: s for s in self.geo_sources}
         for obj in self.objects:
             missing = [s for s in obj.derived_from_sources if s not in sources]
             if missing:
@@ -177,6 +223,13 @@ class SiteManifest(BaseModel):
                 raise ValueError(
                     f"objet {obj.object_id!r} dérivé sans méthode de dérivation"
                 )
+            for source_id in obj.derived_from_sources:
+                incomplete = by_id[source_id].is_citable()
+                if incomplete:
+                    raise ValueError(
+                        f"objet {obj.object_id!r} dérivé de {source_id!r}, dont "
+                        f"la provenance est incomplète : {incomplete}"
+                    )
         return self
 
     # -- accès ------------------------------------------------------------
