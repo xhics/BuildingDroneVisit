@@ -87,6 +87,15 @@ class SpatialManifest(BaseModel):
 
     parking_feature_id: str | None = None
     park_and_ride_feature_id: str | None = None
+
+    #: Azimut de la façade avant, en degrés géographiques. Sans lui, un azimut
+    #: d'observation ne peut pas être traduit en `front`, `left`, `right` ou
+    #: `rear` : on saurait d'où l'on regarde, sans savoir quoi l'on regarde.
+    front_azimuth_deg: float | None = Field(default=None, ge=0, lt=360)
+
+    #: Comment cet azimut a été obtenu — la valeur seule ne dit pas si elle
+    #: est mesurée, déduite ou décidée.
+    front_azimuth_method: str | None = None
     assertions: list[GeometricAssertion] = Field(default_factory=list)
 
     @property

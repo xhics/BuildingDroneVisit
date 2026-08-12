@@ -47,6 +47,77 @@ CATEGORY_PROMPTS: dict[AssetCategory, list[str]] = {
 }
 
 
+#: Chaque sujet est jugé **indépendamment**, par opposition à une description
+#: contraire. Une softmax sur deux termes donne une probabilité par sujet, au
+#: lieu d'un argmax qui désigne toujours un vainqueur même quand toutes les
+#: hypothèses sont faibles.
+SUBJECT_PROMPTS: dict[str, tuple[str, str]] = {
+    "building": (
+        "a photo showing a multi-storey hotel or motel building from outside",
+        "a photo with no building visible",
+    ),
+    "entrance": (
+        "the main entrance doors of a hotel, with a canopy, porch or lobby doors",
+        "a photo with no building entrance visible",
+    ),
+    "sign": (
+        "a hotel sign, illuminated lettering or a branded pylon sign",
+        "a photo with no sign or lettering",
+    ),
+    "parking": (
+        "a parking lot with parked cars",
+        "a photo with no parking lot",
+    ),
+    "roof": (
+        "a view showing the roof of a building from above or from a high angle",
+        "a photo where no roof is visible",
+    ),
+    "grounds": (
+        "landscaped grounds, lawn, hedges or planted areas around a building",
+        "a photo with no landscaping",
+    ),
+    "road": (
+        "a road, street or highway lanes",
+        "a photo with no road",
+    ),
+    "interior": (
+        "an indoor room, corridor, lobby, bathroom or swimming pool inside a building",
+        "an outdoor photo taken outside a building",
+    ),
+}
+
+#: Au-dessus, le sujet est retenu ; en dessous du seuil bas, il est écarté ;
+#: entre les deux, la décision est incertaine et appelle une revue.
+SUBJECT_ACCEPT = 0.70
+SUBJECT_REJECT = 0.40
+
+
+@dataclass
+class MultiLabelResult:
+    """Probabilité par sujet, sans vainqueur imposé."""
+
+    scores: dict[str, float]
+
+    def accepted(self, threshold: float = SUBJECT_ACCEPT) -> list[str]:
+        return sorted([s for s, p in self.scores.items() if p >= threshold])
+
+    def uncertain(
+        self, low: float = SUBJECT_REJECT, high: float = SUBJECT_ACCEPT
+    ) -> list[str]:
+        return sorted([s for s, p in self.scores.items() if low <= p < high])
+
+    def confidence(self) -> float:
+        """Netteté globale de la décision.
+
+        Un jeu de scores tous proches de 0,5 traduit une image que le modèle
+        ne comprend pas : la confiance doit alors être basse, même si un sujet
+        franchit de justesse le seuil.
+        """
+        if not self.scores:
+            return 0.0
+        return max(abs(p - 0.5) * 2 for p in self.scores.values())
+
+
 @dataclass
 class Classification:
     exterior_or_interior: ExteriorInterior
@@ -74,6 +145,37 @@ class Classifier:
 
         self._exterior = self._encode_groups(EXTERIOR_PROMPTS)
         self._category = self._encode_groups(CATEGORY_PROMPTS)
+        self._subject_pairs = self._encode_pairs(SUBJECT_PROMPTS)
+
+    def _encode_pairs(self, pairs: dict[str, tuple[str, str]]):
+        """Encode chaque couple description positive / contraire."""
+        torch = self._torch
+        encoded = {}
+        with torch.no_grad():
+            for subject, (positive, negative) in pairs.items():
+                tokens = self.tokenizer([positive, negative]).to(self.device)
+                features = self.model.encode_text(tokens)
+                features /= features.norm(dim=-1, keepdim=True)
+                encoded[subject] = features
+        return encoded
+
+    def multi_label(self, image_path: Path) -> MultiLabelResult:
+        """Juge chaque sujet indépendamment, sans désigner de vainqueur."""
+        from PIL import Image
+
+        torch = self._torch
+        image = Image.open(image_path).convert("RGB")
+        tensor = self.preprocess(image).unsqueeze(0).to(self.device)
+
+        scores: dict[str, float] = {}
+        with torch.no_grad():
+            features = self.model.encode_image(tensor)
+            features /= features.norm(dim=-1, keepdim=True)
+            for subject, pair in self._subject_pairs.items():
+                probabilities = (100.0 * features @ pair.T).softmax(dim=-1)[0]
+                scores[subject] = float(probabilities[0])
+
+        return MultiLabelResult(scores=scores)
 
     def _encode_groups(self, groups: dict) -> tuple[list, "object"]:
         """Encode chaque groupe de descriptions en un vecteur moyen normalisé."""

@@ -487,6 +487,59 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
         )
 
 
+@assets_app.command("classify")
+def assets_classify(
+    hotel_id: str = typer.Argument(...),
+    use_model: bool = typer.Option(True, "--model/--no-model", help="Étape 4 OpenCLIP."),
+) -> None:
+    """Cascade de catégorisation multidimensionnelle (Lot 1B §6)."""
+    from .classify_cascade import classify
+    from .sectors import resolve_front
+    from .steps import ELEMENTS_FILE
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    spatial = workspace.read_spatial()
+    if manifest is None or spatial is None:
+        typer.secho("manifeste d'assets et manifeste spatial requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    elements = workspace.read_json(ELEMENTS_FILE) or []
+    front = resolve_front(spatial, elements)
+    if front is None:
+        typer.secho(
+            "  · aucune preuve d'orientation de façade — secteurs laissés inconnus",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.echo(f"  façade avant : {front.degrees:.0f}° ({front.method})")
+        spatial.front_azimuth_deg = front.degrees
+        spatial.front_azimuth_method = front.method
+        workspace.write_spatial(spatial)
+
+    classifier = None
+    if use_model:
+        try:
+            from .triage.classify import Classifier
+
+            classifier = Classifier()
+        except ImportError:
+            typer.secho("  · OpenCLIP absent — étape 4 ignorée", fg=typer.colors.YELLOW)
+
+    report = classify(
+        manifest.assets,
+        classifier=classifier,
+        front_azimuth=front.degrees if front else None,
+    )
+    workspace.write_assets(manifest)
+    workspace.write_json("01_sources/classification_report.json", report.as_dict())
+
+    typer.echo("")
+    typer.echo(f"  {report.total} asset(s), {report.needs_review} en revue")
+    typer.echo(f"  sujets  : {report.subjects_assigned}")
+    typer.echo(f"  secteurs: {report.sectors_assigned}")
+
+
 @assets_app.command("coverage")
 def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
     """Compte ce qui conditionne la suite du pipeline."""
