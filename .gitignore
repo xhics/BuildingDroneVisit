@@ -1,0 +1,20 @@
+# Secrets — jamais committés (plan directeur §6)
+.env
+
+# Espaces de travail et artefacts
+work/
+*.tmp
+
+# Cache local des appels externes (complément §3.2)
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# macOS
+.DS_Store

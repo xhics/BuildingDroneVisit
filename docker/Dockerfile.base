@@ -1,0 +1,22 @@
+# Image socle — Lot 0 (complément d'implémentation §2.3).
+#
+# Volontairement minimale : elle prouve que la VM GPU exécute un smoke test
+# depuis un clone propre. Les couches vision (hloc, pycolmap, Brush) et Blender
+# arrivent aux Lots 2 et 3, au-dessus de l'image PyTorch officielle RunPod.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOTEL_PIPELINE_WORK=/workspace/work
+
+WORKDIR /opt/hotel-pipeline
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+RUN pip install --no-cache-dir -e "." && mkdir -p /workspace/work
+
+WORKDIR /workspace
+
+CMD ["hotel-pipeline", "smoke"]

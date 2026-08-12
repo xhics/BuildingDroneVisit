@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotel-pipeline"
+version = "0.1.0"
+description = "Reconstruction d'environnements 3D d'hôtels à partir d'une adresse — Phase 1"
+# 3.11 est la version de référence, fixée par l'image Docker (runtime reproductible).
+# 3.12 est tolérée pour le développement local ; 3.13+ ne l'est pas, les roues
+# torch/pycolmap de la couche vision n'y étant pas disponibles.
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "diskcache>=5.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+hotel-pipeline = "hotel_pipeline.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
