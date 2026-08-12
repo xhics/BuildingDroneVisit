@@ -55,13 +55,13 @@ class TestMedianAggregation:
         y = np.concatenate([np.full(100, 0.25), np.array([0.25])])
         z = np.concatenate([np.full(100, 10.0), np.array([50.0])])
 
-        cx, cy, values = aggregate_median(x, y, z, (0.0, 0.0), (2, 2), 0.5)
+        cx, cy, values = aggregate_median(x, y, z, (0.0, 0.0), 0.5)
         assert len(values) == 2
         assert 10.0 in values
 
     def test_one_value_per_occupied_cell(self):
         x, y, z = sloped_ground(n=500)
-        _, _, values = aggregate_median(x, y, z, (0.0, 0.0), (120, 120), 0.5)
+        _, _, values = aggregate_median(x, y, z, (0.0, 0.0), 0.5)
         assert 0 < len(values) <= 500
 
 
@@ -249,3 +249,50 @@ class TestPseudoBuildingFollowsTheSameRule:
             )
             # L'erreur ne porte que sur ce qui a été reconstruit.
             assert trial["n"] == trial["reconstructed_points"]
+
+
+class TestAggregationDoesNotFoldTheOutside:
+    """Un point de sol lointain ne doit pas devenir un appui contre la façade.
+
+    Défaut mesuré : les indices étaient bornés à une grille couvrant la seule
+    empreinte, si bien qu'un point à cinquante mètres se retrouvait plaqué sur
+    une cellule de bordure. L'enveloppe convexe s'en trouvait resserrée, la
+    distance au support réduite, et toutes les validations faussées.
+    """
+
+    def test_a_distant_point_keeps_its_position(self):
+        x = np.array([2.5, 50.0])
+        y = np.array([2.5, 2.5])
+        z = np.array([10.0, 99.0])
+
+        cx, _, _ = aggregate_median(x, y, z, (0.0, 0.0), 1.0)
+        assert cx.max() == pytest.approx(50.5)
+
+    def test_points_before_the_origin_stay_negative(self):
+        """La grille n'a pas de borne inférieure non plus."""
+        x = np.array([-30.0, 5.0])
+        y = np.array([-30.0, 5.0])
+        z = np.array([1.0, 2.0])
+
+        cx, cy, _ = aggregate_median(x, y, z, (0.0, 0.0), 1.0)
+        assert cx.min() < 0
+        assert cy.min() < 0
+
+    def test_each_point_lands_in_its_own_cell(self):
+        x = np.array([0.25, 10.25, 40.25])
+        y = np.array([0.25, 0.25, 0.25])
+        z = np.array([1.0, 2.0, 3.0])
+
+        cx, _, values = aggregate_median(x, y, z, (0.0, 0.0), 0.5)
+        assert len(values) == 3
+        assert sorted(cx.round(2)) == [0.25, 10.25, 40.25]
+
+    def test_ring_points_stay_outside_the_footprint_extent(self):
+        """Contrôle direct de la conséquence : le pourtour reste au pourtour."""
+        ring_x = np.array([-25.0, 95.0])
+        ring_y = np.array([35.0, 35.0])
+        z = np.array([27.0, 28.0])
+
+        cx, _, _ = aggregate_median(ring_x, ring_y, z, (0.0, 0.0), 0.5)
+        assert cx.min() < 0        # à l'ouest de l'empreinte
+        assert cx.max() > 70       # à l'est

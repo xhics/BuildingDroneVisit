@@ -793,15 +793,19 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         shapely_wkt.loads(building.wkt),
     )
 
-    staging = workspace.path("06_geo", "_staging")
+    from datetime import datetime, timezone
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    staging = workspace.path("06_geo", f"_staging_{run_id}")
     if staging.exists():
         shutil.rmtree(staging)
 
-    typer.echo("  production des couches dans le répertoire de transit…")
+    preflight = workspace.read_json("06_geo/laz_preflight.json") or {}
+    typer.echo(f"  exécution {run_id} — production dans le répertoire de transit…")
     result = derive(
         laz, footprint, staging,
         crs=source["crs_horizontal"], crs_vertical=source["crs_vertical"],
-        source_id=source["source_id"],
+        source_id=source["source_id"], laz_bounds=preflight.get("bounds"),
     )
 
     grid = GridSpec(**result.grid)
@@ -813,26 +817,36 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         raise typer.Exit(code=4)
     typer.echo(f"  {OK} {len(result.layers)} couche(s) relue(s) et contrôlée(s)")
 
-    # Publication seulement après contrôle.
-    final = workspace.path("06_geo", "derived")
-    if final.exists():
-        shutil.rmtree(final)
+    # Publication non destructive : chaque exécution a son répertoire, et les
+    # productions antérieures restent consultables.
+    final = workspace.path("06_geo", "derived", run_id)
+    final.parent.mkdir(parents=True, exist_ok=True)
     staging.replace(final)
     for name in result.layers:
         result.layers[name] = str(final / f"{name}.tif")
     for artifact in result.artifacts:
-        artifact.path = str(final / f"{artifact.artifact_id}.tif")
+        artifact.artifact_id = f"{artifact.artifact_id}@{run_id}"
+        artifact.path = str(final / f"{artifact.path.rsplit('/', 1)[-1]}")
+        artifact.derived_from_artifacts = [
+            f"{parent}@{run_id}" for parent in artifact.derived_from_artifacts
+        ]
 
     site = workspace.read_site()
     if site is not None:
-        source_provenance = acquisition["sources"][0]
         from .schemas import GeoSourceProvenance
 
-        site.geo_sources = [GeoSourceProvenance.model_validate(source_provenance)]
-        site.artifacts = result.artifacts
+        # Fusion par identifiant : rien n'est effacé, seul le même identifiant
+        # est remplacé.
+        sources = {s.source_id: s for s in site.geo_sources}
+        sources[source["source_id"]] = GeoSourceProvenance.model_validate(source)
+        site.geo_sources = list(sources.values())
+
+        artifacts = {a.artifact_id: a for a in site.artifacts}
+        artifacts.update({a.artifact_id: a for a in result.artifacts})
+        site.artifacts = list(artifacts.values())
         workspace.write_site(site)
 
-    workspace.write_report("06_geo/derivation_report.json", result, context)
+    workspace.write_report(f"06_geo/derivation_report_{run_id}.json", result, context)
 
     metrics = result.metrics
     typer.echo("")
@@ -846,7 +860,18 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     typer.echo(f"  refus extrap {metrics['extrapolation_rejected']}")
     typer.echo(f"  distance sol {metrics['support_distance_in_footprint']}")
     typer.echo(f"  bloc CV      {metrics['block_validation']}")
-    typer.echo(f"  faux bâtim.  {len(metrics['pseudo_building_validation'])} essai(s)")
+    pseudo = metrics["pseudo_footprint_validation"]
+    typer.echo(
+        f"  pseudo-empr. {len(pseudo['trials'])} essai(s), "
+        f"{len(pseudo['rejected_candidates'])} refusé(s), "
+        f"zone dans la tuile : {pseudo['search_area_within_tile']}"
+    )
+    for trial in pseudo["trials"]:
+        typer.echo(
+            f"      RMSE {trial['rmse_m']} m, p95 {trial['p95_m']} m, "
+            f"appui max {trial['support_distance_max_m']} m, "
+            f"{trial['reconstructed_points']}/{trial['masked_points']} reconstruits"
+        )
     typer.echo(f"  hauteurs     {metrics['height_statistics']}")
     for flag in result.qa_flags:
         typer.secho(f"  ! {flag}", fg=typer.colors.YELLOW)

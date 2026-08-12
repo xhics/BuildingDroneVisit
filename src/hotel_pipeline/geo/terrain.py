@@ -142,24 +142,32 @@ def cell_centres(origin: tuple[float, float], shape: tuple[int, int], cell_m: fl
     return np.meshgrid(xs, ys, indexing="ij")
 
 
-def aggregate_median(x, y, z, origin, shape, cell_m: float):  # noqa: ANN001
-    """Médiane par cellule, pour neutraliser le biais de densité.
+def aggregate_median(x, y, z, origin, cell_m: float):  # noqa: ANN001
+    """Médiane par cellule, sur une grille **non bornée**.
 
     Une moyenne suivrait les zones sur-échantillonnées ; la médiane non.
-    """
-    columns, rows = shape
-    ix = np.clip(((x - origin[0]) / cell_m).astype(int), 0, columns - 1)
-    iy = np.clip(((y - origin[1]) / cell_m).astype(int), 0, rows - 1)
-    keys = ix.astype(np.int64) * rows + iy.astype(np.int64)
 
-    order = np.argsort(keys, kind="stable")
-    keys_sorted, z_sorted = keys[order], z[order]
-    unique_keys, starts = np.unique(keys_sorted, return_index=True)
-    ends = np.append(starts[1:], keys_sorted.size)
+    La quantification est volontairement sans limites. Une version antérieure
+    bornait les indices à une grille couvrant la seule empreinte : tous les
+    points de sol du pourtour étaient alors rabattus sur les cellules de
+    bordure du bâtiment. Un point situé à cinquante mètres devenait un appui
+    plaqué contre la façade — ce qui resserrait artificiellement l'enveloppe
+    convexe, réduisait la distance au support et faussait chaque validation.
+    """
+    ix = np.floor((x - origin[0]) / cell_m).astype(np.int64)
+    iy = np.floor((y - origin[1]) / cell_m).astype(np.int64)
+
+    cells = np.column_stack([ix, iy])
+    unique_cells, inverse = np.unique(cells, axis=0, return_inverse=True)
+
+    order = np.argsort(inverse, kind="stable")
+    inverse_sorted, z_sorted = inverse[order], z[order]
+    starts = np.searchsorted(inverse_sorted, np.arange(unique_cells.shape[0]))
+    ends = np.append(starts[1:], inverse_sorted.size)
 
     values = np.array([np.median(z_sorted[s:e]) for s, e in zip(starts, ends)])
-    cx = origin[0] + (unique_keys // rows + 0.5) * cell_m
-    cy = origin[1] + (unique_keys % rows + 0.5) * cell_m
+    cx = origin[0] + (unique_cells[:, 0] + 0.5) * cell_m
+    cy = origin[1] + (unique_cells[:, 1] + 0.5) * cell_m
     return cx, cy, values
 
 
@@ -238,6 +246,95 @@ def block_cross_validation(px, py, pz, block_m: float = BLOCK_M) -> ValidationSc
     if not truths:
         return ValidationScores()
     return _scores(np.concatenate(truths), np.concatenate(predictions))
+
+
+def pseudo_footprint_validation(
+    px, py, pz, footprint, ring_m: float = RING_M, trials: int = 3,  # noqa: ANN001
+    search_radius_m: float = 150.0, cell_m: float = CELL_M,
+) -> tuple[list[dict], list[str]]:
+    """Déplacer la **forme réelle** de l'empreinte là où le sol est connu.
+
+    Un rectangle englobant surestimerait la difficulté d'un bâtiment oblique :
+    il creuserait un vide plus large que le bâtiment réel. C'est la forme qui
+    est translatée, pas sa boîte.
+
+    Chaque essai masque l'empreinte translatée, conserve exactement un anneau
+    de `ring_m` comme appui, interpole sur la grille commune, et compare aux
+    altitudes masquées. Les emplacements ne se chevauchent pas, et chaque
+    candidat refusé est rapporté — une absence d'essai ne doit pas se lire
+    comme une absence de difficulté.
+    """
+    from shapely import contains_xy
+    from shapely.affinity import translate
+
+    results: list[dict] = []
+    rejected: list[str] = []
+    if px.size < 4:
+        return results, ["moins de quatre appuis disponibles"]
+
+    centroid = footprint.centroid
+    minx, maxx = float(px.min()), float(px.max())
+    miny, maxy = float(py.min()), float(py.max())
+    fminx, fminy, fmaxx, fmaxy = footprint.bounds
+    needed_x = (fmaxx - fminx) + 2 * ring_m
+    needed_y = (fmaxy - fminy) + 2 * ring_m
+
+    if (maxx - minx) < needed_x or (maxy - miny) < needed_y:
+        rejected.append(
+            f"zone de sol {maxx - minx:.0f} × {maxy - miny:.0f} m insuffisante "
+            f"pour une empreinte de {fmaxx - fminx:.0f} × {fmaxy - fminy:.0f} m "
+            f"plus deux anneaux de {ring_m:.0f} m"
+        )
+        return results, rejected
+
+    rng = np.random.default_rng(seed=1195)
+    used: list = []
+    attempts = 0
+
+    while len(results) < trials and attempts < trials * 20:
+        attempts += 1
+        cx = rng.uniform(minx + needed_x / 2, maxx - needed_x / 2)
+        cy = rng.uniform(miny + needed_y / 2, maxy - needed_y / 2)
+        moved = translate(footprint, cx - centroid.x, cy - centroid.y)
+
+        support_zone = moved.buffer(ring_m)
+        if any(support_zone.intersects(previous) for previous in used):
+            rejected.append(f"emplacement {cx:.0f},{cy:.0f} chevauche un essai précédent")
+            continue
+
+        masked = contains_xy(moved, px, py)
+        ring = contains_xy(support_zone, px, py) & ~masked
+        if masked.sum() < 30 or ring.sum() < 50:
+            rejected.append(
+                f"emplacement {cx:.0f},{cy:.0f} : {int(masked.sum())} point(s) masqué(s), "
+                f"{int(ring.sum())} en anneau — trop peu"
+            )
+            continue
+
+        predicted = interpolate_tin(px[ring], py[ring], pz[ring], px[masked], py[masked])
+        scores = _scores(pz[masked], predicted)
+        unsupported = int(np.isnan(predicted).sum())
+        distances = support_distance(px[ring], py[ring], px[masked], py[masked])
+
+        used.append(support_zone)
+        results.append(
+            {
+                "centre": [round(cx, 1), round(cy, 1)],
+                "masked_points": int(masked.sum()),
+                "reconstructed_points": int(masked.sum()) - unsupported,
+                "unsupported_points": unsupported,
+                **scores.as_dict(),
+                "support_distance_p95_m": round(float(np.percentile(distances, 95)), 2),
+                "support_distance_max_m": round(float(distances.max()), 2),
+            }
+        )
+
+    log.info(
+        "pseudo-empreinte : %d essai(s) retenu(s), %d candidat(s) refusé(s)",
+        len(results),
+        len(rejected),
+    )
+    return results, rejected
 
 
 def pseudo_building_validation(

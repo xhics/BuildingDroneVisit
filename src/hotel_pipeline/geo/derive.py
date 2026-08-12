@@ -73,6 +73,44 @@ class DeriveResult:
 # --- lecture du nuage ------------------------------------------------------
 
 
+def load_ground_within(laz_path: Path, footprint, radius_m: float):  # noqa: ANN001
+    """Classe 2 dans un large voisinage, pour la validation par pseudo-empreinte.
+
+    Cette validation a besoin d'une étendue de sol sans rapport avec l'anneau
+    de production : elle doit pouvoir y creuser plusieurs vides de la taille du
+    bâtiment, sans chevauchement.
+    """
+    import laspy
+
+    with laspy.open(str(laz_path)) as reader:
+        points = reader.read()
+
+    x = np.asarray(points.x)
+    y = np.asarray(points.y)
+    minx, miny, maxx, maxy = footprint.bounds
+    window = (
+        (x >= minx - radius_m) & (x <= maxx + radius_m)
+        & (y >= miny - radius_m) & (y <= maxy + radius_m)
+        & (np.asarray(points.classification) == GROUND)
+    )
+    return x[window], y[window], np.asarray(points.z)[window], window.sum()
+
+
+def tile_covers(laz_bounds: dict, footprint, radius_m: float) -> bool:
+    """La zone de recherche tient-elle entièrement dans la tuile ?
+
+    Sans ce contrôle, une absence d'essai pourrait venir d'une troncature de
+    tuile plutôt que d'une difficulté réelle.
+    """
+    minx, miny, maxx, maxy = footprint.bounds
+    return (
+        minx - radius_m >= laz_bounds["min_x"]
+        and maxx + radius_m <= laz_bounds["max_x"]
+        and miny - radius_m >= laz_bounds["min_y"]
+        and maxy + radius_m <= laz_bounds["max_y"]
+    )
+
+
 def _load_points(laz_path: Path, footprint, ring_m: float):  # noqa: ANN001
     """Points utiles, préfiltrés par boîte puis découpés au polygone.
 
@@ -113,6 +151,8 @@ def derive(
     source_id: str,
     cell_m: float = terrain.CELL_M,
     ring_m: float = terrain.RING_M,
+    search_radius_m: float = 150.0,
+    laz_bounds: dict | None = None,
 ) -> DeriveResult:
     """Produit toutes les couches dans le répertoire de transit."""
     from shapely import contains_xy
@@ -134,13 +174,16 @@ def derive(
     footprint_mask = contains_xy(footprint_projected, gx, gy)
     domain_cells = int(footprint_mask.sum())
 
+    laz_bounds = laz_bounds or {}
     x, y, z, codes, inside = _load_points(laz_path, footprint_projected, ring_m)
 
-    # --- appuis de terrain : classe 2 du pourtour uniquement --------------
-    ring = (codes == GROUND) & ~inside
-    px, py, pz = terrain.aggregate_median(
-        x[ring], y[ring], z[ring], origin, (grid.width, grid.height), cell_m
-    )
+    # --- appuis de terrain : classe 2 dans l'anneau réel -------------------
+    # `buffer(ring).difference(footprint)` plutôt que la boîte : sur un
+    # bâtiment oblique, la boîte inclut des zones bien plus éloignées d'un
+    # côté que de l'autre.
+    ring_polygon = footprint_projected.buffer(ring_m).difference(footprint_projected)
+    ring = (codes == GROUND) & contains_xy(ring_polygon, x, y)
+    px, py, pz = terrain.aggregate_median(x[ring], y[ring], z[ring], origin, cell_m)
     log.info("appuis de terrain : %d cellule(s) de classe 2 au pourtour", pz.size)
 
     flat_x, flat_y = gx.ravel(), gy.ravel()
@@ -191,9 +234,20 @@ def derive(
             write_geotiff(path, array, grid)
         result.layers[name] = str(path)
 
+    # Validation par pseudo-empreinte, sur une étendue de sol bien plus large
+    # que l'anneau de production.
+    wide_x, wide_y, wide_z, _ = load_ground_within(laz_path, footprint_projected, search_radius_m)
+    wide_px, wide_py, wide_pz = terrain.aggregate_median(wide_x, wide_y, wide_z, origin, cell_m)
+    pseudo_result = terrain.pseudo_footprint_validation(
+        wide_px, wide_py, wide_pz, footprint_projected, ring_m=ring_m,
+        search_radius_m=search_radius_m, cell_m=cell_m,
+    )
+    search_within_tile = tile_covers(laz_bounds, footprint_projected, search_radius_m)
+
     result.metrics = _metrics(
         grid, footprint_mask, dtm, dsm_roof, class1, ndsm, ndsm_valid,
         masks, disagreement, rejected, distances, px, py, pz, footprint_projected,
+        pseudo_result, search_within_tile,
     )
     result.qa_flags = _qa_flags(result.metrics, ndsm)
     result.artifacts = _artifacts(
@@ -209,7 +263,7 @@ def _median_grid(x, y, z, grid: GridSpec) -> np.ndarray:  # noqa: ANN001
         return values
 
     cx, cy, medians = terrain.aggregate_median(
-        x, y, z, (grid.origin_x, grid.origin_y), (grid.width, grid.height), grid.cell_m
+        x, y, z, (grid.origin_x, grid.origin_y), grid.cell_m
     )
     ix = ((cx - grid.origin_x) / grid.cell_m).astype(int)
     iy = ((cy - grid.origin_y) / grid.cell_m).astype(int)
@@ -224,14 +278,13 @@ def _median_grid(x, y, z, grid: GridSpec) -> np.ndarray:  # noqa: ANN001
 def _metrics(
     grid, footprint_mask, dtm, dsm_roof, class1, ndsm, ndsm_valid,
     masks, disagreement, rejected, distances, px, py, pz, footprint,  # noqa: ANN001
+    pseudo_result, search_within_tile,  # noqa: ANN001
 ) -> dict:
     domain = int(footprint_mask.sum())
     interior_distances = distances[footprint_mask]
 
     block = terrain.block_cross_validation(px, py, pz)
-    width = footprint.bounds[2] - footprint.bounds[0]
-    height = footprint.bounds[3] - footprint.bounds[1]
-    pseudo = terrain.pseudo_building_validation(px, py, pz, width, height)
+    pseudo, pseudo_rejected = pseudo_result
 
     heights = ndsm[np.isfinite(ndsm)]
     return {
@@ -251,7 +304,11 @@ def _metrics(
             "max_m": round(float(interior_distances.max()), 2),
         },
         "block_validation": block.as_dict(),
-        "pseudo_building_validation": pseudo,
+        "pseudo_footprint_validation": {
+            "trials": pseudo,
+            "rejected_candidates": pseudo_rejected,
+            "search_area_within_tile": search_within_tile,
+        },
         "height_statistics": {
             "count": int(heights.size),
             "min_m": round(float(heights.min()), 2) if heights.size else None,
@@ -283,6 +340,18 @@ def _qa_flags(metrics: dict, ndsm) -> list[str]:  # noqa: ANN001
         flags.append(
             f"{metrics['extrapolation_rejected']['cells']} cellule(s) hors "
             "enveloppe convexe, laissées sans donnée"
+        )
+    pseudo = metrics["pseudo_footprint_validation"]
+    if len(pseudo["trials"]) < 3:
+        detail = (
+            "zone de recherche tronquée par la tuile"
+            if not pseudo["search_area_within_tile"]
+            else "sol insuffisant autour du site"
+        )
+        flags.append(
+            f"{len(pseudo['trials'])} essai(s) de pseudo-empreinte seulement "
+            f"({detail}) — l'erreur sous le bâtiment reste estimée par une "
+            "validation optimiste"
         )
     if metrics["definition_masks"]["tin_only"]:
         flags.append(
@@ -362,8 +431,11 @@ def verify_written(result: DeriveResult, grid: GridSpec) -> list[str]:
     """
     import rasterio
 
+    expected_transform = grid.transform()
     problems: list[str] = []
+
     for name, path in result.layers.items():
+        role = LAYER_ROLES[name]
         with rasterio.open(path) as source:
             if (source.width, source.height) != (grid.width, grid.height):
                 problems.append(
@@ -372,9 +444,33 @@ def verify_written(result: DeriveResult, grid: GridSpec) -> list[str]:
                 )
             if source.crs is None or source.crs.to_string() != grid.crs:
                 problems.append(f"{name} : référentiel {source.crs} au lieu de {grid.crs}")
-            if not np.allclose(
-                [source.transform.c, source.transform.f, source.transform.a],
-                [grid.origin_x, grid.north, grid.cell_m],
-            ):
-                problems.append(f"{name} : transformation incohérente")
+
+            # Les six coefficients, pas seulement l'origine et le pas : une
+            # rotation ou un cisaillement passerait autrement inaperçu.
+            actual = [source.transform[i] for i in range(6)]
+            expected = [expected_transform[i] for i in range(6)]
+            if not np.allclose(actual, expected):
+                problems.append(f"{name} : transformation {actual} au lieu de {expected}")
+
+            expected_dtype = "uint8" if role == "mask" else "float32"
+            if source.dtypes[0] != expected_dtype:
+                problems.append(
+                    f"{name} : type {source.dtypes[0]} au lieu de {expected_dtype}"
+                )
+
+            expected_nodata = None if role == "mask" else NODATA
+            if source.nodata != expected_nodata:
+                problems.append(
+                    f"{name} : nodata {source.nodata} au lieu de {expected_nodata}"
+                )
+
+            # Les valeurs elles-mêmes : un raster peut être conforme en tête et
+            # vide, ou saturé de valeurs sans donnée.
+            band = source.read(1, masked=(role != "mask"))
+            if role == "mask":
+                if not np.isin(np.unique(band), (0, 1)).all():
+                    problems.append(f"{name} : masque contenant autre chose que 0 et 1")
+            elif band.count() == 0:
+                problems.append(f"{name} : aucune valeur exploitable")
+
     return problems
