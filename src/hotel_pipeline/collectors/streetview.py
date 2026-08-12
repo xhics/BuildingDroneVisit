@@ -1,22 +1,33 @@
-"""Collecteur Street View Static.
+"""Collecteur Street View multi-position (Lot 1B §7).
 
-Deux points de conception :
+Le collecteur précédent tournait un unique panorama sur huit caps. L'étape 2 a
+chiffré le résultat : 8 fichiers, 8 photographies, **1 seul point de vue**.
+Huit rotations ne produisent aucun angle nouveau.
 
-1. l'endpoint `metadata` est **gratuit** et dit si un panorama existe avant de
-   déclencher une requête image facturée. Il est donc systématiquement appelé
-   d'abord ;
-2. Street View ne rend pas une liste d'images mais une vue par cap. Les caps
-   sont donc échantillonnés autour du bâtiment, et la déduplication en aval
-   écarte les vues redondantes.
+Ce collecteur cherche donc des **positions** indépendantes : il échantillonne
+le réseau routier autour du bâtiment, interroge le panorama existant à chaque
+point, déduplique par identifiant de panorama, puis calcule un cap dirigé vers
+l'empreinte.
+
+Économie d'appels : l'endpoint `metadata` est gratuit et dit s'il existe un
+panorama, où et à quelle date. Toute la sélection s'y fait ; l'endpoint image,
+lui facturé, n'est appelé que pour les panoramas retenus.
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import requests
+from shapely import wkt as shapely_wkt
+from shapely.geometry import Point
+from shapely.ops import nearest_points
 
 from ..config import secret
 from ..logging import get_logger
 from ..providers.cache import cached_call, ensure_online
+from ..visibility import bearing_deg, haversine_m
 from .base import CollectedImage
 
 log = get_logger("streetview")
@@ -25,15 +36,69 @@ IMAGE_URL = "https://maps.googleapis.com/maps/api/streetview"
 METADATA_URL = "https://maps.googleapis.com/maps/api/streetview/metadata"
 TIMEOUT = 30
 
-#: Caps échantillonnés, en degrés. Huit vues suffisent à couvrir un bâtiment.
-DEFAULT_HEADINGS: tuple[int, ...] = (0, 45, 90, 135, 180, 225, 270, 315)
 SIZE = "640x640"
 FOV = 80
+
+#: Vue élargie, réservée aux positions révélant la transition route–entrée–
+#: stationnement. Elle ne crée pas un point de vue supplémentaire.
+WIDE_FOV = 110
+
+#: Pas d'échantillonnage du réseau. Un panorama Street View est espacé d'une
+#: dizaine de mètres : échantillonner plus finement multiplie les appels sans
+#: révéler de position nouvelle.
+SAMPLE_SPACING_M = 15.0
+
+#: Rayon de recherche autour de chaque point échantillonné.
+SNAP_RADIUS_M = 25
+
+#: Au-delà, un panorama est trop loin pour porter du détail de façade.
+MAX_PANORAMA_DISTANCE_M = 220.0
 
 name = "street_view"
 
 
-def _metadata(lat: float, lon: float, radius_m: int, key: str) -> dict:
+@dataclass
+class Panorama:
+    pano_id: str
+    lat: float
+    lon: float
+    date: str | None
+    copyright: str | None
+
+
+def sample_road_network(
+    elements: list[dict], spacing_m: float = SAMPLE_SPACING_M
+) -> list[tuple[float, float]]:
+    """Points régulièrement espacés le long des voies.
+
+    L'échantillonnage se fait en mètres réels, segment par segment, pour que
+    la densité ne dépende pas de la finesse de numérisation OSM.
+    """
+    samples: list[tuple[float, float]] = []
+
+    for element in elements:
+        geometry = element.get("geometry") or []
+        for start, end in zip(geometry, geometry[1:]):
+            length = haversine_m(start["lat"], start["lon"], end["lat"], end["lon"])
+            if length <= 0:
+                continue
+            steps = max(1, int(length // spacing_m))
+            for step in range(steps):
+                ratio = step / steps
+                samples.append(
+                    (
+                        start["lat"] + (end["lat"] - start["lat"]) * ratio,
+                        start["lon"] + (end["lon"] - start["lon"]) * ratio,
+                    )
+                )
+
+    log.info("réseau échantillonné : %d point(s) tous les %.0f m", len(samples), spacing_m)
+    return samples
+
+
+def panorama_at(lat: float, lon: float, key: str, radius_m: int = SNAP_RADIUS_M) -> Panorama | None:
+    """Panorama le plus proche d'un point, via l'endpoint gratuit."""
+
     def fetch() -> dict:
         response = requests.get(
             METADATA_URL,
@@ -43,48 +108,104 @@ def _metadata(lat: float, lon: float, radius_m: int, key: str) -> dict:
         response.raise_for_status()
         return response.json()
 
-    return cached_call(f"streetview-meta::{lat:.6f}::{lon:.6f}::{radius_m}", fetch)
+    payload = cached_call(f"streetview-meta::{lat:.5f}::{lon:.5f}::{radius_m}", fetch)
+    if payload.get("status") != "OK":
+        return None
+
+    location = payload.get("location") or {}
+    return Panorama(
+        pano_id=payload.get("pano_id", ""),
+        lat=location.get("lat", lat),
+        lon=location.get("lon", location.get("lng", lon)),
+        date=payload.get("date"),
+        copyright=payload.get("copyright"),
+    )
 
 
 def collect(
-    lat: float, lon: float, radius_m: int = 60, headings: tuple[int, ...] = DEFAULT_HEADINGS
+    lat: float,
+    lon: float,
+    building_wkt: str | None = None,
+    road_elements: list[dict] | None = None,
+    radius_m: int = 350,
 ) -> list[CollectedImage]:
-    """Vues Street View autour d'un point, un cap par image."""
+    """Vues Street View depuis des positions indépendantes.
+
+    Sans réseau routier fourni, le collecteur se rabat sur le panorama le plus
+    proche du bâtiment : c'est le comportement dégradé, pas le nominal.
+    """
     ensure_online("Street View")
     key = secret("GOOGLE_MAPS_API_KEY")
 
-    metadata = _metadata(lat, lon, radius_m, key)
-    status = metadata.get("status")
-    if status != "OK":
-        log.warning("Street View sans panorama utilisable (%s)", status)
-        return []
+    if road_elements is None:
+        from ..providers.overpass import roads_around
 
-    pano_id = metadata.get("pano_id", "")
-    pano_lat = (metadata.get("location") or {}).get("lat", lat)
-    pano_lon = (metadata.get("location") or {}).get("lng", lon)
-    year = _year(metadata.get("date"))
+        road_elements = roads_around(lat, lon, radius_m)
 
-    images = [
-        CollectedImage(
-            source=name,
-            source_id=f"{pano_id or 'pano'}-{heading:03d}",
-            # La clé n'est pas stockée dans l'URL du manifeste : elle est
-            # ajoutée au moment du téléchargement seulement.
-            url=(
-                f"{IMAGE_URL}?size={SIZE}&location={lat},{lon}"
-                f"&heading={heading}&fov={FOV}&pitch=0&radius={radius_m}"
-            ),
-            captured_year=year,
-            heading_deg=float(heading),
-            lat=pano_lat,
-            lon=pano_lon,
-            extra={"pano_id": pano_id},
-        )
-        for heading in headings
-    ]
+    samples = sample_road_network(road_elements)
+    if not samples:
+        samples = [(lat, lon)]
 
-    log.info("Street View : %d vue(s) depuis le panorama %s", len(images), pano_id or "?")
+    # Déduplication par identifiant de panorama : plusieurs points
+    # d'échantillonnage tombent nécessairement sur le même panorama.
+    panoramas: dict[str, Panorama] = {}
+    for sample_lat, sample_lon in samples:
+        try:
+            panorama = panorama_at(sample_lat, sample_lon, key)
+        except requests.RequestException as exc:
+            log.warning("métadonnées indisponibles en %.5f,%.5f : %s", sample_lat, sample_lon, exc)
+            continue
+        if panorama and panorama.pano_id and panorama.pano_id not in panoramas:
+            panoramas[panorama.pano_id] = panorama
+
+    log.info("panoramas distincts trouvés : %d", len(panoramas))
+
+    if building_wkt is None:
+        return [_image_for(p, heading=0.0, distance=0.0) for p in panoramas.values()]
+
+    building = shapely_wkt.loads(building_wkt)
+    images: list[CollectedImage] = []
+    too_far = 0
+
+    for panorama in panoramas.values():
+        target = nearest_points(building, Point(panorama.lon, panorama.lat))[0]
+        distance = haversine_m(panorama.lat, panorama.lon, target.y, target.x)
+        if distance > MAX_PANORAMA_DISTANCE_M:
+            too_far += 1
+            continue
+
+        # Cap dirigé vers l'empreinte, et non huit caps fixes.
+        heading = bearing_deg(panorama.lat, panorama.lon, target.y, target.x)
+        images.append(_image_for(panorama, heading, distance))
+
+    log.info(
+        "Street View : %d position(s) cadrant le bâtiment, %d écartée(s) pour distance",
+        len(images),
+        too_far,
+    )
     return images
+
+
+def _image_for(panorama: Panorama, heading: float, distance: float) -> CollectedImage:
+    return CollectedImage(
+        source=name,
+        source_id=panorama.pano_id or f"{panorama.lat:.5f}_{panorama.lon:.5f}",
+        url=(
+            f"{IMAGE_URL}?size={SIZE}&pano={panorama.pano_id}"
+            f"&heading={heading:.1f}&fov={FOV}&pitch=0"
+        ),
+        captured_year=_year(panorama.date),
+        heading_deg=heading % 360.0,
+        lat=panorama.lat,
+        lon=panorama.lon,
+        extra={
+            "pano_id": panorama.pano_id,
+            "date": panorama.date or "",
+            "copyright": panorama.copyright or "",
+            "distance_m": f"{distance:.1f}",
+            "fov": str(FOV),
+        },
+    )
 
 
 def sign_url(image: CollectedImage) -> str:

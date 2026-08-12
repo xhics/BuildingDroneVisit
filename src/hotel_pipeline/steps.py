@@ -186,6 +186,7 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
         project.place_query or project.address,
         project.collect_radius_m,
         website_url=project.website_url,
+        building_wkt=building.wkt,
     )
     downloaded = download_all(images, workspace, reports)
 

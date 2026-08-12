@@ -65,6 +65,7 @@ def collect_sources(
     place_query: str | None,
     radius_m: int = 300,
     website_url: str | None = None,
+    building_wkt: str | None = None,
 ) -> tuple[list[CollectedImage], list[SourceReport]]:
     """Interroge chaque source configurée, sans jamais bloquer sur une absence."""
     from .collectors import commons, flickr, mapillary, places, streetview, tripadvisor, website
@@ -87,7 +88,7 @@ def collect_sources(
         reports.append(SourceReport(name, collected=len(found)))
 
     attempt("mapillary", lambda: mapillary.collect(lat, lon, radius_m))
-    attempt("street_view", lambda: streetview.collect(lat, lon))
+    attempt("street_view", lambda: streetview.collect(lat, lon, building_wkt=building_wkt))
     attempt("commons", lambda: commons.collect(lat, lon, radius_m))
     attempt("flickr", lambda: flickr.collect(lat, lon, radius_m))
     if place_query:

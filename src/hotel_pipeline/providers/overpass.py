@@ -83,6 +83,27 @@ def _query(ql: str) -> dict[str, Any]:
     )
 
 
+def roads_around(lat: float, lon: float, radius_m: int = 350) -> list[dict[str, Any]]:
+    """Voies carrossables et accès dans un rayon.
+
+    Les allées de service et les accès de stationnement sont inclus
+    volontairement : ce sont eux qui pénètrent la propriété et peuvent offrir
+    des points de vue que la voie publique n'a pas.
+    """
+    ql = f"""
+    [out:json][timeout:{TIMEOUT}];
+    (
+      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|service|living_street)$"](around:{radius_m},{lat},{lon});
+    );
+    out geom tags;
+    """.strip()
+
+    payload = cached_call(f"overpass-roads::{lat:.6f}::{lon:.6f}::{radius_m}", lambda: _query(ql))
+    elements = payload["elements"]
+    log.info("réseau routier : %d voie(s) dans un rayon de %d m", len(elements), radius_m)
+    return elements
+
+
 def features_around(lat: float, lon: float, radius_m: int = 500) -> list[dict[str, Any]]:
     """Bâtiments et stationnements dans un rayon, avec leur géométrie.
 
