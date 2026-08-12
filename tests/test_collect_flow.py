@@ -1,0 +1,184 @@
+"""Flux `collect` complet et ses verrous humains (complément §4).
+
+Aucun appel réseau : le manifeste spatial est pré-alimenté depuis le corpus de
+test, exactement comme il le serait après une résolution réelle.
+"""
+
+from __future__ import annotations
+
+import pytest
+from typer.testing import CliRunner
+
+from hotel_pipeline.cli import app
+from hotel_pipeline.resolve import build_candidates
+from hotel_pipeline.schemas.spatial import GeocodeResult, SpatialManifest
+from hotel_pipeline.steps import ELEMENTS_FILE
+from hotel_pipeline.workspace import Workspace
+
+runner = CliRunner()
+
+TRUE_BUILDING = "way/1001"
+NEIGHBOUR_HOTEL = "way/1002"
+
+EXIT_BLOCKED = 3
+EXIT_NOT_IMPLEMENTED = 2
+
+
+@pytest.fixture
+def hotel(tmp_path, monkeypatch, overpass_elements):
+    """Un hôtel initialisé dont la résolution spatiale est déjà faite."""
+    monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path / "work"))
+    hotel_id = "welcominns-boucherville"
+
+    assert runner.invoke(app, ["init", hotel_id, "--address", "1195 rue Ampère"]).exit_code == 0
+
+    geocode = GeocodeResult(lat=45.5896, lon=-73.4372, provider="fixture")
+    workspace = Workspace(hotel_id)
+    workspace.write_spatial(
+        SpatialManifest(
+            hotel_id=hotel_id,
+            address="1195 rue Ampère",
+            geocode=geocode,
+            candidates=build_candidates(overpass_elements, geocode),
+        )
+    )
+    workspace.write_json(ELEMENTS_FILE, overpass_elements)
+    return hotel_id
+
+
+def csv_at(tmp_path, body: str):
+    path = tmp_path / "inv.csv"
+    path.write_text(
+        "id,source,rights,category,exterior_or_interior,entrance_version\n" + body,
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+class TestBuildingLock:
+    def test_collect_blocks_on_building_confirmation(self, hotel):
+        result = runner.invoke(app, ["collect", hotel])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "BUILDING_MAIN" in result.stdout
+
+    def test_block_is_persisted_and_visible_in_status(self, hotel):
+        runner.invoke(app, ["collect", hotel])
+        result = runner.invoke(app, ["status", hotel])
+        assert "BLOQUÉ" in result.stdout
+        assert "confirm-building" in result.stdout
+
+    def test_candidates_are_listed_for_the_human(self, hotel):
+        result = runner.invoke(app, ["candidates", hotel])
+        assert result.exit_code == 0
+        assert TRUE_BUILDING in result.stdout
+        assert NEIGHBOUR_HOTEL in result.stdout
+
+    def test_confirming_an_unknown_feature_is_refused(self, hotel):
+        result = runner.invoke(
+            app,
+            ["confirm-building", hotel, "way/999", "--by", "hm", "--rationale", "x"],
+        )
+        assert result.exit_code == 1
+
+    def test_confirmation_is_persisted_once(self, hotel):
+        runner.invoke(
+            app,
+            [
+                "confirm-building", hotel, TRUE_BUILDING,
+                "--by", "hm", "--rationale", "aérien + orthophoto",
+            ],
+        )
+        spatial = Workspace(hotel).read_spatial()
+        assert spatial.confirmed_building_id == TRUE_BUILDING
+        assert spatial.confirmed_by == "hm"
+        assert spatial.confirmation_rationale == "aérien + orthophoto"
+
+        # Le verrou ne doit pas être redemandé à l'exécution suivante.
+        result = runner.invoke(app, ["collect", hotel])
+        assert "BUILDING_MAIN" not in result.stdout
+
+
+class TestSeparationsGate:
+    def test_wrong_building_blocks_on_separations(self, hotel):
+        runner.invoke(
+            app,
+            ["confirm-building", hotel, NEIGHBOUR_HOTEL, "--by", "hm", "--rationale", "erreur"],
+        )
+        result = runner.invoke(app, ["collect", hotel])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "parking_adjacent_to_building" in result.stdout
+
+    def test_correct_building_reaches_the_media_step(self, hotel):
+        runner.invoke(
+            app, ["confirm-building", hotel, TRUE_BUILDING, "--by", "hm", "--rationale", "ok"]
+        )
+        result = runner.invoke(app, ["collect", hotel])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "inventaire des médias" in result.stdout
+
+
+class TestMediaLocks:
+    @pytest.fixture
+    def confirmed(self, hotel):
+        runner.invoke(
+            app, ["confirm-building", hotel, TRUE_BUILDING, "--by", "hm", "--rationale", "ok"]
+        )
+        return hotel
+
+    def test_blocks_when_nothing_is_production_eligible(self, confirmed, tmp_path):
+        path = csv_at(tmp_path, "img-1,tripadvisor,public_uncleared,facade,exterior,unknown\n")
+        runner.invoke(app, ["assets", "import", confirmed, path])
+
+        result = runner.invoke(app, ["collect", confirmed])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "aucun asset éligible production" in result.stdout
+
+    def test_blocks_on_unknown_entrance_version(self, confirmed, tmp_path):
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,unknown\n")
+        runner.invoke(app, ["assets", "import", confirmed, path])
+        runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
+
+        result = runner.invoke(app, ["collect", confirmed])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "version d'entrée indéterminée" in result.stdout
+
+    def test_collect_completes_once_every_lock_is_released(self, confirmed, tmp_path):
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,post_2024\n")
+        runner.invoke(app, ["assets", "import", confirmed, path])
+        runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
+
+        result = runner.invoke(app, ["collect", confirmed])
+        assert result.exit_code == 0, result.stdout
+
+        manifest = Workspace(confirmed).read_manifest()
+        assert "collect" in manifest.completed_steps()
+        assert manifest.blocked is None
+
+    def test_entrance_version_can_be_set_to_release_the_lock(self, confirmed, tmp_path):
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,unknown\n")
+        runner.invoke(app, ["assets", "import", confirmed, path])
+        runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
+        runner.invoke(app, ["assets", "set-entrance-version", confirmed, "img-1", "post_2024"])
+
+        assert runner.invoke(app, ["collect", confirmed]).exit_code == 0
+
+    def test_phase1_then_stops_on_preflight(self, confirmed, tmp_path):
+        """Une fois collect franchi, l'arrêt suivant est l'étape non construite."""
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,post_2024\n")
+        runner.invoke(app, ["assets", "import", confirmed, path])
+        runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
+
+        result = runner.invoke(app, ["run-phase1", confirmed])
+        assert result.exit_code == EXIT_NOT_IMPLEMENTED
+        assert "preflight" in result.stdout
+        assert "Lot 2" in result.stdout
+
+
+class TestOfflineGuard:
+    def test_network_calls_are_refused_in_tests(self, tmp_path, monkeypatch):
+        """Garde-fou : aucun test ne peut appeler le réseau en silence (§17)."""
+        from hotel_pipeline.providers.cache import OfflineError
+        from hotel_pipeline.providers.geocode import geocode
+
+        with pytest.raises(OfflineError):
+            geocode("1195 rue Ampère, Boucherville")

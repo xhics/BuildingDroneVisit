@@ -6,6 +6,8 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from . import __version__, logging as pipeline_logging
@@ -147,6 +149,177 @@ def _step_command(name: str):
 
 for _name in STEP_ORDER:
     app.command(name=_name)(_step_command(_name))
+
+
+@app.command(name="candidates")
+def candidates(hotel_id: str = typer.Argument(...)) -> None:
+    """Liste les empreintes candidates à BUILDING_MAIN, du mieux classé au moins."""
+    spatial = Workspace(hotel_id).read_spatial()
+    if spatial is None:
+        typer.secho(
+            "aucun manifeste spatial — lancez d'abord : hotel-pipeline collect " + hotel_id,
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
+    if spatial.geocode:
+        typer.echo(
+            f"géocodage : {spatial.geocode.lat:.6f}, {spatial.geocode.lon:.6f} "
+            f"({spatial.geocode.provider})"
+        )
+    typer.echo(f"état : {spatial.state.value}   rayon : {spatial.search_radius_m} m")
+    typer.echo("")
+
+    for candidate in spatial.ranked():
+        mark = "→" if candidate.feature_id == spatial.confirmed_building_id else " "
+        typer.echo(
+            f"{mark} {candidate.feature_id:<16} score={candidate.score:.2f}  "
+            f"{candidate.distance_to_geocode_m:6.0f} m  {candidate.area_m2:8.0f} m²  "
+            f"{candidate.tags.get('name', '(sans nom)')}"
+        )
+        for reason in candidate.score_reasons:
+            typer.echo(f"    · {reason}")
+
+    if spatial.assertions:
+        typer.echo("")
+        for assertion in spatial.assertions:
+            typer.echo(f"  {OK if assertion.passed else KO} {assertion.name} — {assertion.detail}")
+
+
+@app.command(name="confirm-building")
+def confirm_building(
+    hotel_id: str = typer.Argument(...),
+    feature_id: str = typer.Argument(..., help="Ex. way/29382."),
+    by: str = typer.Option(..., "--by", help="Auteur de la confirmation."),
+    rationale: str = typer.Option(..., "--rationale", help="Justification, conservée en preuve."),
+) -> None:
+    """Confirme BUILDING_MAIN. Décision humaine, persistée une fois pour toutes."""
+    from datetime import datetime, timezone
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    if spatial is None:
+        typer.secho("aucun manifeste spatial", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    if spatial.candidate(feature_id) is None:
+        typer.secho(
+            f"{feature_id} n'est pas un candidat connu. "
+            f"Voir : hotel-pipeline candidates {hotel_id}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    spatial.confirmed_building_id = feature_id
+    spatial.confirmed_by = by
+    spatial.confirmed_at = datetime.now(timezone.utc)
+    spatial.confirmation_rationale = rationale
+    workspace.write_spatial(spatial)
+
+    typer.echo(f"{OK} BUILDING_MAIN = {feature_id} (confirmé par {by})")
+
+
+assets_app = typer.Typer(no_args_is_help=True, help="Inventaire et droits des médias (§9).")
+app.add_typer(assets_app, name="assets")
+
+
+@assets_app.command("import")
+def assets_import(
+    hotel_id: str = typer.Argument(...),
+    csv_path: Path = typer.Argument(..., help="Inventaire CSV."),
+    images_root: Path | None = typer.Option(None, "--images-root", help="Racine des fichiers."),
+) -> None:
+    """Importe un inventaire. Les droits sont obligatoires, sans défaut permissif."""
+    from .intake import IntakeError, load_csv
+    from .schemas import AssetManifest
+
+    workspace = Workspace(hotel_id)
+    try:
+        loaded = load_csv(csv_path, images_root)
+    except IntakeError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    workspace.write_assets(AssetManifest(hotel_id=hotel_id, assets=loaded))
+    typer.echo(f"{OK} {len(loaded)} asset(s) inventorié(s) — aucun éligible production par défaut")
+
+
+@assets_app.command("promote")
+def assets_promote(
+    hotel_id: str = typer.Argument(...),
+    asset_ids: list[str] = typer.Argument(..., help="Identifiants à rendre éligibles."),
+) -> None:
+    """Rend des assets éligibles production, après revue des droits."""
+    from pydantic import ValidationError
+
+    from .intake import IntakeError, promote
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets — importez d'abord", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        promoted = promote(manifest, asset_ids)
+    except (IntakeError, ValidationError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    workspace.write_assets(manifest)
+    typer.echo(f"{OK} {len(promoted)} asset(s) éligible(s) production")
+
+
+@assets_app.command("set-entrance-version")
+def assets_set_entrance_version(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    version: str = typer.Argument(..., help="pre_2024 ou post_2024."),
+) -> None:
+    """Fixe la version de l'entrée. Verrou humain : non déductible visuellement."""
+    from .schemas import EntranceVersion
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        entrance = EntranceVersion(version)
+    except ValueError:
+        typer.secho(
+            f"{KO} version invalide {version!r} ; attendu pre_2024 ou post_2024",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+    asset = next((a for a in manifest.assets if a.id == asset_id), None)
+    if asset is None:
+        typer.secho(f"{KO} asset inconnu : {asset_id}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    manifest.assets[manifest.assets.index(asset)] = asset.model_copy(
+        update={"entrance_version": entrance}
+    )
+    workspace.write_assets(manifest)
+    typer.echo(f"{OK} {asset_id} → {entrance.value}")
+
+
+@assets_app.command("coverage")
+def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
+    """Compte ce qui conditionne la suite du pipeline."""
+    from .intake import coverage
+
+    manifest = Workspace(hotel_id).read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    for key, value in coverage(manifest).items():
+        typer.echo(f"  {key:<26} {value}")
 
 
 @app.command(name="run-phase1")

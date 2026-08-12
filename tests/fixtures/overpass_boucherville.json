@@ -1,0 +1,66 @@
+[
+  {
+    "type": "way",
+    "id": 1001,
+    "tags": { "building": "yes" },
+    "geometry": [
+      { "lat": 45.58950, "lon": -73.43770 },
+      { "lat": 45.58950, "lon": -73.43667 },
+      { "lat": 45.58973, "lon": -73.43667 },
+      { "lat": 45.58973, "lon": -73.43770 },
+      { "lat": 45.58950, "lon": -73.43770 }
+    ]
+  },
+  {
+    "type": "way",
+    "id": 1002,
+    "tags": { "building": "yes", "tourism": "hotel", "name": "Hôtel Voisin" },
+    "geometry": [
+      { "lat": 45.59123, "lon": -73.43770 },
+      { "lat": 45.59123, "lon": -73.43690 },
+      { "lat": 45.59146, "lon": -73.43690 },
+      { "lat": 45.59146, "lon": -73.43770 },
+      { "lat": 45.59123, "lon": -73.43770 }
+    ]
+  },
+  {
+    "type": "way",
+    "id": 1003,
+    "tags": { "building": "retail", "name": "Centre commercial Ampère" },
+    "geometry": [
+      { "lat": 45.58680, "lon": -73.43900 },
+      { "lat": 45.58680, "lon": -73.43700 },
+      { "lat": 45.58770, "lon": -73.43700 },
+      { "lat": 45.58770, "lon": -73.43900 },
+      { "lat": 45.58680, "lon": -73.43900 }
+    ]
+  },
+  {
+    "type": "way",
+    "id": 2001,
+    "tags": { "amenity": "parking", "access": "customers" },
+    "geometry": [
+      { "lat": 45.58930, "lon": -73.43770 },
+      { "lat": 45.58930, "lon": -73.43667 },
+      { "lat": 45.58949, "lon": -73.43667 },
+      { "lat": 45.58949, "lon": -73.43770 },
+      { "lat": 45.58930, "lon": -73.43770 }
+    ]
+  },
+  {
+    "type": "way",
+    "id": 2002,
+    "tags": {
+      "amenity": "parking",
+      "park_ride": "yes",
+      "name": "Stationnement incitatif De Mortagne"
+    },
+    "geometry": [
+      { "lat": 45.59300, "lon": -73.43600 },
+      { "lat": 45.59300, "lon": -73.43400 },
+      { "lat": 45.59400, "lon": -73.43400 },
+      { "lat": 45.59400, "lon": -73.43600 },
+      { "lat": 45.59300, "lon": -73.43600 }
+    ]
+  }
+]
