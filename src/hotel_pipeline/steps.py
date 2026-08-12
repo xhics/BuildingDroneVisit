@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass
 
 from .logging import get_logger
-from .schemas import EntranceVersion, ExteriorInterior
+from .schemas import ExteriorInterior
 from .schemas.spatial import SpatialManifest
 
 log = get_logger("steps")
@@ -77,20 +77,18 @@ STEPS: dict[str, Step] = {
 }
 
 
-def _context(project):  # noqa: ANN001
+def _context(workspace, project):  # noqa: ANN001
     """Contexte d'exécution du projet : politique et profil de l'établissement.
 
     Un profil absent n'interrompt pas — le pipeline reste utilisable sans —
     mais l'absence est journalisée, car elle fait retomber la résolution sur
     des bornes d'emprise génériques.
     """
-    from pathlib import Path
-
     from .context import PipelineContext
 
     context, warning = PipelineContext.load_lenient(
         project.property_profile_id or project.hotel_id,
-        policy_path=Path("pipeline_policy.json"),
+        policy_path=workspace.policy_path,
     )
     if warning:
         log.warning("%s — poursuite avec les bornes génériques", warning)
@@ -108,7 +106,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     from .schemas import AssetManifest
 
     project = workspace.read_manifest()
-    context = _context(project)
+    context = _context(workspace, project)
 
     # --- 1. vérité spatiale ---------------------------------------------
     spatial = workspace.read_spatial()
@@ -176,15 +174,29 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
         )
 
     exteriors = [a for a in eligible if a.exterior_or_interior is ExteriorInterior.EXTERIOR]
-    undated = [a for a in exteriors if a.entrance_version is EntranceVersion.UNKNOWN]
-    if undated:
+
+    # Datation par portée : seule l'apparence d'une zone sensible est bloquante.
+    # Bloquer toute la géométrie parce qu'une entrée n'est pas datée reviendrait
+    # à confondre deux usages distincts.
+    from .temporal import assess, undetermined_sensitive_scopes
+
+    assess(assets.assets, context.profile, context.policy)
+    workspace.write_assets(assets)
+
+    blocking = [
+        (a, undetermined_sensitive_scopes(a, context.policy))
+        for a in eligible
+        if undetermined_sensitive_scopes(a, context.policy)
+    ]
+    if blocking:
+        listing = ", ".join(f"{a.id}[{'+'.join(scopes)}]" for a, scopes in blocking[:8])
         raise StepBlocked(
             "collect",
-            f"version d'entrée indéterminée pour {len(undated)} extérieur(s) éligible(s) — "
-            "non déductible visuellement sans référence datée",
-            "hotel-pipeline assets set-entrance-version <hotel> <id> "
-            "<before_renovation|after_renovation> : "
-            + ", ".join(a.id for a in undated[:10]),
+            f"apparence non datée sur une portée sensible pour {len(blocking)} asset(s) — "
+            "la géométrie reste utilisable, l'apparence non",
+            "hotel-pipeline temporal set <hotel> <id> <scope> "
+            "<current_confirmed|before_event|historical> --by <auteur> "
+            "--rationale <justification> : " + listing,
         )
 
     log.info(

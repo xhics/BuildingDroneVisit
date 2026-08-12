@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .enums import (
     AssetCategory,
@@ -35,6 +35,24 @@ class GpsPoint(BaseModel):
 
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
+
+
+class TemporalDecision(BaseModel):
+    """Arbitrage humain de datation, pour une portée donnée.
+
+    Prioritaire sur toute dérivation et jamais recalculé : remplacer le verrou
+    humain par une déduction automatique ferait perdre la seule information
+    qu'aucune date de fichier ne porte.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope: str
+    status: TemporalStatus
+    decided_by: str
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    rationale: str
+    evidence: list[str] = Field(default_factory=list)
 
 
 class Asset(BaseModel):
@@ -107,7 +125,15 @@ class Asset(BaseModel):
     #: décision explicite, jamais par omission.
     reconstruction_role: ReconstructionRole = ReconstructionRole.REFERENCE_ONLY
 
+    #: Statut agrégé, au plus restrictif. Ne sert qu'aux résumés : les
+    #: décisions se prennent par portée.
     temporal_status: TemporalStatus = TemporalStatus.UNKNOWN
+
+    #: Statut par portée — `entrance`, `facade`, `roof`, `signage`. Une photo
+    #: peut montrer une entrée rénovée et une façade inchangée.
+    temporal_by_scope: dict[str, TemporalStatus] = Field(default_factory=dict)
+    temporal_method: str | None = None
+    temporal_decisions: list[TemporalDecision] = Field(default_factory=list)
 
     #: Confiance et méthode de la qualification automatique. Conservées pour
     #: qu'une décision faible reste identifiable comme telle (Lot 1B §6).

@@ -38,6 +38,7 @@ SUBDIRS: tuple[str, ...] = (
 MANIFEST_NAME = "project_manifest.json"
 SPATIAL_MANIFEST_NAME = "spatial_manifest.json"
 ASSET_MANIFEST_NAME = "asset_manifest.json"
+POLICY_NAME = "pipeline_policy.json"
 REPORT_NAME = "report.json"
 
 
@@ -72,6 +73,16 @@ class Workspace:
     @property
     def manifest_path(self) -> Path:
         return self.root / "00_manifest" / MANIFEST_NAME
+
+    @property
+    def policy_path(self) -> Path:
+        """Politique effective du projet.
+
+        Elle vit dans l'espace de travail, non dans le répertoire courant :
+        chercher `pipeline_policy.json` relativement au cwd faisait dépendre
+        le résultat de l'endroit d'où la commande était lancée.
+        """
+        return self.root / "00_manifest" / POLICY_NAME
 
     @property
     def report_path(self) -> Path:

@@ -262,10 +262,12 @@ def confirm_building(
 
 
 def _context(hotel_id: str) -> PipelineContext:
-    """Politique et profil de l'établissement, chargés une seule fois."""
-    context, warning = PipelineContext.load_lenient(
-        hotel_id, policy_path=Path("pipeline_policy.json")
-    )
+    """Politique et profil de l'établissement, chargés une seule fois.
+
+    La politique vient de l'espace de travail : la chercher dans le répertoire
+    courant faisait dépendre le résultat du lieu d'exécution.
+    """
+    context, warning = PipelineContext.for_workspace(Workspace(hotel_id))
     if warning:
         typer.secho(f"  · {warning}", fg=typer.colors.YELLOW)
     return context
@@ -557,6 +559,82 @@ def assets_classify(
     typer.echo(f"  {report.total} asset(s), {report.needs_review} en revue")
     typer.echo(f"  sujets  : {report.subjects_assigned}")
     typer.echo(f"  secteurs: {report.sectors_assigned}")
+
+
+temporal_app = typer.Typer(
+    no_args_is_help=True, help="Datation par portée (entrance, facade, roof, signage)."
+)
+app.add_typer(temporal_app, name="temporal")
+
+
+@temporal_app.command("assess")
+def temporal_assess(hotel_id: str = typer.Argument(...)) -> None:
+    """Dérive la datation par portée, sans écraser les décisions humaines."""
+    from .temporal import assess
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    report = assess(manifest.assets, context.profile, context.policy)
+    workspace.write_assets(manifest)
+    workspace.write_report("01_sources/temporal_report.json", report, context)
+
+    for scope, counts in sorted(report.by_scope.items()):
+        typer.echo(f"  {scope:<12} {counts}")
+    typer.echo(f"  décisions humaines            {report.human_decisions}")
+    typer.echo(f"  portées sensibles indéterminées {report.sensitive_unknown}")
+
+
+@temporal_app.command("set")
+def temporal_set(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    scope: str = typer.Argument(..., help="entrance, facade, roof, signage..."),
+    status: str = typer.Argument(
+        ..., help="current_confirmed, before_event, after_event, historical, unknown"
+    ),
+    by: str = typer.Option(..., "--by", help="Auteur de la décision."),
+    rationale: str = typer.Option(..., "--rationale", help="Justification, conservée."),
+    evidence: list[str] = typer.Option([], "--evidence", help="Preuves, répétable."),
+) -> None:
+    """Enregistre une décision humaine de datation, prioritaire et durable."""
+    from .schemas import TemporalDecision, TemporalStatus
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        parsed = TemporalStatus(status)
+    except ValueError:
+        allowed = ", ".join(m.value for m in TemporalStatus)
+        typer.secho(f"{KO} statut invalide ; attendu : {allowed}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    asset = next((a for a in manifest.assets if a.id == asset_id), None)
+    if asset is None:
+        typer.secho(f"{KO} asset inconnu : {asset_id}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    decision = TemporalDecision(
+        scope=scope, status=parsed, decided_by=by, rationale=rationale,
+        evidence=list(evidence),
+    )
+    kept = [d for d in asset.temporal_decisions if d.scope != scope]
+    manifest.assets[manifest.assets.index(asset)] = asset.model_copy(
+        update={
+            "temporal_decisions": [*kept, decision],
+            "temporal_by_scope": {**asset.temporal_by_scope, scope: parsed},
+        }
+    )
+    workspace.write_assets(manifest)
+    typer.echo(f"{OK} {asset_id} — {scope} : {parsed.value} (par {by})")
 
 
 @assets_app.command("coverage")

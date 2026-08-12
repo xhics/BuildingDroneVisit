@@ -1,6 +1,6 @@
 """Schémas Pydantic du pipeline (plan directeur §4, §9, §18)."""
 
-from .assets import PRODUCTION_RIGHTS, Asset, AssetManifest, GpsPoint
+from .assets import PRODUCTION_RIGHTS, Asset, AssetManifest, GpsPoint, TemporalDecision
 from .critical_objects import (
     EXCLUDED_KINDS,
     REQUIRED_OBJECTS,
@@ -40,6 +40,7 @@ __all__ = [
     "PropertyProfile",
     "RenovationEvent",
     "Asset",
+    "TemporalDecision",
     "AssetCategory",
     "AssetManifest",
     "BlockedState",

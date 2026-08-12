@@ -118,6 +118,16 @@ class PipelineContext:
         return cls(policy=policy, profile=profile), None
 
     @classmethod
+    def for_workspace(cls, workspace) -> tuple["PipelineContext", str | None]:  # noqa: ANN001
+        """Contexte d'un espace de travail, politique comprise.
+
+        La politique est lue dans `00_manifest/`, jamais relativement au
+        répertoire courant : sinon le même projet rendrait des résultats
+        différents selon l'endroit d'où la commande est lancée.
+        """
+        return cls.load_lenient(workspace.hotel_id, policy_path=workspace.policy_path)
+
+    @classmethod
     def default(cls) -> "PipelineContext":
         """Contexte sans profil, réservé aux traitements hors établissement."""
         return cls(policy=DEFAULT_POLICY)

@@ -139,14 +139,19 @@ class TestMediaLocks:
         assert result.exit_code == EXIT_BLOCKED
         assert "aucun asset éligible production" in result.stdout
 
-    def test_blocks_on_unknown_entrance_version(self, confirmed, tmp_path):
+    def test_undated_geometry_is_not_blocking(self, confirmed, tmp_path):
+        """Une entrée non datée ne doit pas interdire toute la géométrie.
+
+        Le blocage portait auparavant sur `entrance_version` de tout extérieur
+        éligible, confondant un problème d'apparence avec un problème de
+        structure.
+        """
         path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,unknown\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
         runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
 
         result = runner.invoke(app, ["collect", confirmed])
-        assert result.exit_code == EXIT_BLOCKED
-        assert "version d'entrée indéterminée" in result.stdout
+        assert result.exit_code == 0, result.stdout
 
     def test_collect_completes_once_every_lock_is_released(self, confirmed, tmp_path):
         path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,after_renovation\n")
@@ -160,13 +165,20 @@ class TestMediaLocks:
         assert "collect" in manifest.completed_steps()
         assert manifest.blocked is None
 
-    def test_entrance_version_can_be_set_to_release_the_lock(self, confirmed, tmp_path):
+    def test_temporal_decision_is_recorded_with_its_author(self, confirmed, tmp_path):
         path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,unknown\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
-        runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
-        runner.invoke(app, ["assets", "set-entrance-version", confirmed, "img-1", "after_renovation"])
+        result = runner.invoke(
+            app,
+            ["temporal", "set", confirmed, "img-1", "entrance", "current_confirmed",
+             "--by", "hm", "--rationale", "photo fournie par l'hôtel après travaux"],
+        )
+        assert result.exit_code == 0, result.stdout
 
-        assert runner.invoke(app, ["collect", confirmed]).exit_code == 0
+        asset = Workspace(confirmed).read_assets().assets[0]
+        assert asset.temporal_decisions[0].decided_by == "hm"
+        assert asset.temporal_decisions[0].scope == "entrance"
+        assert asset.temporal_by_scope["entrance"].value == "current_confirmed"
 
     def test_phase1_then_stops_on_preflight(self, confirmed, tmp_path):
         """Une fois collect franchi, l'arrêt suivant est l'étape non construite."""

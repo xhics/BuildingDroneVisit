@@ -73,13 +73,19 @@ def write_policy(tmp_path, **dedup):
     policy.model.calibration_id = "calibration-de-test"
     for key, value in dedup.items():
         setattr(policy.dedup, key, value)
-    (tmp_path / "pipeline_policy.json").write_text(policy.model_dump_json(), encoding="utf-8")
     return policy
+
+
+def install_policy(hotel_id, policy):
+    """La politique vit dans l'espace de travail, pas dans le cwd."""
+    path = Workspace(hotel_id).policy_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(policy.model_dump_json(), encoding="utf-8")
 
 
 class TestProvenanceReachesDisk:
     def test_report_carries_the_policy_version_from_disk(self, project, tmp_path):
-        write_policy(tmp_path)
+        install_policy(project, write_policy(tmp_path))
         result = runner.invoke(app, ["assets", "dedup", project])
         assert result.exit_code == 0, result.stdout
 
@@ -90,7 +96,7 @@ class TestProvenanceReachesDisk:
         assert report["provenance"]["calibration_id"] == "calibration-de-test"
 
     def test_report_carries_a_policy_digest(self, project, tmp_path):
-        write_policy(tmp_path)
+        install_policy(project, write_policy(tmp_path))
         runner.invoke(app, ["assets", "dedup", project])
         report = json.loads(
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
@@ -98,7 +104,7 @@ class TestProvenanceReachesDisk:
         assert len(report["provenance"]["policy_digest"]) == 16
 
     def test_report_body_is_preserved_alongside_provenance(self, project, tmp_path):
-        write_policy(tmp_path)
+        install_policy(project, write_policy(tmp_path))
         runner.invoke(app, ["assets", "dedup", project])
         report = json.loads(
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
@@ -110,7 +116,7 @@ class TestPolicyOnDiskChangesTheOutcome:
     """La preuve que la politique n'est pas décorative."""
 
     def test_loose_tolerance_merges_the_two_viewpoints(self, project, tmp_path):
-        write_policy(tmp_path, position_tolerance_m=50.0)
+        install_policy(project, write_policy(tmp_path, position_tolerance_m=50.0))
         runner.invoke(app, ["assets", "dedup", project])
         report = json.loads(
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
@@ -118,7 +124,7 @@ class TestPolicyOnDiskChangesTheOutcome:
         assert report["independent_viewpoints"] == 1
 
     def test_tight_tolerance_separates_them(self, project, tmp_path):
-        write_policy(tmp_path, position_tolerance_m=1.0)
+        install_policy(project, write_policy(tmp_path, position_tolerance_m=1.0))
         runner.invoke(app, ["assets", "dedup", project])
         report = json.loads(
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
@@ -129,7 +135,7 @@ class TestPolicyOnDiskChangesTheOutcome:
 class TestProfileLoading:
     def test_missing_profile_is_reported_not_silent(self, project, tmp_path):
         """Tourner sur des valeurs de secours sans le dire était le défaut."""
-        write_policy(tmp_path)
+        install_policy(project, write_policy(tmp_path))
         result = runner.invoke(app, ["assets", "dedup", project])
         assert "profil introuvable" in result.stdout
 

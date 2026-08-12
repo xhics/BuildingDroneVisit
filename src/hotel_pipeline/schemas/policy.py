@@ -86,6 +86,10 @@ class TemporalPolicy(BaseModel):
     allow_unknown_for_appearance: bool = False
     require_current_for_sensitive_zones: bool = True
 
+    #: Portées dont l'apparence engage la fidélité du rendu. Une datation
+    #: inconnue y interdit l'usage d'apparence — jamais l'usage géométrique.
+    sensitive_scopes: list[str] = Field(default_factory=lambda: ["entrance", "signage"])
+
 
 class PipelinePolicy(BaseModel):
     """Politique complète, identifiée par sa version."""
