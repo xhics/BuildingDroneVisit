@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+import requests
+
 from typer.testing import CliRunner
 
 from hotel_pipeline.cli import app
@@ -99,3 +102,49 @@ class TestCommands:
         monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path))
         result = runner.invoke(app, ["status", "absent"])
         assert result.exit_code != 0
+
+
+class TestOverpassResilience:
+    """L'instance publique répond 504 en pratique (complément §5)."""
+
+    def _fake_response(self, status: int, payload: dict | None = None):
+        class R:
+            status_code = status
+
+            def raise_for_status(self):
+                if status >= 400:
+                    raise requests.HTTPError(f"{status}")
+
+            def json(self):
+                return payload or {}
+
+        return R()
+
+    def test_transient_status_triggers_next_mirror(self, monkeypatch):
+        from hotel_pipeline.providers import overpass
+
+        monkeypatch.setenv("HOTEL_PIPELINE_OFFLINE", "0")
+        monkeypatch.setattr(overpass.time, "sleep", lambda _s: None)
+        seen: list[str] = []
+
+        def fake_post(url, **kwargs):
+            seen.append(url)
+            if len(seen) < 3:
+                return self._fake_response(504)
+            return self._fake_response(200, {"elements": [{"type": "way", "id": 1}]})
+
+        monkeypatch.setattr(overpass.requests, "post", fake_post)
+        assert overpass._query("[out:json];") == {"elements": [{"type": "way", "id": 1}]}
+        assert len(seen) == 3
+
+    def test_all_mirrors_failing_raises_actionable_error(self, monkeypatch):
+        from hotel_pipeline.providers import overpass
+
+        monkeypatch.setenv("HOTEL_PIPELINE_OFFLINE", "0")
+        monkeypatch.setattr(overpass.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(
+            overpass.requests, "post", lambda url, **kw: self._fake_response(504)
+        )
+
+        with pytest.raises(overpass.OverpassError, match="OVERPASS_URL"):
+            overpass._query("[out:json];")

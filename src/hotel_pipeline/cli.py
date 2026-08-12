@@ -8,10 +8,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import requests
 import typer
 
 from . import __version__, logging as pipeline_logging
 from .config import check_providers, load_env
+from .providers.cache import OfflineError
+from .providers.geocode import GeocodingError
+from .providers.overpass import OverpassError
 from .schemas import ProjectManifest, StepRecord
 from .steps import STEP_ORDER, STEPS, StepBlocked, StepNotImplemented, run_step
 from .workspace import SUBDIRS, Workspace
@@ -117,6 +121,11 @@ def _run_one(hotel_id: str, step_name: str, force: bool) -> None:
 
     try:
         run_step(step_name, workspace)
+    except (GeocodingError, OverpassError, OfflineError, requests.RequestException) as exc:
+        # Une source externe indisponible est un incident d'exploitation, pas
+        # un défaut du pipeline : message actionnable plutôt que trace brute.
+        typer.secho(f"{KO} source externe indisponible : {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4) from exc
     except StepNotImplemented as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.YELLOW)
         raise typer.Exit(code=2) from exc
