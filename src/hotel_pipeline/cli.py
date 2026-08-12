@@ -453,6 +453,40 @@ def assets_migrate(hotel_id: str = typer.Argument(...)) -> None:
         )
 
 
+@assets_app.command("dedup")
+def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
+    """Déduplication à quatre niveaux (Lot 1B §5)."""
+    from . import dedup_levels
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    spatial = workspace.read_spatial()
+    if manifest is None or spatial is None or not spatial.confirmed_building_id:
+        typer.secho(
+            "manifeste d'assets et bâtiment confirmé requis", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+
+    building = spatial.candidate(spatial.confirmed_building_id)
+    report = dedup_levels.run(manifest.assets, building.centroid_lat, building.centroid_lon)
+    workspace.write_assets(manifest)
+    workspace.write_json("01_sources/duplicate_report.json", report.as_dict())
+
+    typer.echo(f"  fichiers                  {report.files}")
+    typer.echo(f"  photographies uniques     {report.perceptual_groups}")
+    typer.echo(f"  points de vue indépendants {report.viewpoints}")
+    typer.echo(
+        f"  rôles : {report.canonical} canonique(s), "
+        f"{report.overlap} recouvrement, {report.inactive} inactif(s)"
+    )
+    typer.echo("")
+    for family, counts in sorted(report.by_source_family.items()):
+        typer.echo(
+            f"  {family:<22} {counts['files']:>4} fichiers  "
+            f"{counts['photographs']:>4} photos  {counts['viewpoints']:>4} points de vue"
+        )
+
+
 @assets_app.command("coverage")
 def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
     """Compte ce qui conditionne la suite du pipeline."""

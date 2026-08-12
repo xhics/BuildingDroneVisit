@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .enums import (
     AssetCategory,
     CaptureType,
+    ClusterRole,
     EntranceVersion,
     ExteriorInterior,
     PropertyMatchStatus,
@@ -68,6 +69,17 @@ class Asset(BaseModel):
     exact_duplicate_group: str | None = None
     perceptual_duplicate_group: str | None = None
     viewpoint_cluster: str | None = None
+    cluster_role: ClusterRole | None = None
+
+    #: Dimensions et poids réels, servant à choisir le fichier canonique d'un
+    #: groupe : une republication recompressée ne doit pas primer sur la source.
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    file_size_bytes: int | None = Field(default=None, ge=0)
+
+    #: Azimut du bâtiment vers la caméra : de quel côté l'observateur se tient.
+    #: Distinct de `heading_deg`, qui dit où la caméra regarde.
+    bearing_from_building_deg: float | None = Field(default=None, ge=0, lt=360)
 
     #: Multi-étiquette : une photo montre souvent bâtiment, parking et enseigne.
     subjects: list[Subject] = Field(default_factory=list)

@@ -12,6 +12,7 @@ from .critical_objects import (
 from .enums import (
     AssetCategory,
     CaptureType,
+    ClusterRole,
     EntranceVersion,
     ExteriorInterior,
     ObjectState,
@@ -36,6 +37,7 @@ __all__ = [
     "AssetManifest",
     "BlockedState",
     "CaptureType",
+    "ClusterRole",
     "ReconstructionRole",
     "ReviewStatus",
     "Subject",

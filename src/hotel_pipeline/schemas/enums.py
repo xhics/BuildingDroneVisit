@@ -134,6 +134,19 @@ class TemporalStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ClusterRole(StrEnum):
+    """Rôle d'un fichier au sein de son point de vue (Lot 1B §5, niveau 4).
+
+    La déduplication ne supprime rien : elle hiérarchise. Le recouvrement utile
+    entre images successives est ce qui rendra un SfM possible, et l'écraser
+    serait contre-productif.
+    """
+
+    CANONICAL = "canonical"
+    OVERLAP = "overlap"
+    INACTIVE = "inactive"
+
+
 class ReviewStatus(StrEnum):
     """Statut de revue d'une qualification (Lot 1B §4, §6)."""
 
