@@ -203,6 +203,11 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
             )
 
     report = triage(manifest.assets, classifier=classifier)
+
+    from .visibility import annotate
+
+    annotate(manifest.assets, building.wkt)
+
     workspace.write_assets(manifest)
     workspace.write_json(
         "01_sources/gather_report.json",

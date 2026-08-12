@@ -192,14 +192,24 @@ def build_manifest(
 
 
 def summarise(manifest: AssetManifest) -> dict[str, int]:
+    """Compte ce qui décide de la route, pas ce qui flatte le corpus.
+
+    `exterior` recense les vues d'extérieur ; `sees_building` recense celles qui
+    cadrent réellement l'hôtel. Seul le second chiffre a un sens pour le Gate
+    photo-first — le premier inclut la chaussée, l'autoroute et les voisins.
+    """
     exteriors = [
         a for a in manifest.assets if a.exterior_or_interior is ExteriorInterior.EXTERIOR
     ]
-    unique_exteriors = {a.duplicate_group or a.id for a in exteriors}
+    seeing = [a for a in manifest.assets if a.sees_building]
+    seeing_exterior = [a for a in seeing if a in exteriors]
+
     return {
         "total": len(manifest.assets),
         "exterior": len(exteriors),
-        "exterior_unique": len(unique_exteriors),
+        "exterior_unique": len({a.duplicate_group or a.id for a in exteriors}),
+        "sees_building": len(seeing),
+        "sees_building_unique": len({a.duplicate_group or a.id for a in seeing_exterior}),
         "usable_rights": len([a for a in manifest.assets if a.usable_in_production]),
         "encumbered": len([a for a in manifest.assets if a.rights_encumbered]),
     }
