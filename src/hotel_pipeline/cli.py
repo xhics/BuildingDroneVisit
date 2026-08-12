@@ -426,6 +426,33 @@ def assets_set_entrance_version(
     typer.echo(f"{OK} {asset_id} → {entrance.value}")
 
 
+@assets_app.command("migrate")
+def assets_migrate(hotel_id: str = typer.Argument(...)) -> None:
+    """Migre le manifeste vers la structure du Lot 1B (§13, étape 1)."""
+    from .migration import migrate
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    migrated, report = migrate(manifest)
+    workspace.write_assets(migrated)
+    workspace.write_json("00_manifest/migration_report.json", report.as_dict())
+
+    typer.echo(f"{OK} {report.total} asset(s) migré(s)")
+    for key, value in report.as_dict()["derived"].items():
+        typer.echo(f"    dérivé   {key:<26} {value}")
+    for key, value in report.left_unknown.items():
+        typer.echo(f"    inconnu  {key:<26} {value}")
+    if report.unmapped_sources:
+        typer.secho(
+            f"    sources sans famille connue : {report.unmapped_sources}",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @assets_app.command("coverage")
 def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
     """Compte ce qui conditionne la suite du pipeline."""

@@ -10,10 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import (
     AssetCategory,
+    CaptureType,
     EntranceVersion,
     ExteriorInterior,
     PropertyMatchStatus,
+    ReconstructionRole,
+    ReviewStatus,
     Rights,
+    Subject,
+    TemporalStatus,
+    ViewSector,
 )
 
 #: Droits autorisant l'usage d'un asset en production (reconstruction).
@@ -52,6 +58,34 @@ class Asset(BaseModel):
     property_match_status: PropertyMatchStatus = PropertyMatchStatus.UNCERTAIN
     duplicate_group: str | None = None
     production_eligible: bool = False
+
+    # --- Lot 1B : vérité multidimensionnelle -----------------------------
+    #: Origine véritable du média. Expedia, Hotels.com, Momondo et Kayak
+    #: republient une même famille : sans ce champ, une republication gonfle
+    #: artificiellement le nombre de vues.
+    source_family: str | None = None
+
+    exact_duplicate_group: str | None = None
+    perceptual_duplicate_group: str | None = None
+    viewpoint_cluster: str | None = None
+
+    #: Multi-étiquette : une photo montre souvent bâtiment, parking et enseigne.
+    subjects: list[Subject] = Field(default_factory=list)
+
+    view_sector: ViewSector = ViewSector.UNKNOWN
+    capture_type: CaptureType = CaptureType.UNKNOWN
+
+    #: Défaut prudent : un asset ne devient source de géométrie que sur
+    #: décision explicite, jamais par omission.
+    reconstruction_role: ReconstructionRole = ReconstructionRole.REFERENCE_ONLY
+
+    temporal_status: TemporalStatus = TemporalStatus.UNKNOWN
+
+    #: Confiance et méthode de la qualification automatique. Conservées pour
+    #: qu'une décision faible reste identifiable comme telle (Lot 1B §6).
+    classification_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    classification_method: str | None = None
+    review_status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
 
     #: Usage assumé par l'opérateur malgré des droits non établis.
     #: Lève le verrou du §9 pour cet asset, mais reste inscrit dans le manifeste
@@ -134,3 +168,12 @@ class AssetManifest(BaseModel):
     def encumbered(self) -> list[Asset]:
         """Assets utilisés en production sous droits assumés par l'opérateur."""
         return [a for a in self.assets if a.production_eligible and a.rights_encumbered]
+
+    def unique_photographs(self) -> int:
+        """Photographies distinctes, republications fusionnées (Lot 1B §5)."""
+        return len({a.perceptual_duplicate_group or a.exact_duplicate_group or a.id
+                    for a in self.assets})
+
+    def viewpoints(self) -> int:
+        """Points de vue indépendants — l'unité que comptent les Gates."""
+        return len({a.viewpoint_cluster for a in self.assets if a.viewpoint_cluster})

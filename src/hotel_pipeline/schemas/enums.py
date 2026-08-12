@@ -57,6 +57,92 @@ class EntranceVersion(StrEnum):
     UNKNOWN = "unknown"
 
 
+class Subject(StrEnum):
+    """Ce que montre une image (Lot 1B §4).
+
+    Multi-étiquette : une même photo peut montrer le bâtiment, le stationnement
+    et l'enseigne. La catégorie unique ne doit plus porter toute la décision.
+    """
+
+    BUILDING = "building"
+    ENTRANCE = "entrance"
+    SIGN = "sign"
+    PARKING = "parking"
+    ROOF = "roof"
+    GROUNDS = "grounds"
+    ROAD = "road"
+    NEIGHBOUR = "neighbour"
+    INTERIOR = "interior"
+    OTHER = "other"
+
+
+class ViewSector(StrEnum):
+    """Secteur du bâtiment observé (Lot 1B §4, §11)."""
+
+    FRONT = "front"
+    LEFT = "left"
+    RIGHT = "right"
+    REAR = "rear"
+    ROOF = "roof"
+    FRONT_LEFT_CORNER = "front_left_corner"
+    FRONT_RIGHT_CORNER = "front_right_corner"
+    REAR_LEFT_CORNER = "rear_left_corner"
+    REAR_RIGHT_CORNER = "rear_right_corner"
+    TRANSITION = "transition"
+    CONTEXT = "context"
+    UNKNOWN = "unknown"
+
+
+class CaptureType(StrEnum):
+    """Nature de la prise de vue (Lot 1B §4)."""
+
+    STREET_IMAGERY = "street_imagery"
+    TRAVELER = "traveler"
+    PROMOTIONAL = "promotional"
+    SOCIAL = "social"
+    AERIAL_OBLIQUE = "aerial_oblique"
+    ORTHOPHOTO = "orthophoto"
+    LIDAR = "lidar"
+    MUNICIPAL_DOCUMENT = "municipal_document"
+    HOTEL_CAPTURE = "hotel_capture"
+    UNKNOWN = "unknown"
+
+
+class ReconstructionRole(StrEnum):
+    """Usage prévu dans la reconstruction (Lot 1B §4).
+
+    `REFERENCE_ONLY` est le défaut : un asset ne devient une source de
+    géométrie que sur décision explicite, jamais par omission.
+    """
+
+    PHOTO_GEOMETRY = "photo_geometry"
+    TEXTURE_REFERENCE = "texture_reference"
+    GEO_GEOMETRY = "geo_geometry"
+    CONTEXT_LOCK = "context_lock"
+    IDENTITY_EVIDENCE = "identity_evidence"
+    REFERENCE_ONLY = "reference_only"
+    REJECT = "reject"
+
+
+class TemporalStatus(StrEnum):
+    """Position temporelle vis-à-vis de la rénovation de 2024 (Lot 1B §4)."""
+
+    PRE_2024 = "pre_2024"
+    POST_2024 = "post_2024"
+    CURRENT_CONFIRMED = "current_confirmed"
+    HISTORICAL = "historical"
+    UNKNOWN = "unknown"
+
+
+class ReviewStatus(StrEnum):
+    """Statut de revue d'une qualification (Lot 1B §4, §6)."""
+
+    AUTOMATIC_ACCEPTED = "automatic_accepted"
+    HUMAN_ACCEPTED = "human_accepted"
+    NEEDS_REVIEW = "needs_review"
+    REJECTED = "rejected"
+
+
 class PropertyMatchStatus(StrEnum):
     """L'asset représente-t-il bien la propriété visée ?"""
 
