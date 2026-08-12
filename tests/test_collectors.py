@@ -75,11 +75,30 @@ class TestSignOcr:
         reading = evaluate("HÔTEL WELCOMINNS\n1195 rue Ampère", ["WelcomINNS"], ["Mortagne"])
         assert reading.status is PropertyMatchStatus.MATCH
 
-    def test_excluded_name_wins_over_expected(self):
-        """Une enseigne du voisin disqualifie l'image, même si l'hôtel est cité."""
-        reading = evaluate("Hôtel Mortagne — voisin du WelcomINNS", ["WelcomINNS"], ["Mortagne"])
+    def test_competitor_name_disqualifies(self):
+        reading = evaluate("HÔTEL MORTAGNE", ["WelcomINNS"], ["Hôtel Mortagne"])
         assert reading.status is PropertyMatchStatus.MISMATCH
-        assert reading.matched_term == "Mortagne"
+
+    def test_expected_name_wins_over_exclusion(self):
+        """Une image portant le nom de l'établissement lui appartient."""
+        reading = evaluate(
+            "WelcomINNS — voisin de l'Hôtel Mortagne", ["WelcomINNS"], ["Hôtel Mortagne"]
+        )
+        assert reading.status is PropertyMatchStatus.MATCH
+
+    def test_local_street_names_do_not_disqualify(self):
+        """Cas réel : le tableau des salles du WelcomINNS cite des rues locales.
+
+        Exclure le jeton « Mortagne » disqualifiait une page de l'hôtel
+        lui-même. Les termes exclus doivent être des noms complets.
+        """
+        text = "Théâtre École Banquet Pierre-Boucher 100 60 De Mortagne 50 30 De Montbrun 18"
+        reading = evaluate(text, ["WelcomINNS"], ["Hôtel Mortagne"])
+        assert reading.status is not PropertyMatchStatus.MISMATCH
+
+    def test_word_boundaries_prevent_substring_matches(self):
+        reading = evaluate("winning innings", ["inn"], [])
+        assert reading.status is PropertyMatchStatus.UNCERTAIN
 
     def test_no_readable_sign_is_uncertain(self):
         assert evaluate("PARKING", ["WelcomINNS"], ["Mortagne"]).status is (

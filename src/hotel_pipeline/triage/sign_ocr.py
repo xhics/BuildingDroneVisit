@@ -36,25 +36,44 @@ class SignReading:
     matched_term: str | None = None
 
 
+def _contains(haystack: str, term: str) -> bool:
+    """Recherche sur limites de mots, sur textes déjà normalisés.
+
+    Sans limites, « inn » se déclencherait à l'intérieur de « inning » et un
+    toponyme court disqualifierait des textes sans rapport.
+    """
+    needle = normalise(term)
+    if not needle:
+        return False
+    return f" {needle} " in f" {haystack} "
+
+
 def evaluate(
     text: str, expected_terms: list[str], excluded_terms: list[str]
 ) -> SignReading:
     """Confronte un texte lu aux termes attendus et exclus.
 
-    Séparé de l'appel réseau : c'est la logique de décision, et elle se teste
-    sans clé ni service.
+    Le terme attendu l'emporte sur l'exclusion : une image portant le nom de
+    l'établissement lui appartient, quels que soient les autres mots présents.
+
+    Les termes exclus doivent être **spécifiques**, idéalement le nom complet
+    du concurrent. Un jeton isolé produit des faux positifs : sur ce pilote,
+    exclure « Mortagne » a disqualifié une page du WelcomINNS lui-même, dont
+    les salles de réunion portent des noms de rues locales — « De Mortagne »,
+    « De Montbrun », « Pierre-Boucher ».
+
+    Séparé de tout appel réseau : c'est la logique de décision, et elle se
+    teste sans clé ni service.
     """
     haystack = normalise(text)
 
-    for term in excluded_terms:
-        needle = normalise(term)
-        if needle and needle in haystack:
-            return SignReading(text, PropertyMatchStatus.MISMATCH, term)
-
     for term in expected_terms:
-        needle = normalise(term)
-        if needle and needle in haystack:
+        if _contains(haystack, term):
             return SignReading(text, PropertyMatchStatus.MATCH, term)
+
+    for term in excluded_terms:
+        if _contains(haystack, term):
+            return SignReading(text, PropertyMatchStatus.MISMATCH, term)
 
     return SignReading(text, PropertyMatchStatus.UNCERTAIN)
 
