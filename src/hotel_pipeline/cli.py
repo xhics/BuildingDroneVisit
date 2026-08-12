@@ -69,9 +69,19 @@ def provider_check() -> None:
 def init(
     hotel_id: str = typer.Argument(..., help="Identifiant court, ex. welcominns-boucherville."),
     address: str = typer.Option(..., "--address", help="Adresse officielle complète."),
+    lat: float | None = typer.Option(None, "--lat", help="Latitude connue, court-circuite le géocodage."),
+    lon: float | None = typer.Option(None, "--lon", help="Longitude connue."),
     force: bool = typer.Option(False, "--force", help="Réécrit un manifeste existant."),
 ) -> None:
-    """Crée l'espace de travail et le manifeste de projet (§18)."""
+    """Crée l'espace de travail et le manifeste de projet (§18).
+
+    Fournir --lat/--lon supprime la dépendance au géocodeur, dont le code postal
+    a divergé de l'officiel sur cette adresse.
+    """
+    if (lat is None) != (lon is None):
+        typer.secho("--lat et --lon vont ensemble", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     workspace = Workspace(hotel_id)
 
     if workspace.manifest_path.is_file() and not force:
@@ -82,9 +92,13 @@ def init(
         raise typer.Exit(code=0)
 
     workspace.create()
-    workspace.write_manifest(ProjectManifest(hotel_id=hotel_id, address=address))
+    workspace.write_manifest(
+        ProjectManifest(hotel_id=hotel_id, address=address, lat=lat, lon=lon)
+    )
     typer.echo(f"{OK} espace de travail créé : {workspace.root}")
     typer.echo(f"  {len(SUBDIRS)} répertoires, manifeste initialisé")
+    if lat is not None:
+        typer.echo(f"  position fournie : {lat:.6f}, {lon:.6f} — géocodage court-circuité")
 
 
 @app.command()

@@ -92,7 +92,9 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     # --- 1. vérité spatiale ---------------------------------------------
     spatial = workspace.read_spatial()
     if spatial is None:
-        spatial = resolve(project.hotel_id, project.address)
+        spatial = resolve(
+            project.hotel_id, project.address, lat=project.lat, lon=project.lon
+        )
         workspace.write_spatial(spatial)
 
         elements = _fetch_elements(spatial)

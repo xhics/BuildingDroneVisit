@@ -150,3 +150,70 @@ class TestSeparations:
 
         failed = {a.name for a in assertions if not a.passed}
         assert "parking_adjacent_to_building" in failed
+
+
+class TestAdjacencyTiers:
+    """Contiguïté franche et association à confirmer (calibré sur donnée réelle)."""
+
+    def test_touching_parking_is_strong(self, manifest, overpass_elements):
+        manifest.confirmed_building_id = TRUE_BUILDING
+        manifest.confirmed_by = "hm"
+        assertions = check_separations(manifest, overpass_elements)
+        parking = next(a for a in assertions if a.name == "parking_adjacent_to_building")
+        assert parking.passed
+        assert "contiguïté franche" in parking.detail
+
+    def test_distant_parking_passes_but_flags_confirmation(self, manifest, overpass_elements):
+        """Le stationnement réel du WelcomINNS est numérisé à 21 m du bâtiment.
+
+        Il doit passer, mais en annonçant qu'il reste à confirmer visuellement —
+        et non être requalifié en contiguïté franche.
+        """
+        from copy import deepcopy
+
+        elements = deepcopy(overpass_elements)
+        parking = next(e for e in elements if e["id"] == 2001)
+        # Éloigne le stationnement à ~20 m du bâtiment.
+        for node in parking["geometry"]:
+            node["lat"] -= 0.00018
+
+        manifest.confirmed_building_id = TRUE_BUILDING
+        manifest.confirmed_by = "hm"
+        assertions = check_separations(manifest, elements)
+        result = next(a for a in assertions if a.name == "parking_adjacent_to_building")
+        assert result.passed
+        assert "à confirmer" in result.detail
+
+    def test_beyond_max_distance_fails(self, manifest, overpass_elements):
+        from copy import deepcopy
+
+        elements = deepcopy(overpass_elements)
+        parking = next(e for e in elements if e["id"] == 2001)
+        for node in parking["geometry"]:
+            node["lat"] -= 0.0009  # ~100 m
+
+        manifest.confirmed_building_id = TRUE_BUILDING
+        manifest.confirmed_by = "hm"
+        assertions = check_separations(manifest, elements)
+        result = next(a for a in assertions if a.name == "parking_adjacent_to_building")
+        assert not result.passed
+
+
+class TestProvidedPosition:
+    def test_provided_coordinates_skip_geocoding(self, overpass_elements, monkeypatch):
+        """Une position fournie ne doit déclencher aucun appel au géocodeur."""
+        import hotel_pipeline.providers as providers
+        from hotel_pipeline import resolve as resolve_module
+
+        def explode(*_a, **_k):
+            raise AssertionError("le géocodeur ne doit pas être appelé")
+
+        monkeypatch.setattr(providers, "geocode", explode)
+        monkeypatch.setattr(providers, "features_around", lambda *a, **k: overpass_elements)
+
+        manifest = resolve_module.resolve(
+            "h", "1195 rue Ampère", lat=45.574128, lon=-73.443289
+        )
+        assert manifest.geocode.provider == "fourni-par-humain"
+        assert manifest.geocode.lat == pytest.approx(45.574128)
+        assert manifest.candidates

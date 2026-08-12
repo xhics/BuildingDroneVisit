@@ -24,8 +24,18 @@ from .schemas.spatial import (
 
 log = get_logger("resolve")
 
-#: Distance maximale entre deux géométries encore considérées comme contiguës.
-ADJACENCY_TOLERANCE_M = 15.0
+#: Contiguïté franche : les polygones se touchent ou presque.
+ADJACENCY_STRONG_M = 8.0
+
+#: Association plausible : trottoir, aménagement paysager ou simple imprécision
+#: de numérisation OSM séparent le stationnement du bâtiment. Au-delà, le lien
+#: n'est plus présumable.
+#:
+#: Note de calibration : le seuil franc seul rejetterait le bâtiment réel du
+#: WelcomINNS, dont le stationnement OSM est numérisé à 21 m. Un lien à cette
+#: distance est donc rapporté comme *à confirmer*, jamais comme établi — plutôt
+#: que d'élargir le seuil franc jusqu'à ce que le bon résultat passe.
+ADJACENCY_MAX_M = 30.0
 
 #: Indices textuels d'un parc-o-bus, à distinguer du stationnement de l'hôtel.
 PARK_AND_RIDE_HINTS = ("incitatif", "park and ride", "park-and-ride", "stationnement incitatif")
@@ -216,17 +226,26 @@ def check_separations(
         if looks_like_park_and_ride(tags):
             if park_and_ride is None or distance < park_and_ride[1]:
                 park_and_ride = (feature_id, distance, polygon)
-        elif distance <= ADJACENCY_TOLERANCE_M:
+        elif distance <= ADJACENCY_MAX_M:
             if hotel_parking is None or distance < hotel_parking[1]:
                 hotel_parking = (feature_id, distance, polygon)
 
     if hotel_parking:
-        manifest.parking_feature_id = hotel_parking[0]
+        feature_id, distance, _ = hotel_parking
+        manifest.parking_feature_id = feature_id
+        strong = distance <= ADJACENCY_STRONG_M
         assertions.append(
             GeometricAssertion(
                 name="parking_adjacent_to_building",
                 passed=True,
-                detail=f"{hotel_parking[0]} à {hotel_parking[1]:.1f} m du bâtiment",
+                detail=(
+                    f"{feature_id} à {distance:.1f} m — "
+                    + (
+                        "contiguïté franche"
+                        if strong
+                        else "proche mais non contigu, association à confirmer visuellement"
+                    )
+                ),
             )
         )
     else:
@@ -235,7 +254,7 @@ def check_separations(
                 name="parking_adjacent_to_building",
                 passed=False,
                 detail=(
-                    f"aucun stationnement contigu (tolérance {ADJACENCY_TOLERANCE_M:.0f} m) — "
+                    f"aucun stationnement à moins de {ADJACENCY_MAX_M:.0f} m — "
                     f"{len(parkings)} stationnement(s) examiné(s)"
                 ),
             )
@@ -274,12 +293,29 @@ def check_separations(
     return assertions
 
 
-def resolve(hotel_id: str, address: str, radius_m: int = 500) -> SpatialManifest:
-    """Construit le manifeste spatial. Effectue des appels réseau."""
+def resolve(
+    hotel_id: str,
+    address: str,
+    radius_m: int = 500,
+    lat: float | None = None,
+    lon: float | None = None,
+) -> SpatialManifest:
+    """Construit le manifeste spatial. Effectue des appels réseau.
+
+    Une position fournie par l'humain court-circuite le géocodage : elle est
+    plus fiable que n'importe quel géocodeur et sa provenance est enregistrée
+    comme telle.
+    """
     from .providers import features_around, geocode as geocode_address
 
-    position = geocode_address(address)
-    log.info("adresse résolue par %s : %.6f, %.6f", position.provider, position.lat, position.lon)
+    if lat is not None and lon is not None:
+        position = GeocodeResult(lat=lat, lon=lon, provider="fourni-par-humain")
+        log.info("position fournie : %.6f, %.6f — géocodage court-circuité", lat, lon)
+    else:
+        position = geocode_address(address)
+        log.info(
+            "adresse résolue par %s : %.6f, %.6f", position.provider, position.lat, position.lon
+        )
 
     elements = features_around(position.lat, position.lon, radius_m)
     candidates = build_candidates(elements, position)
