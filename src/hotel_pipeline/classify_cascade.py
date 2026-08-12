@@ -45,6 +45,7 @@ class CascadeReport:
     subjects_assigned: dict[str, int] = field(default_factory=dict)
     sectors_assigned: dict[str, int] = field(default_factory=dict)
     needs_review: int = 0
+    occlusion_conflicts: int = 0
     unknown_sector: int = 0
 
     def as_dict(self) -> dict:
@@ -54,6 +55,7 @@ class CascadeReport:
             "subjects": self.subjects_assigned,
             "sectors": self.sectors_assigned,
             "needs_review": self.needs_review,
+            "occlusion_conflicts": self.occlusion_conflicts,
             "unknown_sector": self.unknown_sector,
         }
 
@@ -108,10 +110,43 @@ def _stage_ocr(asset: Asset) -> tuple[list[Subject], str | None]:
 
 
 def _stage_model(result, asset: Asset) -> tuple[list[Subject], list[Subject], float, str]:  # noqa: ANN001
-    """Étape 4 — ce que le modèle propose, avec ses seuils."""
+    """Étape 4 — ce que le modèle propose, avec ses seuils.
+
+    La confiance porte sur les sujets décisifs, et non sur l'ensemble : une
+    classe hors sujet nettement rejetée gonflait l'agrégat à 0,999 sur des
+    décisions médiocres.
+    """
     accepted = [Subject(s) for s in result.accepted()]
     uncertain = [Subject(s) for s in result.uncertain()]
-    return accepted, uncertain, result.confidence(), "openclip:multilabel"
+    decisive = [s.value for s in DECISIVE_SUBJECTS if s.value in result.scores]
+    return accepted, uncertain, result.confidence(decisive), "openclip:multilabel"
+
+
+def _target_visibility(asset: Asset, contains_building: bool) -> tuple[bool | None, str | None]:
+    """Le bâtiment **cible** est-il visible, et sur quelle preuve ?
+
+    Un bâtiment détecté n'est pas le bon bâtiment. Trois preuves seulement
+    l'établissent, dans cet ordre de force.
+    """
+    if asset.property_match_status is PropertyMatchStatus.MISMATCH:
+        return False, "enseigne d'un autre établissement"
+
+    if asset.occluded_by:
+        return False, f"masqué par {asset.occluded_by}"
+
+    # Cap observé, empreinte dans le champ, aucune occultation : la caméra
+    # regardait bien la cible, et un contributeur l'a pointée.
+    if asset.sees_building and asset.heading_is_measured and contains_building:
+        return True, "cap observé cadrant l'empreinte, bâtiment confirmé"
+
+    if asset.property_match_status is PropertyMatchStatus.MATCH:
+        return True, "appartenance confirmée par enseigne"
+
+    if contains_building:
+        # Un bâtiment est là, mais rien ne dit que c'est le nôtre.
+        return None, "bâtiment présent, identité non établie"
+
+    return False, "aucun bâtiment détecté"
 
 
 def classify(
@@ -146,6 +181,7 @@ def classify(
             methods.append(method)
             report.by_stage["ocr"] = report.by_stage.get("ocr", 0) + 1
 
+        scores: dict[str, float] = {}
         if classifier is not None and asset.local_path and Path(asset.local_path).is_file():
             try:
                 result = classifier.multi_label(Path(asset.local_path))
@@ -157,14 +193,24 @@ def classify(
                 # il est la seule preuve du contenu.
                 subjects.extend(s for s in accepted if s not in subjects)
                 methods.append(method)
+                scores = {k: round(v, 4) for k, v in result.scores.items()}
                 report.by_stage["model"] = report.by_stage.get("model", 0) + 1
+
+        # --- identité de la cible, distincte de la présence d'un bâtiment ---
+        contains = Subject.BUILDING in subjects
+        target, evidence = _target_visibility(asset, contains)
 
         # Étape 5 — ce qui doit passer devant un humain.
         review = ReviewStatus.NEEDS_REVIEW
         decisive_uncertain = [s for s in uncertain if s in DECISIVE_SUBJECTS]
-        if not decisive_uncertain and (confidence is None or confidence >= 0.6):
-            if subjects or asset.sees_building is not None:
-                review = ReviewStatus.AUTOMATIC_ACCEPTED
+        blocked_by_occlusion = bool(asset.occluded_by) and contains
+        if (
+            not decisive_uncertain
+            and not blocked_by_occlusion
+            and (confidence is None or confidence >= 0.6)
+            and (subjects or asset.sees_building is not None)
+        ):
+            review = ReviewStatus.AUTOMATIC_ACCEPTED
 
         deduped = sorted(set(subjects), key=lambda s: s.value)
         assets[index] = asset.model_copy(
@@ -174,8 +220,14 @@ def classify(
                 "classification_confidence": confidence,
                 "classification_method": "+".join(methods) if methods else None,
                 "review_status": review,
+                "contains_building": contains,
+                "target_building_visible": target,
+                "target_evidence": evidence,
+                "subject_scores": scores,
             }
         )
+        if blocked_by_occlusion:
+            report.occlusion_conflicts += 1
 
         for subject in deduped:
             report.subjects_assigned[subject.value] = (

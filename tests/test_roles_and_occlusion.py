@@ -18,6 +18,7 @@ from hotel_pipeline.schemas import (
     AssetCategory,
     PropertyMatchStatus,
     ReconstructionRole,
+    ReviewStatus,
     Rights,
     Subject,
 )
@@ -45,10 +46,66 @@ def make(asset_id="a", **overrides) -> Asset:
 
 
 class TestRoleAssignment:
-    def test_positioned_view_of_the_building_carries_geometry(self):
+    def test_generic_building_does_not_carry_geometry(self):
+        """« Un bâtiment » n'est pas « le bâtiment ».
+
+        Ce test encodait auparavant le défaut : position connue plus bâtiment
+        détecté suffisaient. Cela a promu 20 vues Street View montrant
+        Boucherville Toyota, Rachelle Béry et Tetra Tech.
+        """
         asset = make(camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING])
+        role, reason = role_for(asset)
+        assert role is ReconstructionRole.CONTEXT_LOCK
+        assert "non établi" in reason
+
+    def test_confirmed_target_carries_geometry(self):
+        asset = make(
+            camera_lat=45.573,
+            camera_lon=-73.443,
+            subjects=[Subject.BUILDING],
+            target_building_visible=True,
+            review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+        )
         role, _ = role_for(asset)
         assert role is ReconstructionRole.PHOTO_GEOMETRY
+
+    def test_occlusion_downgrades_to_context(self):
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443,
+            subjects=[Subject.BUILDING], target_building_visible=True,
+            review_status=ReviewStatus.AUTOMATIC_ACCEPTED, occluded_by="way/999",
+        )
+        assert role_for(asset)[0] is ReconstructionRole.CONTEXT_LOCK
+
+    def test_pending_review_never_carries_geometry(self):
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443,
+            subjects=[Subject.BUILDING], target_building_visible=True,
+            review_status=ReviewStatus.NEEDS_REVIEW,
+        )
+        assert role_for(asset)[0] is ReconstructionRole.CONTEXT_LOCK
+
+    def test_inactive_viewpoint_never_carries_geometry(self):
+        from hotel_pipeline.schemas import ClusterRole
+
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443,
+            subjects=[Subject.BUILDING], target_building_visible=True,
+            review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.INACTIVE,
+        )
+        assert role_for(asset)[0] is ReconstructionRole.CONTEXT_LOCK
+
+    def test_pre_renovation_view_is_texture_only(self):
+        from hotel_pipeline.schemas import TemporalStatus
+
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443,
+            subjects=[Subject.BUILDING], target_building_visible=True,
+            review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            temporal_status=TemporalStatus.PRE_2024,
+        )
+        assert role_for(asset)[0] is ReconstructionRole.TEXTURE_REFERENCE
 
     def test_unpositioned_view_cannot_carry_geometry(self):
         """Sans position, aucune triangulation — même sur une superbe façade."""
@@ -63,7 +120,7 @@ class TestRoleAssignment:
         role, _ = role_for(asset)
         assert role is ReconstructionRole.IDENTITY_EVIDENCE
 
-    def test_positioned_view_without_building_locks_the_context(self):
+    def test_positioned_view_without_building_locks_the_context(self):  # noqa: D401
         asset = make(camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.ROAD])
         role, _ = role_for(asset)
         assert role is ReconstructionRole.CONTEXT_LOCK
@@ -86,7 +143,8 @@ class TestRoleAssignment:
     def test_no_source_is_eliminated(self):
         """Chaque asset reçoit un rôle : aucun n'est retiré du registre."""
         assets = [
-            make("geo", camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING]),
+            make("geo", camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
+                 target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED),
             make("promo", subjects=[Subject.BUILDING]),
             make("interieur", subjects=[Subject.INTERIOR]),
             make("rien"),

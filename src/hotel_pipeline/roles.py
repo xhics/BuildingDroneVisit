@@ -14,7 +14,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .logging import get_logger
-from .schemas import Asset, ReconstructionRole, Subject
+from .schemas import (
+    Asset,
+    ClusterRole,
+    PropertyMatchStatus,
+    ReconstructionRole,
+    ReviewStatus,
+    Subject,
+    TemporalStatus,
+)
 
 log = get_logger("roles")
 
@@ -31,30 +39,52 @@ class RoleReport:
 def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
     """Rôle d'un asset et sa justification.
 
-    L'ordre compte : on écarte d'abord ce qui nuit, on retient ensuite ce qui
-    porte la géométrie, et on affecte enfin ce qui ne porte qu'une apparence.
+    Porter de la géométrie exige **toutes** les conditions suivantes :
+
+    ```text
+    caméra située
+    + bâtiment cible réellement visible
+    + aucune occultation non arbitrée
+    + revue acceptée
+    + point de vue actif
+    + temporalité admissible
+    ```
+
+    La version précédente se contentait de « position connue + un bâtiment
+    visible », ce qui a promu 20 vues Street View montrant un concessionnaire
+    automobile, une épicerie et un bureau d'ingénierie.
     """
     if Subject.INTERIOR in asset.subjects:
         return ReconstructionRole.REFERENCE_ONLY, "intérieur, hors périmètre extérieur"
 
-    if asset.property_match_status.value == "mismatch":
+    if asset.property_match_status is PropertyMatchStatus.MISMATCH:
         return ReconstructionRole.REJECT, "enseigne d'un autre établissement"
 
     positioned = asset.camera_lat is not None and asset.camera_lon is not None
-    shows_building = Subject.BUILDING in asset.subjects
+    contains = bool(asset.contains_building or Subject.BUILDING in asset.subjects)
 
-    # Seule une image située peut être triangulée. Sans position ni cap, une
-    # photographie ne se rattache à aucun point de vue.
-    if positioned and shows_building:
-        return ReconstructionRole.PHOTO_GEOMETRY, "position connue et bâtiment visible"
-
-    if positioned and not shows_building:
-        return ReconstructionRole.CONTEXT_LOCK, "position connue, environnement seulement"
+    if positioned:
+        if asset.occluded_by:
+            return ReconstructionRole.CONTEXT_LOCK, "ligne de visée masquée par un voisin"
+        if asset.target_building_visible is not True:
+            return (
+                ReconstructionRole.CONTEXT_LOCK,
+                "bâtiment cible non établi" if contains else "environnement seulement",
+            )
+        if asset.review_status is ReviewStatus.REJECTED:
+            return ReconstructionRole.REJECT, "rejeté en revue"
+        if asset.review_status is ReviewStatus.NEEDS_REVIEW:
+            return ReconstructionRole.CONTEXT_LOCK, "en attente de revue humaine"
+        if asset.cluster_role is ClusterRole.INACTIVE:
+            return ReconstructionRole.CONTEXT_LOCK, "point de vue déjà couvert"
+        if asset.temporal_status is TemporalStatus.PRE_2024:
+            return ReconstructionRole.TEXTURE_REFERENCE, "antérieur à la rénovation"
+        return ReconstructionRole.PHOTO_GEOMETRY, "cible visible, située et arbitrée"
 
     if Subject.SIGN in asset.subjects or (asset.sign_text or "").strip():
         return ReconstructionRole.IDENTITY_EVIDENCE, "enseigne lisible, sans position"
 
-    if Subject.ENTRANCE in asset.subjects or shows_building:
+    if Subject.ENTRANCE in asset.subjects or contains:
         return ReconstructionRole.TEXTURE_REFERENCE, "apparence exploitable, sans position"
 
     return ReconstructionRole.REFERENCE_ONLY, "ni géométrie ni apparence exploitable"

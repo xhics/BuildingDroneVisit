@@ -133,6 +133,26 @@ class Asset(BaseModel):
     #: `heading_is_measured`.
     sees_building: bool | None = None
 
+    #: **Un** bâtiment quelconque est-il visible ? Réponse du modèle, qui ne
+    #: distingue pas le WelcomINNS d'un concessionnaire Toyota.
+    contains_building: bool | None = None
+
+    #: **Le** bâtiment cible est-il réellement visible ?
+    #:
+    #: Distinction décisive : confondre les deux a produit 20 vues Street View
+    #: classées porteuses de géométrie alors qu'elles montraient Boucherville
+    #: Toyota, Rachelle Béry ou Tetra Tech — dont 17 avec `sees_building` faux
+    #: et 15 avec un bâtiment interposé.
+    #:
+    #: Ne peut être établi que par une preuve : cap observé cadrant l'empreinte
+    #: sans occlusion, enseigne lue, ou revue humaine.
+    target_building_visible: bool | None = None
+    target_evidence: str | None = None
+
+    #: Score par sujet, conservé tel quel. Une confiance agrégée masquait la
+    #: qualité réelle de la décision décisive.
+    subject_scores: dict[str, float] = Field(default_factory=dict)
+
     #: Empreinte voisine coupant la ligne de visée, le cas échéant. Le champ de
     #: vision ne suffit pas : un pavillon interposé annule la vue.
     occluded_by: str | None = None

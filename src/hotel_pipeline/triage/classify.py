@@ -138,18 +138,34 @@ class MultiLabelResult:
     ) -> list[str]:
         return sorted([s for s, p in self.scores.items() if low <= p < high])
 
-    def confidence(self) -> float:
-        """Netteté globale de la décision.
+    def margin(self, subject: str) -> float:
+        """Netteté de la décision **pour un sujet donné**, dans [0, 1].
 
-        Mesurée comme l'écart au seuil d'acceptation, et non à 0,5. La softmax
-        porte désormais sur `[positif, *alternatives]` : avec cinq termes, la
-        valeur neutre est 0,2, si bien qu'un écart à 0,5 déclarait « confiants »
-        des scores parfaitement indécis.
+        Un sujet dont le score frôle le seuil est indécis ; un sujet nettement
+        au-dessus ou au-dessous est tranché.
+        """
+        if subject not in self.scores:
+            return 0.0
+        span = max(SUBJECT_ACCEPT, 1.0 - SUBJECT_ACCEPT)
+        return min(abs(self.scores[subject] - SUBJECT_ACCEPT) / span, 1.0)
+
+    def confidence(self, subjects: list[str] | None = None) -> float:
+        """Netteté de la décision, sur les sujets qui la portent.
+
+        Prendre le **maximum** sur tous les sujets était trompeur : une classe
+        hors sujet nettement rejetée — « intérieur » sur une photo de rue —
+        suffisait à afficher 0,999 alors que la décision « bâtiment » était
+        médiocre. C'est ce qui a produit des faux positifs à confiance 1,00.
+
+        On retient donc le **minimum** sur les sujets décisifs : la décision
+        vaut ce que vaut son maillon le plus faible.
         """
         if not self.scores:
             return 0.0
-        span = max(SUBJECT_ACCEPT, 1.0 - SUBJECT_ACCEPT)
-        return max(min(abs(p - SUBJECT_ACCEPT) / span, 1.0) for p in self.scores.values())
+        targets = [s for s in (subjects or list(self.scores)) if s in self.scores]
+        if not targets:
+            return 0.0
+        return min(self.margin(s) for s in targets)
 
 
 @dataclass
