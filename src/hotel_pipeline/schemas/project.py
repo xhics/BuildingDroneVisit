@@ -62,6 +62,9 @@ class ProjectManifest(BaseModel):
     website_url: str | None = None
     assume_rights: bool = False
 
+    #: Profil d'établissement à charger. À défaut, `hotel_id` sert de clé.
+    property_profile_id: str | None = None
+
     created_at: datetime = Field(default_factory=_now)
     status: Phase1Status | None = None
     steps: list[StepRecord] = Field(default_factory=list)

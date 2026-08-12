@@ -13,6 +13,7 @@ import typer
 
 from . import __version__, logging as pipeline_logging
 from .config import check_providers, load_env
+from .context import PipelineContext
 from .providers.cache import OfflineError
 from .providers.geocode import GeocodingError
 from .providers.overpass import OverpassError
@@ -260,6 +261,16 @@ def confirm_building(
     typer.echo(f"{OK} BUILDING_MAIN = {feature_id} (confirmé par {by})")
 
 
+def _context(hotel_id: str) -> PipelineContext:
+    """Politique et profil de l'établissement, chargés une seule fois."""
+    context, warning = PipelineContext.load_lenient(
+        hotel_id, policy_path=Path("pipeline_policy.json")
+    )
+    if warning:
+        typer.secho(f"  · {warning}", fg=typer.colors.YELLOW)
+    return context
+
+
 assets_app = typer.Typer(no_args_is_help=True, help="Inventaire et droits des médias (§9).")
 app.add_typer(assets_app, name="assets")
 
@@ -326,7 +337,10 @@ def assets_gather(
     lat, lon = building.centroid_lat, building.centroid_lon
     typer.echo(f"collecte autour de {lat:.6f}, {lon:.6f} (rayon {radius_m} m)")
 
-    images, reports = collect_sources(lat, lon, place_query, radius_m)
+    context = _context(hotel_id)
+    images, reports = collect_sources(
+        lat, lon, place_query, radius_m, policy=context.policy, building_wkt=building.wkt
+    )
     downloaded = download_all(images, workspace, reports)
 
     for report in reports:
@@ -345,7 +359,7 @@ def assets_gather(
         try:
             from .triage.classify import Classifier
 
-            classifier = Classifier()
+            classifier = Classifier(policy=context.policy)
         except ImportError:
             typer.secho(
                 "  · OpenCLIP absent — classification ignorée "
@@ -355,7 +369,7 @@ def assets_gather(
 
     gather_report = triage(manifest.assets, classifier=classifier)
     workspace.write_assets(manifest)
-    workspace.write_json("01_sources/gather_report.json", gather_report.as_dict())
+    workspace.write_report("01_sources/gather_report.json", gather_report, context)
 
     typer.echo("")
     for key, value in summarise(manifest).items():
@@ -467,10 +481,13 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
+    context = _context(hotel_id)
     building = spatial.candidate(spatial.confirmed_building_id)
-    report = dedup_levels.run(manifest.assets, building.centroid_lat, building.centroid_lon)
+    report = dedup_levels.run(
+        manifest.assets, building.centroid_lat, building.centroid_lon, policy=context.policy
+    )
     workspace.write_assets(manifest)
-    workspace.write_json("01_sources/duplicate_report.json", report.as_dict())
+    workspace.write_report("01_sources/duplicate_report.json", report, context)
 
     typer.echo(f"  fichiers                  {report.files}")
     typer.echo(f"  photographies uniques     {report.perceptual_groups}")
@@ -504,6 +521,7 @@ def assets_classify(
         typer.secho("manifeste d'assets et manifeste spatial requis", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
+    context = _context(hotel_id)
     elements = workspace.read_json(ELEMENTS_FILE) or []
     front = resolve_front(spatial, elements)
     if front is None:
@@ -522,7 +540,7 @@ def assets_classify(
         try:
             from .triage.classify import Classifier
 
-            classifier = Classifier()
+            classifier = Classifier(policy=context.policy)
         except ImportError:
             typer.secho("  · OpenCLIP absent — étape 4 ignorée", fg=typer.colors.YELLOW)
 
@@ -530,9 +548,10 @@ def assets_classify(
         manifest.assets,
         classifier=classifier,
         front_azimuth=front.degrees if front else None,
+        policy=context.policy,
     )
     workspace.write_assets(manifest)
-    workspace.write_json("01_sources/classification_report.json", report.as_dict())
+    workspace.write_report("01_sources/classification_report.json", report, context)
 
     typer.echo("")
     typer.echo(f"  {report.total} asset(s), {report.needs_review} en revue")

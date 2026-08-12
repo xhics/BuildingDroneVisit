@@ -204,7 +204,9 @@ def looks_like_park_and_ride(tags: dict[str, str]) -> bool:
 
 
 def check_separations(
-    manifest: SpatialManifest, elements: list[dict[str, Any]]
+    manifest: SpatialManifest,
+    elements: list[dict[str, Any]],
+    policy: PipelinePolicy = DEFAULT_POLICY,
 ) -> list[GeometricAssertion]:
     """Vérifie les séparations exigées par le §3 du plan directeur.
 
@@ -243,14 +245,14 @@ def check_separations(
         if looks_like_park_and_ride(tags):
             if park_and_ride is None or distance < park_and_ride[1]:
                 park_and_ride = (feature_id, distance, polygon)
-        elif distance <= ADJACENCY_MAX_M:
+        elif distance <= policy.geometry.adjacency_max_m:
             if hotel_parking is None or distance < hotel_parking[1]:
                 hotel_parking = (feature_id, distance, polygon)
 
     if hotel_parking:
         feature_id, distance, _ = hotel_parking
         manifest.parking_feature_id = feature_id
-        strong = distance <= ADJACENCY_STRONG_M
+        strong = distance <= policy.geometry.adjacency_strong_m
         assertions.append(
             GeometricAssertion(
                 name="parking_adjacent_to_building",
@@ -271,7 +273,7 @@ def check_separations(
                 name="parking_adjacent_to_building",
                 passed=False,
                 detail=(
-                    f"aucun stationnement à moins de {ADJACENCY_MAX_M:.0f} m — "
+                    f"aucun stationnement à moins de {policy.geometry.adjacency_max_m:.0f} m — "
                     f"{len(parkings)} stationnement(s) examiné(s)"
                 ),
             )

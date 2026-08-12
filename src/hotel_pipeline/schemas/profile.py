@@ -71,9 +71,18 @@ class RenovationEvent(BaseModel):
                 f"événement {self.event_id!r} sans aucune date : "
                 "approved_on, started_on ou completed_on est requis"
             )
+        if self.completion_confirmed and self.completed_on is None:
+            raise ValueError(
+                f"événement {self.event_id!r} : completion_confirmed sans completed_on — "
+                "on ne confirme pas une date absente"
+            )
+        # Toutes les paires, y compris approbation/achèvement : une approbation
+        # postérieure à l'achèvement était acceptée tant que started_on
+        # manquait.
         for earlier, later, names in (
             (self.approved_on, self.started_on, "approved_on/started_on"),
             (self.started_on, self.completed_on, "started_on/completed_on"),
+            (self.approved_on, self.completed_on, "approved_on/completed_on"),
         ):
             if earlier and later and earlier > later:
                 raise ValueError(f"dates incohérentes : {names}")
@@ -207,8 +216,10 @@ class PropertyProfile(BaseModel):
         if event is None:
             return None
 
-        first_change = event.started_on or event.approved_on
-        if first_change and taken_on < first_change:
+        # Seul un début de travaux attesté permet d'affirmer qu'une image lui
+        # est antérieure. Une approbation ne prouve pas que le chantier a
+        # commencé : il peut n'avoir jamais démarré.
+        if event.started_on and taken_on < event.started_on:
             return False
 
         if event.establishes_current_appearance and taken_on >= event.completed_on:

@@ -206,3 +206,58 @@ class TestPipelinePolicy:
     def test_incoherent_threshold_rejected(self):
         with pytest.raises(ValueError):
             PipelinePolicy.model_validate({"model": {"subject_accept": 1.7}})
+
+
+class TestRenovationInvariants:
+    """Trois failles relevées à l'audit du profil."""
+
+    def test_confirmed_completion_requires_a_date(self):
+        from datetime import date as _date
+
+        with pytest.raises(ValueError, match="sans completed_on"):
+            RenovationEvent(
+                event_id="e", scope="entrance",
+                approved_on=_date(2024, 1, 1), completion_confirmed=True,
+            )
+
+    def test_approval_after_completion_is_rejected(self):
+        """Le contrôle sautait quand started_on manquait."""
+        from datetime import date as _date
+
+        with pytest.raises(ValueError, match="approved_on/completed_on"):
+            RenovationEvent(
+                event_id="e", scope="entrance",
+                approved_on=_date(2025, 1, 1), completed_on=_date(2024, 1, 1),
+            )
+
+    def test_photo_before_an_approval_stays_undecided(self):
+        """Approuver ne prouve pas que le chantier a commencé.
+
+        Une image antérieure à l'approbation était déclarée « pas actuelle »,
+        alors que les travaux pouvaient n'avoir jamais démarré — auquel cas
+        elle montre bien l'état courant.
+        """
+        from datetime import date as _date
+
+        profile = PropertyProfile(
+            property_id="p", address="a", official_name="X",
+            renovation_events=[
+                RenovationEvent(event_id="e", scope="entrance", approved_on=_date(2024, 9, 16))
+            ],
+        )
+        assert profile.shows_current_appearance(_date(2023, 1, 1), "entrance") is None
+
+    def test_photo_before_a_confirmed_start_is_not_current(self):
+        from datetime import date as _date
+
+        profile = PropertyProfile(
+            property_id="p", address="a", official_name="X",
+            renovation_events=[
+                RenovationEvent(
+                    event_id="e", scope="entrance",
+                    started_on=_date(2024, 10, 1),
+                    completed_on=_date(2025, 3, 1), completion_confirmed=True,
+                )
+            ],
+        )
+        assert profile.shows_current_appearance(_date(2023, 1, 1), "entrance") is False

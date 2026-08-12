@@ -77,6 +77,26 @@ STEPS: dict[str, Step] = {
 }
 
 
+def _context(project):  # noqa: ANN001
+    """Contexte d'exécution du projet : politique et profil de l'établissement.
+
+    Un profil absent n'interrompt pas — le pipeline reste utilisable sans —
+    mais l'absence est journalisée, car elle fait retomber la résolution sur
+    des bornes d'emprise génériques.
+    """
+    from pathlib import Path
+
+    from .context import PipelineContext
+
+    context, warning = PipelineContext.load_lenient(
+        project.property_profile_id or project.hotel_id,
+        policy_path=Path("pipeline_policy.json"),
+    )
+    if warning:
+        log.warning("%s — poursuite avec les bornes génériques", warning)
+    return context
+
+
 def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
     """Résolution de propriété et qualification des médias (Lot 1).
 
@@ -88,12 +108,18 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     from .schemas import AssetManifest
 
     project = workspace.read_manifest()
+    context = _context(project)
 
     # --- 1. vérité spatiale ---------------------------------------------
     spatial = workspace.read_spatial()
     if spatial is None:
         spatial = resolve(
-            project.hotel_id, project.address, lat=project.lat, lon=project.lon
+            project.hotel_id,
+            project.address,
+            radius_m=context.policy.collection.radius_m,
+            lat=project.lat,
+            lon=project.lon,
+            profile=context.profile,
         )
         workspace.write_spatial(spatial)
 
@@ -118,7 +144,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
 
     # --- 2. séparations géométriques ------------------------------------
     elements = workspace.read_json(ELEMENTS_FILE) or []
-    spatial.assertions = check_separations(spatial, elements)
+    spatial.assertions = check_separations(spatial, elements, context.policy)
     workspace.write_spatial(spatial)
 
     failed = spatial.failed_assertions()
@@ -137,7 +163,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     # déductible — les droits assumés et la version de l'entrée.
     assets_path = workspace.path("00_manifest", ASSET_MANIFEST_NAME)
     if not assets_path.is_file():
-        _gather(workspace, project, spatial)
+        _gather(workspace, project, spatial, context)
 
     assets = AssetManifest.model_validate_json(assets_path.read_text("utf-8"))
     eligible = assets.production_eligible()
@@ -157,7 +183,8 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
             f"version d'entrée indéterminée pour {len(undated)} extérieur(s) éligible(s) — "
             "non déductible visuellement sans référence datée",
             "hotel-pipeline assets set-entrance-version <hotel> <id> "
-            "<pre_2024|post_2024> : " + ", ".join(a.id for a in undated[:10]),
+            "<before_renovation|after_renovation> : "
+            + ", ".join(a.id for a in undated[:10]),
         )
 
     log.info(
@@ -168,7 +195,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     )
 
 
-def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN001
+def _gather(workspace, project, spatial: SpatialManifest, context) -> None:  # noqa: ANN001
     """Collecte et trie le corpus automatiquement (§9, §11).
 
     Les options de collecte viennent du manifeste de projet, pas d'arguments de
@@ -180,13 +207,15 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
     building = spatial.candidate(spatial.confirmed_building_id or "")
     lat, lon = building.centroid_lat, building.centroid_lon
 
+    profile = context.profile
     images, reports = collect_sources(
         lat,
         lon,
-        project.place_query or project.address,
+        (profile.place_query if profile else None) or project.place_query or project.address,
         project.collect_radius_m,
-        website_url=project.website_url,
+        website_url=(profile.website_url if profile else None) or project.website_url,
         building_wkt=building.wkt,
+        policy=context.policy,
     )
     downloaded = download_all(images, workspace, reports)
 
@@ -201,7 +230,7 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
         try:
             from .triage.classify import Classifier
 
-            classifier = Classifier()
+            classifier = Classifier(policy=context.policy)
         except ImportError:
             log.warning(
                 "OpenCLIP absent — classification ignorée ; extérieur/intérieur restera inconnu"
@@ -211,12 +240,13 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
 
     from .visibility import annotate
 
-    annotate(manifest.assets, building.wkt)
+    annotate(manifest.assets, building.wkt, policy=context.policy)
 
     workspace.write_assets(manifest)
-    workspace.write_json(
+    workspace.write_report(
         "01_sources/gather_report.json",
         {**report.as_dict(), "summary": summarise(manifest)},
+        context,
     )
     log.info("collecte : %s", summarise(manifest))
 

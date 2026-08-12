@@ -28,6 +28,9 @@ class ModelPolicy(BaseModel):
 
     #: Sur quoi ces seuils ont été mesurés. Sans cette trace, un seuil est un
     #: nombre sans autorité.
+    #: En deçà, une décision automatique n'est pas acceptée sans revue.
+    review_confidence_floor: float = Field(default=0.60, ge=0.0, le=1.0)
+
     calibration_id: str = "welcominns-2026-08-36-images"
     calibrated_on_sites: int = 1
 
@@ -62,6 +65,11 @@ class CollectionPolicy(BaseModel):
     sample_spacing_m: float = Field(default=15.0, gt=0)
     snap_radius_m: int = Field(default=25, gt=0)
     max_panorama_distance_m: float = Field(default=220.0, gt=0)
+
+    #: Champ de vision demandé aux vues Street View, et sa variante élargie
+    #: pour les transitions route–entrée–stationnement.
+    image_fov_deg: int = Field(default=80, gt=0, le=120)
+    wide_fov_deg: int = Field(default=110, gt=0, le=120)
 
 
 class TemporalPolicy(BaseModel):

@@ -38,11 +38,11 @@ METADATA_URL = "https://maps.googleapis.com/maps/api/streetview/metadata"
 TIMEOUT = 30
 
 SIZE = "640x640"
-FOV = 80
+FOV = DEFAULT_POLICY.collection.image_fov_deg
 
 #: Vue élargie, réservée aux positions révélant la transition route–entrée–
 #: stationnement. Elle ne crée pas un point de vue supplémentaire.
-WIDE_FOV = 110
+WIDE_FOV = DEFAULT_POLICY.collection.wide_fov_deg
 
 #: Pas d'échantillonnage du réseau. Un panorama Street View est espacé d'une
 #: dizaine de mètres : échantillonner plus finement multiplie les appels sans
@@ -180,7 +180,7 @@ def collect(
 
         # Cap dirigé vers l'empreinte, et non huit caps fixes.
         heading = bearing_deg(panorama.lat, panorama.lon, target.y, target.x)
-        images.append(_image_for(panorama, heading, distance))
+        images.append(_image_for(panorama, heading, distance, policy.collection.image_fov_deg))
 
     log.info(
         "Street View : %d position(s) cadrant le bâtiment, %d écartée(s) pour distance",
@@ -190,13 +190,15 @@ def collect(
     return images
 
 
-def _image_for(panorama: Panorama, heading: float, distance: float) -> CollectedImage:
+def _image_for(
+    panorama: Panorama, heading: float, distance: float, fov: int = FOV
+) -> CollectedImage:
     return CollectedImage(
         source=name,
         source_id=panorama.pano_id or f"{panorama.lat:.5f}_{panorama.lon:.5f}",
         url=(
             f"{IMAGE_URL}?size={SIZE}&pano={panorama.pano_id}"
-            f"&heading={heading:.1f}&fov={FOV}&pitch=0"
+            f"&heading={heading:.1f}&fov={fov}&pitch=0"
         ),
         captured_year=_year(panorama.date),
         heading_deg=heading % 360.0,
@@ -210,7 +212,7 @@ def _image_for(panorama: Panorama, heading: float, distance: float) -> Collected
             "date": panorama.date or "",
             "copyright": panorama.copyright or "",
             "distance_m": f"{distance:.1f}",
-            "fov": str(FOV),
+            "fov": str(fov),
         },
     )
 

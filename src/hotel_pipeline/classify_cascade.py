@@ -30,8 +30,8 @@ from .schemas import (
     TemporalStatus,
     ViewSector,
 )
+from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .sectors import sector_for
-from .triage.classify import SUBJECT_ACCEPT
 
 log = get_logger("cascade")
 
@@ -111,15 +111,20 @@ def _stage_ocr(asset: Asset) -> tuple[list[Subject], str | None]:
     return [], None
 
 
-def _stage_model(result, asset: Asset) -> tuple[list[Subject], list[Subject], float, str]:  # noqa: ANN001
+def _stage_model(
+    result, asset: Asset, policy: PipelinePolicy  # noqa: ANN001
+) -> tuple[list[Subject], list[Subject], float, str]:
     """Étape 4 — ce que le modèle propose, avec ses seuils.
 
     La confiance porte sur les sujets décisifs, et non sur l'ensemble : une
     classe hors sujet nettement rejetée gonflait l'agrégat à 0,999 sur des
     décisions médiocres.
     """
-    accepted = [Subject(s) for s in result.accepted()]
-    uncertain = [Subject(s) for s in result.uncertain()]
+    accepted = [Subject(s) for s in result.accepted(policy.model.subject_accept)]
+    uncertain = [
+        Subject(s)
+        for s in result.uncertain(policy.model.subject_reject, policy.model.subject_accept)
+    ]
     decisive = [s.value for s in DECISIVE_SUBJECTS if s.value in result.scores]
     return accepted, uncertain, result.confidence(decisive), "openclip:multilabel"
 
@@ -182,6 +187,7 @@ def classify(
     assets: list[Asset],
     classifier=None,  # noqa: ANN001
     front_azimuth: float | None = None,
+    policy: PipelinePolicy = DEFAULT_POLICY,
 ) -> CascadeReport:
     """Applique la cascade à chaque asset, en place."""
     report = CascadeReport(total=len(assets))
@@ -217,7 +223,7 @@ def classify(
             except (OSError, ValueError, RuntimeError) as exc:
                 log.warning("classification impossible pour %s : %s", asset.id, exc)
             else:
-                accepted, uncertain, confidence, method = _stage_model(result, asset)
+                accepted, uncertain, confidence, method = _stage_model(result, asset, policy)
                 # Le modèle complète une géométrie mesurée ; sur un cap choisi,
                 # il est la seule preuve du contenu.
                 subjects.extend(s for s in accepted if s not in subjects)
@@ -231,7 +237,9 @@ def classify(
         # de contenu.
         model_contains: bool | None = None
         if scores:
-            model_contains = scores.get(Subject.BUILDING.value, 0.0) >= SUBJECT_ACCEPT
+            model_contains = (
+                scores.get(Subject.BUILDING.value, 0.0) >= policy.model.subject_accept
+            )
 
         target_in_fov = bool(asset.sees_building and asset.heading_is_measured)
         target, evidence = _target_visibility(asset, model_contains, target_in_fov)
@@ -244,7 +252,7 @@ def classify(
         if (
             not decisive_uncertain
             and not blocked_by_occlusion
-            and (confidence is None or confidence >= 0.6)
+            and (confidence is None or confidence >= policy.model.review_confidence_floor)
             and (subjects or asset.sees_building is not None)
         ):
             review = ReviewStatus.AUTOMATIC_ACCEPTED

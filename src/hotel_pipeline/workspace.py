@@ -97,6 +97,19 @@ class Workspace:
         _atomic_write(target, json.dumps(payload, indent=2, ensure_ascii=False))
         return target
 
+    def write_report(self, relative: str, report, context) -> Path:  # noqa: ANN001
+        """Écrit un rapport en y apposant sa provenance.
+
+        Point de passage **obligatoire** : `write_json` reste disponible pour
+        les données brutes, mais tout rapport doit dire avec quelle politique
+        et quel profil il a été produit. Sans cela, un chiffre n'est pas
+        reproductible — les rapports du WelcomINNS n'en portaient aucune.
+        """
+        from .provenance import stamp
+
+        payload = report.as_dict() if hasattr(report, "as_dict") else dict(report)
+        return self.write_json(relative, stamp(payload, context.policy, context.profile))
+
     def read_json(self, relative: str) -> object | None:
         target = self.root / relative
         if not target.is_file():
