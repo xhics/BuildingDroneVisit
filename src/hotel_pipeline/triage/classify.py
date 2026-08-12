@@ -47,55 +47,81 @@ CATEGORY_PROMPTS: dict[AssetCategory, list[str]] = {
 }
 
 
-#: Chaque sujet est jugé **indépendamment**, par opposition à une scène
-#: alternative. Une softmax sur ce couple donne une probabilité par sujet, au
-#: lieu d'un argmax qui désigne toujours un vainqueur même quand toutes les
-#: hypothèses sont faibles.
+#: Chaque sujet est jugé **indépendamment**, contre un ensemble d'alternatives.
+#: La softmax porte sur `[positif, *alternatives]` : la probabilité du sujet est
+#: celle du premier terme face à un monde clos, au lieu d'un argmax qui désigne
+#: toujours un vainqueur même quand toutes les hypothèses sont faibles.
 #:
-#: **Le terme opposé décrit une scène concrète, jamais une négation.** CLIP ne
-#: traite pas la négation : « a photo with no building visible » contient le
-#: mot « building » et l'emporte donc sur une image de bâtiment. Ce piège a
-#: mesuré 0 hôtel sur 118 vues Street View dont la première montrait clairement
-#: le WelcomINNS ; corriger l'opposé a fait passer le score de 0,01 à 0,60.
-SUBJECT_PROMPTS: dict[str, tuple[str, str]] = {
+#: Deux règles, l'une et l'autre issues d'un défaut mesuré sur le corpus réel.
+#:
+#: 1. **Une alternative décrit une scène concrète, jamais une négation.** CLIP
+#:    n'encode pas la négation : « a photo with no building visible » contient
+#:    le mot « building » et l'emportait sur les images de bâtiments — 0 hôtel
+#:    détecté sur 118 vues Street View.
+#: 2. **Les alternatives couvrent le monde du corpus, pas un contre-exemple.**
+#:    Avec un opposé unique, les photographies d'intérieur scoraient 0,98 en
+#:    « façade vue de l'extérieur » : une piscine ne ressemble ni à une façade
+#:    ni à « une route vide », mais davantage à la première.
+COMMON_ALTERNATIVES: tuple[str, ...] = (
+    "an indoor room, hotel lobby, bedroom, restaurant or swimming pool seen from inside",
+    "an empty road or highway seen from a car windscreen",
+    "a single-storey suburban house with a driveway and a front lawn",
+    "a graphic, logo, text banner or promotional illustration",
+)
+
+SUBJECT_PROMPTS: dict[str, tuple[str, tuple[str, ...]]] = {
     "building": (
-        "a multi-storey hotel, motel or apartment building seen from outside",
-        "an empty road, parking lot, sky, trees or open grass field",
+        "the exterior facade of a large multi-storey hotel or motel, seen from the street",
+        COMMON_ALTERNATIVES,
     ),
     "entrance": (
         "the main entrance of a hotel, with glass doors under a canopy or porch",
-        "a long blank facade, an empty road or a stretch of lawn",
+        COMMON_ALTERNATIVES + ("a long blank facade of brick or concrete",),
     ),
     "sign": (
-        "large lettering, an illuminated hotel sign or a branded pylon sign",
-        "a plain brick wall, bare asphalt or a row of trees",
+        "large lettering, an illuminated hotel sign or a branded pylon sign outdoors",
+        COMMON_ALTERNATIVES + ("a plain brick wall or bare asphalt",),
     ),
     "parking": (
-        "a parking lot with several parked cars",
-        "an empty lawn, a building interior or a clear stretch of asphalt",
+        "an outdoor parking lot with several parked cars",
+        COMMON_ALTERNATIVES + ("a lawn or garden with grass and shrubs",),
     ),
     "roof": (
         "a rooftop seen from above, showing roof surfaces and their edges",
-        "a ground-level view of walls, road surface and trees",
+        COMMON_ALTERNATIVES + ("a ground-level view of walls and pavement",),
     ),
     "grounds": (
         "landscaped grounds with lawn, hedges, shrubs or planted beds",
-        "bare asphalt pavement, a building interior or a blank wall",
+        COMMON_ALTERNATIVES + ("bare asphalt pavement or a blank wall",),
     ),
     "road": (
         "a road, street or highway with lane markings and asphalt",
-        "a building interior, a rooftop view or a dense lawn",
+        (
+            "an indoor room, hotel lobby, bedroom or swimming pool seen from inside",
+            "a graphic, logo, text banner or promotional illustration",
+            "a rooftop view or a dense green lawn",
+        ),
     ),
     "interior": (
-        "an indoor room, corridor, lobby, bathroom or swimming pool",
-        "an outdoor street scene with open sky above",
+        "an indoor room, corridor, lobby, bathroom or swimming pool seen from inside",
+        (
+            "an outdoor street scene with open sky above",
+            "the exterior facade of a building seen from the street",
+            "a graphic, logo, text banner or promotional illustration",
+        ),
     ),
 }
 
 #: Au-dessus, le sujet est retenu ; en dessous du seuil bas, il est écarté ;
 #: entre les deux, la décision est incertaine et appelle une revue.
-SUBJECT_ACCEPT = 0.70
-SUBJECT_REJECT = 0.40
+#:
+#: Ces valeurs ne sont pas choisies a priori : elles sont mesurées sur le jeu
+#: de validation étiqueté à la main (§6). Sur ce jeu, les scores `building`
+#: des vues d'hôtel s'échelonnent de 0,57 à 0,92, tandis que intérieurs,
+#: maisons, routes et visuels promotionnels restent à 0,00–0,01. Le seuil haut
+#: est placé au milieu de cet intervalle vide, pas au bord d'une distribution.
+SUBJECT_ACCEPT = 0.50
+SUBJECT_REJECT = 0.20
 
 
 @dataclass
@@ -153,13 +179,17 @@ class Classifier:
         self._category = self._encode_groups(CATEGORY_PROMPTS)
         self._subject_pairs = self._encode_pairs(SUBJECT_PROMPTS)
 
-    def _encode_pairs(self, pairs: dict[str, tuple[str, str]]):
-        """Encode chaque couple description positive / contraire."""
+    def _encode_pairs(self, pairs: dict[str, tuple[str, tuple[str, ...]]]):
+        """Encode, par sujet, la description positive suivie de ses alternatives.
+
+        La softmax porte sur l'ensemble : la probabilité du sujet est celle du
+        premier terme face à un monde clos, et non face à un unique contraire.
+        """
         torch = self._torch
         encoded = {}
         with torch.no_grad():
-            for subject, (positive, negative) in pairs.items():
-                tokens = self.tokenizer([positive, negative]).to(self.device)
+            for subject, (positive, alternatives) in pairs.items():
+                tokens = self.tokenizer([positive, *alternatives]).to(self.device)
                 features = self.model.encode_text(tokens)
                 features /= features.norm(dim=-1, keepdim=True)
                 encoded[subject] = features

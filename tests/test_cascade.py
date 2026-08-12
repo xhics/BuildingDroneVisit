@@ -125,7 +125,7 @@ class TestThresholds:
         path = tmp_path / "i.jpg"
         path.write_bytes(b"x")
         assets = [make(local_path=str(path))]
-        classify(assets, classifier=FakeClassifier({"parking": 0.52, "building": 0.48}))
+        classify(assets, classifier=FakeClassifier({"parking": 0.30, "building": 0.10}))
         assert assets[0].subjects == []
 
     def test_ambiguous_decisive_subject_forces_review(self, tmp_path):
@@ -197,26 +197,27 @@ class TestPromptConstruction:
 
         forbidden = (" no ", "without", "not ", "n't")
         offenders = [
-            subject
-            for subject, (_, opposite) in SUBJECT_PROMPTS.items()
-            if any(token in f" {opposite.lower()} " for token in forbidden)
+            f"{subject}:{alt}"
+            for subject, (_, alternatives) in SUBJECT_PROMPTS.items()
+            for alt in alternatives
+            if any(token in f" {alt.lower()} " for token in forbidden)
         ]
-        assert offenders == [], f"négation dans les opposés : {offenders}"
+        assert offenders == [], f"négation dans les alternatives : {offenders}"
 
-    def test_opposite_never_repeats_the_subject_word(self):
-        """Un opposé qui répète le mot du sujet attire ce qu'il devait exclure."""
+    def test_alternatives_cover_the_real_corpus(self):
+        """Un opposé unique laissait les intérieurs scorer 0,98 en façade.
+
+        Les alternatives doivent représenter le monde du corpus — intérieurs,
+        routes, pavillons, visuels promotionnels — et non un seul contre-exemple.
+        """
         from hotel_pipeline.triage.classify import SUBJECT_PROMPTS
 
-        offenders = [
-            subject
-            for subject, (_, opposite) in SUBJECT_PROMPTS.items()
-            if subject.rstrip("s") in opposite.lower()
-        ]
-        assert offenders == [], f"le sujet apparaît dans son opposé : {offenders}"
+        for subject, (_, alternatives) in SUBJECT_PROMPTS.items():
+            assert len(alternatives) >= 3, f"{subject} : trop peu d'alternatives"
 
-    def test_every_subject_declares_both_prompts(self):
+    def test_every_subject_declares_a_positive_and_alternatives(self):
         from hotel_pipeline.triage.classify import SUBJECT_PROMPTS
 
-        for subject, prompts in SUBJECT_PROMPTS.items():
-            assert len(prompts) == 2, subject
-            assert all(p.strip() for p in prompts), subject
+        for subject, (positive, alternatives) in SUBJECT_PROMPTS.items():
+            assert positive.strip(), subject
+            assert all(a.strip() for a in alternatives), subject
