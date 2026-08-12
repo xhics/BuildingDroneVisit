@@ -79,7 +79,7 @@ def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
         # créé avant la déduplication porte `None` et franchissait le Router.
         if asset.cluster_role not in (ClusterRole.CANONICAL, ClusterRole.OVERLAP):
             return ReconstructionRole.CONTEXT_LOCK, "point de vue non arbitré ou déjà couvert"
-        if asset.temporal_status is TemporalStatus.PRE_2024:
+        if asset.temporal_status is TemporalStatus.BEFORE_EVENT:
             return ReconstructionRole.TEXTURE_REFERENCE, "antérieur à la rénovation"
         return ReconstructionRole.PHOTO_GEOMETRY, "cible visible, située et arbitrée"
 

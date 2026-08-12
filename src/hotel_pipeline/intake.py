@@ -4,8 +4,9 @@ Deux règles structurantes :
 
 1. une image reste `reference_only` tant que ses droits ne permettent pas son
    usage en reconstruction — c'est le schéma qui l'impose, pas la discipline ;
-2. la version de l'entrée (avant/après la rénovation de 2024) n'est pas
-   déductible visuellement sans référence datée. C'est un verrou humain.
+2. la version de l'entrée, relative aux travaux déclarés au profil de
+   l'établissement, n'est pas déductible visuellement sans référence datée.
+   C'est un verrou humain.
 """
 
 from __future__ import annotations
@@ -165,8 +166,8 @@ def coverage(manifest: AssetManifest) -> dict[str, int]:
         "total": len(manifest.assets),
         "production_eligible": len(eligible),
         "exterior_eligible": len(exteriors),
-        "exterior_post_2024": len(
-            [a for a in exteriors if a.entrance_version is EntranceVersion.POST_2024]
+        "exterior_after_renovation": len(
+            [a for a in exteriors if a.entrance_version is EntranceVersion.AFTER_RENOVATION]
         ),
         "entrance_version_unknown": len(
             [a for a in exteriors if a.entrance_version is EntranceVersion.UNKNOWN]

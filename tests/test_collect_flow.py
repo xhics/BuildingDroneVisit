@@ -149,7 +149,7 @@ class TestMediaLocks:
         assert "version d'entrée indéterminée" in result.stdout
 
     def test_collect_completes_once_every_lock_is_released(self, confirmed, tmp_path):
-        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,post_2024\n")
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,after_renovation\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
         runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
 
@@ -164,13 +164,13 @@ class TestMediaLocks:
         path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,unknown\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
         runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
-        runner.invoke(app, ["assets", "set-entrance-version", confirmed, "img-1", "post_2024"])
+        runner.invoke(app, ["assets", "set-entrance-version", confirmed, "img-1", "after_renovation"])
 
         assert runner.invoke(app, ["collect", confirmed]).exit_code == 0
 
     def test_phase1_then_stops_on_preflight(self, confirmed, tmp_path):
         """Une fois collect franchi, l'arrêt suivant est l'étape non construite."""
-        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,post_2024\n")
+        path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,after_renovation\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
         runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
 

@@ -89,10 +89,10 @@ class TestDeterministicDerivation:
         manifest, _ = migrate(
             AssetManifest(
                 hotel_id="h",
-                assets=[legacy_asset(entrance_version=EntranceVersion.POST_2024)],
+                assets=[legacy_asset(entrance_version=EntranceVersion.AFTER_RENOVATION)],
             )
         )
-        assert manifest.assets[0].temporal_status is TemporalStatus.POST_2024
+        assert manifest.assets[0].temporal_status is TemporalStatus.AFTER_EVENT
 
     def test_identical_checksums_share_an_exact_group(self):
         manifest, _ = migrate(

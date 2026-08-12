@@ -62,9 +62,16 @@ CAPTURE_TYPE: dict[str, CaptureType] = {
 CHOSEN_HEADING_SOURCES: frozenset[str] = frozenset({"street_view"})
 
 TEMPORAL_FROM_ENTRANCE: dict[EntranceVersion, TemporalStatus] = {
-    EntranceVersion.PRE_2024: TemporalStatus.PRE_2024,
-    EntranceVersion.POST_2024: TemporalStatus.POST_2024,
+    EntranceVersion.BEFORE_RENOVATION: TemporalStatus.BEFORE_EVENT,
+    EntranceVersion.AFTER_RENOVATION: TemporalStatus.AFTER_EVENT,
     EntranceVersion.UNKNOWN: TemporalStatus.UNKNOWN,
+}
+
+#: Valeurs héritées, antérieures à la généralisation. Une date d'établissement
+#: précis figurait alors dans le vocabulaire du schéma.
+LEGACY_TEMPORAL: dict[str, str] = {
+    "pre_2024": "before_renovation",
+    "post_2024": "after_renovation",
 }
 
 

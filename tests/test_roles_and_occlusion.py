@@ -113,7 +113,7 @@ class TestRoleAssignment:
             subjects=[Subject.BUILDING], target_building_visible=True,
             review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
             cluster_role=ClusterRole.CANONICAL,
-            temporal_status=TemporalStatus.PRE_2024,
+            temporal_status=TemporalStatus.BEFORE_EVENT,
         )
         assert role_for(asset)[0] is ReconstructionRole.TEXTURE_REFERENCE
 

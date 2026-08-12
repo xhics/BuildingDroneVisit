@@ -45,15 +45,14 @@ class ExteriorInterior(StrEnum):
 
 
 class EntranceVersion(StrEnum):
-    """Version de l'entrée principale.
+    """Version de l'entrée, relative aux travaux déclarés au profil.
 
-    La rénovation approuvée en 2024 interdit de fusionner les deux périodes
-    sans contrôle (plan directeur §3). Non déductible visuellement sans
-    référence datée : c'est un verrou humain.
+    Mélanger deux périodes sans contrôle est interdit (plan directeur §3).
+    Non déductible visuellement sans référence datée : c'est un verrou humain.
     """
 
-    PRE_2024 = "pre_2024"
-    POST_2024 = "post_2024"
+    BEFORE_RENOVATION = "before_renovation"
+    AFTER_RENOVATION = "after_renovation"
     UNKNOWN = "unknown"
 
 
@@ -125,10 +124,16 @@ class ReconstructionRole(StrEnum):
 
 
 class TemporalStatus(StrEnum):
-    """Position temporelle vis-à-vis de la rénovation de 2024 (Lot 1B §4)."""
+    """Position temporelle vis-à-vis des derniers travaux déclarés.
 
-    PRE_2024 = "pre_2024"
-    POST_2024 = "post_2024"
+    Générique : les valeurs se rapportent à un `RenovationEvent` du profil,
+    dont la date vit dans les données. La version précédente gravait
+    `pre_2024` / `post_2024` dans le type — la rénovation d'un établissement
+    précis promue au rang de vocabulaire.
+    """
+
+    BEFORE_EVENT = "before_event"
+    AFTER_EVENT = "after_event"
     CURRENT_CONFIRMED = "current_confirmed"
     HISTORICAL = "historical"
     UNKNOWN = "unknown"

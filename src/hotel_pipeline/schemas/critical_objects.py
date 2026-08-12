@@ -6,9 +6,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import ObjectState
 
-#: Objets à identifier et valider (plan directeur §4).
+#: Gabarit d'objets à identifier, valable pour tout établissement.
+#:
+#: La version précédente nommait `PROPERTY_WELCOMINNS` et `RUE_AMPERE` : des
+#: instances d'un site particulier promues au rang de constantes. La voie
+#: d'accès et la parcelle sont désormais des rôles, dont l'identité réelle est
+#: **découverte** puis inscrite au manifeste de site.
 REQUIRED_OBJECTS: tuple[str, ...] = (
-    "PROPERTY_WELCOMINNS",
+    "PROPERTY_PARCEL",
     "BUILDING_MAIN",
     "ENTRANCE_MAIN_CURRENT",
     "ROOFLINE_MAIN",
@@ -16,20 +21,22 @@ REQUIRED_OBJECTS: tuple[str, ...] = (
     "FACADE_LEFT",
     "FACADE_RIGHT",
     "FACADE_REAR",
-    "HOTEL_SIGN",
+    "PROPERTY_SIGN",
     "DRIVEWAY_MAIN",
     "PARKING_HOTEL",
-    "RUE_AMPERE",
+    "ACCESS_ROAD_MAIN",
     "TERRAIN_MAIN",
 )
 
-#: Objets à distinguer ou exclure (plan directeur §4).
-EXCLUDED_OBJECTS: tuple[str, ...] = (
-    "INDOOR_POOL",
-    "PARK_AND_RIDE_DE_MORTAGNE",
-    "NEIGHBOURING_HOTELS",
-    "UNRELATED_COMMERCIAL_BUILDINGS",
-    "AUTOROUTE_20_CONTEXT",
+#: Catégories d'objets à distinguer de la propriété. Ce sont des **natures**,
+#: pas des noms : le parc-o-bus De Mortagne est une instance de
+#: `PARK_AND_RIDE`, découverte sur ce site, absente du suivant.
+EXCLUDED_KINDS: tuple[str, ...] = (
+    "INDOOR_AMENITY",
+    "PARK_AND_RIDE",
+    "NEIGHBOURING_ACCOMMODATION",
+    "UNRELATED_COMMERCIAL",
+    "MAJOR_ROAD_CONTEXT",
 )
 
 

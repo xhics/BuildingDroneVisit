@@ -2,13 +2,15 @@
 
 from .assets import PRODUCTION_RIGHTS, Asset, AssetManifest, GpsPoint
 from .critical_objects import (
-    EXCLUDED_OBJECTS,
+    EXCLUDED_KINDS,
     REQUIRED_OBJECTS,
     CriticalObject,
     CriticalObjectRegistry,
     HumanCorrection,
     SpatialRelation,
 )
+from .policy import DEFAULT_POLICY, PipelinePolicy
+from .profile import PropertyProfile, RenovationEvent
 from .enums import (
     AssetCategory,
     CaptureType,
@@ -32,7 +34,11 @@ from .project import BlockedState, ProjectManifest, StepRecord
 __all__ = [
     "PRODUCTION_RIGHTS",
     "REQUIRED_OBJECTS",
-    "EXCLUDED_OBJECTS",
+    "EXCLUDED_KINDS",
+    "DEFAULT_POLICY",
+    "PipelinePolicy",
+    "PropertyProfile",
+    "RenovationEvent",
     "Asset",
     "AssetCategory",
     "AssetManifest",
