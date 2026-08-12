@@ -191,3 +191,95 @@ class TestManifestIntegrity:
         assert manifest.summary()["artifacts"] == 1
         assert manifest.artifact("dtm-0.5m").role == "dtm"
         assert [o.kind for o in manifest.derived()] == ["TERRAIN_MAIN"]
+
+
+class TestArtifactLineage:
+    """Citer seulement le LAZ masquerait la dérivation réelle."""
+
+    def _chain(self, **overrides):
+        base = dict(
+            format="GeoTIFF", sha256="a" * 64, crs_horizontal="EPSG:2950",
+            crs_vertical="CGVD 1928", resolution_m=0.5, algorithm_id="v1",
+            measured_fraction=0.0, interpolated_fraction=1.0,
+            coverage_domain="footprint", derived_from_sources=[SOURCE_ID],
+        )
+        base.update(overrides)
+        return base
+
+    def test_ndsm_declares_its_parents(self):
+        manifest = SiteManifest(
+            hotel_id="h",
+            geo_sources=[source()],
+            artifacts=[
+                DerivedArtifact(artifact_id="dtm", role="dtm", path="a", **self._chain()),
+                DerivedArtifact(artifact_id="dsm_roof", role="dsm_roof", path="b", **self._chain()),
+                DerivedArtifact(
+                    artifact_id="ndsm_valid", role="mask", path="c",
+                    **self._chain(crs_vertical=None),
+                ),
+                DerivedArtifact(
+                    artifact_id="ndsm", role="ndsm", path="d",
+                    **self._chain(),
+                    derived_from_artifacts=["dtm", "dsm_roof", "ndsm_valid"],
+                ),
+            ],
+        )
+        assert manifest.artifact("ndsm").derived_from_artifacts == [
+            "dtm", "dsm_roof", "ndsm_valid"
+        ]
+
+    def test_absent_parent_is_refused(self):
+        with pytest.raises(ValueError, match="artefacts absents"):
+            SiteManifest(
+                hotel_id="h",
+                geo_sources=[source()],
+                artifacts=[
+                    DerivedArtifact(
+                        artifact_id="ndsm", role="ndsm", path="d",
+                        **self._chain(), derived_from_artifacts=["dtm"],
+                    )
+                ],
+            )
+
+    def test_self_reference_is_refused(self):
+        with pytest.raises(ValueError, match="se cite lui-même"):
+            DerivedArtifact(
+                artifact_id="ndsm", role="ndsm", path="d",
+                **self._chain(), derived_from_artifacts=["ndsm"],
+            )
+
+    def test_a_cycle_is_refused(self):
+        """Une filiation circulaire ne peut pas être rejouée : rien ne vient en premier."""
+        with pytest.raises(ValueError, match="cyclique"):
+            SiteManifest(
+                hotel_id="h",
+                geo_sources=[source()],
+                artifacts=[
+                    DerivedArtifact(
+                        artifact_id="a", role="dtm", path="a",
+                        **self._chain(), derived_from_artifacts=["b"],
+                    ),
+                    DerivedArtifact(
+                        artifact_id="b", role="dsm_roof", path="b",
+                        **self._chain(), derived_from_artifacts=["a"],
+                    ),
+                ],
+            )
+
+    def test_a_deep_chain_without_cycle_is_accepted(self):
+        manifest = SiteManifest(
+            hotel_id="h",
+            geo_sources=[source()],
+            artifacts=[
+                DerivedArtifact(artifact_id="a", role="dtm", path="a", **self._chain()),
+                DerivedArtifact(
+                    artifact_id="b", role="ndsm", path="b",
+                    **self._chain(), derived_from_artifacts=["a"],
+                ),
+                DerivedArtifact(
+                    artifact_id="c", role="ndsm", path="c",
+                    **self._chain(), derived_from_artifacts=["b"],
+                ),
+            ],
+        )
+        assert len(manifest.artifacts) == 3

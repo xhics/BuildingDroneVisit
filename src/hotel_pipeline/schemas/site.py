@@ -107,6 +107,36 @@ class GeoSourceProvenance(BaseModel):
         return sorted(name for name, value in required.items() if not value)
 
 
+def _first_cycle(parents: dict[str, list[str]]) -> list[str] | None:
+    """Premier cycle rencontré dans la filiation, s'il en existe un.
+
+    Une filiation circulaire rendrait la chaîne de dérivation impossible à
+    rejouer : aucun artefact ne pourrait être produit en premier.
+    """
+    visiting: set[str] = set()
+    done: set[str] = set()
+
+    def walk(node: str, path: list[str]) -> list[str] | None:
+        if node in done:
+            return None
+        if node in visiting:
+            return [*path[path.index(node):], node]
+        visiting.add(node)
+        for parent in parents.get(node, []):
+            found = walk(parent, [*path, node])
+            if found:
+                return found
+        visiting.discard(node)
+        done.add(node)
+        return None
+
+    for artifact_id in parents:
+        found = walk(artifact_id, [])
+        if found:
+            return found
+    return None
+
+
 class DerivedArtifact(BaseModel):
     """Fichier produit par une dérivation — raster, TIN, nuage découpé.
 
@@ -147,6 +177,12 @@ class DerivedArtifact(BaseModel):
     coverage_mask_artifact_id: str | None = None
 
     derived_from_sources: list[str] = Field(default_factory=list)
+
+    #: Artefacts dont celui-ci procède. Le nDSM dérive du DTM, de la surface de
+    #: toiture et de son masque de validité : ne citer que le LAZ masquerait la
+    #: dérivation réelle et rendrait la chaîne irreproductible.
+    derived_from_artifacts: list[str] = Field(default_factory=list)
+
     produced_at: datetime | None = None
 
     @model_validator(mode="after")
@@ -176,6 +212,10 @@ class DerivedArtifact(BaseModel):
             raise ValueError(
                 f"artefact {self.artifact_id!r} : domaine 'mask' sans artefact "
                 "de masque référencé"
+            )
+        if self.artifact_id in self.derived_from_artifacts:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} se cite lui-même comme parent"
             )
         return self
 
@@ -358,6 +398,18 @@ class SiteManifest(BaseModel):
                     f"artefact {artifact.artifact_id!r} référence un masque "
                     f"absent : {mask_id!r}"
                 )
+            missing_parents = [
+                a for a in artifact.derived_from_artifacts if a not in known_artifacts
+            ]
+            if missing_parents:
+                raise ValueError(
+                    f"artefact {artifact.artifact_id!r} dérive d'artefacts "
+                    f"absents : {missing_parents}"
+                )
+
+        cycle = _first_cycle({a.artifact_id: a.derived_from_artifacts for a in self.artifacts})
+        if cycle:
+            raise ValueError(f"filiation d'artefacts cyclique : {' → '.join(cycle)}")
 
         for obj in self.objects:
             missing_artifacts = [a for a in obj.artifact_ids if a not in known_artifacts]
