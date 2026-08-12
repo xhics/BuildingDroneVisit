@@ -1,0 +1,85 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "IndexTelechargementLidarPlusRecent.1",
+      "properties": {
+        "NOM_TUILE": "23_3095047F08_DC",
+        "NOM_PROJET": "2023_CMM_LiDAR",
+        "DATE_ACQUISITION": "2023-11-21",
+        "DENSITE": "15 pts/m2",
+        "CLASSIFICATION": "1, 2, 6, 7",
+        "FORMAT_FICHIER": "LAZ 1.4",
+        "CODE_EPSG": 2950,
+        "SYSREF_ALTIMETRIQUE": "CGVD 1928",
+        "LICENCE": "CC BY 4.0",
+        "TAILLE_FICHIER": "212 Mo",
+        "TELECHARGEMENT_TUILE": "https://diffusion.mern.gouv.qc.ca/diffusion/RGQ/Lidar/2023_Cmm_Lidar_Den15_DonneesClassifiees/Mtm8/Laz/23_3095047F08_DC.LAZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-73.4500, 45.5700], [-73.4460, 45.5700], [-73.4460, 45.5735], [-73.4500, 45.5735], [-73.4500, 45.5700]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "IndexTelechargementLidarPlusRecent.2",
+      "properties": {
+        "NOM_TUILE": "23_3095048F08_DC",
+        "NOM_PROJET": "2023_CMM_LiDAR",
+        "DATE_ACQUISITION": "2023-11-21",
+        "DENSITE": "15 pts/m2",
+        "CLASSIFICATION": "1, 2, 6, 7",
+        "FORMAT_FICHIER": "LAZ 1.4",
+        "CODE_EPSG": 2950,
+        "SYSREF_ALTIMETRIQUE": "CGVD 1928",
+        "LICENCE": "CC BY 4.0",
+        "TAILLE_FICHIER": "216 Mo",
+        "TELECHARGEMENT_TUILE": "https://diffusion.mern.gouv.qc.ca/diffusion/RGQ/Lidar/2023_Cmm_Lidar_Den15_DonneesClassifiees/Mtm8/Laz/23_3095048F08_DC.LAZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-73.4460, 45.5720], [-73.4400, 45.5720], [-73.4400, 45.5760], [-73.4460, 45.5760], [-73.4460, 45.5720]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "IndexTelechargementLidarPlusRecent.3",
+      "properties": {
+        "NOM_TUILE": "23_3085047F08_DC",
+        "NOM_PROJET": "2023_CMM_LiDAR",
+        "DATE_ACQUISITION": "2023-11-21",
+        "DENSITE": "15 pts/m2",
+        "CODE_EPSG": 2950,
+        "SYSREF_ALTIMETRIQUE": "CGVD 1928",
+        "LICENCE": "CC BY 4.0",
+        "TAILLE_FICHIER": "209 Mo",
+        "TELECHARGEMENT_TUILE": "https://diffusion.mern.gouv.qc.ca/diffusion/RGQ/Lidar/2023_Cmm_Lidar_Den15_DonneesClassifiees/Mtm8/Laz/23_3085047F08_DC.LAZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-73.4500, 45.5760], [-73.4460, 45.5760], [-73.4460, 45.5800], [-73.4500, 45.5800], [-73.4500, 45.5760]]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "IndexTelechargementLidarPlusRecent.4",
+      "properties": {
+        "NOM_TUILE": "23_3085048F08_DC",
+        "NOM_PROJET": "2023_CMM_LiDAR",
+        "DATE_ACQUISITION": "2023-11-21",
+        "DENSITE": "15 pts/m2",
+        "CODE_EPSG": 2950,
+        "SYSREF_ALTIMETRIQUE": "CGVD 1928",
+        "LICENCE": "CC BY 4.0",
+        "TAILLE_FICHIER": "218 Mo",
+        "TELECHARGEMENT_TUILE": "https://diffusion.mern.gouv.qc.ca/diffusion/RGQ/Lidar/2023_Cmm_Lidar_Den15_DonneesClassifiees/Mtm8/Laz/23_3085048F08_DC.LAZ"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[-73.4460, 45.5760], [-73.4400, 45.5760], [-73.4400, 45.5800], [-73.4460, 45.5800], [-73.4460, 45.5760]]]
+      }
+    }
+  ]
+}

@@ -199,3 +199,81 @@ class TestQueryShape:
         )
         result = discover(FOOTPRINT, measure_sizes=False)
         assert result.state is CoverageState.COVERED
+
+
+class TestRealServiceResponse:
+    """Fixture reprenant la réponse réelle du service québécois.
+
+    Mes fixtures précédentes reproduisaient mes suppositions : elles passaient
+    toutes alors que la découverte réelle rendait `not_covered` avec zéro
+    entité. Deux défauts s'y cachaient — un ordre d'axes inversé et des noms
+    d'attributs inconnus.
+    """
+
+    @pytest.fixture
+    def payload(self) -> dict:
+        import json
+
+        path = Path(__file__).parent / "fixtures" / "lidar_wfs_boucherville.json"
+        return json.loads(path.read_text("utf-8"))
+
+    @pytest.fixture
+    def discovered(self, online, monkeypatch, payload):
+        monkeypatch.setattr(lidar, "_query_wfs", lambda bbox, url=lidar.WFS_URL: payload)
+        monkeypatch.setattr(
+            lidar, "exact_size", lambda url: TILE_BYTES if "3095048F08" in url else 1
+        )
+        return discover(FOOTPRINT)
+
+    def test_four_tiles_are_considered(self, discovered):
+        assert discovered.considered == 4
+
+    def test_exactly_one_tile_intersects_the_footprint(self, discovered):
+        """Trois voisines entrent dans la boîte élargie sans toucher le bâtiment."""
+        assert len(discovered.tiles) == 1
+        assert discovered.tiles[0].tile_id == "23_3095048F08_DC"
+
+    def test_coverage_is_confirmed(self, discovered):
+        assert discovered.state is CoverageState.COVERED
+
+    def test_download_url_is_read_from_the_real_attribute(self, discovered):
+        """`TELECHARGEMENT_TUILE` n'était pas reconnu : to_tile rendait None."""
+        assert discovered.tiles[0].url.endswith("23_3095048F08_DC.LAZ")
+
+    def test_density_is_extracted_from_a_unit_bearing_string(self, discovered):
+        """« 15 pts/m2 » cassait la conversion directe en float."""
+        assert discovered.tiles[0].point_density_per_m2 == 15.0
+
+    def test_epsg_code_is_normalised(self, discovered):
+        """Un nombre nu n'est pas un référentiel."""
+        assert discovered.tiles[0].crs_horizontal == "EPSG:2950"
+
+    def test_vertical_datum_is_preserved(self, discovered):
+        assert discovered.tiles[0].crs_vertical == "CGVD 1928"
+
+    def test_exact_size_is_measured_on_the_retained_tile_only(self, discovered):
+        assert discovered.total_bytes == TILE_BYTES
+
+    def test_announced_and_exact_sizes_both_survive(self, discovered):
+        tile = discovered.tiles[0]
+        assert tile.announced_size == "216 Mo"
+        assert tile.exact_size_bytes == TILE_BYTES
+
+
+class TestBboxAxisOrder:
+    def test_longitude_comes_first(self):
+        """Ce GeoServer attend lon,lat — l'ordre inverse rend zéro entité."""
+        bbox = lidar.bbox_around(FOOTPRINT, margin_deg=0.001)
+        first, second, third, fourth, srs = bbox.split(",")
+
+        assert float(first) < -73.0   # longitude
+        assert 45.0 < float(second) < 46.0  # latitude
+        assert float(third) < -73.0
+        assert 45.0 < float(fourth) < 46.0
+        assert srs == "EPSG:4326"
+
+    def test_bbox_widens_in_both_axes(self):
+        tight = lidar.bbox_around(FOOTPRINT, margin_deg=0.0)
+        wide = lidar.bbox_around(FOOTPRINT, margin_deg=0.01)
+        assert float(wide.split(",")[0]) < float(tight.split(",")[0])
+        assert float(wide.split(",")[1]) < float(tight.split(",")[1])

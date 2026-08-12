@@ -110,13 +110,20 @@ class DiscoveryResult:
 
 
 def bbox_around(footprint_wkt: str, margin_deg: float = DEFAULT_MARGIN_DEG) -> str:
-    """Emprise élargie de l'empreinte, au format attendu par le WFS."""
+    """Emprise élargie de l'empreinte, au format attendu par ce WFS.
+
+    Ordre des axes : **longitude, latitude**. WFS 2.0 avec EPSG:4326 impose en
+    principe latitude d'abord, mais ce GeoServer attend l'ordre inverse. Émettre
+    la mauvaise convention ne provoque aucune erreur : le service répond zéro
+    entité, ce qui se lit comme une absence de couverture. C'est le pire mode
+    de défaillance possible, et il s'est produit au premier appel réel.
+    """
     from shapely import wkt as shapely_wkt
 
     minx, miny, maxx, maxy = shapely_wkt.loads(footprint_wkt).bounds
     return (
-        f"{miny - margin_deg},{minx - margin_deg},"
-        f"{maxy + margin_deg},{maxx + margin_deg},EPSG:4326"
+        f"{minx - margin_deg},{miny - margin_deg},"
+        f"{maxx + margin_deg},{maxy + margin_deg},EPSG:4326"
     )
 
 
@@ -159,9 +166,16 @@ def _parse_date(value) -> date | None:  # noqa: ANN001
 
 
 def to_tile(feature: dict) -> TileCandidate | None:
-    """Convertit une entité WFS en tuile candidate."""
+    """Convertit une entité WFS en tuile candidate.
+
+    Les noms d'attributs sont ceux du service québécois, relevés sur une
+    réponse réelle. Les alias supplémentaires couvrent d'autres services sans
+    dépendre d'eux.
+    """
     properties = feature.get("properties") or {}
-    url = _field(properties, "url", "lien", "chemin", "download_url")
+    url = _field(
+        properties, "TELECHARGEMENT_TUILE", "url", "lien", "chemin", "download_url"
+    )
     if not url:
         return None
 
@@ -173,26 +187,60 @@ def to_tile(feature: dict) -> TileCandidate | None:
         geometry_wkt = shape(geometry).wkt
 
     return TileCandidate(
-        tile_id=str(_field(properties, "tuile", "tile", "nom", "name") or url.rsplit("/", 1)[-1]),
+        tile_id=str(
+            _field(properties, "NOM_TUILE", "tuile", "tile", "nom", "name")
+            or url.rsplit("/", 1)[-1]
+        ),
         url=str(url),
-        project=_field(properties, "projet", "project"),
-        acquired_on=_parse_date(_field(properties, "date_acquisition", "date", "acquisition")),
-        point_density_per_m2=_as_float(_field(properties, "densite", "density")),
-        classification=_stringify(_field(properties, "classification", "classes")),
-        file_format=_field(properties, "format"),
-        crs_horizontal=_field(properties, "crs", "srs", "projection"),
-        crs_vertical=_field(properties, "referentiel_vertical", "vertical"),
-        licence=_field(properties, "licence", "license"),
-        announced_size=_stringify(_field(properties, "taille", "size", "volume")),
+        project=_field(properties, "NOM_PROJET", "PROJET", "projet", "project"),
+        acquired_on=_parse_date(
+            _field(properties, "DATE_ACQUISITION", "DATE_FIN", "date_acquisition", "date")
+        ),
+        point_density_per_m2=_as_float(_field(properties, "DENSITE", "densite", "density")),
+        classification=_stringify(
+            _field(properties, "CLASSIFICATION", "CLASSES", "classification")
+        ),
+        file_format=_field(properties, "FORMAT_FICHIER", "FORMAT", "format"),
+        crs_horizontal=_as_epsg(
+            _field(properties, "CODE_EPSG", "EPSG", "crs", "srs", "projection")
+        ),
+        crs_vertical=_field(
+            properties, "SYSREF_ALTIMETRIQUE", "referentiel_vertical", "vertical"
+        ),
+        licence=_field(properties, "LICENCE", "licence", "license"),
+        announced_size=_stringify(
+            _field(properties, "TAILLE_FICHIER", "taille", "size", "volume")
+        ),
         geometry_wkt=geometry_wkt,
     )
 
 
 def _as_float(value):  # noqa: ANN001
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+    """Premier nombre d'une valeur, même accompagnée d'une unité.
+
+    Le service rend « 15 pts/m2 » : une conversion directe échouait et perdait
+    silencieusement la densité.
+    """
+    if value is None:
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    import re
+
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", str(value))
+    return float(match.group().replace(",", ".")) if match else None
+
+
+def _as_epsg(value):  # noqa: ANN001
+    """Normalise un code de projection en identifiant complet.
+
+    Le service rend `CODE_EPSG=2950` ; un nombre nu n'est pas un référentiel.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return f"EPSG:{text}" if text.isdigit() else text
 
 
 def _stringify(value):  # noqa: ANN001
