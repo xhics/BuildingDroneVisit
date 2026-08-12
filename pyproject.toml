@@ -40,6 +40,11 @@ vision = [
 # compilée pour x86_64 macOS et exige NumPy 1, tandis qu'OpenCV 5 et tifffile
 # exigent NumPy 2 : sans ces bornes, chaque installation recasse l'autre.
 # La VM GPU (Linux) n'a pas cette contrainte et n'utilise pas cet extra.
+geo = [
+    "laspy[lazrs]>=2.5",   # lecture LAZ, sans dépendance système
+    "pyproj>=3.6",         # reprojection WGS84 vers le référentiel de la tuile
+]
+
 vision-macos-intel = [
     "torch==2.2.2",
     "torchvision==0.17.2",
@@ -48,6 +53,8 @@ vision-macos-intel = [
     "opencv-python-headless<4.11",
     "tifffile<2025",
     "scikit-image<0.25",
+    # pyproj 3.7 n'a pas de roue x86_64 macOS et exige PROJ pour compiler.
+    "pyproj==3.6.1",
 ]
 
 # OCR par service, uniquement en repli si EasyOCR est indisponible.

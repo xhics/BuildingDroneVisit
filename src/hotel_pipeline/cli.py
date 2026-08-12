@@ -712,6 +712,57 @@ def geo_acquire(
         raise typer.Exit(code=4)
 
 
+@geo_app.command("preflight")
+def geo_preflight(hotel_id: str = typer.Argument(...)) -> None:
+    """Mesure ce que la tuile porte réellement. **Ne dérive aucun objet.**"""
+    from .geo.preflight import BUILDING, GROUND, run
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    acquisition = workspace.read_json("06_geo/acquisition_report.json")
+    if spatial is None or not acquisition or not acquisition.get("sources"):
+        typer.secho(
+            "tuile acquise et bâtiment confirmé requis", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    building = spatial.candidate(spatial.confirmed_building_id)
+    source = acquisition["sources"][0]
+    laz = Path(acquisition["acquisitions"][0]["path"])
+
+    report = run(laz, building.wkt, source["crs_horizontal"])
+    workspace.write_report("06_geo/laz_preflight.json", report, context)
+
+    typer.echo(f"  fichier      {report.file}")
+    typer.echo(f"  LAS {report.las_version}, format {report.point_format}, "
+               f"{report.point_count:,} points".replace(",", " "))
+    typer.echo(f"  CRS déclaré  {report.declared_crs}")
+    typer.echo(f"  empreinte    {report.footprint_area_m2:.0f} m²")
+    typer.echo("")
+    typer.echo("  classe            empreinte   pourtour   z médian")
+    for code, stats in sorted(report.footprint_classes.items()):
+        margin = report.margin_classes[code]
+        median = f"{stats.z_median:.1f}" if stats.z_median is not None else "—"
+        typer.echo(
+            f"  {code} {stats.name:<12} {stats.count:>9} {margin.count:>10} {median:>10}"
+        )
+    typer.echo("")
+    typer.echo(f"  densité sol       {report.ground_density_per_m2} pts/m²")
+    typer.echo(f"  densité bâtiment  {report.building_density_per_m2} pts/m²")
+    typer.secho(
+        f"  couverture toiture {(report.roof_cell_coverage or 0) * 100:.1f} % des cellules",
+        fg=typer.colors.GREEN if (report.roof_cell_coverage or 0) >= 0.5 else typer.colors.YELLOW,
+    )
+    typer.echo(f"  couverture sol     {(report.ground_cell_coverage or 0) * 100:.1f} %")
+
+    for warning in report.warnings:
+        typer.secho(f"  ! {warning}", fg=typer.colors.YELLOW)
+    if not report.warnings:
+        typer.echo("")
+        typer.echo("  aucun avertissement — la méthode de dérivation peut être arrêtée")
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 
