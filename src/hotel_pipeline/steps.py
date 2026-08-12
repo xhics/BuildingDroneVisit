@@ -132,14 +132,12 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
         )
 
     # --- 3. médias et droits --------------------------------------------
+    # La collecte est automatique : c'est le sens d'« une adresse, une
+    # commande » (§1). L'humain n'intervient que sur ce qui n'est pas
+    # déductible — les droits assumés et la version de l'entrée.
     assets_path = workspace.path("00_manifest", ASSET_MANIFEST_NAME)
     if not assets_path.is_file():
-        raise StepBlocked(
-            "collect",
-            "inventaire des médias et de leurs droits",
-            "hotel-pipeline assets import <hotel> <inventaire.csv> "
-            "[--images-root <dir>]",
-        )
+        _gather(workspace, project, spatial)
 
     assets = AssetManifest.model_validate_json(assets_path.read_text("utf-8"))
     eligible = assets.production_eligible()
@@ -168,6 +166,49 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
         len(eligible),
         len(exteriors),
     )
+
+
+def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN001
+    """Collecte et trie le corpus automatiquement (§9, §11).
+
+    Les options de collecte viennent du manifeste de projet, pas d'arguments de
+    ligne de commande : c'est ce qui permet à `run-phase1` de traverser cette
+    étape sans intervention.
+    """
+    from .gather import build_manifest, collect_sources, download_all, summarise, triage
+
+    building = spatial.candidate(spatial.confirmed_building_id or "")
+    lat, lon = building.centroid_lat, building.centroid_lon
+
+    images, reports = collect_sources(
+        lat, lon, project.place_query or project.address, project.collect_radius_m
+    )
+    downloaded = download_all(images, workspace, reports)
+
+    manifest = build_manifest(
+        project.hotel_id, downloaded, assume_rights=project.assume_rights
+    )
+
+    classifier = None
+    if any(a.local_path for a in manifest.assets):
+        # Charger le modèle coûte plusieurs secondes et un téléchargement de
+        # poids : inutile quand il n'y a rien à classer.
+        try:
+            from .triage.classify import Classifier
+
+            classifier = Classifier()
+        except ImportError:
+            log.warning(
+                "OpenCLIP absent — classification ignorée ; extérieur/intérieur restera inconnu"
+            )
+
+    report = triage(manifest.assets, classifier=classifier)
+    workspace.write_assets(manifest)
+    workspace.write_json(
+        "01_sources/gather_report.json",
+        {**report.as_dict(), "summary": summarise(manifest)},
+    )
+    log.info("collecte : %s", summarise(manifest))
 
 
 def _fetch_elements(spatial: SpatialManifest) -> list[dict]:

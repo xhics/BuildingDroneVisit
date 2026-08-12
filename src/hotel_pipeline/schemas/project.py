@@ -55,6 +55,12 @@ class ProjectManifest(BaseModel):
     lat: float | None = Field(default=None, ge=-90, le=90)
     lon: float | None = Field(default=None, ge=-180, le=180)
 
+    #: Paramètres de collecte, fixés à l'initialisation pour que `run-phase1`
+    #: traverse la collecte sans arguments supplémentaires.
+    collect_radius_m: int = Field(default=300, ge=25, le=2000)
+    place_query: str | None = None
+    assume_rights: bool = False
+
     created_at: datetime = Field(default_factory=_now)
     status: Phase1Status | None = None
     steps: list[StepRecord] = Field(default_factory=list)

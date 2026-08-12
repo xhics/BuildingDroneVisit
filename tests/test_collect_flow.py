@@ -109,12 +109,18 @@ class TestSeparationsGate:
         assert "parking_adjacent_to_building" in result.stdout
 
     def test_correct_building_reaches_the_media_step(self, hotel):
+        """La collecte est automatique : hors ligne, elle rend un corpus vide.
+
+        Le blocage porte alors sur l'absence d'asset exploitable, et non sur un
+        inventaire manuel à fournir — c'est ce qui permet à « une adresse, une
+        commande » de tenir (§1).
+        """
         runner.invoke(
             app, ["confirm-building", hotel, TRUE_BUILDING, "--by", "hm", "--rationale", "ok"]
         )
         result = runner.invoke(app, ["collect", hotel])
         assert result.exit_code == EXIT_BLOCKED
-        assert "inventaire des médias" in result.stdout
+        assert "aucun asset éligible production" in result.stdout
 
 
 class TestMediaLocks:

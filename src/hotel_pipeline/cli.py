@@ -71,6 +71,13 @@ def init(
     address: str = typer.Option(..., "--address", help="Adresse officielle complète."),
     lat: float | None = typer.Option(None, "--lat", help="Latitude connue, court-circuite le géocodage."),
     lon: float | None = typer.Option(None, "--lon", help="Longitude connue."),
+    radius_m: int = typer.Option(300, "--radius", help="Rayon de collecte, en mètres."),
+    place_query: str | None = typer.Option(None, "--place", help="Requête Places."),
+    assume_rights: bool = typer.Option(
+        False,
+        "--assume-rights",
+        help="Assumer l'usage des sources aux droits non établis (tracé au manifeste).",
+    ),
     force: bool = typer.Option(False, "--force", help="Réécrit un manifeste existant."),
 ) -> None:
     """Crée l'espace de travail et le manifeste de projet (§18).
@@ -93,7 +100,15 @@ def init(
 
     workspace.create()
     workspace.write_manifest(
-        ProjectManifest(hotel_id=hotel_id, address=address, lat=lat, lon=lon)
+        ProjectManifest(
+            hotel_id=hotel_id,
+            address=address,
+            lat=lat,
+            lon=lon,
+            collect_radius_m=radius_m,
+            place_query=place_query,
+            assume_rights=assume_rights,
+        )
     )
     typer.echo(f"{OK} espace de travail créé : {workspace.root}")
     typer.echo(f"  {len(SUBDIRS)} répertoires, manifeste initialisé")
