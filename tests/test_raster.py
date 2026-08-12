@@ -166,3 +166,32 @@ class TestStrictNormalisedHeight:
         dsm = np.array([[28.0]])
         dtm = np.array([[30.0]])
         assert normalised_height(dsm, dtm, np.array([[True]]))[0, 0] == pytest.approx(-2.0)
+
+
+class TestShapeGuards:
+    def test_write_refuses_a_mismatched_layer(self, tmp_path):
+        """Une couche mal dimensionnée s'écrirait sans erreur visible."""
+        with pytest.raises(ValueError, match="forme"):
+            write_geotiff(tmp_path / "x.tif", np.zeros((2, 2)), GRID)
+
+    def test_mask_write_refuses_too(self, tmp_path):
+        with pytest.raises(ValueError, match="forme"):
+            write_mask(tmp_path / "m.tif", np.zeros((9, 9), dtype=bool), GRID)
+
+    def test_correct_shape_is_accepted(self, tmp_path):
+        assert write_geotiff(
+            tmp_path / "ok.tif", np.zeros((GRID.width, GRID.height)), GRID
+        ).is_file()
+
+    def test_height_refuses_broadcasting(self):
+        """NumPy diffuserait silencieusement une ligne sur toute la grille."""
+        with pytest.raises(ValueError, match="formes incompatibles"):
+            normalised_height(
+                np.zeros((4, 3)), np.zeros((1, 3)), np.ones((4, 3), dtype=bool)
+            )
+
+    def test_height_refuses_a_mismatched_mask(self):
+        with pytest.raises(ValueError, match="formes incompatibles"):
+            normalised_height(
+                np.zeros((4, 3)), np.zeros((4, 3)), np.ones((2, 2), dtype=bool)
+            )

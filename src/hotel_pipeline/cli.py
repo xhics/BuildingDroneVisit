@@ -763,6 +763,100 @@ def geo_preflight(hotel_id: str = typer.Argument(...)) -> None:
         typer.echo("  aucun avertissement — la méthode de dérivation peut être arrêtée")
 
 
+@geo_app.command("derive")
+def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
+    """Produit les rasters dérivés. **Ne qualifie aucun objet.**"""
+    import shutil
+
+    from pyproj import Transformer
+    from shapely import wkt as shapely_wkt
+    from shapely.ops import transform as shapely_transform
+
+    from .geo.derive import derive, verify_written
+    from .geo.raster import GridSpec
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    acquisition = workspace.read_json("06_geo/acquisition_report.json")
+    if spatial is None or not acquisition or not acquisition.get("sources"):
+        typer.secho("tuile acquise et bâtiment confirmé requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    building = spatial.candidate(spatial.confirmed_building_id)
+    source = acquisition["sources"][0]
+    laz = Path(acquisition["acquisitions"][0]["path"])
+
+    transformer = Transformer.from_crs("EPSG:4326", source["crs_horizontal"], always_xy=True)
+    footprint = shapely_transform(
+        lambda xs, ys, zs=None: transformer.transform(xs, ys),
+        shapely_wkt.loads(building.wkt),
+    )
+
+    staging = workspace.path("06_geo", "_staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+
+    typer.echo("  production des couches dans le répertoire de transit…")
+    result = derive(
+        laz, footprint, staging,
+        crs=source["crs_horizontal"], crs_vertical=source["crs_vertical"],
+        source_id=source["source_id"],
+    )
+
+    grid = GridSpec(**result.grid)
+    problems = verify_written(result, grid)
+    if problems:
+        typer.secho(f"{KO} contrôle des couches échoué :", fg=typer.colors.RED, err=True)
+        for problem in problems:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+    typer.echo(f"  {OK} {len(result.layers)} couche(s) relue(s) et contrôlée(s)")
+
+    # Publication seulement après contrôle.
+    final = workspace.path("06_geo", "derived")
+    if final.exists():
+        shutil.rmtree(final)
+    staging.replace(final)
+    for name in result.layers:
+        result.layers[name] = str(final / f"{name}.tif")
+    for artifact in result.artifacts:
+        artifact.path = str(final / f"{artifact.artifact_id}.tif")
+
+    site = workspace.read_site()
+    if site is not None:
+        source_provenance = acquisition["sources"][0]
+        from .schemas import GeoSourceProvenance
+
+        site.geo_sources = [GeoSourceProvenance.model_validate(source_provenance)]
+        site.artifacts = result.artifacts
+        workspace.write_site(site)
+
+    workspace.write_report("06_geo/derivation_report.json", result, context)
+
+    metrics = result.metrics
+    typer.echo("")
+    typer.echo(f"  grille {grid.width} × {grid.height} à {grid.cell_m} m, {grid.crs}")
+    typer.echo(f"  empreinte : {metrics['footprint_cells']} cellules")
+    for key, value in metrics["coverage"].items():
+        typer.echo(f"    {key:<22} {value * 100:5.1f} %")
+    typer.echo("")
+    typer.echo(f"  masques      {metrics['definition_masks']}")
+    typer.echo(f"  TIN vs IDW   {metrics['tin_vs_idw']}")
+    typer.echo(f"  refus extrap {metrics['extrapolation_rejected']}")
+    typer.echo(f"  distance sol {metrics['support_distance_in_footprint']}")
+    typer.echo(f"  bloc CV      {metrics['block_validation']}")
+    typer.echo(f"  faux bâtim.  {len(metrics['pseudo_building_validation'])} essai(s)")
+    typer.echo(f"  hauteurs     {metrics['height_statistics']}")
+    for flag in result.qa_flags:
+        typer.secho(f"  ! {flag}", fg=typer.colors.YELLOW)
+    typer.echo("")
+    typer.secho(
+        "  aucun objet qualifié — TERRAIN_MAIN et ROOFLINE_MAIN restent en l'état",
+        fg=typer.colors.YELLOW,
+    )
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 

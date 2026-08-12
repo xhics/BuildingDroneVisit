@@ -103,6 +103,22 @@ def from_raster(array_rowcol: np.ndarray) -> np.ndarray:
     return np.flipud(array_rowcol).T
 
 
+def _check_shape(array_xy: np.ndarray, grid: GridSpec, label: str) -> None:
+    """Refuse une couche qui n'est pas à la forme de la grille.
+
+    Sans ce contrôle, une couche mal dimensionnée s'écrit quand même — après
+    transposition elle prend l'allure d'un raster valide, et le décalage ne se
+    voit qu'en superposant les couches.
+    """
+    expected = (grid.width, grid.height)
+    actual = tuple(np.shape(array_xy))
+    if actual != expected:
+        raise ValueError(
+            f"{label} : forme {actual} au lieu de {expected} — toutes les "
+            "couches d'un site partagent la même grille"
+        )
+
+
 def write_geotiff(
     path: Path,
     array_xy: np.ndarray,
@@ -117,6 +133,7 @@ def write_geotiff(
     """
     import rasterio
 
+    _check_shape(array_xy, grid, path.name)
     data = to_raster(np.asarray(array_xy, dtype=np.float64))
     if np.issubdtype(np.dtype(dtype), np.floating):
         data = np.where(np.isnan(data), nodata, data).astype(dtype)
@@ -142,6 +159,7 @@ def write_mask(path: Path, mask_xy: np.ndarray, grid: GridSpec) -> Path:
     """Écrit un masque booléen en entier 8 bits, sans valeur sans donnée."""
     import rasterio
 
+    _check_shape(mask_xy, grid, path.name)
     data = to_raster(np.asarray(mask_xy)).astype("uint8")
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".part")
@@ -174,7 +192,17 @@ def normalised_height(dsm_xy: np.ndarray, dtm_xy: np.ndarray, valid_xy: np.ndarr
     """
     dsm = np.asarray(dsm_xy, dtype=np.float64)
     dtm = np.asarray(dtm_xy, dtype=np.float64)
-    valid = np.asarray(valid_xy, dtype=bool) & np.isfinite(dsm) & np.isfinite(dtm)
+    mask = np.asarray(valid_xy, dtype=bool)
+
+    # Le broadcasting de NumPy accepterait des formes différentes et
+    # produirait une surface plausible mais fausse.
+    if not (dsm.shape == dtm.shape == mask.shape):
+        raise ValueError(
+            f"formes incompatibles : DSM {dsm.shape}, DTM {dtm.shape}, "
+            f"masque {mask.shape}"
+        )
+
+    valid = mask & np.isfinite(dsm) & np.isfinite(dtm)
 
     height = np.full(dsm.shape, np.nan, dtype=np.float64)
     np.subtract(dsm, dtm, out=height, where=valid)
