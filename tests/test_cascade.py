@@ -221,3 +221,52 @@ class TestPromptConstruction:
         for subject, (positive, alternatives) in SUBJECT_PROMPTS.items():
             assert positive.strip(), subject
             assert all(a.strip() for a in alternatives), subject
+
+
+class TestHeadingProvenance:
+    """Un cap observé et un cap choisi ne valent pas la même preuve.
+
+    Défaut mesuré : la géométrie attribuait le sujet « bâtiment » à 105 vues
+    Street View, dont 20 seulement étaient confirmées par le modèle. Le cap
+    étant dirigé par nous vers l'empreinte, la visibilité s'y déduisait de
+    notre propre intention.
+    """
+
+    def test_measured_heading_establishes_the_building(self):
+        """Imagerie de roulage : le cap est celui qu'un conducteur a adopté."""
+        assets = [make(sees_building=True, heading_is_measured=True)]
+        classify(assets)
+        assert Subject.BUILDING in assets[0].subjects
+
+    def test_chosen_heading_establishes_only_the_aim(self):
+        """Street View : viser l'empreinte ne prouve rien sur le contenu."""
+        assets = [make(sees_building=True, heading_is_measured=False)]
+        classify(assets)
+        assert Subject.BUILDING not in assets[0].subjects
+        assert "aim_only" in assets[0].classification_method
+
+    def test_model_alone_can_still_confirm_a_chosen_heading(self, tmp_path):
+        path = tmp_path / "i.jpg"
+        path.write_bytes(b"x")
+        assets = [make(sees_building=True, heading_is_measured=False, local_path=str(path))]
+        classify(assets, classifier=FakeClassifier({"building": 0.95}))
+        assert Subject.BUILDING in assets[0].subjects
+
+    def test_sector_is_still_derived_from_a_chosen_heading(self):
+        """La position reste une mesure, même quand la visée ne l'est pas."""
+        assets = [
+            make(sees_building=True, heading_is_measured=False, bearing_from_building_deg=180.0)
+        ]
+        classify(assets, front_azimuth=180.0)
+        assert assets[0].view_sector is ViewSector.FRONT
+
+    def test_street_view_collector_declares_a_chosen_heading(self):
+        from hotel_pipeline.collectors.streetview import Panorama, _image_for
+
+        image = _image_for(Panorama("P", 45.57, -73.44, "2025-05", "©"), 90.0, 50.0)
+        assert image.heading_is_measured is False
+
+    def test_mapillary_collector_keeps_a_measured_heading(self):
+        from hotel_pipeline.collectors.base import CollectedImage
+
+        assert CollectedImage(source="mapillary", source_id="1", url="u").heading_is_measured

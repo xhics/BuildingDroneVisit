@@ -196,6 +196,9 @@ def _image_for(panorama: Panorama, heading: float, distance: float) -> Collected
         ),
         captured_year=_year(panorama.date),
         heading_deg=heading % 360.0,
+        # Le cap est dirigé par nous vers l'empreinte : il exprime une
+        # intention de cadrage, pas une observation.
+        heading_is_measured=False,
         lat=panorama.lat,
         lon=panorama.lon,
         extra={

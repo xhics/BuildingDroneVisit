@@ -109,6 +109,10 @@ class CollectedImage:
     extra: dict[str, str] = field(default_factory=dict)
     local_path: Path | None = None
 
+    #: Le cap est-il observé (imagerie de roulage) ou choisi par nous
+    #: (extraction d'un panorama sphérique) ? Voir `Asset.heading_is_measured`.
+    heading_is_measured: bool = True
+
     @property
     def asset_id(self) -> str:
         return f"{self.source}-{self.source_id}"
@@ -175,6 +179,7 @@ def to_asset(image: CollectedImage, assume_rights: bool = False) -> Asset:
         exterior_or_interior=ExteriorInterior.UNKNOWN,
         attribution=policy.attribution,
         heading_deg=image.heading_deg,
+        heading_is_measured=image.heading_is_measured,
         camera_lat=image.lat,
         camera_lon=image.lon,
         local_path=str(image.local_path) if image.local_path else None,

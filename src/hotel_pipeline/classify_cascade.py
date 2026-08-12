@@ -79,9 +79,14 @@ def _stage_geometry(asset: Asset, front_azimuth: float | None) -> tuple[list[Sub
     sector = ViewSector.UNKNOWN
     method = None
 
-    if asset.sees_building:
+    # La géométrie n'établit le contenu que si le cap est observé. Avec un cap
+    # que nous avons nous-mêmes dirigé vers l'empreinte — Street View —, elle
+    # n'établit que la direction de visée : le contenu revient au modèle.
+    if asset.sees_building and asset.heading_is_measured:
         subjects.append(Subject.BUILDING)
         method = "geometry:fov"
+    elif asset.sees_building:
+        method = "geometry:aim_only"
 
     if asset.bearing_from_building_deg is not None and front_azimuth is not None:
         sector = sector_for(asset.bearing_from_building_deg, front_azimuth)
@@ -148,7 +153,8 @@ def classify(
                 log.warning("classification impossible pour %s : %s", asset.id, exc)
             else:
                 accepted, uncertain, confidence, method = _stage_model(result, asset)
-                # Le modèle complète, il ne contredit pas la géométrie.
+                # Le modèle complète une géométrie mesurée ; sur un cap choisi,
+                # il est la seule preuve du contenu.
                 subjects.extend(s for s in accepted if s not in subjects)
                 methods.append(method)
                 report.by_stage["model"] = report.by_stage.get("model", 0) + 1

@@ -81,6 +81,19 @@ class Asset(BaseModel):
     #: Distinct de `heading_deg`, qui dit où la caméra regarde.
     bearing_from_building_deg: float | None = Field(default=None, ge=0, lt=360)
 
+    #: Le cap est-il **observé** ou **choisi par nous** ?
+    #:
+    #: Mapillary rapporte le cap qu'un conducteur a réellement adopté : c'est
+    #: une mesure, et la visibilité qui en découle vaut preuve. Street View rend
+    #: un panorama sphérique dont nous extrayons la direction de notre choix :
+    #: la visibilité n'y est qu'une intention de cadrage et ne dit rien du
+    #: contenu de l'image.
+    #:
+    #: Confondre les deux revient à se donner raison — 105 vues « voyant le
+    #: bâtiment » par construction, contre 20 réellement confirmées par le
+    #: modèle sur le même lot.
+    heading_is_measured: bool = True
+
     #: Multi-étiquette : une photo montre souvent bâtiment, parking et enseigne.
     subjects: list[Subject] = Field(default_factory=list)
 
