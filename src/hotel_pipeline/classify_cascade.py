@@ -24,12 +24,14 @@ from .schemas import (
     Asset,
     CaptureType,
     PropertyMatchStatus,
+    ReviewDecision,
     ReviewStatus,
     Subject,
     TemporalStatus,
     ViewSector,
 )
 from .sectors import sector_for
+from .triage.classify import SUBJECT_ACCEPT
 
 log = get_logger("cascade")
 
@@ -122,31 +124,58 @@ def _stage_model(result, asset: Asset) -> tuple[list[Subject], list[Subject], fl
     return accepted, uncertain, result.confidence(decisive), "openclip:multilabel"
 
 
-def _target_visibility(asset: Asset, contains_building: bool) -> tuple[bool | None, str | None]:
+def _target_visibility(
+    asset: Asset,
+    model_contains_building: bool | None,
+    target_in_fov: bool,
+) -> tuple[bool | None, str | None]:
     """Le bâtiment **cible** est-il visible, et sur quelle preuve ?
 
-    Un bâtiment détecté n'est pas le bon bâtiment. Trois preuves seulement
-    l'établissent, dans cet ordre de force.
+    Deux axes strictement distincts, qu'il ne faut jamais fusionner :
+
+    ```text
+    enseigne reconnue   → propriété confirmée   (identité)
+    bâtiment détecté    → contenu confirmé      (visibilité)
+    les deux ensemble   → cible probablement visible
+    revue humaine       → cible confirmée
+    ```
+
+    `model_contains_building` vient **exclusivement** du modèle. Le calculer
+    depuis la liste `subjects` était fautif : cette liste fusionne modèle,
+    géométrie et OCR, si bien que la géométrie forçait le drapeau à vrai —
+    11 vues sur 13 déclarées « bâtiment confirmé » avec des scores tombant à
+    0,0006.
     """
+    # Une décision humaine prime sur toute déduction et n'est jamais écrasée.
+    if asset.target_visibility_decision is ReviewDecision.CONFIRMED:
+        return True, f"revue humaine : {asset.review_rationale or 'confirmé'}"
+    if asset.target_visibility_decision is ReviewDecision.REJECTED:
+        return False, f"revue humaine : {asset.review_rationale or 'rejeté'}"
+
     if asset.property_match_status is PropertyMatchStatus.MISMATCH:
         return False, "enseigne d'un autre établissement"
 
     if asset.occluded_by:
         return False, f"masqué par {asset.occluded_by}"
 
-    # Cap observé, empreinte dans le champ, aucune occultation : la caméra
-    # regardait bien la cible, et un contributeur l'a pointée.
-    if asset.sees_building and asset.heading_is_measured and contains_building:
-        return True, "cap observé cadrant l'empreinte, bâtiment confirmé"
+    if model_contains_building is False:
+        # Le modèle affirme qu'aucun bâtiment n'est visible : viser la bonne
+        # direction n'y change rien.
+        return False, "aucun bâtiment détecté par le modèle"
 
-    if asset.property_match_status is PropertyMatchStatus.MATCH:
-        return True, "appartenance confirmée par enseigne"
+    if model_contains_building is None:
+        return None, "contenu non évalué"
 
-    if contains_building:
-        # Un bâtiment est là, mais rien ne dit que c'est le nôtre.
-        return None, "bâtiment présent, identité non établie"
+    identity = asset.property_match_status is PropertyMatchStatus.MATCH
 
-    return False, "aucun bâtiment détecté"
+    if target_in_fov:
+        return True, "cap observé cadrant l'empreinte, bâtiment confirmé par le modèle"
+
+    if identity:
+        return True, "enseigne de l'établissement et bâtiment confirmé par le modèle"
+
+    # Un bâtiment est là, mais rien ne dit que c'est le nôtre.
+    return None, "bâtiment présent, identité non établie"
 
 
 def classify(
@@ -197,8 +226,16 @@ def classify(
                 report.by_stage["model"] = report.by_stage.get("model", 0) + 1
 
         # --- identité de la cible, distincte de la présence d'un bâtiment ---
-        contains = Subject.BUILDING in subjects
-        target, evidence = _target_visibility(asset, contains)
+        # `contains_building` est la réponse du **modèle seul**. Le déduire de
+        # `subjects` mêlerait géométrie et OCR à ce qui doit rester une mesure
+        # de contenu.
+        model_contains: bool | None = None
+        if scores:
+            model_contains = scores.get(Subject.BUILDING.value, 0.0) >= SUBJECT_ACCEPT
+
+        target_in_fov = bool(asset.sees_building and asset.heading_is_measured)
+        target, evidence = _target_visibility(asset, model_contains, target_in_fov)
+        contains = model_contains
 
         # Étape 5 — ce qui doit passer devant un humain.
         review = ReviewStatus.NEEDS_REVIEW

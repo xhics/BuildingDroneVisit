@@ -75,8 +75,10 @@ def role_for(asset: Asset) -> tuple[ReconstructionRole, str]:
             return ReconstructionRole.REJECT, "rejeté en revue"
         if asset.review_status is ReviewStatus.NEEDS_REVIEW:
             return ReconstructionRole.CONTEXT_LOCK, "en attente de revue humaine"
-        if asset.cluster_role is ClusterRole.INACTIVE:
-            return ReconstructionRole.CONTEXT_LOCK, "point de vue déjà couvert"
+        # Exiger un statut actif, et non seulement « pas inactif » : un asset
+        # créé avant la déduplication porte `None` et franchissait le Router.
+        if asset.cluster_role not in (ClusterRole.CANONICAL, ClusterRole.OVERLAP):
+            return ReconstructionRole.CONTEXT_LOCK, "point de vue non arbitré ou déjà couvert"
         if asset.temporal_status is TemporalStatus.PRE_2024:
             return ReconstructionRole.TEXTURE_REFERENCE, "antérieur à la rénovation"
         return ReconstructionRole.PHOTO_GEOMETRY, "cible visible, située et arbitrée"

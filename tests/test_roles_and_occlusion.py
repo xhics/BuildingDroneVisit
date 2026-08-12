@@ -16,6 +16,7 @@ from hotel_pipeline.roles import assign, role_for
 from hotel_pipeline.schemas import (
     Asset,
     AssetCategory,
+    ClusterRole,
     PropertyMatchStatus,
     ReconstructionRole,
     ReviewStatus,
@@ -65,9 +66,19 @@ class TestRoleAssignment:
             subjects=[Subject.BUILDING],
             target_building_visible=True,
             review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.CANONICAL,
         )
         role, _ = role_for(asset)
         assert role is ReconstructionRole.PHOTO_GEOMETRY
+
+    def test_unarbitrated_cluster_never_carries_geometry(self):
+        """Un asset antérieur à la déduplication porte `None` et passait."""
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
+            target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=None,
+        )
+        assert role_for(asset)[0] is ReconstructionRole.CONTEXT_LOCK
 
     def test_occlusion_downgrades_to_context(self):
         asset = make(
@@ -86,8 +97,6 @@ class TestRoleAssignment:
         assert role_for(asset)[0] is ReconstructionRole.CONTEXT_LOCK
 
     def test_inactive_viewpoint_never_carries_geometry(self):
-        from hotel_pipeline.schemas import ClusterRole
-
         asset = make(
             camera_lat=45.573, camera_lon=-73.443,
             subjects=[Subject.BUILDING], target_building_visible=True,
@@ -103,6 +112,7 @@ class TestRoleAssignment:
             camera_lat=45.573, camera_lon=-73.443,
             subjects=[Subject.BUILDING], target_building_visible=True,
             review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.CANONICAL,
             temporal_status=TemporalStatus.PRE_2024,
         )
         assert role_for(asset)[0] is ReconstructionRole.TEXTURE_REFERENCE
@@ -144,7 +154,8 @@ class TestRoleAssignment:
         """Chaque asset reçoit un rôle : aucun n'est retiré du registre."""
         assets = [
             make("geo", camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
-                 target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED),
+                 target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+                 cluster_role=ClusterRole.CANONICAL),
             make("promo", subjects=[Subject.BUILDING]),
             make("interieur", subjects=[Subject.INTERIOR]),
             make("rien"),

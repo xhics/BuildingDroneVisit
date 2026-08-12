@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from datetime import datetime
+
 from .enums import (
     AssetCategory,
     CaptureType,
@@ -16,6 +18,7 @@ from .enums import (
     ExteriorInterior,
     PropertyMatchStatus,
     ReconstructionRole,
+    ReviewDecision,
     ReviewStatus,
     Rights,
     Subject,
@@ -148,6 +151,15 @@ class Asset(BaseModel):
     #: sans occlusion, enseigne lue, ou revue humaine.
     target_building_visible: bool | None = None
     target_evidence: str | None = None
+
+    #: Arbitrage humain. Prioritaire sur toute déduction, et **jamais**
+    #: recalculé : relancer la cascade ne doit pas effacer une décision prise
+    #: par une personne.
+    target_visibility_decision: ReviewDecision = ReviewDecision.UNRESOLVED
+    reviewer: str | None = None
+    reviewed_at: datetime | None = None
+    review_rationale: str | None = None
+    review_evidence: list[str] = Field(default_factory=list)
 
     #: Score par sujet, conservé tel quel. Une confiance agrégée masquait la
     #: qualité réelle de la décision décisive.

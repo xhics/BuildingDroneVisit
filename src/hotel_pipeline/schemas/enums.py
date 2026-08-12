@@ -147,6 +147,19 @@ class ClusterRole(StrEnum):
     INACTIVE = "inactive"
 
 
+class ReviewDecision(StrEnum):
+    """Arbitrage humain sur la visibilité de la cible (Lot 1B §6).
+
+    Distinct de `ReviewStatus`, qui décrit l'état du flux de revue. Ici il
+    s'agit du **contenu** de la décision, qui prime sur toute déduction et
+    n'est jamais recalculée.
+    """
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    UNRESOLVED = "unresolved"
+
+
 class ReviewStatus(StrEnum):
     """Statut de revue d'une qualification (Lot 1B §4, §6)."""
 
