@@ -58,6 +58,27 @@ POLICIES: dict[str, SourcePolicy] = {
         attribution="© déposants Google Places",
         note="droits détenus par les déposants",
     ),
+    "commons": SourcePolicy(
+        "commons",
+        Rights.OPEN_DATA,
+        requires_assumption=False,
+        attribution="© contributeurs Wikimedia Commons",
+        note="licences ouvertes, attribution selon la fiche du fichier",
+    ),
+    "flickr": SourcePolicy(
+        "flickr",
+        Rights.OPEN_DATA,
+        requires_assumption=False,
+        attribution="© auteur Flickr, licence Creative Commons",
+        note="collecte restreinte aux licences CC et domaine public",
+    ),
+    "tripadvisor": SourcePolicy(
+        "tripadvisor",
+        Rights.PUBLIC_UNCLEARED,
+        requires_assumption=True,
+        attribution="© déposants TripAdvisor",
+        note="droits des déposants, attribution imposée par TripAdvisor",
+    ),
     "hotel": SourcePolicy(
         "hotel",
         Rights.OWNED,

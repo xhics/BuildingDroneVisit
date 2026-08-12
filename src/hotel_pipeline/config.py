@@ -29,7 +29,12 @@ PROVIDERS: tuple[Provider, ...] = (
     Provider("Google Places", "GOOGLE_PLACES_API_KEY", required=False),
     Provider("Street View", "GOOGLE_MAPS_API_KEY", required=False),
     Provider("Mapillary", "MAPILLARY_TOKEN", required=False),
-    Provider("Vision", "VISION_API_KEY", required=False),
+    Provider("TripAdvisor", "TRIPADVISOR_API_KEY", required=False, note="Content API"),
+    Provider("Flickr", "FLICKR_API_KEY", required=False, note="licences CC uniquement"),
+    Provider("Wikimedia", None, required=False, note="aucune clé requise"),
+    Provider(
+        "Vision", "VISION_API_KEY", required=False, note="repli OCR ; EasyOCR suffit en local"
+    ),
     Provider("OSM", None, required=True, note="aucune clé requise"),
     Provider("Overture", None, required=True, note="aucune clé requise"),
     Provider("RunPod", "RUNPOD_API_KEY", required=False, note="VM GPU"),

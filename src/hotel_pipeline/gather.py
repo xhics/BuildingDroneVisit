@@ -67,7 +67,7 @@ def collect_sources(
     website_url: str | None = None,
 ) -> tuple[list[CollectedImage], list[SourceReport]]:
     """Interroge chaque source configurée, sans jamais bloquer sur une absence."""
-    from .collectors import mapillary, places, streetview, website
+    from .collectors import commons, flickr, mapillary, places, streetview, tripadvisor, website
 
     images: list[CollectedImage] = []
     reports: list[SourceReport] = []
@@ -88,22 +88,32 @@ def collect_sources(
 
     attempt("mapillary", lambda: mapillary.collect(lat, lon, radius_m))
     attempt("street_view", lambda: streetview.collect(lat, lon))
+    attempt("commons", lambda: commons.collect(lat, lon, radius_m))
+    attempt("flickr", lambda: flickr.collect(lat, lon, radius_m))
     if place_query:
         attempt("places", lambda: places.collect(place_query))
+        attempt("tripadvisor", lambda: tripadvisor.collect(place_query))
     if website_url:
         attempt("website", lambda: website.collect(website_url))
 
     return images, reports
 
 
+#: Variable d'environnement conditionnant chaque source. `None` = aucune clé.
+SOURCE_KEYS: dict[str, str | None] = {
+    "mapillary": "MAPILLARY_TOKEN",
+    "street_view": "GOOGLE_MAPS_API_KEY",
+    "places": "GOOGLE_PLACES_API_KEY",
+    "tripadvisor": "TRIPADVISOR_API_KEY",
+    "flickr": "FLICKR_API_KEY",
+    "commons": None,
+    "website": None,
+}
+
+
 def _configured(source: str) -> bool:
-    """Le site officiel ne requiert aucune clé : seule son URL le conditionne."""
-    required = {
-        "mapillary": "MAPILLARY_TOKEN",
-        "street_view": "GOOGLE_MAPS_API_KEY",
-        "places": "GOOGLE_PLACES_API_KEY",
-        "website": None,
-    }[source]
+    """Wikimedia Commons et le site officiel ne requièrent aucune clé."""
+    required = SOURCE_KEYS[source]
     return required is None or bool(os.environ.get(required, "").strip())
 
 
