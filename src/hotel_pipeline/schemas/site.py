@@ -446,12 +446,35 @@ class SiteManifest(BaseModel):
         if cycle:
             raise ValueError(f"filiation d'artefacts cyclique : {' → '.join(cycle)}")
 
+        by_artifact = {a.artifact_id: a for a in self.artifacts}
+        for artifact in self.artifacts:
+            if not artifact.is_active:
+                continue
+            stale = [
+                parent
+                for parent in artifact.derived_from_artifacts
+                if not by_artifact[parent].is_active
+            ]
+            if stale:
+                raise ValueError(
+                    f"artefact actif {artifact.artifact_id!r} dépend d'artefacts "
+                    f"périmés : {stale}"
+                )
+
         for obj in self.objects:
             missing_artifacts = [a for a in obj.artifact_ids if a not in known_artifacts]
             if missing_artifacts:
                 raise ValueError(
                     f"objet {obj.object_id!r} référence des artefacts absents : "
                     f"{missing_artifacts}"
+                )
+            inactive = [
+                a for a in obj.artifact_ids if not by_artifact[a].is_active
+            ]
+            if inactive:
+                raise ValueError(
+                    f"objet {obj.object_id!r} référence des artefacts non actifs : "
+                    f"{inactive} — une qualification en dépendrait sans le savoir"
                 )
         return self
 

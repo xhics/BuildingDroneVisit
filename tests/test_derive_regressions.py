@@ -120,9 +120,16 @@ class TestSearchAreaWithinTile:
         footprint = Polygon([(20, 20), (70, 20), (70, 70), (20, 70)])
         assert not tile_covers(self.BOUNDS, footprint, 150.0)
 
-    def test_unknown_bounds_are_treated_as_not_covering(self):
-        with pytest.raises(KeyError):
-            tile_covers({}, OBLIQUE, 150.0)
+    def test_unknown_bounds_yield_unknown_not_a_refusal(self):
+        """L'ignorance est un troisième état, pas un cas particulier du refus.
+
+        Lever ferait échouer la dérivation ; rendre False affirmerait une
+        troncature qu'on n'a pas constatée.
+        """
+        assert tile_covers({}, OBLIQUE, 150.0) == "unknown"
+
+    def test_partial_bounds_also_yield_unknown(self):
+        assert tile_covers({"min_x": 0.0}, OBLIQUE, 150.0) == "unknown"
 
 
 class TestCorruptedRasterIsDetected:
@@ -254,3 +261,130 @@ class TestSuccessivePublications:
     def test_a_supersession_without_successor_is_refused(self, tmp_path):
         with pytest.raises(ValueError, match="sans successeur"):
             self._artifact("dtm@run1", tmp_path / "x.tif", status="superseded")
+
+
+class TestSupersessionOnPublication:
+    """Deux séries actives rendraient toute qualification ambiguë."""
+
+    def _source(self):
+        from datetime import datetime, timezone
+
+        return GeoSourceProvenance(
+            source_id="lidar", dataset="LiDAR", vintage="2023", tile_id="t",
+            crs_horizontal="EPSG:2950", crs_vertical="CGVD 1928",
+            carries_elevation=True, licence="CC BY 4.0", file_digest="abc",
+            retrieved_at=datetime(2026, 8, 12, tzinfo=timezone.utc),
+        )
+
+    def _artifact(self, artifact_id, path, role="dtm", **overrides):
+        fields = dict(
+            artifact_id=artifact_id, role=role, path=str(path), format="GeoTIFF",
+            sha256="a" * 64, crs_horizontal="EPSG:2950", crs_vertical="CGVD 1928",
+            resolution_m=0.5, algorithm_id="v1", measured_fraction=0.0,
+            interpolated_fraction=1.0, coverage_domain="footprint",
+            derived_from_sources=["lidar"],
+        )
+        fields.update(overrides)
+        return DerivedArtifact(**fields)
+
+    def test_the_previous_series_becomes_superseded(self, tmp_path):
+        from hotel_pipeline.geo.derive import supersede_previous
+
+        old = tmp_path / "run1" / "dtm.tif"
+        new = tmp_path / "run2" / "dtm.tif"
+        for path in (old, new):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_geotiff(path, np.zeros((GRID.width, GRID.height)), GRID)
+
+        manifest = SiteManifest(
+            hotel_id="h", geo_sources=[self._source()],
+            artifacts=[self._artifact("dtm@run1", old)],
+        )
+        newcomers = [self._artifact("dtm@run2", new)]
+        assert supersede_previous(manifest, newcomers) == 1
+
+        manifest.artifacts.extend(newcomers)
+        assert manifest.artifacts[0].status == "superseded"
+        assert manifest.artifacts[0].superseded_by == "dtm@run2"
+        assert len(manifest.active_artifacts()) == 1
+
+    def test_a_different_role_is_left_alone(self, tmp_path):
+        from hotel_pipeline.geo.derive import supersede_previous
+
+        old = tmp_path / "run1" / "ndsm.tif"
+        new = tmp_path / "run2" / "dtm.tif"
+        for path in (old, new):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_geotiff(path, np.zeros((GRID.width, GRID.height)), GRID)
+
+        manifest = SiteManifest(
+            hotel_id="h", geo_sources=[self._source()],
+            artifacts=[self._artifact("ndsm@run1", old, role="ndsm")],
+        )
+        assert supersede_previous(manifest, [self._artifact("dtm@run2", new)]) == 0
+
+    def test_an_active_artifact_cannot_depend_on_a_superseded_parent(self, tmp_path):
+        path = tmp_path / "x.tif"
+        write_geotiff(path, np.zeros((GRID.width, GRID.height)), GRID)
+
+        with pytest.raises(ValueError, match="dépend d'artefacts périmés"):
+            SiteManifest(
+                hotel_id="h", geo_sources=[self._source()],
+                artifacts=[
+                    self._artifact(
+                        "dtm@run1", path, status="superseded", superseded_by="dtm@run2"
+                    ),
+                    self._artifact("dtm@run2", path),
+                    self._artifact(
+                        "ndsm@run2", path, role="ndsm",
+                        derived_from_artifacts=["dtm@run1"],
+                    ),
+                ],
+            )
+
+    def test_an_object_cannot_reference_an_inactive_artifact(self, tmp_path):
+        from hotel_pipeline.schemas import SiteObject
+
+        path = tmp_path / "x.tif"
+        write_geotiff(path, np.zeros((GRID.width, GRID.height)), GRID)
+
+        with pytest.raises(ValueError, match="non actifs"):
+            SiteManifest(
+                hotel_id="h", geo_sources=[self._source()],
+                artifacts=[
+                    self._artifact(
+                        "dtm@run1", path, status="invalidated",
+                        invalidation_reason="bug d'agrégation",
+                    )
+                ],
+                objects=[
+                    SiteObject(
+                        object_id="h:TERRAIN_MAIN", kind="TERRAIN_MAIN",
+                        artifact_ids=["dtm@run1"],
+                    )
+                ],
+            )
+
+
+class TestDigestVerification:
+    def test_an_edited_file_is_detected(self, tmp_path):
+        """L'existence d'un fichier ne prouve pas qu'il n'a pas changé."""
+        from hotel_pipeline.geo.derive import verify_digests
+        from hotel_pipeline.geo.raster import sha256_file
+
+        path = tmp_path / "dtm.tif"
+        write_geotiff(path, np.zeros((GRID.width, GRID.height)), GRID)
+        digest = sha256_file(path)
+
+        manifest = SiteManifest(
+            hotel_id="h",
+            geo_sources=[TestSupersessionOnPublication()._source()],
+            artifacts=[
+                TestSupersessionOnPublication()._artifact("dtm@run1", path, sha256=digest)
+            ],
+        )
+        assert verify_digests(manifest) == []
+
+        write_geotiff(path, np.ones((GRID.width, GRID.height)), GRID)
+        problems = verify_digests(manifest)
+        assert any("le fichier a changé" in problem for problem in problems)

@@ -100,12 +100,17 @@ def load_ground_within(laz_path: Path, footprint, radius_m: float):  # noqa: ANN
     return x[window], y[window], np.asarray(points.z)[window], window.sum()
 
 
-def tile_covers(laz_bounds: dict, footprint, radius_m: float) -> bool:
+def tile_covers(laz_bounds: dict, footprint, radius_m: float) -> bool | str:
     """La zone de recherche tient-elle entièrement dans la tuile ?
 
-    Sans ce contrôle, une absence d'essai pourrait venir d'une troncature de
-    tuile plutôt que d'une difficulté réelle.
+    Rend `"unknown"` faute de bornes : lever une exception ferait échouer la
+    dérivation, et rendre `False` affirmerait une troncature non constatée.
+    L'ignorance est un troisième état, pas un cas particulier du refus.
     """
+    required = ("min_x", "max_x", "min_y", "max_y")
+    if not laz_bounds or any(key not in laz_bounds for key in required):
+        return "unknown"
+
     minx, miny, maxx, maxy = footprint.bounds
     return (
         minx - radius_m >= laz_bounds["min_x"]
@@ -153,13 +158,22 @@ def derive(
     crs: str,
     crs_vertical: str,
     source_id: str,
-    cell_m: float = terrain.CELL_M,
-    ring_m: float = terrain.RING_M,
-    search_radius_m: float = 150.0,
+    policy=None,  # noqa: ANN001 — PipelinePolicy
     laz_bounds: dict | None = None,
 ) -> DeriveResult:
-    """Produit toutes les couches dans le répertoire de transit."""
+    """Produit toutes les couches dans le répertoire de transit.
+
+    Tous les paramètres géométriques viennent de la politique : sans cela, une
+    politique posée dans l'espace de travail ne changerait pas la dérivation.
+    """
     from shapely import contains_xy
+
+    from ..schemas.policy import DEFAULT_POLICY
+
+    limits = (policy or DEFAULT_POLICY).terrain
+    cell_m = limits.cell_m
+    ring_m = limits.ring_m
+    search_radius_m = limits.search_radius_m
 
     result = DeriveResult()
     minx, miny, maxx, maxy = footprint_projected.bounds
@@ -242,9 +256,16 @@ def derive(
     # que l'anneau de production.
     wide_x, wide_y, wide_z, _ = load_ground_within(laz_path, footprint_projected, search_radius_m)
     wide_px, wide_py, wide_pz = terrain.aggregate_median(wide_x, wide_y, wide_z, origin, cell_m)
+    # Les exclusions ne servent à rien si l'orchestration ne les transmet pas :
+    # le vrai bâtiment et les concentrations de classe 6 privent une zone de
+    # sol pour la même raison.
+    building_x = x[(codes == BUILDING)]
+    building_y = y[(codes == BUILDING)]
     pseudo_result = terrain.pseudo_footprint_validation(
         wide_px, wide_py, wide_pz, footprint_projected, ring_m=ring_m,
-        search_radius_m=search_radius_m, cell_m=cell_m,
+        trials=limits.min_trials, search_radius_m=search_radius_m, cell_m=cell_m,
+        policy=policy, real_footprint=footprint_projected,
+        building_xy=(building_x, building_y),
     )
     search_within_tile = tile_covers(laz_bounds, footprint_projected, search_radius_m)
 
@@ -254,7 +275,7 @@ def derive(
         masks, disagreement, rejected, distances, px, py, pz, footprint_projected,
         pseudo_result, search_within_tile,
     )
-    result.qa_flags = _qa_flags(result.metrics, ndsm)
+    result.qa_flags = _qa_flags(result.metrics, ndsm, limits)
     result.artifacts = _artifacts(
         result, grid, crs, crs_vertical, source_id, domain_cells, masks, ndsm_valid
     )
@@ -329,7 +350,7 @@ def _fraction(mask, domain: int) -> float:  # noqa: ANN001
     return round(int(np.asarray(mask).sum()) / max(domain, 1), 4)
 
 
-def _qa_flags(metrics: dict, ndsm) -> list[str]:  # noqa: ANN001
+def _qa_flags(metrics: dict, ndsm, limits) -> list[str]:  # noqa: ANN001
     """Signale sans corriger. Une hauteur aberrante reste dans le raster."""
     flags: list[str] = []
     heights = metrics["height_statistics"]
@@ -347,16 +368,19 @@ def _qa_flags(metrics: dict, ndsm) -> list[str]:  # noqa: ANN001
             "enveloppe convexe, laissées sans donnée"
         )
     pseudo = metrics["pseudo_footprint_validation"]
-    if len(pseudo["trials"]) < 3:
-        detail = (
-            "zone de recherche tronquée par la tuile"
-            if not pseudo["search_area_within_tile"]
-            else "sol insuffisant autour du site"
-        )
+    if len(pseudo["trials"]) < limits.min_trials:
         flags.append(
-            f"{len(pseudo['trials'])} essai(s) de pseudo-empreinte seulement "
-            f"({detail}) — l'erreur sous le bâtiment reste estimée par une "
-            "validation optimiste"
+            f"{len(pseudo['trials'])} essai(s) de pseudo-empreinte pour un "
+            f"minimum de {limits.min_trials} — l'erreur sous le bâtiment reste "
+            "estimée par une validation optimiste"
+        )
+    # La troncature se signale indépendamment du nombre d'essais : une zone
+    # tronquée qui en produit trois reste une zone tronquée.
+    if pseudo["search_area_within_tile"] is not True:
+        flags.append(
+            f"zone de recherche non entièrement couverte par la tuile "
+            f"({pseudo['search_area_within_tile']}) — les essais ne portent "
+            "que sur la portion disponible"
         )
     if metrics["definition_masks"]["tin_only"]:
         flags.append(
@@ -542,6 +566,55 @@ def verify_publication(site) -> list[str]:  # noqa: ANN001 — SiteManifest
             problems.append(
                 f"artefact actif {artifact.artifact_id!r} : fichier absent "
                 f"({artifact.path}) — le marquer superseded ou invalidated"
+            )
+    return problems
+
+
+def supersede_previous(site, new_artifacts) -> int:  # noqa: ANN001
+    """Fait passer en `superseded` les actifs remplacés par une nouvelle série.
+
+    Sans cela, deux exécutions restent actives simultanément et une
+    qualification ne saurait pas laquelle choisir. La correspondance se fait
+    par rôle **et** par chemin de couche, non par identifiant : celui-ci porte
+    l'horodatage de son exécution.
+    """
+    successors = {}
+    for artifact in new_artifacts:
+        key = (artifact.role, Path(artifact.path).name)
+        successors[key] = artifact.artifact_id
+
+    new_ids = {a.artifact_id for a in new_artifacts}
+    marked = 0
+    for index, artifact in enumerate(site.artifacts):
+        if artifact.artifact_id in new_ids or not artifact.is_active:
+            continue
+        successor = successors.get((artifact.role, Path(artifact.path).name))
+        if successor:
+            site.artifacts[index] = artifact.model_copy(
+                update={"status": "superseded", "superseded_by": successor}
+            )
+            marked += 1
+    return marked
+
+
+def verify_digests(site) -> list[str]:  # noqa: ANN001
+    """Confronte l'empreinte déclarée au contenu réel des artefacts actifs.
+
+    L'existence d'un fichier ne prouve pas qu'il n'a pas changé depuis sa
+    publication : un raster réécrit à la main passerait le contrôle de présence.
+    """
+    from .raster import sha256_file
+
+    problems: list[str] = []
+    for artifact in site.active_artifacts():
+        path = Path(artifact.path)
+        if not path.is_file():
+            continue
+        actual = sha256_file(path)
+        if actual != artifact.sha256:
+            problems.append(
+                f"artefact {artifact.artifact_id!r} : empreinte {actual[:16]}… "
+                f"au lieu de {artifact.sha256[:16]}… — le fichier a changé"
             )
     return problems
 

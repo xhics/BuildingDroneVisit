@@ -35,8 +35,13 @@ def provenance(
     """Bloc de provenance à insérer dans tout rapport."""
     block = {
         "policy_version": policy.version,
-        "calibration_id": policy.model.calibration_id,
-        "calibrated_on_sites": str(policy.model.calibrated_on_sites),
+        # Deux calibrations distinctes : celle du classifieur photographique et
+        # celle des seuils géospatiaux. Les confondre laisserait croire que les
+        # secondes reposent sur les 36 images du jeu de validation.
+        "model_calibration_id": policy.model.calibration_id,
+        "model_calibrated_on_sites": str(policy.model.calibrated_on_sites),
+        "terrain_calibration_id": policy.terrain.calibration_id,
+        "terrain_calibrated_on_sites": str(policy.terrain.calibrated_on_sites),
         "policy_digest": policy_digest(policy),
     }
     if profile is not None:

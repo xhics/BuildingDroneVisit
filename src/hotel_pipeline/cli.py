@@ -772,7 +772,14 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     from shapely import wkt as shapely_wkt
     from shapely.ops import transform as shapely_transform
 
-    from .geo.derive import derive, supersede_missing, verify_publication, verify_written
+    from .geo.derive import (
+        derive,
+        supersede_missing,
+        supersede_previous,
+        verify_digests,
+        verify_publication,
+        verify_written,
+    )
     from .geo.raster import GridSpec
 
     workspace = Workspace(hotel_id)
@@ -806,6 +813,7 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         laz, footprint, staging,
         crs=source["crs_horizontal"], crs_vertical=source["crs_vertical"],
         source_id=source["source_id"], laz_bounds=preflight.get("bounds"),
+        policy=context.policy,
     )
 
     grid = GridSpec(**result.grid)
@@ -841,6 +849,12 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         sources[source["source_id"]] = GeoSourceProvenance.model_validate(source)
         site.geo_sources = list(sources.values())
 
+        # Une série remplace la précédente : sans supersession, deux
+        # exécutions resteraient actives et la qualification serait ambiguë.
+        replaced = supersede_previous(site, result.artifacts)
+        if replaced:
+            typer.echo(f"  · {replaced} artefact(s) de la série précédente remplacé(s)")
+
         artifacts = {a.artifact_id: a for a in site.artifacts}
         artifacts.update({a.artifact_id: a for a in result.artifacts})
         site.artifacts = list(artifacts.values())
@@ -856,13 +870,22 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
             typer.secho(f"  · {stale} artefact(s) invalidé(s) — fichier absent",
                         fg=typer.colors.YELLOW)
 
-        dead = verify_publication(site)
+        dead = verify_publication(site) + verify_digests(site)
         if dead:
             for problem in dead:
                 typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=4)
 
         workspace.write_site(site)
+
+    # Matérialiser la politique effective à côté des résultats : le rapport
+    # porte son empreinte, mais une empreinte ne se relit pas.
+    if not workspace.policy_path.is_file():
+        workspace.policy_path.parent.mkdir(parents=True, exist_ok=True)
+        workspace.policy_path.write_text(
+            context.policy.model_dump_json(indent=2) + "\n", encoding="utf-8"
+        )
+        typer.echo(f"  · politique effective écrite dans {workspace.policy_path.name}")
 
     workspace.write_report(f"06_geo/derivation_report_{run_id}.json", result, context)
 

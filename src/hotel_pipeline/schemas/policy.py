@@ -102,6 +102,12 @@ class TerrainPolicy(BaseModel):
 
     min_trials: int = Field(default=3, ge=1)
 
+    #: Sur quoi ces seuils reposent. Distinct de la calibration du modèle
+    #: photographique : celle-ci porte sur 36 images et n'a rien à dire d'une
+    #: validation géospatiale.
+    calibration_id: str = "non-calibré — valeurs initiales, un seul site"
+    calibrated_on_sites: int = 0
+
 
 class TemporalPolicy(BaseModel):
     """Ce qu'une datation inconnue autorise, selon l'usage.
@@ -127,7 +133,7 @@ class PipelinePolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: str = "1.0.0"
+    version: str = "1.1.0"
     model: ModelPolicy = Field(default_factory=ModelPolicy)
     geometry: GeometryPolicy = Field(default_factory=GeometryPolicy)
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)

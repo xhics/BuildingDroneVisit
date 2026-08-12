@@ -158,8 +158,13 @@ class TestProvenance:
     def test_report_carries_policy_and_profile_identity(self, profile):
         block = provenance(DEFAULT_POLICY, profile)
         assert block["policy_version"] == DEFAULT_POLICY.version
-        assert block["calibration_id"] == DEFAULT_POLICY.model.calibration_id
+        assert block["model_calibration_id"] == DEFAULT_POLICY.model.calibration_id
         assert block["property_profile_id"] == "welcominns"
+        # La calibration terrain est distincte de celle du modèle photo :
+        # les confondre laisserait croire que les seuils géospatiaux reposent
+        # sur les 36 images du jeu de validation.
+        assert block["terrain_calibration_id"] != block["model_calibration_id"]
+        assert block["terrain_calibrated_on_sites"] == "0"
 
     def test_digest_detects_an_unversioned_edit(self):
         """Une version ne dit rien d'une modification locale non publiée."""

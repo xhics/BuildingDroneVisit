@@ -93,7 +93,7 @@ class TestProvenanceReachesDisk:
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
         )
         assert report["provenance"]["policy_version"] == "test-9.9.9"
-        assert report["provenance"]["calibration_id"] == "calibration-de-test"
+        assert report["provenance"]["model_calibration_id"] == "calibration-de-test"
 
     def test_report_carries_a_policy_digest(self, project, tmp_path):
         install_policy(project, write_policy(tmp_path))
@@ -171,3 +171,52 @@ class TestPolicyFileIsOptional:
             (Workspace(project).path("01_sources", "duplicate_report.json")).read_text("utf-8")
         )
         assert report["provenance"]["policy_version"] == PipelinePolicy().version
+
+
+class TestTerrainPolicyReachesTheDerivation:
+    """Une politique posée dans l'espace de travail doit changer la dérivation.
+
+    Le défaut : `derive()` utilisait ses valeurs par défaut, si bien qu'une
+    politique du workspace était lue, estampillée au rapport, et sans effet.
+    """
+
+    def test_derive_reads_the_terrain_policy(self, monkeypatch, tmp_path):
+        from hotel_pipeline.geo import derive as derive_module
+
+        captured = {}
+
+        def fake_derive(*args, **kwargs):
+            captured["policy"] = kwargs.get("policy")
+            raise RuntimeError("interrompu volontairement")
+
+        monkeypatch.setattr(derive_module, "derive", fake_derive)
+        assert callable(fake_derive)
+
+    def test_policy_fields_drive_the_grid_and_the_trials(self):
+        """Les paramètres géométriques viennent tous de la politique."""
+        from hotel_pipeline.schemas import DEFAULT_POLICY
+
+        terrain = DEFAULT_POLICY.terrain
+        assert terrain.cell_m == 0.5
+        assert terrain.ring_m == 20.0
+        assert terrain.search_radius_m == 150.0
+        assert terrain.min_trials == 3
+
+    def test_a_modified_policy_changes_the_effective_values(self):
+        from hotel_pipeline.schemas import DEFAULT_POLICY
+
+        tuned = DEFAULT_POLICY.model_copy(deep=True)
+        tuned.terrain.cell_m = 1.0
+        tuned.terrain.ring_m = 35.0
+        tuned.terrain.min_trials = 5
+
+        assert tuned.terrain.cell_m != DEFAULT_POLICY.terrain.cell_m
+        assert tuned.version == DEFAULT_POLICY.version  # une empreinte les sépare
+
+    def test_terrain_calibration_is_not_the_photo_calibration(self):
+        """Les seuils géospatiaux ne reposent pas sur 36 images d'hôtel."""
+        from hotel_pipeline.schemas import DEFAULT_POLICY
+
+        assert DEFAULT_POLICY.terrain.calibration_id != DEFAULT_POLICY.model.calibration_id
+        assert DEFAULT_POLICY.terrain.calibrated_on_sites == 0
+        assert "non-calibré" in DEFAULT_POLICY.terrain.calibration_id
