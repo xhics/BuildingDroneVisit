@@ -53,6 +53,7 @@ def artifact(**overrides) -> DerivedArtifact:
         parameters={"ring_m": "20", "aggregation": "median"},
         measured_fraction=0.09,
         interpolated_fraction=0.88,
+        coverage_domain="footprint",
         derived_from_sources=[SOURCE_ID],
     )
     fields.update(overrides)
@@ -95,6 +96,43 @@ class TestArtifactInvariants:
         assert produced.parameters["aggregation"] == "median"
 
 
+class TestCoverageDomain:
+    """« 97 % » ne veut rien dire tant qu'on ignore 97 % de quoi."""
+
+    def test_domain_is_mandatory(self):
+        with pytest.raises(ValueError):
+            DerivedArtifact(
+                artifact_id="x", role="dtm", path="p", format="GeoTIFF",
+                sha256="a" * 64, crs_horizontal="EPSG:2950", crs_vertical="CGVD 1928",
+                resolution_m=0.5, algorithm_id="a", measured_fraction=0.5,
+                derived_from_sources=[SOURCE_ID],
+            )
+
+    def test_unknown_domain_is_refused(self):
+        with pytest.raises(ValueError, match="domaine de couverture"):
+            artifact(coverage_domain="autour-du-batiment-ish")
+
+    def test_mask_domain_requires_a_mask_artifact(self):
+        with pytest.raises(ValueError, match="sans artefact"):
+            artifact(coverage_domain="mask")
+
+    def test_mask_domain_is_accepted_with_a_reference(self):
+        produced = artifact(
+            coverage_domain="mask", coverage_mask_artifact_id="footprint-mask"
+        )
+        assert produced.coverage_mask_artifact_id == "footprint-mask"
+
+    def test_referenced_mask_must_exist_in_the_manifest(self):
+        with pytest.raises(ValueError, match="masque absent"):
+            SiteManifest(
+                hotel_id="h",
+                geo_sources=[source()],
+                artifacts=[
+                    artifact(coverage_domain="mask", coverage_mask_artifact_id="absent")
+                ],
+            )
+
+
 class TestManifestIntegrity:
     def test_artifact_sources_must_be_declared(self):
         with pytest.raises(ValueError, match="sources non"):
@@ -102,6 +140,14 @@ class TestManifestIntegrity:
                 hotel_id="h",
                 geo_sources=[],
                 artifacts=[artifact()],
+            )
+
+    def test_artifact_cannot_cite_an_incomplete_provenance(self):
+        """Même exigence que pour un objet : sinon la règle se contourne."""
+        incomplete = source().model_copy(update={"file_digest": None})
+        with pytest.raises(ValueError, match="provenance est incomplète"):
+            SiteManifest(
+                hotel_id="h", geo_sources=[incomplete], artifacts=[artifact()]
             )
 
     def test_duplicate_artifact_ids_are_refused(self):

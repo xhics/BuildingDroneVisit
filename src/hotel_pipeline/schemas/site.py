@@ -139,6 +139,13 @@ class DerivedArtifact(BaseModel):
     measured_fraction: float = Field(ge=0.0, le=1.0)
     interpolated_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
 
+    #: **Dénominateur** de ces fractions. L'empreinte, l'anneau, la boîte du
+    #: raster et le site entier donnent des chiffres très différents pour la
+    #: même donnée ; la boîte englobante flatte systématiquement un bâtiment
+    #: oblique. Jamais implicite.
+    coverage_domain: str
+    coverage_mask_artifact_id: str | None = None
+
     derived_from_sources: list[str] = Field(default_factory=list)
     produced_at: datetime | None = None
 
@@ -159,12 +166,29 @@ class DerivedArtifact(BaseModel):
                 f"artefact {self.artifact_id!r} sans source : une dérivation "
                 "sans origine n'est pas vérifiable"
             )
+        if self.coverage_domain not in COVERAGE_DOMAINS:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} : domaine de couverture "
+                f"{self.coverage_domain!r} inconnu ; attendu l'un de "
+                f"{sorted(COVERAGE_DOMAINS)}"
+            )
+        if self.coverage_domain == "mask" and not self.coverage_mask_artifact_id:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} : domaine 'mask' sans artefact "
+                "de masque référencé"
+            )
         return self
 
     @property
     def nodata_fraction(self) -> float:
         return round(1.0 - self.measured_fraction - self.interpolated_fraction, 6)
 
+
+#: Domaines sur lesquels une fraction peut être calculée. Sans cette précision,
+#: `measured_fraction=0.97` ne veut rien dire : 97 % de quoi ?
+COVERAGE_DOMAINS: frozenset[str] = frozenset(
+    {"footprint", "ring", "raster_box", "site", "mask"}
+)
 
 #: Rôles d'artefacts portant des altitudes, donc exigeant un datum vertical.
 ELEVATION_ROLES: frozenset[str] = frozenset(
@@ -315,8 +339,26 @@ class SiteManifest(BaseModel):
                     f"artefact {artifact.artifact_id!r} dérivé de sources non "
                     f"déclarées : {unknown}"
                 )
+            # Même exigence que pour un objet : un artefact citant une
+            # provenance incomplète serait tout aussi invérifiable.
+            for source_id in artifact.derived_from_sources:
+                incomplete = by_id[source_id].is_citable()
+                if incomplete:
+                    raise ValueError(
+                        f"artefact {artifact.artifact_id!r} dérivé de "
+                        f"{source_id!r}, dont la provenance est incomplète : "
+                        f"{incomplete}"
+                    )
 
         known_artifacts = set(artifact_ids)
+        for artifact in self.artifacts:
+            mask_id = artifact.coverage_mask_artifact_id
+            if mask_id and mask_id not in known_artifacts:
+                raise ValueError(
+                    f"artefact {artifact.artifact_id!r} référence un masque "
+                    f"absent : {mask_id!r}"
+                )
+
         for obj in self.objects:
             missing_artifacts = [a for a in obj.artifact_ids if a not in known_artifacts]
             if missing_artifacts:
