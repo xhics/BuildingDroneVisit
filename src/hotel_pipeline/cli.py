@@ -73,6 +73,7 @@ def init(
     lon: float | None = typer.Option(None, "--lon", help="Longitude connue."),
     radius_m: int = typer.Option(300, "--radius", help="Rayon de collecte, en mètres."),
     place_query: str | None = typer.Option(None, "--place", help="Requête Places."),
+    website_url: str | None = typer.Option(None, "--website", help="Site officiel."),
     assume_rights: bool = typer.Option(
         False,
         "--assume-rights",
@@ -107,6 +108,7 @@ def init(
             lon=lon,
             collect_radius_m=radius_m,
             place_query=place_query,
+            website_url=website_url,
             assume_rights=assume_rights,
         )
     )

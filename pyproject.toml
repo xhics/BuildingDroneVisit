@@ -19,22 +19,39 @@ dependencies = [
     "shapely>=2.0",
     "Pillow>=10.0",
     "ImageHash>=4.3",
+    "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
 ]
-# Couche vision — installée dans l'image GPU (Lot 2), pas sur le poste local.
-# Chaque bibliothèque remplace du code qu'il aurait fallu écrire et calibrer.
+# Couche vision — cible : image GPU (Lot 2). Chaque bibliothèque remplace du
+# code qu'il aurait fallu écrire et calibrer.
 vision = [
     "open_clip_torch>=2.24",   # classification zero-shot, sans entraînement
+    "easyocr>=1.7",            # OCR d'enseigne, local et gratuit
     "cleanvision>=0.3",        # flou, exposition, quasi-doublons, images vides
     "imagededup>=0.3",         # déduplication perceptuelle et CNN
     "pyiqa>=0.1.10",           # qualité sans référence (BRISQUE, NIQE, MUSIQ)
-    "google-cloud-vision>=3.7",  # OCR d'enseigne, détection web
-    "googlemaps>=4.10",        # client officiel Places
 ]
+
+# Poste local Mac Intel uniquement. torch 2.2.2 est la dernière version
+# compilée pour x86_64 macOS et exige NumPy 1, tandis qu'OpenCV 5 et tifffile
+# exigent NumPy 2 : sans ces bornes, chaque installation recasse l'autre.
+# La VM GPU (Linux) n'a pas cette contrainte et n'utilise pas cet extra.
+vision-macos-intel = [
+    "torch==2.2.2",
+    "torchvision==0.17.2",
+    "numpy<2",
+    "scipy<1.15",
+    "opencv-python-headless<4.11",
+    "tifffile<2025",
+    "scikit-image<0.25",
+]
+
+# OCR par service, uniquement en repli si EasyOCR est indisponible.
+vision-cloud = ["google-cloud-vision>=3.7"]
 
 [project.scripts]
 hotel-pipeline = "hotel_pipeline.cli:app"

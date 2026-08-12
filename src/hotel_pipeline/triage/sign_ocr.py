@@ -59,8 +59,27 @@ def evaluate(
     return SignReading(text, PropertyMatchStatus.UNCERTAIN)
 
 
-def read_text(image_path: Path) -> str:
-    """OCR d'une image par Google Cloud Vision."""
+class LocalReader:
+    """OCR local par EasyOCR, sans clé ni service.
+
+    EasyOCR vise le texte en scène — enseignes, angles, éclairage variable —
+    là où Tesseract vise le document scanné. Le modèle est chargé une seule
+    fois, l'initialisation étant coûteuse.
+    """
+
+    def __init__(self, languages: tuple[str, ...] = ("fr", "en")) -> None:
+        import easyocr
+
+        log.info("chargement d'EasyOCR (%s)", ", ".join(languages))
+        self._reader = easyocr.Reader(list(languages), gpu=False, verbose=False)
+
+    def read(self, image_path: Path) -> str:
+        results = self._reader.readtext(str(image_path), detail=0)
+        return " ".join(results)
+
+
+def read_text_vision(image_path: Path) -> str:
+    """OCR par Google Cloud Vision — repli si l'OCR local est indisponible."""
     from google.cloud import vision
 
     client = vision.ImageAnnotatorClient()
@@ -72,3 +91,21 @@ def read_text(image_path: Path) -> str:
 
     annotations = response.text_annotations
     return annotations[0].description if annotations else ""
+
+
+def get_reader():
+    """Retourne un lecteur OCR, local de préférence.
+
+    L'OCR local suffit à cet usage et évite une dépendance facturée ; Vision
+    n'est qu'un repli.
+    """
+    try:
+        return LocalReader()
+    except ImportError:
+        log.warning("EasyOCR absent — repli sur Google Cloud Vision")
+
+        class _VisionReader:
+            def read(self, image_path: Path) -> str:
+                return read_text_vision(image_path)
+
+        return _VisionReader()

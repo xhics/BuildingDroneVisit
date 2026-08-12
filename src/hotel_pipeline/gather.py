@@ -64,9 +64,10 @@ def collect_sources(
     lon: float,
     place_query: str | None,
     radius_m: int = 300,
+    website_url: str | None = None,
 ) -> tuple[list[CollectedImage], list[SourceReport]]:
     """Interroge chaque source configurée, sans jamais bloquer sur une absence."""
-    from .collectors import mapillary, places, streetview
+    from .collectors import mapillary, places, streetview, website
 
     images: list[CollectedImage] = []
     reports: list[SourceReport] = []
@@ -89,17 +90,21 @@ def collect_sources(
     attempt("street_view", lambda: streetview.collect(lat, lon))
     if place_query:
         attempt("places", lambda: places.collect(place_query))
+    if website_url:
+        attempt("website", lambda: website.collect(website_url))
 
     return images, reports
 
 
 def _configured(source: str) -> bool:
+    """Le site officiel ne requiert aucune clé : seule son URL le conditionne."""
     required = {
         "mapillary": "MAPILLARY_TOKEN",
         "street_view": "GOOGLE_MAPS_API_KEY",
         "places": "GOOGLE_PLACES_API_KEY",
+        "website": None,
     }[source]
-    return bool(os.environ.get(required, "").strip())
+    return required is None or bool(os.environ.get(required, "").strip())
 
 
 def download_all(
@@ -131,6 +136,44 @@ def download_all(
             image.url = original_url
 
     return downloaded
+
+
+def read_signs(
+    assets: list[Asset], reader, expected: list[str], excluded: list[str]  # noqa: ANN001
+) -> dict[str, int]:
+    """Lit l'enseigne des images et en déduit l'appartenance à l'établissement.
+
+    C'est la réponse au risque nº1 du §3 : lire « Mortagne » disqualifie une
+    image, lire « WelcomINNS » la confirme. Décisif pour les images sans
+    position caméra, que la géométrie ne peut pas trancher.
+    """
+    from .schemas import PropertyMatchStatus
+    from .triage import evaluate
+
+    counts = {"match": 0, "mismatch": 0, "uncertain": 0}
+
+    for index, asset in enumerate(assets):
+        if not asset.local_path or not Path(asset.local_path).is_file():
+            continue
+        try:
+            text = reader.read(Path(asset.local_path))
+        except (OSError, ValueError, RuntimeError) as exc:
+            log.warning("OCR impossible pour %s : %s", asset.id, exc)
+            continue
+
+        reading = evaluate(text, expected, excluded)
+        assets[index] = asset.model_copy(
+            update={"property_match_status": reading.status, "sign_text": text[:500] or None}
+        )
+        counts[reading.status.value] += 1
+
+    log.info(
+        "OCR d'enseigne : %d confirmée(s), %d disqualifiée(s), %d indéterminée(s)",
+        counts["match"],
+        counts["mismatch"],
+        counts["uncertain"],
+    )
+    return counts
 
 
 def triage(

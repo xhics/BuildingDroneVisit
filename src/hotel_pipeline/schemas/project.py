@@ -59,6 +59,7 @@ class ProjectManifest(BaseModel):
     #: traverse la collecte sans arguments supplémentaires.
     collect_radius_m: int = Field(default=300, ge=25, le=2000)
     place_query: str | None = None
+    website_url: str | None = None
     assume_rights: bool = False
 
     created_at: datetime = Field(default_factory=_now)

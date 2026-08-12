@@ -181,7 +181,11 @@ def _gather(workspace, project, spatial: SpatialManifest) -> None:  # noqa: ANN0
     lat, lon = building.centroid_lat, building.centroid_lon
 
     images, reports = collect_sources(
-        lat, lon, project.place_query or project.address, project.collect_radius_m
+        lat,
+        lon,
+        project.place_query or project.address,
+        project.collect_radius_m,
+        website_url=project.website_url,
     )
     downloaded = download_all(images, workspace, reports)
 

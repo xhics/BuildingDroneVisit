@@ -68,6 +68,7 @@ POLICIES: dict[str, SourcePolicy] = {
         "website",
         Rights.UNKNOWN,
         requires_assumption=True,
+        attribution="© site officiel de l'établissement",
         note="site officiel — à clarifier avec l'établissement",
     ),
 }

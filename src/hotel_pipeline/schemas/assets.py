@@ -67,6 +67,10 @@ class Asset(BaseModel):
 
     #: Le bâtiment confirmé tombe-t-il dans le champ de la caméra ?
     #: Critère géométrique exact, indépendant de la classification sémantique.
+    #: Texte lu sur l'image par OCR, conservé comme preuve du statut
+    #: d'appartenance plutôt que comme simple verdict.
+    sign_text: str | None = None
+
     sees_building: bool | None = None
     target_distance_m: float | None = Field(default=None, ge=0)
     target_offset_deg: float | None = Field(default=None, ge=0, le=180)
