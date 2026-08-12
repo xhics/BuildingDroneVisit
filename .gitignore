@@ -18,3 +18,7 @@ venv/
 
 # macOS
 .DS_Store
+
+# Données géospatiales brutes — volumineuses, reproductibles depuis la provenance
+*.LAZ
+*.laz

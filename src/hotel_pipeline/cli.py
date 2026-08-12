@@ -638,6 +638,80 @@ def geo_discover(
     typer.echo("  aucun LAZ téléchargé — accord requis avant acquisition")
 
 
+@geo_app.command("acquire")
+def geo_acquire(
+    hotel_id: str = typer.Argument(...),
+    max_bytes: int = typer.Option(
+        ..., "--max-bytes", help="Volume autorisé, en octets. Exigé explicitement."
+    ),
+) -> None:
+    """Télécharge les tuiles découvertes. Le volume autorisé est obligatoire."""
+    from pathlib import Path
+
+    from .geo.acquire import download_tile, provenance_from
+    from .geo.lidar import TileCandidate
+
+    workspace = Workspace(hotel_id)
+    discovery = workspace.read_json("06_geo/lidar_discovery.json")
+    if not discovery or discovery.get("coverage") != "covered":
+        typer.secho(
+            "aucune couverture confirmée — lancez d'abord : geo discover",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    tiles = [TileCandidate(**{k: v for k, v in t.items() if k in TileCandidate.__annotations__})
+             for t in discovery["tiles"]]
+    total = discovery["total_bytes"]
+
+    if total != max_bytes:
+        typer.secho(
+            f"{KO} volume découvert {total} ≠ volume autorisé {max_bytes} — "
+            "acquisition refusée",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    results = []
+    for raw, tile in zip(discovery["tiles"], tiles):
+        tile.acquired_on = None
+        from datetime import date as _date
+
+        if raw.get("acquired_on"):
+            tile.acquired_on = _date.fromisoformat(raw["acquired_on"])
+        target = workspace.path("06_geo", "lidar_raw", f"{tile.tile_id}.LAZ")
+        typer.echo(f"  téléchargement {tile.tile_id} — {raw['exact_size_bytes']:,} octets"
+                   .replace(",", " "))
+        result = download_tile(tile.url, target, raw["exact_size_bytes"])
+        results.append((result, tile))
+
+    payload = {"acquisitions": [r.as_dict() for r, _ in results]}
+    failed = [r for r, _ in results if not r.succeeded]
+
+    if not failed:
+        payload["sources"] = [
+            provenance_from(r, t).model_dump(mode="json") for r, t in results
+        ]
+
+    workspace.write_report("06_geo/acquisition_report.json", payload, context)
+
+    for result, tile in results:
+        if result.succeeded:
+            typer.echo(f"  {OK} {tile.tile_id}  sha256 {result.sha256[:16]}…")
+        else:
+            typer.secho(f"  {KO} {tile.tile_id} — {result.error}", fg=typer.colors.RED)
+
+    if failed:
+        typer.secho(
+            "  aucune source citable produite — aucun objet ne peut en dériver",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=4)
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 
