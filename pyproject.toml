@@ -36,15 +36,17 @@ vision = [
     "pyiqa>=0.1.10",           # qualité sans référence (BRISQUE, NIQE, MUSIQ)
 ]
 
+# Couche géospatiale. Aucune dépendance système : lazrs décompresse le LAZ
+# sans LASzip, et pyproj embarque PROJ dans sa roue.
+geo = [
+    "laspy[lazrs]>=2.5",   # lecture LAZ
+    "pyproj>=3.6",         # reprojection WGS84 vers le référentiel de la tuile
+]
+
 # Poste local Mac Intel uniquement. torch 2.2.2 est la dernière version
 # compilée pour x86_64 macOS et exige NumPy 1, tandis qu'OpenCV 5 et tifffile
 # exigent NumPy 2 : sans ces bornes, chaque installation recasse l'autre.
 # La VM GPU (Linux) n'a pas cette contrainte et n'utilise pas cet extra.
-geo = [
-    "laspy[lazrs]>=2.5",   # lecture LAZ, sans dépendance système
-    "pyproj>=3.6",         # reprojection WGS84 vers le référentiel de la tuile
-]
-
 vision-macos-intel = [
     "torch==2.2.2",
     "torchvision==0.17.2",
