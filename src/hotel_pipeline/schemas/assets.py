@@ -124,13 +124,18 @@ class Asset(BaseModel):
     camera_lat: float | None = Field(default=None, ge=-90, le=90)
     camera_lon: float | None = Field(default=None, ge=-180, le=180)
 
-    #: Le bâtiment confirmé tombe-t-il dans le champ de la caméra ?
-    #: Critère géométrique exact, indépendant de la classification sémantique.
     #: Texte lu sur l'image par OCR, conservé comme preuve du statut
     #: d'appartenance plutôt que comme simple verdict.
     sign_text: str | None = None
 
+    #: Le bâtiment confirmé tombe-t-il dans le champ de la caméra, sans
+    #: obstacle ? Critère géométrique, dont la valeur probante dépend de
+    #: `heading_is_measured`.
     sees_building: bool | None = None
+
+    #: Empreinte voisine coupant la ligne de visée, le cas échéant. Le champ de
+    #: vision ne suffit pas : un pavillon interposé annule la vue.
+    occluded_by: str | None = None
     target_distance_m: float | None = Field(default=None, ge=0)
     target_offset_deg: float | None = Field(default=None, ge=0, le=180)
     local_path: str | None = None

@@ -101,23 +101,87 @@ def assess(
     return Visibility(False, distance, offset, f"hors champ ({offset:.0f}° d'écart)")
 
 
-def annotate(assets: list, building_wkt: str) -> int:  # noqa: ANN001
+def is_occluded(
+    camera_lat: float,
+    camera_lon: float,
+    target_lat: float,
+    target_lon: float,
+    obstacles: list,  # noqa: ANN001 — polygones Shapely
+) -> str | None:
+    """Un autre bâtiment coupe-t-il la ligne de visée ?
+
+    Le champ de vision seul est insuffisant : sur 118 vues Street View visant
+    l'empreinte, une majorité ne montrait que des pavillons interposés. La
+    ligne caméra → cible est donc confrontée aux empreintes voisines.
+
+    Retourne l'identifiant de l'obstacle rencontré, ou `None` si la vue est
+    dégagée. Test purement 2D : il ignore la hauteur, et reste donc
+    conservateur — il ne signale que ce qu'il peut prouver.
+    """
+    from shapely.geometry import LineString
+
+    sight = LineString([(camera_lon, camera_lat), (target_lon, target_lat)])
+    for identifier, polygon in obstacles:
+        if polygon is None or polygon.is_empty:
+            continue
+        if sight.crosses(polygon) or sight.within(polygon):
+            return identifier
+    return None
+
+
+def obstacles_from(elements: list[dict], exclude_id: str) -> list:
+    """Empreintes de bâtiments susceptibles de masquer la cible."""
+    from .resolve import _to_polygon
+
+    obstacles = []
+    for element in elements:
+        identifier = f"{element.get('type')}/{element.get('id')}"
+        if identifier == exclude_id:
+            continue
+        if "building" not in (element.get("tags") or {}):
+            continue
+        polygon = _to_polygon(element)
+        if polygon is not None:
+            obstacles.append((identifier, polygon))
+    return obstacles
+
+
+def annotate(assets: list, building_wkt: str, obstacles: list | None = None) -> int:  # noqa: ANN001
     """Marque chaque asset géolocalisé. Retourne le nombre de vues du bâtiment."""
+    from shapely import wkt as shapely_wkt
+    from shapely.geometry import Point
+    from shapely.ops import nearest_points
+
+    building = shapely_wkt.loads(building_wkt)
     visible_count = 0
+    occluded_count = 0
 
     for index, asset in enumerate(assets):
         if asset.camera_lat is None or asset.camera_lon is None:
             continue
 
         result = assess(asset.camera_lat, asset.camera_lon, asset.heading_deg, building_wkt)
+        blocker = None
+        if result.visible and obstacles:
+            target = nearest_points(building, Point(asset.camera_lon, asset.camera_lat))[0]
+            blocker = is_occluded(
+                asset.camera_lat, asset.camera_lon, target.y, target.x, obstacles
+            )
+            if blocker:
+                occluded_count += 1
+
         assets[index] = asset.model_copy(
             update={
-                "sees_building": result.visible,
+                "sees_building": result.visible and blocker is None,
                 "target_distance_m": round(result.distance_m, 1),
                 "target_offset_deg": round(result.offset_deg, 1),
+                "occluded_by": blocker,
             }
         )
-        visible_count += int(result.visible)
+        visible_count += int(result.visible and blocker is None)
+
+    if obstacles:
+        log.info("occultation : %d vue(s) masquée(s) par un bâtiment voisin", occluded_count)
 
     log.info("visibilité : %d image(s) cadrent le bâtiment confirmé", visible_count)
     return visible_count

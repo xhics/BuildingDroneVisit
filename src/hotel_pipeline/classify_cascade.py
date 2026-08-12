@@ -201,10 +201,14 @@ def property_status(asset: Asset, expected: list[str], excluded: list[str]) -> P
 
     Une image peut montrer une magnifique façade d'hôtel sans être celle du
     bon hôtel. La géométrie et l'OCR y répondent ; le classifieur, jamais.
+
+    La géométrie ne vaut ici que si le cap est **observé** : viser soi-même
+    l'empreinte depuis un panorama sphérique ne prouve pas l'appartenance, pas
+    davantage qu'il ne prouvait le contenu.
     """
     from .triage import evaluate
 
-    if asset.sees_building:
+    if asset.sees_building and asset.heading_is_measured:
         return PropertyMatchStatus.MATCH
 
     if asset.sign_text:

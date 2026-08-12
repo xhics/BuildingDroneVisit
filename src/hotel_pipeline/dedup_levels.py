@@ -127,7 +127,18 @@ def viewpoint_groups(
 
     geolocated = [a for a in assets if a.camera_lat is not None and a.camera_lon is not None]
 
-    for asset in sorted(geolocated, key=lambda a: a.id):
+    # L'ordre décide du résultat : un regroupement glouton produit un nombre de
+    # points de vue différent selon l'ordre de parcours — 105 ou 118 sur le même
+    # corpus, selon qu'on triait par identifiant ou par distance. L'ordre est
+    # donc fixé ici, une fois pour toutes, et sur un critère utile : la vue la
+    # plus proche du bâtiment nomme son groupe.
+    def _order(asset: Asset) -> tuple:
+        return (
+            asset.target_distance_m if asset.target_distance_m is not None else float("inf"),
+            asset.id,
+        )
+
+    for asset in sorted(geolocated, key=_order):
         bearing = bearing_deg(building_lat, building_lon, asset.camera_lat, asset.camera_lon)
         bearings[asset.id] = bearing
 

@@ -141,13 +141,15 @@ class MultiLabelResult:
     def confidence(self) -> float:
         """Netteté globale de la décision.
 
-        Un jeu de scores tous proches de 0,5 traduit une image que le modèle
-        ne comprend pas : la confiance doit alors être basse, même si un sujet
-        franchit de justesse le seuil.
+        Mesurée comme l'écart au seuil d'acceptation, et non à 0,5. La softmax
+        porte désormais sur `[positif, *alternatives]` : avec cinq termes, la
+        valeur neutre est 0,2, si bien qu'un écart à 0,5 déclarait « confiants »
+        des scores parfaitement indécis.
         """
         if not self.scores:
             return 0.0
-        return max(abs(p - 0.5) * 2 for p in self.scores.values())
+        span = max(SUBJECT_ACCEPT, 1.0 - SUBJECT_ACCEPT)
+        return max(min(abs(p - SUBJECT_ACCEPT) / span, 1.0) for p in self.scores.values())
 
 
 @dataclass

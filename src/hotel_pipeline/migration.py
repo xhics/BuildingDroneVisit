@@ -54,6 +54,13 @@ CAPTURE_TYPE: dict[str, CaptureType] = {
     "hotel": CaptureType.HOTEL_CAPTURE,
 }
 
+#: Sources dont le cap est **choisi par nous** plutôt qu'observé. Street View
+#: rend un panorama sphérique : la direction extraite exprime une intention de
+#: cadrage. Sans cette correction, les assets créés avant l'ajout du champ
+#: conservent la valeur par défaut et se voient créditer d'une preuve qu'ils
+#: n'apportent pas.
+CHOSEN_HEADING_SOURCES: frozenset[str] = frozenset({"street_view"})
+
 TEMPORAL_FROM_ENTRANCE: dict[EntranceVersion, TemporalStatus] = {
     EntranceVersion.PRE_2024: TemporalStatus.PRE_2024,
     EntranceVersion.POST_2024: TemporalStatus.POST_2024,
@@ -71,6 +78,7 @@ class MigrationReport:
     exact_groups: int = 0
     perceptual_groups: int = 0
     subjects_set: int = 0
+    heading_corrected: int = 0
     left_unknown: dict[str, int] = field(default_factory=dict)
     unmapped_sources: list[str] = field(default_factory=list)
 
@@ -83,6 +91,7 @@ class MigrationReport:
                 "capture_type": self.capture_type_set,
                 "temporal_status": self.temporal_set,
                 "subjects": self.subjects_set,
+                "heading_provenance_corrected": self.heading_corrected,
                 "exact_duplicate_groups": self.exact_groups,
                 "perceptual_duplicate_groups": self.perceptual_groups,
             },
@@ -112,6 +121,14 @@ def migrate(manifest: AssetManifest) -> tuple[AssetManifest, MigrationReport]:
     checksum_groups: dict[str, str] = {}
 
     for index, asset in enumerate(manifest.assets):
+        # La provenance du cap se corrige même sur un asset déjà migré : le
+        # champ est postérieur à leur création.
+        if asset.source in CHOSEN_HEADING_SOURCES and asset.heading_is_measured:
+            manifest.assets[index] = asset = asset.model_copy(
+                update={"heading_is_measured": False}
+            )
+            report.heading_corrected += 1
+
         if asset.source_family is not None:
             report.already_migrated += 1
             continue
