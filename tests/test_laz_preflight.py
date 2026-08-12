@@ -33,9 +33,9 @@ def filled(polygon: Polygon, step: float = 0.3):
     xs = np.arange(minx, maxx, step)
     ys = np.arange(miny, maxy, step)
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
-    from shapely.vectorized import contains
+    from shapely import contains_xy
 
-    inside = contains(polygon, gx.ravel(), gy.ravel())
+    inside = contains_xy(polygon, gx.ravel(), gy.ravel())
     return gx.ravel()[inside], gy.ravel()[inside]
 
 
@@ -132,22 +132,44 @@ class TestWarnings:
         _add_warnings(report)
         assert report.warnings == []
 
-    def test_unclassified_reaching_roof_height_is_flagged(self):
-        """La classe 1 peut porter des superstructures : ne pas l'exclure à l'aveugle."""
+    def test_a_low_median_hides_a_high_tail(self):
+        """Le défaut réel : médiane 29,3 m, mais p95 à 40,4 m.
+
+        Comparer deux médianes ne dit rien des extrêmes, et un équipement de
+        toiture ne déplace pas une médiane sur 1 626 points.
+        """
         report = self._report(
             c2=ClassStats(GROUND, "sol", 900),
-            c6=ClassStats(BUILDING, "bâtiment", 5000, z_median=37.8),
-            c1=ClassStats(UNCLASSIFIED, "non classé", 400, z_median=38.5),
+            c6=ClassStats(BUILDING, "bâtiment", 46829, z_median=37.82, z_p95=39.76),
+            c1=ClassStats(
+                UNCLASSIFIED, "non classé", 1626, z_median=29.3, z_p95=40.42,
+                count_above={"roof_median": 239},
+            ),
         )
         _add_warnings(report)
-        assert any("superstructures" in w for w in report.warnings)
+        assert any("queue haute" in w for w in report.warnings)
+        assert any("isoler et non à exclure" in w for w in report.warnings)
 
-    def test_low_unclassified_is_not_flagged(self):
-        """Sur ce site, la classe 1 médiane à 29,3 m contre 37,8 m au toit."""
+    def test_points_above_the_roof_median_are_reported_even_below_p95(self):
         report = self._report(
             c2=ClassStats(GROUND, "sol", 900),
-            c6=ClassStats(BUILDING, "bâtiment", 5000, z_median=37.8),
-            c1=ClassStats(UNCLASSIFIED, "non classé", 1626, z_median=29.3),
+            c6=ClassStats(BUILDING, "bâtiment", 5000, z_median=37.8, z_p95=39.8),
+            c1=ClassStats(
+                UNCLASSIFIED, "non classé", 400, z_median=29.0, z_p95=33.0,
+                count_above={"roof_median": 12},
+            ),
+        )
+        _add_warnings(report)
+        assert any("12 point(s)" in w for w in report.warnings)
+
+    def test_a_genuinely_low_class_one_raises_nothing(self):
+        report = self._report(
+            c2=ClassStats(GROUND, "sol", 900),
+            c6=ClassStats(BUILDING, "bâtiment", 5000, z_median=37.8, z_p95=39.8),
+            c1=ClassStats(
+                UNCLASSIFIED, "non classé", 1626, z_median=29.3, z_p95=31.0,
+                count_above={"roof_median": 0},
+            ),
         )
         _add_warnings(report)
         assert report.warnings == []

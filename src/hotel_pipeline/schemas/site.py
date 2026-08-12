@@ -107,6 +107,71 @@ class GeoSourceProvenance(BaseModel):
         return sorted(name for name, value in required.items() if not value)
 
 
+class DerivedArtifact(BaseModel):
+    """Fichier produit par une dérivation — raster, TIN, nuage découpé.
+
+    Un WKT ne peut pas représenter honnêtement une surface 2,5D : il dit où,
+    jamais à quelle altitude, ni à quelle résolution, ni quelle part est
+    mesurée plutôt qu'interpolée. L'artefact porte donc ce que la géométrie
+    seule tait.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str
+    role: str  # dtm, dsm_roof, ndsm, unclassified_roof_candidates...
+    path: str
+    format: str  # GeoTIFF, LAZ, GeoJSON...
+    sha256: str
+
+    crs_horizontal: str
+    crs_vertical: str | None = None
+    resolution_m: float = Field(gt=0)
+    nodata: float | None = None
+
+    #: Quel traitement, avec quels paramètres. Sans eux, l'artefact n'est pas
+    #: reproductible — et un raster non reproductible n'est pas une mesure.
+    algorithm_id: str
+    parameters: dict[str, str] = Field(default_factory=dict)
+
+    #: Parts respectives de cellules mesurées et interpolées. Leur somme peut
+    #: être inférieure à 1 : le reste est sans donnée.
+    measured_fraction: float = Field(ge=0.0, le=1.0)
+    interpolated_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    derived_from_sources: list[str] = Field(default_factory=list)
+    produced_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _fractions_and_datums(self) -> "DerivedArtifact":
+        if self.measured_fraction + self.interpolated_fraction > 1.0 + 1e-9:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} : mesuré + interpolé dépasse 1 "
+                f"({self.measured_fraction} + {self.interpolated_fraction})"
+            )
+        if self.role in ELEVATION_ROLES and not self.crs_vertical:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} porte des altitudes sans "
+                "référentiel vertical"
+            )
+        if not self.derived_from_sources:
+            raise ValueError(
+                f"artefact {self.artifact_id!r} sans source : une dérivation "
+                "sans origine n'est pas vérifiable"
+            )
+        return self
+
+    @property
+    def nodata_fraction(self) -> float:
+        return round(1.0 - self.measured_fraction - self.interpolated_fraction, 6)
+
+
+#: Rôles d'artefacts portant des altitudes, donc exigeant un datum vertical.
+ELEVATION_ROLES: frozenset[str] = frozenset(
+    {"dtm", "dsm", "dsm_roof", "ndsm", "tin", "unclassified_roof_candidates"}
+)
+
+
 class SiteRelation(BaseModel):
     """Lien entre deux instances du site.
 
@@ -150,6 +215,10 @@ class SiteObject(BaseModel):
     derived_from_sources: list[str] = Field(default_factory=list)
     derivation_method: str | None = None
 
+    #: Artefacts produits qui portent la substance de l'objet — un raster
+    #: d'altitude en dit davantage qu'un contour.
+    artifact_ids: list[str] = Field(default_factory=list)
+
     #: Pourquoi l'objet reste indéterminé, le cas échéant. Un état sans motif
     #: est une information perdue.
     unresolved_reason: str | None = None
@@ -185,6 +254,9 @@ class SiteManifest(BaseModel):
 
     #: Sources géospatiales référencées par les objets dérivés.
     geo_sources: list[GeoSourceProvenance] = Field(default_factory=list)
+
+    #: Fichiers produits par les dérivations.
+    artifacts: list[DerivedArtifact] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "SiteManifest":
@@ -230,6 +302,28 @@ class SiteManifest(BaseModel):
                         f"objet {obj.object_id!r} dérivé de {source_id!r}, dont "
                         f"la provenance est incomplète : {incomplete}"
                     )
+
+        artifact_ids = [a.artifact_id for a in self.artifacts]
+        duplicated = {i for i in artifact_ids if artifact_ids.count(i) > 1}
+        if duplicated:
+            raise ValueError(f"identifiants d'artefact dupliqués : {sorted(duplicated)}")
+
+        for artifact in self.artifacts:
+            unknown = [s for s in artifact.derived_from_sources if s not in sources]
+            if unknown:
+                raise ValueError(
+                    f"artefact {artifact.artifact_id!r} dérivé de sources non "
+                    f"déclarées : {unknown}"
+                )
+
+        known_artifacts = set(artifact_ids)
+        for obj in self.objects:
+            missing_artifacts = [a for a in obj.artifact_ids if a not in known_artifacts]
+            if missing_artifacts:
+                raise ValueError(
+                    f"objet {obj.object_id!r} référence des artefacts absents : "
+                    f"{missing_artifacts}"
+                )
         return self
 
     # -- accès ------------------------------------------------------------
@@ -262,6 +356,9 @@ class SiteManifest(BaseModel):
     def source(self, source_id: str) -> GeoSourceProvenance | None:
         return next((s for s in self.geo_sources if s.source_id == source_id), None)
 
+    def artifact(self, artifact_id: str) -> DerivedArtifact | None:
+        return next((a for a in self.artifacts if a.artifact_id == artifact_id), None)
+
     def derived(self) -> list[SiteObject]:
         """Objets issus d'un traitement géospatial, par opposition aux relevés."""
         return [o for o in self.objects if o.derived_from_sources]
@@ -275,5 +372,6 @@ class SiteManifest(BaseModel):
             "missing_kinds": len(self.missing_required()),
             "relations": sum(len(o.relations) for o in self.objects),
             "geo_sources": len(self.geo_sources),
+            "artifacts": len(self.artifacts),
             "derived_objects": len(self.derived()),
         }

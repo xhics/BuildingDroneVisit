@@ -55,6 +55,14 @@ class ClassStats:
     z_median: float | None = None
     z_max: float | None = None
 
+    #: Queue haute. Une médiane basse peut masquer des points élevés :
+    #: la classe 1 de ce site est médiane à 29,3 m mais atteint 41,9 m.
+    z_p90: float | None = None
+    z_p95: float | None = None
+
+    #: Effectifs au-dessus de seuils dérivés de la toiture.
+    count_above: dict[str, int] = field(default_factory=dict)
+
     def as_dict(self) -> dict:
         return {
             "code": self.code,
@@ -62,7 +70,10 @@ class ClassStats:
             "count": self.count,
             "z_min": self.z_min,
             "z_median": self.z_median,
+            "z_p90": self.z_p90,
+            "z_p95": self.z_p95,
             "z_max": self.z_max,
+            "count_above": self.count_above,
         }
 
 
@@ -126,8 +137,16 @@ def _stats(codes, z, code: int) -> ClassStats:  # noqa: ANN001
     if stats.count:
         stats.z_min = float(np.min(selected))
         stats.z_median = float(np.median(selected))
+        stats.z_p90 = float(np.percentile(selected, 90))
+        stats.z_p95 = float(np.percentile(selected, 95))
         stats.z_max = float(np.max(selected))
     return stats
+
+
+def _count_above(z, codes, code: int, thresholds: dict[str, float]) -> dict[str, int]:  # noqa: ANN001
+    """Effectifs d'une classe au-dessus de seuils donnés."""
+    selected = z[codes == code]
+    return {name: int((selected > value).sum()) for name, value in thresholds.items()}
 
 
 def _cell_coverage(x, y, footprint, cell_m: float) -> float:  # noqa: ANN001
@@ -141,7 +160,7 @@ def _cell_coverage(x, y, footprint, cell_m: float) -> float:  # noqa: ANN001
     par mètre carré.
     """
     import numpy as np
-    from shapely.vectorized import contains
+    from shapely import contains_xy
 
     minx, miny, maxx, maxy = footprint.bounds
     columns = max(1, int((maxx - minx) / cell_m))
@@ -151,7 +170,7 @@ def _cell_coverage(x, y, footprint, cell_m: float) -> float:  # noqa: ANN001
     cx = minx + (np.arange(columns) + 0.5) * cell_m
     cy = miny + (np.arange(rows) + 0.5) * cell_m
     grid_x, grid_y = np.meshgrid(cx, cy, indexing="ij")
-    inside_grid = contains(footprint, grid_x.ravel(), grid_y.ravel())
+    inside_grid = contains_xy(footprint, grid_x.ravel(), grid_y.ravel())
     denominator = int(inside_grid.sum())
     if denominator == 0:
         return 0.0
@@ -179,8 +198,8 @@ def run(laz_path: Path, footprint_wkt: str, declared_crs: str) -> PreflightRepor
     import numpy as np
     from pyproj import Transformer
     from shapely import wkt as shapely_wkt
+    from shapely import contains_xy
     from shapely.ops import transform as shapely_transform
-    from shapely.vectorized import contains
 
     report = PreflightReport(file=laz_path.name)
 
@@ -227,10 +246,23 @@ def run(laz_path: Path, footprint_wkt: str, declared_crs: str) -> PreflightRepor
     )
     xw, yw, zw, cw = x[window], y[window], z[window], codes[window]
 
-    inside = contains(footprint, xw, yw)
+    inside = contains_xy(footprint, xw, yw)
     for code in (UNCLASSIFIED, GROUND, BUILDING, NOISE):
         report.footprint_classes[code] = _stats(cw[inside], zw[inside], code)
         report.margin_classes[code] = _stats(cw[~inside], zw[~inside], code)
+
+    # Seuils rapportés à la toiture réelle, non à des valeurs absolues : un
+    # bâtiment bas et une tour n'ont pas les mêmes altitudes.
+    roof = report.footprint_classes[BUILDING]
+    if roof.count:
+        thresholds = {
+            "roof_median": roof.z_median,
+            "roof_p95": roof.z_p95,
+            "roof_max": roof.z_max,
+        }
+        report.footprint_classes[UNCLASSIFIED].count_above = _count_above(
+            zw[inside], cw[inside], UNCLASSIFIED, thresholds
+        )
 
     area = report.footprint_area_m2 or 1.0
     report.ground_density_per_m2 = round(
@@ -303,11 +335,22 @@ def _add_warnings(report: PreflightReport) -> None:
         )
 
     if unclassified and building and unclassified.count and building.count:
-        # Si la classe 1 culmine au niveau du toit, elle en porte probablement
-        # des éléments ; si elle reste basse, c'est de la végétation ou du sol.
-        if unclassified.z_median is not None and building.z_median is not None:
-            if unclassified.z_median >= building.z_median:
+        # Comparer les médianes ne suffit pas : sur ce site, la classe 1 est
+        # médiane à 29,3 m — donc apparemment basse — tout en atteignant
+        # 41,9 m, au-dessus du maximum de la toiture. C'est la queue haute qui
+        # porte le risque, pas le centre de la distribution.
+        roof_reference = building.z_median
+        high = unclassified.count_above.get("roof_median", 0)
+        if unclassified.z_p95 is not None and building.z_p95 is not None:
+            if unclassified.z_p95 >= building.z_p95:
                 report.warnings.append(
-                    "classe 1 aussi haute que la classe 6 — examiner avant de "
-                    "l'exclure du MNS, elle peut porter des superstructures"
+                    f"queue haute de la classe 1 au niveau de la toiture "
+                    f"(p95 {unclassified.z_p95:.1f} m contre {building.z_p95:.1f} m) — "
+                    f"{high} point(s) au-dessus de {roof_reference:.1f} m : "
+                    "candidats à des superstructures, à isoler et non à exclure"
+                )
+            elif high:
+                report.warnings.append(
+                    f"{high} point(s) de classe 1 au-dessus de la médiane de "
+                    "toiture — à isoler dans une couche de candidats"
                 )
