@@ -24,6 +24,25 @@ from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 
 log = get_logger("temporal")
 
+#: Sujets par lesquels une portée devient visible dans une image.
+#:
+#: Les deux vocabulaires ne coïncident pas : la portée `signage` désigne des
+#: travaux d'enseigne, le sujet `sign` désigne une enseigne à l'écran. Sans
+#: cette table, `signage` ne se déclenchait jamais.
+SCOPE_SUBJECTS: dict[str, tuple[str, ...]] = {
+    "entrance": ("entrance",),
+    "signage": ("sign",),
+    "facade": ("building",),
+    "roof": ("roof",),
+    "grounds": ("grounds",),
+    "parking": ("parking",),
+}
+
+
+def subjects_for_scope(scope: str) -> tuple[str, ...]:
+    """Sujets révélant une portée. Une portée inconnue se cherche sous son nom."""
+    return SCOPE_SUBJECTS.get(scope, (scope,))
+
 
 @dataclass
 class TemporalReport:
@@ -148,7 +167,7 @@ def undetermined_sensitive_scopes(
     return [
         scope
         for scope in policy.temporal.sensitive_scopes
-        if scope in shown
+        if shown.intersection(subjects_for_scope(scope))
         and asset.temporal_by_scope.get(scope, TemporalStatus.UNKNOWN)
         is TemporalStatus.UNKNOWN
     ]

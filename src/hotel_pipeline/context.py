@@ -119,13 +119,25 @@ class PipelineContext:
 
     @classmethod
     def for_workspace(cls, workspace) -> tuple["PipelineContext", str | None]:  # noqa: ANN001
-        """Contexte d'un espace de travail, politique comprise.
+        """Contexte d'un espace de travail, politique et profil compris.
 
         La politique est lue dans `00_manifest/`, jamais relativement au
         répertoire courant : sinon le même projet rendrait des résultats
         différents selon l'endroit d'où la commande est lancée.
+
+        Le profil vient du manifeste de projet — `property_profile_id` — et non
+        de l'identifiant d'hôtel. Les commandes autonomes et `run-phase1`
+        chargeaient sinon deux profils différents pour le même projet.
         """
-        return cls.load_lenient(workspace.hotel_id, policy_path=workspace.policy_path)
+        property_id = workspace.hotel_id
+        try:
+            project = workspace.read_manifest()
+        except FileNotFoundError:
+            pass
+        else:
+            property_id = project.property_profile_id or project.hotel_id
+
+        return cls.load_lenient(property_id, policy_path=workspace.policy_path)
 
     @classmethod
     def default(cls) -> "PipelineContext":

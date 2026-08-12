@@ -183,6 +183,11 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     assess(assets.assets, context.profile, context.policy)
     workspace.write_assets(assets)
 
+    # `assess` remplace les instances : relire la liste éligible, sinon le
+    # verrou examine des états périmés et bloque sur une datation qui vient
+    # d'être dérivée.
+    eligible = assets.production_eligible()
+
     blocking = [
         (a, undetermined_sensitive_scopes(a, context.policy))
         for a in eligible
