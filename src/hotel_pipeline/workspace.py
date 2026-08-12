@@ -39,6 +39,7 @@ MANIFEST_NAME = "project_manifest.json"
 SPATIAL_MANIFEST_NAME = "spatial_manifest.json"
 ASSET_MANIFEST_NAME = "asset_manifest.json"
 POLICY_NAME = "pipeline_policy.json"
+SITE_MANIFEST_NAME = "site_manifest.json"
 REPORT_NAME = "report.json"
 
 
@@ -156,6 +157,21 @@ class Workspace:
         from .schemas import AssetManifest
 
         return AssetManifest.model_validate_json(self.assets_path.read_text("utf-8"))
+
+    @property
+    def site_path(self) -> Path:
+        return self.root / "00_manifest" / SITE_MANIFEST_NAME
+
+    def read_site(self):  # noqa: ANN201
+        if not self.site_path.is_file():
+            return None
+        from .schemas.site import SiteManifest
+
+        return SiteManifest.model_validate_json(self.site_path.read_text("utf-8"))
+
+    def write_site(self, site) -> None:  # noqa: ANN001
+        self.site_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(self.site_path, site.model_dump_json(indent=2))
 
     def write_assets(self, assets: "AssetManifest") -> None:
         self.assets_path.parent.mkdir(parents=True, exist_ok=True)

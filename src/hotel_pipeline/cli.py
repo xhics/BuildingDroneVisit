@@ -561,6 +561,59 @@ def assets_classify(
     typer.echo(f"  secteurs: {report.sectors_assigned}")
 
 
+site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
+app.add_typer(site_app, name="site")
+
+
+@site_app.command("build")
+def site_build(hotel_id: str = typer.Argument(...)) -> None:
+    """Instancie les objets du site depuis le gabarit générique."""
+    from . import site as site_builder
+    from .steps import ELEMENTS_FILE
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    if spatial is None:
+        typer.secho("aucun manifeste spatial", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    elements = workspace.read_json(ELEMENTS_FILE) or []
+    roads = workspace.read_json("01_sources/road_network.json") or []
+    manifest = workspace.read_assets()
+
+    site, report = site_builder.build(
+        hotel_id, spatial, elements, roads, manifest.assets if manifest else None
+    )
+    workspace.write_site(site)
+    workspace.write_report("01_sources/site_report.json", report, context)
+
+    for key, value in site.summary().items():
+        typer.echo(f"  {key:<20} {value}")
+    if site.missing_required():
+        typer.secho(f"  types non instanciés : {site.missing_required()}", fg=typer.colors.RED)
+
+
+@site_app.command("show")
+def site_show(hotel_id: str = typer.Argument(...)) -> None:
+    """Liste les instances du site, leur état et leurs relations."""
+    site = Workspace(hotel_id).read_site()
+    if site is None:
+        typer.secho("aucun manifeste de site — lancez : site build", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+
+    for obj in sorted(site.objects, key=lambda o: (o.state.value, o.kind)):
+        mark = {"confirmed": OK, "inferred": "~", "conflicted": "!", "unresolved": "·"}[
+            obj.state.value
+        ]
+        source = obj.source_ref or ""
+        typer.echo(f"  {mark} {obj.kind:<24} {obj.state.value:<11} {source}")
+        if obj.unresolved_reason:
+            typer.echo(f"      motif : {obj.unresolved_reason}")
+        for relation in obj.relations:
+            typer.echo(f"      {relation.predicate} → {relation.target_id.split(':')[-1]}")
+
+
 temporal_app = typer.Typer(
     no_args_is_help=True, help="Datation par portée (entrance, facade, roof, signage)."
 )
