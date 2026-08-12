@@ -289,13 +289,19 @@ def pseudo_building_validation(
         predicted = interpolate_tin(
             px[ring], py[ring], pz[ring], px[masked], py[masked]
         )
+        # Même règle que pour la production : l'erreur ne se mesure que là où
+        # le TIN reconstruit. Sinon une méthode extrapolant partout serait
+        # récompensée d'avoir répondu.
         scores = _scores(pz[masked], predicted)
+        unsupported = int(np.isnan(predicted).sum())
         distances = support_distance(px[ring], py[ring], px[masked], py[masked])
 
         results.append(
             {
                 "centre": [round(cx, 1), round(cy, 1)],
                 "masked_points": int(masked.sum()),
+                "reconstructed_points": int(masked.sum()) - unsupported,
+                "unsupported_points": unsupported,
                 **scores.as_dict(),
                 "support_distance_p95_m": round(float(np.percentile(distances, 95)), 2),
                 "support_distance_max_m": round(float(distances.max()), 2),
@@ -304,3 +310,136 @@ def pseudo_building_validation(
 
     log.info("validation par faux bâtiment : %d essai(s) exploitable(s)", len(results))
     return results
+
+
+# --- domaine de comparaison et masques ------------------------------------
+
+
+@dataclass
+class Disagreement:
+    """Écart entre le TIN de production et l'IDW de diagnostic.
+
+    Mesuré **uniquement** là où les deux répondent. Le comparer là où le TIN
+    renonce n'aurait aucun sens : l'écart y serait infini par construction, et
+    récompenserait la méthode qui extrapole le plus.
+    """
+
+    compared_cells: int = 0
+    compared_fraction: float = 0.0
+    median_signed_bias: float | None = None
+    mae: float | None = None
+    rmse: float | None = None
+    p95_abs: float | None = None
+    max_abs: float | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "compared_cells": self.compared_cells,
+            "compared_fraction": self.compared_fraction,
+            "median_signed_bias_m": self.median_signed_bias,
+            "mae_m": self.mae,
+            "rmse_m": self.rmse,
+            "p95_abs_m": self.p95_abs,
+            "max_abs_m": self.max_abs,
+        }
+
+
+@dataclass
+class ExtrapolationRejected:
+    """Cellules que seul l'IDW aurait remplies — et qui restent sans donnée.
+
+    Ce n'est pas un désaccord entre méthodes : c'est une extrapolation refusée.
+    Les compter à part empêche de présenter un refus comme une divergence.
+    """
+
+    cells: int = 0
+    fraction: float = 0.0
+    distance_p50: float | None = None
+    distance_p95: float | None = None
+    distance_max: float | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "cells": self.cells,
+            "fraction_of_footprint": self.fraction,
+            "distance_to_ground_p50_m": self.distance_p50,
+            "distance_to_ground_p95_m": self.distance_p95,
+            "distance_to_ground_max_m": self.distance_max,
+        }
+
+
+@dataclass
+class DefinitionMasks:
+    """Quatre masques mutuellement exclusifs, sur la grille du domaine.
+
+    `tin_only` devrait rester vide — le TIN est plus restrictif que l'IDW —
+    mais le masque existe pour que l'anomalie soit visible si elle survient,
+    plutôt que silencieusement absorbée.
+    """
+
+    both_defined: np.ndarray
+    tin_only: np.ndarray
+    idw_only: np.ndarray
+    neither_defined: np.ndarray
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "both_defined": int(self.both_defined.sum()),
+            "tin_only": int(self.tin_only.sum()),
+            "idw_only": int(self.idw_only.sum()),
+            "neither_defined": int(self.neither_defined.sum()),
+        }
+
+    def is_partition_of(self, domain_cells: int) -> bool:
+        return sum(self.counts().values()) == domain_cells
+
+
+def definition_masks(tin_values, idw_values, in_domain) -> DefinitionMasks:  # noqa: ANN001
+    """Répartit les cellules du domaine selon les méthodes qui y répondent."""
+    tin_ok = np.isfinite(tin_values) & in_domain
+    idw_ok = np.isfinite(idw_values) & in_domain
+    return DefinitionMasks(
+        both_defined=tin_ok & idw_ok,
+        tin_only=tin_ok & ~idw_ok,
+        idw_only=idw_ok & ~tin_ok,
+        neither_defined=in_domain & ~tin_ok & ~idw_ok,
+    )
+
+
+def compare_models(tin_values, idw_values, masks: DefinitionMasks, domain_cells: int) -> Disagreement:  # noqa: ANN001
+    """Désaccord TIN/IDW sur le seul domaine commun."""
+    both = masks.both_defined
+    result = Disagreement(
+        compared_cells=int(both.sum()),
+        compared_fraction=round(int(both.sum()) / max(domain_cells, 1), 4),
+    )
+    if result.compared_cells == 0:
+        return result
+
+    error = np.asarray(idw_values)[both] - np.asarray(tin_values)[both]
+    absolute = np.abs(error)
+    result.median_signed_bias = round(float(np.median(error)), 4)
+    result.mae = round(float(np.mean(absolute)), 4)
+    result.rmse = round(float(np.sqrt(np.mean(error**2))), 4)
+    result.p95_abs = round(float(np.percentile(absolute, 95)), 4)
+    result.max_abs = round(float(absolute.max()), 4)
+    return result
+
+
+def rejected_extrapolation(
+    masks: DefinitionMasks, distances_to_ground, domain_cells: int  # noqa: ANN001
+) -> ExtrapolationRejected:
+    """Décrit les cellules refusées, avec leur éloignement au sol réel."""
+    idw_only = masks.idw_only
+    result = ExtrapolationRejected(
+        cells=int(idw_only.sum()),
+        fraction=round(int(idw_only.sum()) / max(domain_cells, 1), 4),
+    )
+    if result.cells == 0:
+        return result
+
+    distances = np.asarray(distances_to_ground)[idw_only]
+    result.distance_p50 = round(float(np.percentile(distances, 50)), 2)
+    result.distance_p95 = round(float(np.percentile(distances, 95)), 2)
+    result.distance_max = round(float(distances.max()), 2)
+    return result

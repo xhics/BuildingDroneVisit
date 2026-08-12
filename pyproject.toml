@@ -41,6 +41,8 @@ vision = [
 geo = [
     "laspy[lazrs]>=2.5",   # lecture LAZ
     "pyproj>=3.6",         # reprojection WGS84 vers le référentiel de la tuile
+    "rasterio>=1.4",       # écriture des GeoTIFF dérivés
+    "scipy>=1.11",         # triangulation TIN et recherche du plus proche voisin
 ]
 
 # Poste local Mac Intel uniquement. torch 2.2.2 est la dernière version
@@ -57,6 +59,9 @@ vision-macos-intel = [
     "scikit-image<0.25",
     # pyproj 3.7 n'a pas de roue x86_64 macOS et exige PROJ pour compiler.
     "pyproj==3.6.1",
+    # Les roues Intel de rasterio 1.4.4 et 1.5 exigent macOS 15 ; cette
+    # machine est sous macOS 12. La 1.4.3 fournit une roue macosx_10_15.
+    "rasterio==1.4.3",
 ]
 
 # OCR par service, uniquement en repli si EasyOCR est indisponible.

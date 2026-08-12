@@ -12,6 +12,9 @@ import pytest
 
 from hotel_pipeline.geo.terrain import (
     aggregate_median,
+    compare_models,
+    definition_masks,
+    rejected_extrapolation,
     aligned_origin,
     block_cross_validation,
     interpolate_idw,
@@ -154,3 +157,95 @@ class TestPseudoBuildingValidation:
         """Sans pourtour, un essai serait dégénéré plutôt qu'informatif."""
         x, y, z = sloped_ground(n=1200)
         assert pseudo_building_validation(x, y, z, width_m=200, height_m=200) == []
+
+
+class TestComparisonDomain:
+    """IDW est un contre-modèle de diagnostic, jamais un remplisseur.
+
+    Comparer les deux méthodes là où le TIN renonce donnerait un écart infini
+    par construction, et récompenserait celle qui extrapole le plus.
+    """
+
+    def domain(self, n=12):
+        tin = np.full(n, 10.0)
+        idw = np.full(n, 10.2)
+        in_domain = np.ones(n, dtype=bool)
+        return tin, idw, in_domain
+
+    def test_masks_partition_the_domain(self):
+        tin, idw, in_domain = self.domain()
+        tin[:3] = np.nan          # refus du TIN
+        idw[10:] = np.nan         # refus de l'IDW
+        in_domain[11] = False     # hors empreinte
+
+        masks = definition_masks(tin, idw, in_domain)
+        assert masks.is_partition_of(int(in_domain.sum()))
+        assert masks.counts()["idw_only"] == 3
+        assert masks.counts()["tin_only"] == 1
+
+    def test_disagreement_uses_only_the_common_domain(self):
+        tin, idw, in_domain = self.domain()
+        tin[:4] = np.nan
+        masks = definition_masks(tin, idw, in_domain)
+        result = compare_models(tin, idw, masks, int(in_domain.sum()))
+
+        assert result.compared_cells == 8
+        assert result.mae == pytest.approx(0.2, abs=1e-6)
+
+    def test_disagreement_reports_a_signed_median_bias(self):
+        """Un biais signé dit dans quel sens les modèles divergent."""
+        tin, idw, in_domain = self.domain()
+        masks = definition_masks(tin, idw, in_domain)
+        result = compare_models(tin, idw, masks, int(in_domain.sum()))
+        assert result.median_signed_bias == pytest.approx(0.2, abs=1e-6)
+
+    def test_no_common_cell_yields_no_score(self):
+        tin = np.array([np.nan, np.nan])
+        idw = np.array([1.0, 2.0])
+        masks = definition_masks(tin, idw, np.ones(2, dtype=bool))
+        assert compare_models(tin, idw, masks, 2).compared_cells == 0
+
+    def test_idw_only_cells_are_rejected_not_disagreeing(self):
+        """Une extrapolation refusée n'est pas une divergence de méthodes."""
+        tin, idw, in_domain = self.domain()
+        tin[:5] = np.nan
+        distances = np.linspace(1.0, 24.0, 12)
+
+        masks = definition_masks(tin, idw, in_domain)
+        rejected = rejected_extrapolation(masks, distances, int(in_domain.sum()))
+
+        assert rejected.cells == 5
+        assert rejected.fraction == pytest.approx(5 / 12, abs=1e-4)
+        assert rejected.distance_max is not None
+
+    def test_rejected_cells_report_their_distance_to_real_ground(self):
+        tin, idw, in_domain = self.domain(n=4)
+        tin[:2] = np.nan
+        distances = np.array([18.0, 22.0, 1.0, 2.0])
+
+        masks = definition_masks(tin, idw, in_domain)
+        rejected = rejected_extrapolation(masks, distances, 4)
+        assert rejected.distance_max == pytest.approx(22.0)
+        assert rejected.distance_p50 == pytest.approx(20.0)
+
+    def test_a_fully_supported_domain_rejects_nothing(self):
+        tin, idw, in_domain = self.domain()
+        masks = definition_masks(tin, idw, in_domain)
+        rejected = rejected_extrapolation(masks, np.zeros(12), 12)
+        assert rejected.cells == 0
+        assert rejected.distance_max is None
+
+
+class TestPseudoBuildingFollowsTheSameRule:
+    def test_unsupported_points_are_counted_apart_from_the_error(self):
+        x, y, z = sloped_ground(n=2500)
+        trials = pseudo_building_validation(
+            x, y, z, width_m=16, height_m=10, ring_m=8.0, trials=2
+        )
+        assert trials
+        for trial in trials:
+            assert trial["reconstructed_points"] + trial["unsupported_points"] == (
+                trial["masked_points"]
+            )
+            # L'erreur ne porte que sur ce qui a été reconstruit.
+            assert trial["n"] == trial["reconstructed_points"]
