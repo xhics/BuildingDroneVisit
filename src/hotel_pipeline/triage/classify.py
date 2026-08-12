@@ -47,42 +47,48 @@ CATEGORY_PROMPTS: dict[AssetCategory, list[str]] = {
 }
 
 
-#: Chaque sujet est jugé **indépendamment**, par opposition à une description
-#: contraire. Une softmax sur deux termes donne une probabilité par sujet, au
+#: Chaque sujet est jugé **indépendamment**, par opposition à une scène
+#: alternative. Une softmax sur ce couple donne une probabilité par sujet, au
 #: lieu d'un argmax qui désigne toujours un vainqueur même quand toutes les
 #: hypothèses sont faibles.
+#:
+#: **Le terme opposé décrit une scène concrète, jamais une négation.** CLIP ne
+#: traite pas la négation : « a photo with no building visible » contient le
+#: mot « building » et l'emporte donc sur une image de bâtiment. Ce piège a
+#: mesuré 0 hôtel sur 118 vues Street View dont la première montrait clairement
+#: le WelcomINNS ; corriger l'opposé a fait passer le score de 0,01 à 0,60.
 SUBJECT_PROMPTS: dict[str, tuple[str, str]] = {
     "building": (
-        "a photo showing a multi-storey hotel or motel building from outside",
-        "a photo with no building visible",
+        "a multi-storey hotel, motel or apartment building seen from outside",
+        "an empty road, parking lot, sky, trees or open grass field",
     ),
     "entrance": (
-        "the main entrance doors of a hotel, with a canopy, porch or lobby doors",
-        "a photo with no building entrance visible",
+        "the main entrance of a hotel, with glass doors under a canopy or porch",
+        "a long blank facade, an empty road or a stretch of lawn",
     ),
     "sign": (
-        "a hotel sign, illuminated lettering or a branded pylon sign",
-        "a photo with no sign or lettering",
+        "large lettering, an illuminated hotel sign or a branded pylon sign",
+        "a plain brick wall, bare asphalt or a row of trees",
     ),
     "parking": (
-        "a parking lot with parked cars",
-        "a photo with no parking lot",
+        "a parking lot with several parked cars",
+        "an empty lawn, a building interior or a clear stretch of asphalt",
     ),
     "roof": (
-        "a view showing the roof of a building from above or from a high angle",
-        "a photo where no roof is visible",
+        "a rooftop seen from above, showing roof surfaces and their edges",
+        "a ground-level view of walls, road surface and trees",
     ),
     "grounds": (
-        "landscaped grounds, lawn, hedges or planted areas around a building",
-        "a photo with no landscaping",
+        "landscaped grounds with lawn, hedges, shrubs or planted beds",
+        "bare asphalt pavement, a building interior or a blank wall",
     ),
     "road": (
-        "a road, street or highway lanes",
-        "a photo with no road",
+        "a road, street or highway with lane markings and asphalt",
+        "a building interior, a rooftop view or a dense lawn",
     ),
     "interior": (
-        "an indoor room, corridor, lobby, bathroom or swimming pool inside a building",
-        "an outdoor photo taken outside a building",
+        "an indoor room, corridor, lobby, bathroom or swimming pool",
+        "an outdoor street scene with open sky above",
     ),
 }
 

@@ -182,3 +182,41 @@ class TestReport:
         assert report.total == 2
         assert report.unknown_sector == 2
         assert "unknown" in report.sectors_assigned
+
+
+class TestPromptConstruction:
+    """CLIP ne traite pas la négation (régression mesurée sur le corpus réel).
+
+    Le prompt opposé « a photo with no building visible » contenait le mot
+    « building » et l'emportait sur une image de bâtiment : 0 hôtel détecté sur
+    118 vues Street View dont la première montrait clairement le WelcomINNS.
+    """
+
+    def test_no_opposite_prompt_uses_negation(self):
+        from hotel_pipeline.triage.classify import SUBJECT_PROMPTS
+
+        forbidden = (" no ", "without", "not ", "n't")
+        offenders = [
+            subject
+            for subject, (_, opposite) in SUBJECT_PROMPTS.items()
+            if any(token in f" {opposite.lower()} " for token in forbidden)
+        ]
+        assert offenders == [], f"négation dans les opposés : {offenders}"
+
+    def test_opposite_never_repeats_the_subject_word(self):
+        """Un opposé qui répète le mot du sujet attire ce qu'il devait exclure."""
+        from hotel_pipeline.triage.classify import SUBJECT_PROMPTS
+
+        offenders = [
+            subject
+            for subject, (_, opposite) in SUBJECT_PROMPTS.items()
+            if subject.rstrip("s") in opposite.lower()
+        ]
+        assert offenders == [], f"le sujet apparaît dans son opposé : {offenders}"
+
+    def test_every_subject_declares_both_prompts(self):
+        from hotel_pipeline.triage.classify import SUBJECT_PROMPTS
+
+        for subject, prompts in SUBJECT_PROMPTS.items():
+            assert len(prompts) == 2, subject
+            assert all(p.strip() for p in prompts), subject
