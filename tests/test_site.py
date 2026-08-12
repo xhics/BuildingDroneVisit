@@ -231,3 +231,74 @@ class TestNoBuildingConfirmed:
         assert site.missing_required() == []
         assert site.by_id(object_id(HOTEL, "BUILDING_MAIN")).state is ObjectState.UNRESOLVED
         assert report.confirmed == 0
+
+
+class TestGeoProvenance:
+    """Un objet dérivé sans provenance n'est pas vérifiable (audit LiDAR)."""
+
+    def _source(self, **overrides):
+        from hotel_pipeline.schemas import GeoSourceProvenance
+
+        fields = dict(
+            source_id="lidar-2023-31H05NE",
+            dataset="Données LiDAR du Québec",
+            vintage="2023",
+            tile_id="31H05NE",
+            crs_horizontal="EPSG:2950",
+            crs_vertical="CGVD2013",
+            point_density_per_m2=8.0,
+        )
+        fields.update(overrides)
+        return GeoSourceProvenance(**fields)
+
+    def test_derived_object_must_reference_a_declared_source(self):
+        with pytest.raises(ValueError, match="sources non déclarées"):
+            SiteManifest(
+                hotel_id=HOTEL,
+                objects=[
+                    SiteObject(
+                        object_id="a", kind="TERRAIN_MAIN", state=ObjectState.INFERRED,
+                        derived_from_sources=["source-fantome"],
+                        derivation_method="MNT",
+                    )
+                ],
+            )
+
+    def test_derived_object_must_state_its_method(self):
+        with pytest.raises(ValueError, match="sans méthode"):
+            SiteManifest(
+                hotel_id=HOTEL,
+                geo_sources=[self._source()],
+                objects=[
+                    SiteObject(
+                        object_id="a", kind="TERRAIN_MAIN", state=ObjectState.INFERRED,
+                        derived_from_sources=["lidar-2023-31H05NE"],
+                    )
+                ],
+            )
+
+    def test_valid_derivation_is_accepted_and_listed(self):
+        manifest = SiteManifest(
+            hotel_id=HOTEL,
+            geo_sources=[self._source()],
+            objects=[
+                SiteObject(
+                    object_id="a", kind="ROOFLINE_MAIN", state=ObjectState.INFERRED,
+                    derived_from_sources=["lidar-2023-31H05NE"],
+                    derivation_method="MNS − MNT, seuil 2 m",
+                )
+            ],
+        )
+        assert [o.kind for o in manifest.derived()] == ["ROOFLINE_MAIN"]
+        assert manifest.source("lidar-2023-31H05NE").crs_vertical == "CGVD2013"
+
+    def test_vertical_datum_without_horizontal_is_rejected(self):
+        """Une altitude sans référentiel horizontal ne situe rien."""
+        with pytest.raises(ValueError, match="ne situe rien"):
+            self._source(crs_horizontal=None)
+
+    def test_summary_counts_sources_and_derived_objects(self, spatial, elements, roads):
+        site, _ = build(HOTEL, spatial, elements, roads)
+        summary = site.summary()
+        assert summary["geo_sources"] == 0
+        assert summary["derived_objects"] == 0

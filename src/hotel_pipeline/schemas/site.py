@@ -30,6 +30,46 @@ from .critical_objects import EXCLUDED_KINDS, REQUIRED_OBJECTS
 from .enums import ObjectState
 
 
+class GeoSourceProvenance(BaseModel):
+    """Origine d'une donnée géospatiale ayant servi à dériver un objet.
+
+    Un objet dérivé sans provenance n'est pas vérifiable : on ignore de quel
+    millésime il vient, dans quel référentiel vertical il est exprimé, et avec
+    quel algorithme il a été produit. Une altitude sans référentiel vertical
+    n'est pas une altitude — c'est un nombre.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_id: str
+    dataset: str            # ex. « LiDAR Québec », « Orthophotos CMM »
+    vintage: str | None = None   # millésime ou année d'acquisition
+    tile_id: str | None = None
+
+    #: Référentiels horizontal **et** vertical, distincts et tous deux requis
+    #: pour une donnée d'élévation.
+    crs_horizontal: str | None = None
+    crs_vertical: str | None = None
+
+    #: Résolution d'un raster, ou densité de points d'un nuage.
+    resolution_m: float | None = Field(default=None, gt=0)
+    point_density_per_m2: float | None = Field(default=None, gt=0)
+
+    file_digest: str | None = None
+    licence: str | None = None
+    retrieved_at: datetime | None = None
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def _elevation_needs_a_vertical_datum(self) -> "GeoSourceProvenance":
+        if (self.point_density_per_m2 or self.crs_vertical) and not self.crs_horizontal:
+            raise ValueError(
+                f"source {self.source_id!r} : un référentiel vertical sans "
+                "référentiel horizontal ne situe rien"
+            )
+        return self
+
+
 class SiteRelation(BaseModel):
     """Lien entre deux instances du site.
 
@@ -69,6 +109,10 @@ class SiteObject(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     relations: list[SiteRelation] = Field(default_factory=list)
 
+    #: Sources géospatiales dont l'objet est dérivé, et par quel traitement.
+    derived_from_sources: list[str] = Field(default_factory=list)
+    derivation_method: str | None = None
+
     #: Pourquoi l'objet reste indéterminé, le cas échéant. Un état sans motif
     #: est une information perdue.
     unresolved_reason: str | None = None
@@ -102,6 +146,9 @@ class SiteManifest(BaseModel):
     objects: list[SiteObject] = Field(default_factory=list)
     built_at: datetime | None = None
 
+    #: Sources géospatiales référencées par les objets dérivés.
+    geo_sources: list[GeoSourceProvenance] = Field(default_factory=list)
+
     @model_validator(mode="after")
     def _unique_ids(self) -> "SiteManifest":
         seen: set[str] = set()
@@ -118,6 +165,18 @@ class SiteManifest(BaseModel):
                         f"relation de {obj.object_id!r} vers un objet absent : "
                         f"{relation.target_id!r}"
                     )
+
+        sources = {s.source_id for s in self.geo_sources}
+        for obj in self.objects:
+            missing = [s for s in obj.derived_from_sources if s not in sources]
+            if missing:
+                raise ValueError(
+                    f"objet {obj.object_id!r} dérivé de sources non déclarées : {missing}"
+                )
+            if obj.derived_from_sources and not obj.derivation_method:
+                raise ValueError(
+                    f"objet {obj.object_id!r} dérivé sans méthode de dérivation"
+                )
         return self
 
     # -- accès ------------------------------------------------------------
@@ -147,6 +206,13 @@ class SiteManifest(BaseModel):
         present = {o.kind for o in self.objects}
         return [kind for kind in REQUIRED_OBJECTS if kind not in present]
 
+    def source(self, source_id: str) -> GeoSourceProvenance | None:
+        return next((s for s in self.geo_sources if s.source_id == source_id), None)
+
+    def derived(self) -> list[SiteObject]:
+        """Objets issus d'un traitement géospatial, par opposition aux relevés."""
+        return [o for o in self.objects if o.derived_from_sources]
+
     def summary(self) -> dict[str, int]:
         return {
             "objects": len(self.objects),
@@ -155,4 +221,6 @@ class SiteManifest(BaseModel):
             "excluded_instances": len(self.excluded_instances()),
             "missing_kinds": len(self.missing_required()),
             "relations": sum(len(o.relations) for o in self.objects),
+            "geo_sources": len(self.geo_sources),
+            "derived_objects": len(self.derived()),
         }

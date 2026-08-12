@@ -30,7 +30,7 @@ from .enums import (
     ViewSector,
 )
 from .project import BlockedState, ProjectManifest, StepRecord
-from .site import SiteManifest, SiteObject, SiteRelation
+from .site import GeoSourceProvenance, SiteManifest, SiteObject, SiteRelation
 
 __all__ = [
     "PRODUCTION_RIGHTS",
@@ -41,6 +41,7 @@ __all__ = [
     "PropertyProfile",
     "RenovationEvent",
     "Asset",
+    "GeoSourceProvenance",
     "SiteManifest",
     "SiteObject",
     "SiteRelation",
