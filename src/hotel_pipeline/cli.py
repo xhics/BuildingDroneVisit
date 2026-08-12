@@ -561,6 +561,83 @@ def assets_classify(
     typer.echo(f"  secteurs: {report.sectors_assigned}")
 
 
+geo_app = typer.Typer(no_args_is_help=True, help="Sources géospatiales (Lot 1B §9).")
+app.add_typer(geo_app, name="geo")
+
+
+@geo_app.command("route")
+def geo_route(hotel_id: str = typer.Argument(...)) -> None:
+    """Sources territorialement admissibles — pas encore leur couverture."""
+    from .geo import route
+
+    spatial = Workspace(hotel_id).read_spatial()
+    if spatial is None or not spatial.confirmed_building_id:
+        typer.secho("bâtiment confirmé requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    building = spatial.candidate(spatial.confirmed_building_id)
+    routing = route(building.centroid_lat, building.centroid_lon)
+
+    typer.echo(f"  territoires : {sorted(routing.territories)}")
+    for source in routing.territorial_candidates:
+        automated = "" if source.acquisition_automated else "  (acquisition non automatisée)"
+        typer.echo(
+            f"  ~ {source.source_id:<20} {routing.state_of(source.source_id).value}{automated}"
+        )
+    for source_id, reason in routing.rejected.items():
+        typer.echo(f"  {KO} {source_id:<20} {reason}")
+
+
+@geo_app.command("discover")
+def geo_discover(
+    hotel_id: str = typer.Argument(...),
+    no_sizes: bool = typer.Option(False, "--no-sizes", help="Ne pas mesurer les volumes."),
+) -> None:
+    """Découvre les tuiles LiDAR couvrant l'empreinte. **Ne télécharge aucun LAZ.**"""
+    from .geo import CoverageState, discover
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    if spatial is None or not spatial.confirmed_building_id:
+        typer.secho("bâtiment confirmé requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    building = spatial.candidate(spatial.confirmed_building_id)
+    result = discover(building.wkt, measure_sizes=not no_sizes)
+    workspace.write_report("06_geo/lidar_discovery.json", result, context)
+
+    if result.state is CoverageState.DISCOVERY_ERROR:
+        typer.secho(f"{KO} découverte impossible : {result.error}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  ce n'est pas une absence de couverture — l'index n'a pas répondu",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=4)
+
+    if result.state is CoverageState.NOT_COVERED:
+        typer.secho(
+            f"{KO} aucune tuile n'intersecte l'empreinte "
+            f"({result.considered} examinée(s))",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=3)
+
+    typer.echo(f"{OK} couverture confirmée — {len(result.tiles)} tuile(s)")
+    for tile in result.tiles:
+        typer.echo(f"    {tile.tile_id}  {tile.project or ''}  {tile.acquired_on or ''}")
+        typer.echo(
+            f"      densité {tile.point_density_per_m2 or '?'} pts/m²  "
+            f"{tile.crs_horizontal or '?'} / {tile.crs_vertical or '?'}"
+        )
+    typer.echo("")
+    typer.secho(
+        f"  volume exact à télécharger : {result.total_bytes:,} octets".replace(",", " "),
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("  aucun LAZ téléchargé — accord requis avant acquisition")
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 
