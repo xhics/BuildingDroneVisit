@@ -45,6 +45,19 @@ def redact(text: str, values: Iterable[str] | None = None) -> str:
     return text
 
 
+def _redact_arg(value: object, secrets: list[str]) -> object:
+    """Expurge un argument de log sans altérer son type.
+
+    Convertir tous les arguments en chaînes casserait les formats numériques
+    (`%d`, `%.6f`) dès qu'un secret existe dans l'environnement — c'est-à-dire
+    en production, précisément là où la journalisation compte le plus. Seules
+    les chaînes peuvent porter un secret ; le reste passe intact.
+    """
+    if isinstance(value, str):
+        return redact(value, secrets)
+    return value
+
+
 class SecretRedactingFilter(logging.Filter):
     """Expurge les secrets du message et de ses arguments."""
 
@@ -52,12 +65,13 @@ class SecretRedactingFilter(logging.Filter):
         secrets = secret_values()
         if not secrets:
             return True
+
         record.msg = redact(str(record.msg), secrets)
         if record.args:
             if isinstance(record.args, dict):
-                record.args = {k: redact(str(v), secrets) for k, v in record.args.items()}
+                record.args = {k: _redact_arg(v, secrets) for k, v in record.args.items()}
             else:
-                record.args = tuple(redact(str(a), secrets) for a in record.args)
+                record.args = tuple(_redact_arg(a, secrets) for a in record.args)
         return True
 
 

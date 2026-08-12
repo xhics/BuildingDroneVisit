@@ -148,3 +148,25 @@ class TestOverpassResilience:
 
         with pytest.raises(overpass.OverpassError, match="OVERPASS_URL"):
             overpass._query("[out:json];")
+
+
+class TestLoggingWithSecretsPresent:
+    """Régression : la journalisation doit survivre à la présence de secrets."""
+
+    def test_numeric_format_survives_redaction(self, monkeypatch):
+        monkeypatch.setenv("MAPILLARY_TOKEN", "MLY|un-vrai-jeton-long")
+        record = logging.LogRecord(
+            name="t", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="%d groupe(s), %.2f s", args=(3, 1.5), exc_info=None,
+        )
+        SecretRedactingFilter().filter(record)
+        assert record.getMessage() == "3 groupe(s), 1.50 s"
+
+    def test_string_arguments_are_still_redacted(self, monkeypatch):
+        monkeypatch.setenv("MAPILLARY_TOKEN", "MLY|un-vrai-jeton-long")
+        record = logging.LogRecord(
+            name="t", level=logging.INFO, pathname=__file__, lineno=1,
+            msg="appel %s", args=("MLY|un-vrai-jeton-long",), exc_info=None,
+        )
+        SecretRedactingFilter().filter(record)
+        assert "un-vrai-jeton" not in record.getMessage()

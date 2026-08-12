@@ -53,21 +53,45 @@ class Asset(BaseModel):
     duplicate_group: str | None = None
     production_eligible: bool = False
 
+    #: Usage assumé par l'opérateur malgré des droits non établis.
+    #: Lève le verrou du §9 pour cet asset, mais reste inscrit dans le manifeste
+    #: et propagé jusqu'au rapport final : l'option est tracée, pas dissoute.
+    rights_encumbered: bool = False
+    rights_note: str | None = None
+
+    #: Métadonnées de prise de vue, utiles au preflight et à la couverture.
+    attribution: str | None = None
+    heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    local_path: str | None = None
+    phash: str | None = None
+    quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @property
+    def usable_in_production(self) -> bool:
+        return self.rights in PRODUCTION_RIGHTS or self.rights_encumbered
+
     @model_validator(mode="after")
     def _rights_gate_production(self) -> "Asset":
         """Un asset ne peut être éligible production que si ses droits le permettent.
 
         Verrou structurel du §9 : une image publique reste `reference_only` tant
-        que ses droits ne permettent pas son usage en reconstruction.
+        que ses droits ne permettent pas son usage en reconstruction — sauf
+        décision explicite de l'opérateur, qui doit alors être inscrite.
         """
-        if self.production_eligible and self.rights not in PRODUCTION_RIGHTS:
+        if self.production_eligible and not self.usable_in_production:
             raise ValueError(
-                f"asset {self.id!r} marqué production_eligible avec rights={self.rights.value!r} ; "
-                f"droits acceptés : {sorted(r.value for r in PRODUCTION_RIGHTS)}"
+                f"asset {self.id!r} marqué production_eligible avec "
+                f"rights={self.rights.value!r} ; droits acceptés : "
+                f"{sorted(r.value for r in PRODUCTION_RIGHTS)}, ou rights_encumbered explicite"
             )
-        if self.ai_eligible and self.rights not in PRODUCTION_RIGHTS:
+        if self.ai_eligible and not self.usable_in_production:
             raise ValueError(
                 f"asset {self.id!r} marqué ai_eligible avec rights={self.rights.value!r}"
+            )
+        if self.rights_encumbered and self.rights in PRODUCTION_RIGHTS:
+            raise ValueError(
+                f"asset {self.id!r} : rights_encumbered n'a pas de sens avec "
+                f"des droits déjà suffisants ({self.rights.value!r})"
             )
         return self
 
@@ -94,3 +118,7 @@ class AssetManifest(BaseModel):
 
     def reference_only(self) -> list[Asset]:
         return [a for a in self.assets if not a.production_eligible]
+
+    def encumbered(self) -> list[Asset]:
+        """Assets utilisés en production sous droits assumés par l'opérateur."""
+        return [a for a in self.assets if a.production_eligible and a.rights_encumbered]

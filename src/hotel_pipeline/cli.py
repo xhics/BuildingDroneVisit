@@ -268,6 +268,84 @@ def assets_import(
     typer.echo(f"{OK} {len(loaded)} asset(s) inventorié(s) — aucun éligible production par défaut")
 
 
+@assets_app.command("gather")
+def assets_gather(
+    hotel_id: str = typer.Argument(...),
+    radius_m: int = typer.Option(300, "--radius", help="Rayon de collecte, en mètres."),
+    place_query: str | None = typer.Option(None, "--place", help="Requête Places."),
+    assume_rights: bool = typer.Option(
+        False,
+        "--assume-rights",
+        help="Assumer l'usage des sources aux droits non établis (tracé au manifeste).",
+    ),
+    classify: bool = typer.Option(
+        True, "--classify/--no-classify", help="Classification OpenCLIP (couche vision)."
+    ),
+    force: bool = typer.Option(False, "--force", help="Réécrit le manifeste d'assets."),
+) -> None:
+    """Collecte multi-sources puis tri assisté (§9, §11)."""
+    from .gather import (
+        build_manifest,
+        collect_sources,
+        download_all,
+        summarise,
+        triage,
+    )
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    if spatial is None or not spatial.confirmed_building_id:
+        typer.secho(
+            "confirmez d'abord BUILDING_MAIN — la collecte se centre sur le bâtiment",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
+    if workspace.assets_path.is_file() and not force:
+        typer.secho("manifeste d'assets déjà présent (--force pour recollecter)", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+
+    building = spatial.candidate(spatial.confirmed_building_id)
+    lat, lon = building.centroid_lat, building.centroid_lon
+    typer.echo(f"collecte autour de {lat:.6f}, {lon:.6f} (rayon {radius_m} m)")
+
+    images, reports = collect_sources(lat, lon, place_query, radius_m)
+    downloaded = download_all(images, workspace, reports)
+
+    for report in reports:
+        if report.skipped_reason:
+            typer.echo(f"  {KO} {report.name:<12} ignorée — {report.skipped_reason}")
+        else:
+            typer.echo(
+                f"  {OK} {report.name:<12} {report.collected} trouvée(s), "
+                f"{report.downloaded} téléchargée(s)"
+            )
+
+    manifest = build_manifest(hotel_id, downloaded, assume_rights=assume_rights)
+
+    classifier = None
+    if classify:
+        try:
+            from .triage.classify import Classifier
+
+            classifier = Classifier()
+        except ImportError:
+            typer.secho(
+                "  · OpenCLIP absent — classification ignorée "
+                "(installer l'extra 'vision' sur la VM GPU)",
+                fg=typer.colors.YELLOW,
+            )
+
+    gather_report = triage(manifest.assets, classifier=classifier)
+    workspace.write_assets(manifest)
+    workspace.write_json("01_sources/gather_report.json", gather_report.as_dict())
+
+    typer.echo("")
+    for key, value in summarise(manifest).items():
+        typer.echo(f"  {key:<18} {value}")
+    typer.echo(f"  {'doublons':<18} {gather_report.duplicates}")
+
+
 @assets_app.command("promote")
 def assets_promote(
     hotel_id: str = typer.Argument(...),

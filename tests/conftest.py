@@ -19,6 +19,19 @@ def offline(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def ignore_real_dotenv(monkeypatch):
+    """Le `.env` du développeur ne doit pas décider du résultat des tests.
+
+    Sans cela, un test qui vérifie l'absence d'une clé passe ou échoue selon
+    ce que la machine contient — et les vraies clés se retrouvent chargées
+    dans un processus de test.
+    """
+    import hotel_pipeline.config as config_module
+
+    monkeypatch.setattr(config_module, "load_dotenv", lambda *a, **k: False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_cache(tmp_path, monkeypatch):
     """Chaque test a son propre cache : aucune fuite entre tests."""
     monkeypatch.setenv("HOTEL_PIPELINE_CACHE", str(tmp_path / "cache"))

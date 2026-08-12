@@ -17,11 +17,23 @@ dependencies = [
     "diskcache>=5.6",
     "requests>=2.31",
     "shapely>=2.0",
+    "Pillow>=10.0",
+    "ImageHash>=4.3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+# Couche vision — installée dans l'image GPU (Lot 2), pas sur le poste local.
+# Chaque bibliothèque remplace du code qu'il aurait fallu écrire et calibrer.
+vision = [
+    "open_clip_torch>=2.24",   # classification zero-shot, sans entraînement
+    "cleanvision>=0.3",        # flou, exposition, quasi-doublons, images vides
+    "imagededup>=0.3",         # déduplication perceptuelle et CNN
+    "pyiqa>=0.1.10",           # qualité sans référence (BRISQUE, NIQE, MUSIQ)
+    "google-cloud-vision>=3.7",  # OCR d'enseigne, détection web
+    "googlemaps>=4.10",        # client officiel Places
 ]
 
 [project.scripts]
