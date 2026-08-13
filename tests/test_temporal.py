@@ -200,6 +200,22 @@ class TestAppearanceVersusGeometry:
             target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
             cluster_role=ClusterRole.CANONICAL, temporal_status=TemporalStatus.UNKNOWN,
             temporal_by_scope={"entrance": TemporalStatus.UNKNOWN},
+            **usable(),
         )
         assert role_for(asset)[0] is ReconstructionRole.PHOTO_GEOMETRY
         assert appearance_allowed(asset, "entrance") is False
+
+
+def usable(suitability="primary", by="hm", rationale="façade franche, lignes raccordables"):
+    """Champs d'une aptitude géométrique établie.
+
+    Une vue n'est plus porteuse du seul fait qu'on y reconnaît l'hôtel :
+    l'aptitude est une décision distincte, et elle exige son historique.
+    """
+    from hotel_pipeline.review import assessment_fields
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    return assessment_fields(
+        GeometrySuitability(suitability), by, rationale,
+        ["cadrage et netteté vérifiés sur la façade"], "a" * 64,
+    )

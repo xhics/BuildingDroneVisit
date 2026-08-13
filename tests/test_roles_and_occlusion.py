@@ -46,6 +46,21 @@ def make(asset_id="a", **overrides) -> Asset:
     return Asset(**fields)
 
 
+def usable(suitability="primary", by="hm", rationale="façade franche, lignes raccordables"):
+    """Champs d'une aptitude géométrique établie.
+
+    Une vue n'est plus porteuse du seul fait qu'on y reconnaît l'hôtel :
+    l'aptitude est une décision distincte, et elle exige son historique.
+    """
+    from hotel_pipeline.review import assessment_fields
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    return assessment_fields(
+        GeometrySuitability(suitability), by, rationale,
+        ["cadrage et netteté vérifiés sur la façade"], "a" * 64,
+    )
+
+
 class TestRoleAssignment:
     def test_generic_building_does_not_carry_geometry(self):
         """« Un bâtiment » n'est pas « le bâtiment ».
@@ -67,9 +82,40 @@ class TestRoleAssignment:
             target_building_visible=True,
             review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
             cluster_role=ClusterRole.CANONICAL,
+            **usable(),
         )
         role, _ = role_for(asset)
         assert role is ReconstructionRole.PHOTO_GEOMETRY
+
+    def test_a_recognised_but_unassessed_view_is_not_a_carrier(self):
+        """Reconnaître l'hôtel ne dit pas que l'image porte sa structure."""
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
+            target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.CANONICAL,
+        )
+        role, reason = role_for(asset)
+        assert role is ReconstructionRole.CONTEXT_LOCK
+        assert reason == "aptitude géométrique non évaluée"
+
+    def test_an_insufficient_view_is_not_a_carrier(self):
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
+            target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.CANONICAL, **usable("insufficient"),
+        )
+        role, reason = role_for(asset)
+        assert role is ReconstructionRole.CONTEXT_LOCK
+        assert reason == "structure insuffisante pour la géométrie"
+
+    def test_an_auxiliary_view_still_carries_geometry(self):
+        """`auxiliary` reste admis : le Router, lui, le comptera à part."""
+        asset = make(
+            camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
+            target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+            cluster_role=ClusterRole.CANONICAL, **usable("auxiliary"),
+        )
+        assert role_for(asset)[0] is ReconstructionRole.PHOTO_GEOMETRY
 
     def test_unarbitrated_cluster_never_carries_geometry(self):
         """Un asset antérieur à la déduplication porte `None` et passait."""
@@ -114,6 +160,7 @@ class TestRoleAssignment:
             review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
             cluster_role=ClusterRole.CANONICAL,
             temporal_status=TemporalStatus.BEFORE_EVENT,
+            **usable(),
         )
         assert role_for(asset)[0] is ReconstructionRole.TEXTURE_REFERENCE
 

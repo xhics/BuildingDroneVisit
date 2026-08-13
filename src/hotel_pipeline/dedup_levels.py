@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .logging import get_logger
-from .schemas import Asset, ClusterRole, Rights
+from .schemas import Asset, ClusterRole, GeometrySuitability, Rights
 from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .visibility import angular_difference, bearing_deg, haversine_m
 
@@ -176,14 +176,32 @@ def viewpoint_groups(
 # --- niveau 4 : recouvrement utile ---------------------------------------
 
 
+#: Préférence sur l'aptitude géométrique, du plus utile au moins.
+_SUITABILITY_RANK: dict[GeometrySuitability, int] = {
+    GeometrySuitability.PRIMARY: 0,
+    GeometrySuitability.AUXILIARY: 1,
+    GeometrySuitability.UNASSESSED: 2,
+    GeometrySuitability.INSUFFICIENT: 3,
+}
+
+
 def _quality_key(asset: Asset) -> tuple:
     """Ordre de préférence pour le fichier canonique d'un groupe.
 
-    Résolution d'abord, puis poids — une recompression agressive perd du
-    détail à dimensions égales —, puis qualité de provenance.
+    **La cible d'abord.** Choisir sur la seule résolution laissait un point de
+    vue représenté par la vue la plus grande, fût-elle tournée ailleurs :
+    l'unique fichier promu ne montrait alors pas le bâtiment, tandis que celui
+    qui le montrait était rangé en `overlap` ou en `inactive`. Un point de vue
+    doit être représenté par ce qu'il apporte, non par le poids de son JPEG.
+
+    Ensuite seulement : aptitude géométrique, résolution, poids — une
+    recompression agressive perd du détail à dimensions égales — et provenance.
     """
     pixels = (asset.width or 0) * (asset.height or 0)
     return (
+        # `False` trie avant `True` : la cible visible passe en tête.
+        asset.target_building_visible is not True,
+        _SUITABILITY_RANK.get(asset.geometry_suitability, 9),
         -pixels,
         -(asset.file_size_bytes or 0),
         PROVENANCE_RANK.get(asset.rights, 99),

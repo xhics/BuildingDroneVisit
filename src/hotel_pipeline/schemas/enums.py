@@ -171,6 +171,41 @@ class ReviewDecision(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+class GeometrySuitability(StrEnum):
+    """Ce que l'image apporte à la **structure**, distinct de ce qu'elle montre.
+
+    Trois questions se posaient jusqu'ici en une seule, et se répondaient donc
+    mal :
+
+    ```text
+    est-ce le bon bâtiment ?          → ReviewDecision
+    y a-t-il assez de structure ?     → GeometrySuitability
+    est-ce la meilleure du lot ?      → ClusterRole
+    ```
+
+    Confirmer l'identité d'une vue lointaine la promouvait immédiatement en
+    porteuse de géométrie : la cible y est bien reconnaissable, sans que la
+    façade y soit exploitable. Le critère n'est pas la distance — un téléobjectif
+    à 117 m vaut mieux qu'un grand-angle à 40 — mais la part du cadre occupée
+    par la cible, ses dimensions en pixels, la façade non masquée, la netteté
+    sur la zone utile et les lignes raccordables.
+    """
+
+    #: Personne n'a encore répondu. Une vue non évaluée ne porte pas de
+    #: géométrie : l'inverse ferait de l'absence d'examen une approbation.
+    UNASSESSED = "unassessed"
+
+    #: Structure exploitable : la vue peut fonder la reconstruction.
+    PRIMARY = "primary"
+
+    #: Utile pour relier le bâtiment à son environnement ou pour
+    #: l'enregistrement, sans apporter de structure propre.
+    AUXILIARY = "auxiliary"
+
+    #: Rien d'exploitable pour la géométrie, quelle que soit l'identité.
+    INSUFFICIENT = "insufficient"
+
+
 class ReviewStatus(StrEnum):
     """Statut de revue d'une qualification (Lot 1B §4, §6)."""
 

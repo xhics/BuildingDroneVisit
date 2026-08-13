@@ -16,6 +16,7 @@ from .enums import (
     ClusterRole,
     EntranceVersion,
     ExteriorInterior,
+    GeometrySuitability,
     PropertyMatchStatus,
     ReconstructionRole,
     ReviewDecision,
@@ -48,6 +49,13 @@ VISIBILITY_OF: dict[ReviewDecision, bool | None] = {
 #: Statuts qu'une personne seule peut poser.
 _HUMAN_STATUSES = frozenset({ReviewStatus.HUMAN_ACCEPTED, ReviewStatus.REJECTED})
 
+#: Aptitudes autorisant un usage géométrique. `auxiliary` y figure : la vue
+#: sert au raccord et à l'enregistrement, mais le Router la comptera à part —
+#: un point de vue auxiliaire n'est pas une observation structurante.
+_GEOMETRY_USABLE = frozenset(
+    {GeometrySuitability.PRIMARY, GeometrySuitability.AUXILIARY}
+)
+
 
 class GpsPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -74,8 +82,8 @@ class TemporalDecision(BaseModel):
     evidence: list[str] = Field(default_factory=list)
 
 
-class ReviewEntry(BaseModel):
-    """Un arbitrage humain de visibilité, tel qu'il a été rendu.
+class DecisionEntry(BaseModel):
+    """Socle commun des arbitrages humains, quel qu'en soit l'objet.
 
     Immuable par convention : on n'édite jamais une entrée, on en ajoute une
     qui la corrige. L'empreinte de l'image jugée y figure — une décision porte
@@ -84,7 +92,6 @@ class ReviewEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    decision: ReviewDecision
     decided_by: str = Field(min_length=1)
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     rationale: str = Field(min_length=1)
@@ -104,7 +111,7 @@ class ReviewEntry(BaseModel):
     supersedes_index: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
-    def _no_blank_text(self) -> "ReviewEntry":
+    def _no_blank_text(self) -> "DecisionEntry":
         if not self.decided_by.strip():
             raise ValueError("revue sans auteur — une décision anonyme n'engage rien")
         if not self.rationale.strip():
@@ -117,6 +124,51 @@ class ReviewEntry(BaseModel):
                 "revue sans preuve : une preuve vide n'en est pas une"
             )
         return self
+
+
+class ReviewEntry(DecisionEntry):
+    """Arbitrage d'identité : est-ce bien le bâtiment cible ?"""
+
+    decision: ReviewDecision
+
+
+class GeometryEntry(DecisionEntry):
+    """Arbitrage d'aptitude : l'image apporte-t-elle de la structure ?
+
+    Séparée de la visibilité parce que les deux réponses divergent
+    couramment : le WelcomINNS est parfaitement identifiable à 117 m, sur
+    40 % de la largeur du cadre, sans que sa façade y soit exploitable.
+    """
+
+    suitability: GeometrySuitability
+
+    #: Mesures ayant fondé l'appréciation — fraction du cadre, dimensions en
+    #: pixels, façade non masquée, netteté sur la cible. Conservées telles
+    #: quelles : `quality_score` mesure le fichier entier, or un ciel net
+    #: n'aide en rien la géométrie.
+    measurements: dict[str, float] = Field(default_factory=dict)
+
+
+def check_history(entries: list, label: str, asset_id: str) -> None:  # noqa: ANN001
+    """Filiation d'un historique append-only, quelle qu'en soit la nature."""
+    for position, entry in enumerate(entries):
+        if position == 0:
+            if entry.supersedes_index is not None:
+                raise ValueError(
+                    f"asset {asset_id!r} : la première décision {label} ne corrige "
+                    f"rien, mais désigne l'entrée {entry.supersedes_index}"
+                )
+            continue
+        if entry.supersedes_index is None:
+            raise ValueError(
+                f"asset {asset_id!r} : la décision {label} n° {position + 1} ne dit "
+                "pas laquelle elle corrige"
+            )
+        if entry.supersedes_index >= position:
+            raise ValueError(
+                f"asset {asset_id!r} : la décision {label} n° {position + 1} corrige "
+                f"l'entrée {entry.supersedes_index}, qui ne lui est pas antérieure"
+            )
 
 
 class Asset(BaseModel):
@@ -258,6 +310,27 @@ class Asset(BaseModel):
     #: champs plats disent toujours la même chose.
     review_history: list["ReviewEntry"] = Field(default_factory=list)
 
+    #: Aptitude géométrique, **indépendante** de l'identité. Une vue peut
+    #: montrer la bonne façade sans porter de structure exploitable ; les
+    #: confondre promouvait une vue lointaine au rang d'observation
+    #: géométrique du seul fait qu'on y reconnaissait l'hôtel.
+    geometry_suitability: GeometrySuitability = GeometrySuitability.UNASSESSED
+    geometry_history: list["GeometryEntry"] = Field(default_factory=list)
+
+    @property
+    def has_been_assessed(self) -> bool:
+        """Une personne s'est-elle prononcée sur l'aptitude géométrique ?"""
+        return bool(self.geometry_history)
+
+    @property
+    def carries_geometry(self) -> bool:
+        """L'aptitude autorise-t-elle un usage géométrique ?
+
+        `unassessed` ne l'autorise pas : faire de l'absence d'examen une
+        approbation est précisément ce qui a promu des vues lointaines.
+        """
+        return self.geometry_suitability in _GEOMETRY_USABLE
+
     @property
     def has_been_reviewed(self) -> bool:
         """Une personne a-t-elle regardé cet asset ?
@@ -320,26 +393,21 @@ class Asset(BaseModel):
         d'afficher une décision humaine que rien n'atteste.
         """
         history = self.review_history
+        check_history(history, "de visibilité", self.id)
+        check_history(self.geometry_history, "d'aptitude géométrique", self.id)
 
-        for position, entry in enumerate(history):
-            if position == 0:
-                if entry.supersedes_index is not None:
-                    raise ValueError(
-                        f"asset {self.id!r} : la première revue ne corrige rien, "
-                        f"mais désigne l'entrée {entry.supersedes_index}"
-                    )
-                continue
-            if entry.supersedes_index is None:
+        if self.geometry_history:
+            if self.geometry_suitability is not self.geometry_history[-1].suitability:
                 raise ValueError(
-                    f"asset {self.id!r} : la revue n° {position + 1} ne dit pas "
-                    "laquelle elle corrige"
+                    f"asset {self.id!r} : aptitude courante "
+                    f"{self.geometry_suitability.value!r} ≠ dernière appréciation "
+                    f"{self.geometry_history[-1].suitability.value!r}"
                 )
-            if entry.supersedes_index >= position:
-                raise ValueError(
-                    f"asset {self.id!r} : la revue n° {position + 1} corrige "
-                    f"l'entrée {entry.supersedes_index}, qui ne lui est pas "
-                    "antérieure"
-                )
+        elif self.geometry_suitability is not GeometrySuitability.UNASSESSED:
+            raise ValueError(
+                f"asset {self.id!r} : aptitude {self.geometry_suitability.value!r} "
+                "sans appréciation à l'appui"
+            )
 
         if not history:
             # Aucune revue : les champs plats ne peuvent pas prétendre le

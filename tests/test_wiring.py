@@ -99,6 +99,7 @@ class TestTemporalPolicyIsHonoured:
             camera_lat=45.573, camera_lon=-73.443, subjects=[Subject.BUILDING],
             target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
             cluster_role=ClusterRole.CANONICAL, temporal_status=TemporalStatus.UNKNOWN,
+            **usable(),
         )
 
     def test_unknown_date_allowed_for_geometry_by_default(self):
@@ -185,3 +186,18 @@ class TestProvenance:
     def test_policy_reload_keeps_the_same_digest(self):
         reloaded = PipelinePolicy.model_validate_json(DEFAULT_POLICY.model_dump_json())
         assert policy_digest(reloaded) == policy_digest(DEFAULT_POLICY)
+
+
+def usable(suitability="primary", by="hm", rationale="façade franche, lignes raccordables"):
+    """Champs d'une aptitude géométrique établie.
+
+    Une vue n'est plus porteuse du seul fait qu'on y reconnaît l'hôtel :
+    l'aptitude est une décision distincte, et elle exige son historique.
+    """
+    from hotel_pipeline.review import assessment_fields
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    return assessment_fields(
+        GeometrySuitability(suitability), by, rationale,
+        ["cadrage et netteté vérifiés sur la façade"], "a" * 64,
+    )

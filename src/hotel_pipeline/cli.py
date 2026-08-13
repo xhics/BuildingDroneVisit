@@ -6,6 +6,7 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import requests
@@ -488,8 +489,16 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     report = dedup_levels.run(
         manifest.assets, building.centroid_lat, building.centroid_lon, policy=context.policy
     )
+
+    # L'arbitrage de grappe est un prédicat de rôle : le changer sans
+    # réaffecter laissait le manifeste porter des rôles que `role_for` ne
+    # produirait plus, et un rapport de rôles décrivant l'état d'avant.
+    from .roles import assign
+
+    roles = assign(manifest.assets, context.policy)
     workspace.write_assets(manifest)
     workspace.write_report("01_sources/duplicate_report.json", report, context)
+    workspace.write_report("01_sources/roles_report.json", roles, context)
 
     typer.echo(f"  fichiers                  {report.files}")
     typer.echo(f"  photographies uniques     {report.perceptual_groups}")
@@ -498,6 +507,7 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
         f"  rôles : {report.canonical} canonique(s), "
         f"{report.overlap} recouvrement, {report.inactive} inactif(s)"
     )
+    typer.echo(f"  rôles : {roles.counts}")
     typer.echo("")
     for family, counts in sorted(report.by_source_family.items()):
         typer.echo(
@@ -646,6 +656,7 @@ def review_set(
     context = _context(hotel_id)
     before_roles = review_module.recompute(manifest.assets, context.policy)
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
+    before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
 
     try:
         before, after = review_module.decide(
@@ -667,22 +678,24 @@ def review_set(
     impact = review_module.Impact(
         asset_id=asset_id,
         decision=verdict.value,
+        checksum=after.review_history[-1].reviewed_checksum,
+        entry=json.loads(after.review_history[-1].model_dump_json()),
         role_before=role_before.value,
         role_after=role_after.value,
         reason_before=reason_before,
         reason_after=reason_after,
+        cluster_before=before.cluster_role.value if before.cluster_role else "—",
+        cluster_after=updated.cluster_role.value if updated.cluster_role else "—",
         roles_before=before_roles,
         roles_after=after_roles,
         counts_before=before_counts,
         counts_after=review_module.counts(manifest.assets, context.policy).as_dict(),
+        viewpoints_before=before_viewpoints,
+        viewpoints_after=review_module.viewpoints_by_suitability(manifest.assets),
     )
 
     workspace.write_assets(manifest)
-    workspace.write_report(
-        f"01_sources/review_decision_{asset_id}_"
-        f"{after.reviewed_at.strftime('%Y%m%dT%H%M%SZ')}.json",
-        impact, context,
-    )
+    workspace.write_report(f"01_sources/review_decision_{impact.slug}.json", impact, context)
 
     typer.echo("")
     typer.secho(
@@ -697,6 +710,191 @@ def review_set(
         was, now = before_roles.get(role, 0), after_roles.get(role, 0)
         marker = "  " if was == now else " ←"
         typer.echo(f"    {role:<20} {was:>4} → {now:>4}{marker}")
+
+
+@review_app.command("geometry")
+def review_geometry(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    suitability: str = typer.Option(
+        ..., "--suitability", help="primary, auxiliary ou insufficient."
+    ),
+    by: str = typer.Option(..., "--by", help="Auteur de l'appréciation."),
+    rationale: str = typer.Option(..., "--rationale", help="Motif, obligatoire."),
+    evidence: list[str] = typer.Option(..., "--evidence", help="Preuve(s), au moins une."),
+    measure: list[str] = typer.Option(
+        [], "--measure", help="Mesure à l'appui, forme clé=valeur. Répétable."
+    ),
+) -> None:
+    """Apprécie ce que l'image apporte à la **structure**, non son identité."""
+    from . import review as review_module
+    from .schemas import GeometrySuitability
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        verdict = GeometrySuitability(suitability)
+    except ValueError as exc:
+        typer.secho(
+            f"{KO} aptitude inconnue : {suitability!r} ; attendu "
+            f"{[s.value for s in GeometrySuitability]}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    if verdict is GeometrySuitability.UNASSESSED:
+        typer.secho(
+            f"{KO} « unassessed » est l'état initial, pas une appréciation",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    measurements: dict[str, float] = {}
+    for item in measure:
+        key, _, value = item.partition("=")
+        try:
+            measurements[key.strip()] = float(value)
+        except ValueError as exc:
+            typer.secho(f"{KO} mesure illisible : {item!r} (attendu clé=valeur)",
+                        fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+    context = _context(hotel_id)
+    before_roles = review_module.recompute(manifest.assets, context.policy)
+    before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
+    before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
+
+    try:
+        before, after = review_module.assess(
+            manifest.assets, asset_id, verdict, by, rationale, list(evidence),
+            measurements, workspace_root=workspace.root,
+        )
+    except review_module.ReviewRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    from .roles import role_for
+
+    role_before, reason_before = role_for(before, context.policy)
+    after_roles = review_module.recompute(manifest.assets, context.policy)
+    updated = next(a for a in manifest.assets if a.id == asset_id)
+    role_after, reason_after = role_for(updated, context.policy)
+
+    impact = review_module.Impact(
+        asset_id=asset_id,
+        decision=verdict.value,
+        checksum=after.geometry_history[-1].reviewed_checksum,
+        entry=json.loads(after.geometry_history[-1].model_dump_json()),
+        role_before=role_before.value,
+        role_after=role_after.value,
+        reason_before=reason_before,
+        reason_after=reason_after,
+        cluster_before=before.cluster_role.value if before.cluster_role else "—",
+        cluster_after=updated.cluster_role.value if updated.cluster_role else "—",
+        roles_before=before_roles,
+        roles_after=after_roles,
+        counts_before=before_counts,
+        counts_after=review_module.counts(manifest.assets, context.policy).as_dict(),
+        viewpoints_before=before_viewpoints,
+        viewpoints_after=review_module.viewpoints_by_suitability(manifest.assets),
+    )
+
+    workspace.write_assets(manifest)
+    workspace.write_report(f"01_sources/geometry_decision_{impact.slug}.json", impact, context)
+
+    typer.echo("")
+    typer.secho(f"  {asset_id} · {verdict.value} · par {after.geometry_history[-1].decided_by}",
+                fg=typer.colors.GREEN)
+    typer.echo(f"  appréciation n° {len(after.geometry_history)}")
+    typer.echo(f"  rôle    : {role_before.value} ({reason_before})")
+    typer.echo(f"            {role_after.value} ({reason_after})")
+    typer.echo("")
+    for role in sorted(set(before_roles) | set(after_roles)):
+        was, now = before_roles.get(role, 0), after_roles.get(role, 0)
+        typer.echo(f"    {role:<20} {was:>4} → {now:>4}{'' if was == now else ' ←'}")
+    typer.echo("")
+    typer.echo("  points de vue indépendants, par aptitude :")
+    for name, total in review_module.viewpoints_by_suitability(manifest.assets).items():
+        typer.echo(f"    {name:<14} {total:>4}")
+
+
+@review_app.command("export")
+def review_export(
+    hotel_id: str = typer.Argument(...),
+    root: Path = typer.Option(None, "--root", help="Racine du registre (défaut : decisions/)."),
+) -> None:
+    """Extrait les décisions humaines dans un registre versionnable."""
+    from . import decisions as register_module
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    register = register_module.export(manifest.assets, hotel_id)
+    target = register_module.path_for(hotel_id, root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(register.as_dict(), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+    visibility = sum(len(d.review_history) for d in register.decisions)
+    aptitude = sum(len(d.geometry_history) for d in register.decisions)
+    typer.echo("")
+    typer.echo(f"  {len(register.decisions)} asset(s) portant une décision")
+    typer.echo(f"    visibilité  {visibility:>4} entrée(s)")
+    typer.echo(f"    aptitude    {aptitude:>4} entrée(s)")
+    typer.echo(f"  {target}")
+    typer.secho(
+        "  les images ne sont pas versionnées ; leurs empreintes le sont",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@review_app.command("import")
+def review_import(
+    hotel_id: str = typer.Argument(...),
+    root: Path = typer.Option(None, "--root", help="Racine du registre (défaut : decisions/)."),
+) -> None:
+    """Réapplique un registre au manifeste, empreintes vérifiées."""
+    from . import decisions as register_module
+    from . import review as review_module
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    source = register_module.path_for(hotel_id, root)
+    if not source.is_file():
+        typer.secho(f"{KO} registre introuvable : {source}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    try:
+        result = register_module.apply(
+            manifest.assets, json.loads(source.read_text("utf-8"))
+        )
+    except register_module.RegisterRefused as exc:
+        typer.secho(f"{KO} registre refusé — rien n'a été modifié :", fg=typer.colors.RED, err=True)
+        typer.secho(f"    {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4) from exc
+
+    roles = review_module.recompute(manifest.assets, context.policy)
+    workspace.write_assets(manifest)
+
+    typer.echo("")
+    typer.echo(f"  {result['applied']} asset(s) mis à jour depuis {source}")
+    typer.echo(f"  rôles : {roles}")
+    typer.echo(
+        f"  points de vue : {review_module.viewpoints_by_suitability(manifest.assets)}"
+    )
 
 
 geo_app = typer.Typer(no_args_is_help=True, help="Sources géospatiales (Lot 1B §9).")

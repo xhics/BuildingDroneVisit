@@ -38,8 +38,13 @@ def image(tmp_path, name: str = "vue.jpg", content: bytes = b"jpeg-donnees"):
 
 
 def asset(tmp_path, **overrides) -> Asset:
-    """Un asset Mapillary porteur : cap mesuré, cible visible, non masqué."""
+    """Un asset Mapillary porteur : cap mesuré, cible visible, non masqué.
+
+    Son aptitude géométrique est établie, sauf mention contraire : sans elle,
+    aucun rôle porteur n'est possible, et ces cas-là portent sur la visibilité.
+    """
     path, digest = image(tmp_path, overrides.pop("name", "vue.jpg"))
+    suitability = overrides.pop("suitability", "primary")
     fields = dict(
         id="mapillary-1",
         source="mapillary",
@@ -64,6 +69,17 @@ def asset(tmp_path, **overrides) -> Asset:
         review_status=ReviewStatus.NEEDS_REVIEW,
         subject_scores={"building": 0.5537, "parking": 0.9997, "sign": 0.1273},
     )
+    if suitability:
+        from hotel_pipeline.review import assessment_fields
+        from hotel_pipeline.schemas import GeometrySuitability
+
+        fields.update(
+            assessment_fields(
+                GeometrySuitability(suitability), "hm",
+                "façade cadrée, lignes exploitables",
+                ["contrôle du cadrage et de la netteté sur la cible"], digest,
+            )
+        )
     fields.update(overrides)
     return Asset(**fields)
 
@@ -507,7 +523,7 @@ def test_an_entry_without_reviewed_checksum_is_refused() -> None:
 
 
 def test_the_first_entry_cannot_supersede_anything(tmp_path) -> None:
-    with pytest.raises(ValueError, match="première revue ne corrige rien"):
+    with pytest.raises(ValueError, match="première décision de visibilité ne corrige"):
         reviewed_asset(tmp_path, [entry(supersedes_index=0)])
 
 
@@ -616,3 +632,208 @@ def test_the_queue_records_the_state_it_describes(tmp_path) -> None:
 
     decide(assets)
     assert review.manifest_digest(assets) != queue.manifest_digest
+
+
+# --- identité, aptitude et point de vue sont trois questions ----------------
+
+
+def test_two_near_identical_confirmations_make_one_auxiliary_viewpoint(tmp_path) -> None:
+    """Le cas réel : deux vues du même point, à deux degrés près.
+
+    Le WelcomINNS y est identifiable à 117 m, sur 40 % de la largeur du cadre.
+    Confirmer leur identité les promouvait toutes deux en porteuses, si bien
+    que le corpus paraissait compter deux observations géométriques
+    indépendantes là où il n'y a qu'un point de vue auxiliaire, photographié
+    deux fois.
+    """
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    first = asset(tmp_path, name="v1.jpg", id="mapillary-7688979294475178",
+                  suitability=None, viewpoint_cluster="vp-1",
+                  target_building_visible=None)
+    second = asset(tmp_path, name="v2.jpg", id="mapillary-949396083308163",
+                   suitability=None, viewpoint_cluster="vp-1",
+                   target_building_visible=None, cluster_role=ClusterRole.OVERLAP)
+    assets = [first, second]
+
+    for asset_id in (first.id, second.id):
+        decide(assets, asset_id=asset_id, rationale="pylône « HW HÔTEL WELCOMINNS » lisible")
+        review.assess(
+            assets, asset_id, GeometrySuitability.AUXILIARY, "hm",
+            "cible reconnaissable mais façade trop reculée pour la structure",
+            ["distance ≈ 117 m, arbres et clôture devant la façade"],
+            {"frame_width_fraction": 0.40, "frame_height_fraction": 0.20},
+        )
+
+    # Les deux restent admises — `auxiliary` autorise l'usage géométrique…
+    assert all(role_for(a, policy())[0].value == "photo_geometry" for a in assets)
+    # …mais elles ne comptent que pour **un** point de vue, et auxiliaire.
+    assert review.viewpoints_by_suitability(assets) == {"auxiliary": 1}
+
+
+def test_a_primary_and_an_auxiliary_viewpoint_are_counted_apart(tmp_path) -> None:
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    close = asset(tmp_path, name="a.jpg", id="mapillary-1", suitability="primary",
+                  viewpoint_cluster="vp-1")
+    far = asset(tmp_path, name="b.jpg", id="mapillary-2", suitability="auxiliary",
+                viewpoint_cluster="vp-2")
+
+    assert review.viewpoints_by_suitability([close, far]) == {
+        "auxiliary": 1, "primary": 1
+    }
+
+
+def test_the_best_member_names_the_viewpoint(tmp_path) -> None:
+    """Une grappe vaut ce que vaut son meilleur membre, pas sa moyenne."""
+    strong = asset(tmp_path, name="a.jpg", id="m-1", suitability="primary",
+                   viewpoint_cluster="vp-1")
+    weak = asset(tmp_path, name="b.jpg", id="m-2", suitability="auxiliary",
+                 viewpoint_cluster="vp-1")
+
+    assert review.viewpoints_by_suitability([strong, weak]) == {"primary": 1}
+
+
+def test_an_unverified_target_is_not_counted_as_a_viewpoint(tmp_path) -> None:
+    unseen = asset(tmp_path, name="a.jpg", id="m-1", suitability="primary",
+                   viewpoint_cluster="vp-1", target_building_visible=None)
+
+    assert review.viewpoints_by_suitability([unseen]) == {}
+
+
+def test_the_cluster_canonical_follows_the_target(tmp_path) -> None:
+    """Le défaut distinct que l'arbitrage laissait passer.
+
+    Le représentant d'un point de vue était choisi sur la résolution seule :
+    une image plus lourde tournée ailleurs l'emportait sur celle qui montre
+    réellement le bâtiment.
+    """
+    from hotel_pipeline import dedup_levels
+    from hotel_pipeline.schemas import ClusterRole as CR
+
+    elsewhere = asset(tmp_path, name="a.jpg", id="m-large", suitability=None,
+                      target_building_visible=None, viewpoint_cluster="vp-1",
+                      width=4000, height=3000, file_size_bytes=5_000_000)
+    on_target = asset(tmp_path, name="b.jpg", id="m-small", suitability=None,
+                      viewpoint_cluster="vp-1",
+                      width=1024, height=768, file_size_bytes=200_000)
+    assets = [elsewhere, on_target]
+
+    dedup_levels.assign_roles(assets)
+
+    canonical = next(a for a in assets if a.cluster_role is CR.CANONICAL)
+    assert canonical.id == "m-small"
+
+
+def test_an_identity_confirmed_view_awaiting_aptitude_is_blocking(tmp_path) -> None:
+    """La revue porte sur deux questions ; une seule tranchée bloque encore."""
+    assets = [asset(tmp_path, suitability=None)]
+    decide(assets)
+
+    assert review.counts(assets, policy()).blocking == 1
+    assert role_for(assets[0], policy())[1] == "aptitude géométrique non évaluée"
+
+
+def test_scenery_is_never_blocking_even_though_a_review_could_say_yes(tmp_path) -> None:
+    """La file doit mesurer le travail restant, pas le corpus.
+
+    Simuler une revue favorable sur tout ce qui n'est pas apprécié faisait
+    entrer les 247 vues d'environnement, dont la revue dirait non.
+    """
+    scenery = asset(
+        tmp_path, suitability=None, id="street_view-1", source="street_view",
+        target_building_visible=False, contains_building=False, subjects=[],
+        review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+    )
+
+    assert review.counts([scenery], policy()).blocking == 0
+
+
+def test_an_assessed_view_is_no_longer_blocking(tmp_path) -> None:
+    assets = [asset(tmp_path, suitability=None)]
+    decide(assets)
+    assert review.counts(assets, policy()).blocking == 1
+
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    review.assess(
+        assets, assets[0].id, GeometrySuitability.PRIMARY, "hm",
+        "façade franche sur la moitié du cadre", ["mesures de cadrage"],
+    )
+
+    assert review.counts(assets, policy()).blocking == 0
+
+
+# --- registre versionnable --------------------------------------------------
+
+
+def test_the_register_carries_decisions_and_no_images(tmp_path) -> None:
+    """`work/` est ignoré par Git : sans registre, rien n'est versionnable.
+
+    Les décisions sont la seule chose que le pipeline ne sait pas régénérer.
+    """
+    from hotel_pipeline import decisions
+
+    assets = [asset(tmp_path, suitability=None), asset(tmp_path, name="b.jpg", id="m-2")]
+    decide(assets)
+
+    register = decisions.export(assets, "hotel-test").as_dict()
+
+    ids = [d["asset_id"] for d in register["decisions"]]
+    assert ids == ["m-2", "mapillary-1"]  # trié, et l'asset sans décision exclu
+    first = next(d for d in register["decisions"] if d["asset_id"] == "mapillary-1")
+    assert first["checksum"] == assets[0].checksum
+    assert first["review_history"][0]["decided_by"] == "Hicham"
+    assert "local_path" not in json.dumps(register)
+
+
+def test_applying_the_register_reproduces_the_decisions(tmp_path) -> None:
+    from hotel_pipeline import decisions
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    review.assess(decided, "mapillary-1", GeometrySuitability.AUXILIARY, "hm",
+                  "cible reconnaissable, façade reculée", ["mesures de cadrage"])
+    register = decisions.export(decided, "hotel-test").as_dict()
+
+    # Un manifeste neuf, sans aucune décision.
+    fresh = [asset(tmp_path, suitability=None)]
+    assert not fresh[0].has_been_reviewed
+
+    decisions.apply(fresh, register)
+
+    assert fresh[0].review_status is ReviewStatus.HUMAN_ACCEPTED
+    assert fresh[0].target_building_visible is True
+    assert fresh[0].geometry_suitability is GeometrySuitability.AUXILIARY
+    assert len(fresh[0].review_history) == 1
+    assert fresh[0].reviewer == "Hicham"
+
+
+def test_a_register_pointing_at_another_image_is_refused(tmp_path) -> None:
+    """Une décision porte sur ce qui a été vu, jamais sur ce qui l'a remplacé."""
+    from hotel_pipeline import decisions
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    register = decisions.export(decided, "hotel-test").as_dict()
+    register["decisions"][0]["checksum"] = "f" * 64
+
+    fresh = [asset(tmp_path, suitability=None)]
+    before = fresh[0].model_dump_json()
+
+    with pytest.raises(decisions.RegisterRefused, match="l'image a changé"):
+        decisions.apply(fresh, register)
+
+    assert fresh[0].model_dump_json() == before
+
+
+def test_a_register_entry_for_an_unknown_asset_is_refused(tmp_path) -> None:
+    from hotel_pipeline import decisions
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    register = decisions.export(decided, "hotel-test").as_dict()
+
+    with pytest.raises(decisions.RegisterRefused, match="sans asset correspondant"):
+        decisions.apply([asset(tmp_path, name="b.jpg", id="autre")], register)

@@ -18,6 +18,7 @@ from .schemas.policy import DEFAULT_POLICY, PipelinePolicy
 from .schemas import (
     Asset,
     ClusterRole,
+    GeometrySuitability,
     PropertyMatchStatus,
     ReconstructionRole,
     ReviewStatus,
@@ -50,6 +51,7 @@ def role_for(
     + aucune occultation non arbitrée
     + revue acceptée
     + point de vue actif
+    + aptitude géométrique établie
     + temporalité admissible
     ```
 
@@ -82,6 +84,17 @@ def role_for(
         # créé avant la déduplication porte `None` et franchissait le Router.
         if asset.cluster_role not in (ClusterRole.CANONICAL, ClusterRole.OVERLAP):
             return ReconstructionRole.CONTEXT_LOCK, "point de vue non arbitré ou déjà couvert"
+        # L'identité ne dit rien de la structure. Une vue peut montrer sans
+        # conteste le bon bâtiment et n'apporter aucune façade exploitable :
+        # promouvoir sur la seule reconnaissance confondait « c'est bien lui »
+        # et « on peut le reconstruire avec ça ».
+        if not asset.carries_geometry:
+            return (
+                ReconstructionRole.CONTEXT_LOCK,
+                "aptitude géométrique non évaluée"
+                if asset.geometry_suitability is GeometrySuitability.UNASSESSED
+                else "structure insuffisante pour la géométrie",
+            )
         # La géométrie d'un volume change peu : une vue non datée reste
         # exploitable pour la structure. L'apparence, non — mais c'est un
         # usage distinct, exprimé par la politique et non par le rôle seul.

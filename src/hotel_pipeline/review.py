@@ -31,6 +31,8 @@ from pydantic import ValidationError
 from .logging import get_logger
 from .schemas import (
     Asset,
+    GeometryEntry,
+    GeometrySuitability,
     ReconstructionRole,
     ReviewDecision,
     ReviewEntry,
@@ -54,13 +56,19 @@ def pending(assets: list[Asset]) -> list[Asset]:
 
 
 def would_confirm(asset: Asset, policy) -> tuple[bool, str]:  # noqa: ANN001
-    """Une confirmation humaine ferait-elle de cet asset un porteur ?
+    """Une revue favorable ferait-elle de cet asset un porteur ?
 
     La question ne se répond pas en récitant les prédicats de `role_for` : les
     recopier, c'était en oublier — l'arbitrage de grappe et la politique
     temporelle n'y figuraient pas, si bien qu'une vue déjà couverte ou non
     datée passait pour « débloquable ». On simule donc la décision et on
     demande au juge lui-même.
+
+    La revue porte sur **deux** questions depuis qu'elles sont séparées :
+    l'identité et l'aptitude géométrique. Ne simuler que la première rendait
+    la file vide par construction — plus aucune confirmation seule ne produit
+    un porteur — ce qui aurait fait passer un changement de définition pour
+    une revue terminée.
     """
     from .roles import role_for
 
@@ -69,6 +77,7 @@ def would_confirm(asset: Asset, policy) -> tuple[bool, str]:  # noqa: ANN001
             "target_visibility_decision": ReviewDecision.CONFIRMED,
             "target_building_visible": True,
             "review_status": ReviewStatus.HUMAN_ACCEPTED,
+            "geometry_suitability": GeometrySuitability.PRIMARY,
         }
     )
     role, reason = role_for(simulated, policy)
@@ -79,16 +88,26 @@ def blocking(assets: list[Asset], policy) -> list[Asset]:  # noqa: ANN001
     """Assets dont la revue, à elle seule, débloque un rôle.
 
     Un asset n'est bloquant que si **tout le reste** est déjà satisfait : une
-    confirmation le rendrait porteur de géométrie séance tenante. Ceux qu'un
-    second verrou retient — grappe non arbitrée, datation exigée, occlusion —
-    restent en attente sans être bloquants : les y mêler ferait espérer d'une
-    revue ce qu'elle ne peut pas donner.
+    revue favorable — identité confirmée et aptitude établie — le rendrait
+    porteur séance tenante. Ceux qu'un second verrou retient — grappe non
+    arbitrée, datation exigée, occlusion — restent en attente sans être
+    bloquants : les y mêler ferait espérer d'une revue ce qu'elle ne peut pas
+    donner.
+
+    Un asset déjà confirmé mais dont l'aptitude reste à apprécier est bloquant
+    lui aussi : c'est bien une revue qui manque.
     """
-    return [
-        a
-        for a in assets
-        if a.review_status is ReviewStatus.NEEDS_REVIEW and would_confirm(a, policy)[0]
-    ]
+    def awaits_a_decision(asset: Asset) -> bool:
+        # Soit la cascade n'a pas tranché l'identité, soit l'identité est
+        # acquise et seule l'aptitude manque. Élargir au-delà — « tout ce qui
+        # n'est pas apprécié » — ferait entrer les 247 vues d'environnement,
+        # dont la revue dirait non : la file mesurerait alors le corpus, pas
+        # le travail restant.
+        if asset.review_status is ReviewStatus.NEEDS_REVIEW:
+            return True
+        return asset.target_building_visible is True and not asset.has_been_assessed
+
+    return [a for a in assets if awaits_a_decision(a) and would_confirm(a, policy)[0]]
 
 
 def cohort(assets: list[Asset], source: str) -> list[Asset]:
@@ -382,22 +401,14 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def decide(
-    assets: list[Asset],
-    asset_id: str,
-    decision: ReviewDecision,
-    by: str,
-    rationale: str,
-    evidence: list[str],
-    workspace_root: Path | None = None,
-) -> tuple[Asset, Asset]:
-    """Inscrit une décision, après avoir vérifié qu'elle porte sur la bonne image.
+def _prepare(
+    assets: list[Asset], asset_id: str, by: str, rationale: str,
+    evidence: list[str], workspace_root: Path | None,
+) -> tuple[Asset, Path, str]:
+    """Contrôles communs à tout arbitrage, avant la moindre mutation.
 
-    Rien n'est modifié si un contrôle échoue : une décision partiellement
-    appliquée serait pire qu'aucune, puisqu'elle paraîtrait complète.
-
-    Rend l'asset avant et après, pour que l'appelant produise un avant/après
-    sans avoir à le reconstituer.
+    Identité et aptitude engagent la même chose : une personne, un motif, une
+    preuve, et une image dont on sait qu'elle n'a pas changé depuis.
     """
     if not (by or "").strip():
         raise ReviewRefused("décision sans auteur — une revue anonyme n'engage rien")
@@ -405,8 +416,7 @@ def decide(
         raise ReviewRefused(
             "décision sans justification — le verdict seul ne s'audite pas"
         )
-    kept = [e.strip() for e in evidence if (e or "").strip()]
-    if not kept:
+    if not [e for e in evidence if (e or "").strip()]:
         raise ReviewRefused(
             "décision sans preuve — le motif dit ce qui a été conclu, la preuve "
             "dit sur quoi ; sans elle, la revue ne se rejoue pas"
@@ -435,6 +445,45 @@ def decide(
             f"{before.checksum[:16]}… — l'image a changé depuis son manifeste ; "
             "la décision porterait sur autre chose que ce qui est déclaré"
         )
+    return before, path, actual
+
+
+def _revalidate(candidate: Asset, asset_id: str) -> Asset:
+    """`model_copy(update=...)` ne revalide rien.
+
+    Les invariants du manifeste seraient contournés par la seule voie qui les
+    met en jeu. L'échec laisse la liste d'assets intacte.
+    """
+    try:
+        return Asset.model_validate(candidate.model_dump())
+    except ValidationError as exc:
+        raise ReviewRefused(
+            f"{asset_id} : décision incohérente avec le manifeste — {exc}"
+        ) from exc
+
+
+def decide(
+    assets: list[Asset],
+    asset_id: str,
+    decision: ReviewDecision,
+    by: str,
+    rationale: str,
+    evidence: list[str],
+    workspace_root: Path | None = None,
+) -> tuple[Asset, Asset]:
+    """Inscrit une décision, après avoir vérifié qu'elle porte sur la bonne image.
+
+    Rien n'est modifié si un contrôle échoue : une décision partiellement
+    appliquée serait pire qu'aucune, puisqu'elle paraîtrait complète.
+
+    Rend l'asset avant et après, pour que l'appelant produise un avant/après
+    sans avoir à le reconstituer.
+    """
+    before, _path, actual = _prepare(
+        assets, asset_id, by, rationale, evidence, workspace_root
+    )
+    index = next(i for i, a in enumerate(assets) if a.id == asset_id)
+    kept = [e.strip() for e in evidence if (e or "").strip()]
 
     entry = ReviewEntry(
         decision=decision,
@@ -463,18 +512,72 @@ def decide(
         }
     )
 
-    # `model_copy(update=...)` ne revalide rien : les invariants du manifeste
-    # seraient contournés par la seule voie qui les met en jeu. On revalide
-    # donc explicitement, et l'échec laisse la liste intacte.
-    try:
-        after = Asset.model_validate(candidate.model_dump())
-    except ValidationError as exc:
-        raise ReviewRefused(
-            f"{asset_id} : décision incohérente avec le manifeste — {exc}"
-        ) from exc
-
+    after = _revalidate(candidate, asset_id)
     assets[index] = after
     log.info("%s : %s par %s", asset_id, decision.value, entry.decided_by)
+    return before, after
+
+
+def assessment_fields(
+    suitability: GeometrySuitability,
+    by: str,
+    rationale: str,
+    evidence: list[str],
+    checksum: str,
+    measurements: dict[str, float] | None = None,
+    previous: list | None = None,  # noqa: ANN001
+) -> dict:
+    """Champs d'une appréciation géométrique, historique compris.
+
+    Exposé plutôt que reconstruit chez chaque appelant : l'aptitude et son
+    historique ne doivent jamais pouvoir diverger, et un test qui poserait le
+    champ seul décrirait un état que le manifeste refuse.
+    """
+    previous = list(previous or [])
+    entry = GeometryEntry(
+        suitability=suitability,
+        decided_by=by.strip(),
+        rationale=rationale.strip(),
+        evidence=[e.strip() for e in evidence if e.strip()],
+        reviewed_checksum=checksum,
+        measurements=dict(measurements or {}),
+        supersedes_index=len(previous) - 1 if previous else None,
+    )
+    return {
+        "geometry_suitability": suitability,
+        "geometry_history": [*previous, entry],
+    }
+
+
+def assess(
+    assets: list[Asset],
+    asset_id: str,
+    suitability: GeometrySuitability,
+    by: str,
+    rationale: str,
+    evidence: list[str],
+    measurements: dict[str, float] | None = None,
+    workspace_root: Path | None = None,
+) -> tuple[Asset, Asset]:
+    """Inscrit une appréciation d'aptitude géométrique.
+
+    Mêmes exigences que pour la visibilité — auteur, motif, preuve, empreinte
+    vérifiée — parce que c'est la même nature de décision : une personne
+    engage sa lecture d'une image précise.
+    """
+    before, path, digest = _prepare(assets, asset_id, by, rationale, evidence, workspace_root)
+    index = next(i for i, a in enumerate(assets) if a.id == asset_id)
+
+    candidate = before.model_copy(
+        update=assessment_fields(
+            suitability, by, rationale,
+            [e.strip() for e in evidence if e.strip()],
+            digest, measurements, previous=before.geometry_history,
+        )
+    )
+    after = _revalidate(candidate, asset_id)
+    assets[index] = after
+    log.info("%s : aptitude %s par %s", asset_id, suitability.value, by.strip())
     return before, after
 
 
@@ -487,35 +590,94 @@ class Impact:
 
     asset_id: str
     decision: str
+    checksum: str = ""
+    entry: dict = field(default_factory=dict)
     role_before: str = ""
     role_after: str = ""
     reason_before: str = ""
     reason_after: str = ""
+    cluster_before: str = ""
+    cluster_after: str = ""
     roles_before: dict[str, int] = field(default_factory=dict)
     roles_after: dict[str, int] = field(default_factory=dict)
     counts_before: dict = field(default_factory=dict)
     counts_after: dict = field(default_factory=dict)
+    viewpoints_before: dict[str, int] = field(default_factory=dict)
+    viewpoints_after: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def slug(self) -> str:
+        """Nom de publication, unique jusqu'à la microseconde."""
+        stamp = datetime.now(timezone.utc).isoformat()
+        stamp = stamp.replace(":", "").replace("-", "").replace(".", "")
+        return f"{self.asset_id}_{stamp}_{self.checksum[:12]}"
 
     def as_dict(self) -> dict:
         return {
             "asset_id": self.asset_id,
             "decision": self.decision,
+            "reviewed_checksum": self.checksum,
+            "entry": self.entry,
             "asset_role": {
                 "before": f"{self.role_before} — {self.reason_before}",
                 "after": f"{self.role_after} — {self.reason_after}",
             },
+            # Le rôle de grappe compte autant que le rôle de reconstruction :
+            # la revue peut faire d'une vue le représentant de son point de vue.
+            "cluster_role": {"before": self.cluster_before, "after": self.cluster_after},
             "corpus_roles": {"before": self.roles_before, "after": self.roles_after},
             "review_counts": {"before": self.counts_before, "after": self.counts_after},
+            # Fichiers et points de vue ne se confondent pas : deux vues d'un
+            # même point ne font pas deux observations.
+            "viewpoints_by_suitability": {
+                "before": self.viewpoints_before, "after": self.viewpoints_after
+            },
         }
 
 
+def viewpoints_by_suitability(assets: list[Asset]) -> dict[str, int]:
+    """Points de vue **indépendants**, par aptitude, jamais des fichiers.
+
+    Deux photographies prises du même endroit à deux degrés près ne font pas
+    deux observations : elles font une seule, photographiée deux fois. Compter
+    les fichiers surestimerait la couverture d'autant.
+    """
+    best: dict[str, GeometrySuitability] = {}
+    for asset in assets:
+        if asset.target_building_visible is not True:
+            continue
+        viewpoint = asset.viewpoint_cluster or asset.id
+        current = best.get(viewpoint)
+        rank = {
+            GeometrySuitability.PRIMARY: 0,
+            GeometrySuitability.AUXILIARY: 1,
+            GeometrySuitability.UNASSESSED: 2,
+            GeometrySuitability.INSUFFICIENT: 3,
+        }
+        if current is None or rank[asset.geometry_suitability] < rank[current]:
+            best[viewpoint] = asset.geometry_suitability
+
+    counted: dict[str, int] = {}
+    for suitability in best.values():
+        counted[suitability.value] = counted.get(suitability.value, 0) + 1
+    return dict(sorted(counted.items()))
+
+
 def recompute(assets: list[Asset], policy) -> dict[str, int]:  # noqa: ANN001
-    """Réaffecte les rôles **sans** relancer le classifieur.
+    """Réarbitre les grappes **puis** les rôles, sans relancer le classifieur.
 
     Une décision de revue ne change pas ce que le modèle a vu ; relancer
     OpenCLIP ici coûterait cher et changerait des chiffres sans rapport avec la
     décision, rendant l'avant/après illisible.
+
+    Elle change en revanche la clé de choix du représentant d'un point de vue,
+    depuis que celle-ci suit la cible. Ne réaffecter que les rôles laissait
+    donc le manifeste dans un état transitoire — canonique périmé, rôles
+    calculés dessus — jusqu'à une commande `assets dedup` que rien n'imposait.
+    Les deux étapes vont ensemble ou pas du tout.
     """
+    from .dedup_levels import assign_roles
     from .roles import assign
 
+    assign_roles(assets, max_overlap=policy.dedup.max_overlap_per_cluster)
     return assign(assets, policy).counts

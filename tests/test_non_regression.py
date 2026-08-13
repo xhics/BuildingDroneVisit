@@ -58,20 +58,34 @@ class TestCorpusIsStable:
 class TestKeyFindingsHold:
     """Les conclusions tirées du corpus, protégées contre une régression."""
 
-    def test_only_two_assets_carry_geometry(self, assets, snapshot):
-        building = snapshot["building"]
-        dedup_levels.run(assets, building["lat"], building["lon"])
-        roles.assign(assets)
-        carriers = [a for a in assets if a.reconstruction_role.value == "photo_geometry"]
-        assert len(carriers) == 2
+    def test_no_asset_carries_geometry_before_its_aptitude_is_assessed(
+        self, assets, snapshot
+    ):
+        """Deux vues franchissent tous les prédicats d'identité et de position.
 
-    def test_geometry_carriers_are_all_measured_headings(self, assets, snapshot):
-        """Aucune vue à cap choisi ne doit reparaître comme porteuse."""
+        Elles ne portent pourtant aucune géométrie tant que personne n'a dit ce
+        qu'elles montrent réellement de la structure : l'aptitude n'est pas
+        déduite de la reconnaissance.
+        """
         building = snapshot["building"]
         dedup_levels.run(assets, building["lat"], building["lon"])
-        roles.assign(assets)
+        report = roles.assign(assets)
         carriers = [a for a in assets if a.reconstruction_role.value == "photo_geometry"]
-        assert all(a.heading_is_measured for a in carriers)
+
+        assert carriers == []
+        assert report.reasons["aptitude géométrique non évaluée"] == 3
+
+    def test_geometry_candidates_are_all_measured_headings(self, assets, snapshot):
+        """Aucune vue à cap choisi ne doit reparaître comme candidate."""
+        building = snapshot["building"]
+        dedup_levels.run(assets, building["lat"], building["lon"])
+        report = roles.assign(assets)
+        candidates = [
+            a for a in assets
+            if roles.role_for(a)[1] == "aptitude géométrique non évaluée"
+        ]
+        assert len(candidates) == report.reasons["aptitude géométrique non évaluée"]
+        assert all(a.heading_is_measured for a in candidates)
 
     def test_no_street_view_position_is_confirmed_visible(self, assets):
         assert street_view_coverage(assets).visible == 0
