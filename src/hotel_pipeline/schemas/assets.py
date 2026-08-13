@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from datetime import datetime, timezone
 
+from .acquisition import AcquisitionProvenance
 from .enums import (
     AssetCategory,
     CaptureType,
@@ -351,6 +352,12 @@ class Asset(BaseModel):
     target_distance_m: float | None = Field(default=None, ge=0)
     target_offset_deg: float | None = Field(default=None, ge=0, le=180)
     local_path: str | None = None
+    #: D'où vient réellement le fichier : identifiant fournisseur, positions
+    #: interrogée et rendue, cadrage demandé, plan qui l'a retenu. Sans elle,
+    #: `source_url_or_id` portait une URL de CDN, et l'identité durable de
+    #: l'asset dépendait d'un lien qui expire.
+    acquisition: "AcquisitionProvenance | None" = None
+
     phash: str | None = None
     quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
 

@@ -1,0 +1,909 @@
+"""Contrat d'acquisition photographique ciblée (Lot 1B V2).
+
+La chaîne précédente découvrait, téléchargeait tout, puis qualifiait. Elle
+traitait donc une image trouvée comme une image acquise, et une image acquise
+comme une preuve. Quatre vérités s'y confondaient :
+
+```text
+ce qu'on cherche              → CaptureDemand        (objectif, stable)
+où l'on en est                → DemandAssessment     (mesuré sur un corpus)
+ce qu'on a trouvé             → CaptureCandidate     (métadonnées seules)
+ce que ça vaut pour un besoin → CandidateEvaluation  (un couple à la fois)
+ce qu'on a décidé de prendre  → AcquisitionPlan
+ce qu'on a réellement pris    → Asset + AcquisitionProvenance
+```
+
+Trois séparations méritent d'être justifiées.
+
+Le besoin est **immuable** ; « satisfait » ou « inatteignable » dépend du
+corpus du jour. Les tenir ensemble ferait d'un objectif une variable.
+
+Un candidat vaut différemment selon le besoin : la même vue peut cadrer la
+façade avant, manquer l'entrée et documenter la voie d'accès. Une seule
+géométrie et une seule intention par candidat ne peuvent pas le dire.
+
+Aucun manifeste ne conserve d'URL. Celles des CDN expirent, les signées
+portent une clé d'API : l'adresse se reconstruit en mémoire au moment du
+téléchargement, à partir d'une spécification sans secret.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime, timezone
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .enums import ViewSector
+
+#: Champs d'empreinte qu'un plan exécutable doit **tous** porter. Une liste
+#: fermée, vérifiée par le plan lui-même : laisser l'appelant choisir ce qu'il
+#: transmet permettait de déclarer courant un plan sans lien avec le site.
+REQUIRED_PLAN_DIGESTS: tuple[str, ...] = (
+    "candidate_manifest_digest",
+    "demand_digest",
+    "policy_digest",
+    "site_manifest_digest",
+    "spatial_manifest_digest",
+    "corpus_digest",
+    "road_geometry_digest",
+    "obstacle_geometry_digest",
+)
+
+
+class CaptureIntent(StrEnum):
+    """Ce qu'une prise de vue est censée servir.
+
+    Les deux intentions n'ont pas les mêmes exigences : une vue de bâtiment
+    demande une ligne de vue utile et une taille projetée suffisante, une vue
+    de contexte documente un accès, une orientation ou une transition. Les
+    confondre a produit 302 verrous de contexte par défaut plutôt que par
+    choix.
+    """
+
+    BUILDING_CAPTURE = "building_capture"
+    CONTEXT_CAPTURE = "context_capture"
+
+
+class TargetKind(StrEnum):
+    """Nature d'une cible de besoin.
+
+    Une chaîne libre recréerait les décalages de vocabulaire déjà rencontrés —
+    `ROOFLINE_MAIN2` n'établissait rien sans que rien ne le signale.
+    """
+
+    SITE_OBJECT = "site_object"
+    VIEW_SECTOR = "view_sector"
+    CONTEXT_CORRIDOR = "context_corridor"
+    TRANSITION = "transition"
+
+
+class DemandStatus(StrEnum):
+    OPEN = "open"
+    PARTIALLY_MET = "partially_met"
+    MET = "met"
+    #: Aucune acquisition possible ne peut le satisfaire — voie privée,
+    #: façade sans accès public. Un besoin clos, non un besoin ouvert.
+    UNREACHABLE = "unreachable"
+
+
+class Eligibility(StrEnum):
+    ELIGIBLE = "eligible"
+    REJECTED = "rejected"
+    #: Admissible sur la géométrie, mais son contenu demande une vérification
+    #: par miniature avant d'engager la pleine résolution.
+    PREVIEW_REQUIRED = "preview_required"
+
+
+class VolumeStatus(StrEnum):
+    EXACT = "exact"
+    PARTIAL = "partial"
+    #: Aucune taille connue et aucune estimation produite. « Estimé » aurait
+    #: laissé croire qu'un calcul a eu lieu.
+    UNKNOWN = "unknown"
+
+
+class PlanStatus(StrEnum):
+    #: Un brouillon existe pour être discuté ; il ne s'acquiert jamais.
+    DRAFT = "draft"
+    EXECUTABLE = "executable"
+
+
+# --- besoins ----------------------------------------------------------------
+
+
+class CaptureDemand(BaseModel):
+    """Un objectif de couverture, **immuable**.
+
+    Chercher d'abord et constater ensuite reviendrait à laisser le corpus
+    définir l'objectif. Le besoin est donc énoncé en premier, et c'est lui qui
+    juge la collecte — jamais l'inverse.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    demand_id: str
+    intent: CaptureIntent
+
+    target_kind: TargetKind
+    #: Identifiant d'objet du site, secteur du vocabulaire officiel, ou
+    #: corridor. Vérifié par `validate_targets`, jamais librement interprété.
+    target_ref: str
+
+    #: Nombre de **points de vue indépendants** attendus, jamais de fichiers :
+    #: deux photographies d'un même point ne font pas deux observations.
+    viewpoints_required: int = Field(default=1, ge=1)
+
+    #: Recouvrement attendu entre vues voisines, pour qu'un SfM puisse les
+    #: relier. Zéro signifie « vues indépendantes acceptées ».
+    continuity_required: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Taille projetée minimale de la cible, en fraction de la largeur du
+    #: cadre. Le critère utile n'est pas la distance : un téléobjectif à 117 m
+    #: vaut mieux qu'un grand-angle à 40.
+    min_projected_width_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Fraction de façade utile non masquée, en deçà de laquelle la vue ne
+    #: répond pas au besoin.
+    min_visible_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Zones interdites aux plans rapprochés, **désignées** : les 18 lacunes de
+    #: toiture, une géométrie versionnée. Un booléen ne disait pas laquelle.
+    forbidden_zone_refs: list[str] = Field(default_factory=list)
+
+    rationale: str | None = None
+
+
+class DemandAssessment(BaseModel):
+    """Où en est un besoin, **contre un corpus précis**.
+
+    Le même objectif est satisfait ou non selon ce qu'on possède : l'état est
+    donc daté et rattaché à une empreinte de corpus, sans quoi « couvert »
+    serait un souvenir.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    demand_id: str
+    corpus_digest: str = Field(min_length=1)
+    assessed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    status: DemandStatus = DemandStatus.OPEN
+
+    viewpoints_found: int = Field(default=0, ge=0)
+    continuity_achieved: float | None = Field(default=None, ge=0.0, le=1.0)
+    best_projected_width_fraction: float | None = Field(default=None, ge=0.0)
+    best_visible_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: Pourquoi cet état. Obligatoire pour un besoin déclaré inatteignable :
+    #: renoncer sans motif interdit d'y revenir.
+    rationale: str | None = None
+
+    @model_validator(mode="after")
+    def _unreachable_needs_a_reason(self) -> "DemandAssessment":
+        if self.status is DemandStatus.UNREACHABLE and not (self.rationale or "").strip():
+            raise ValueError(
+                f"besoin {self.demand_id!r} déclaré inatteignable sans motif"
+            )
+        return self
+
+
+class CaptureDemandManifest(BaseModel):
+    """Les objectifs, et ce dont ils dérivent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hotel_id: str
+    built_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    demands: list[CaptureDemand] = Field(default_factory=list)
+
+    site_manifest_digest: str | None = None
+    spatial_manifest_digest: str | None = None
+    policy_digest: str | None = None
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> "CaptureDemandManifest":
+        ids = [d.demand_id for d in self.demands]
+        if len(set(ids)) != len(ids):
+            raise ValueError("identifiants de besoin dupliqués")
+        return self
+
+    def outstanding(self, assessments: "DemandAssessmentManifest | list[DemandAssessment]") -> list[CaptureDemand]:
+        """Besoins qu'une acquisition peut encore servir.
+
+        `met` est clos parce qu'il est atteint, `unreachable` parce qu'aucune
+        acquisition ne le servira : les compter comme ouverts ferait chercher
+        indéfiniment ce qui n'existe pas.
+        """
+        entries = (
+            assessments.assessments
+            if isinstance(assessments, DemandAssessmentManifest)
+            else assessments
+        )
+        state = {a.demand_id: a.status for a in entries}
+        closed = {DemandStatus.MET, DemandStatus.UNREACHABLE}
+        return [d for d in self.demands if state.get(d.demand_id, DemandStatus.OPEN) not in closed]
+
+
+class DemandAssessmentManifest(BaseModel):
+    """L'état de tous les besoins, sur **un** corpus.
+
+    Une liste nue laissait deux évaluations d'un même besoin s'écraser dans un
+    dictionnaire, et permettait de mêler des états mesurés sur des corpus
+    différents — « couvert » aurait alors désigné des instants distincts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hotel_id: str
+    corpus_digest: str = Field(min_length=1)
+    demand_digest: str = Field(min_length=1)
+    assessed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    assessments: list[DemandAssessment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _one_assessment_per_demand_on_one_corpus(self) -> "DemandAssessmentManifest":
+        ids = [a.demand_id for a in self.assessments]
+        duplicated = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicated:
+            raise ValueError(
+                f"besoins évalués deux fois : {duplicated} — le dernier lu "
+                "aurait silencieusement effacé l'autre"
+            )
+        divergent = sorted(
+            {a.corpus_digest for a in self.assessments if a.corpus_digest != self.corpus_digest}
+        )
+        if divergent:
+            raise ValueError(
+                f"états mesurés sur d'autres corpus : {divergent} — un état de "
+                "couverture ne se compose pas d'instants différents"
+            )
+        return self
+
+    def bind(self, demands: CaptureDemandManifest) -> list[str]:
+        """Confronte l'état au manifeste de besoins qu'il prétend décrire."""
+        problems: list[str] = []
+        if demands.hotel_id != self.hotel_id:
+            problems.append(
+                f"état de {self.hotel_id!r} confronté aux besoins de {demands.hotel_id!r}"
+            )
+        known = {d.demand_id for d in demands.demands}
+        for assessment in self.assessments:
+            if assessment.demand_id not in known:
+                problems.append(f"état d'un besoin inconnu : {assessment.demand_id!r}")
+        return problems
+
+
+#: Secteurs qu'une cible ne peut pas désigner. `unknown` n'est pas un
+#: objectif ; `context` et `transition` ont leur propre `TargetKind`, et les
+#: accepter comme secteurs ferait exister deux vocabulaires pour la même chose.
+_NON_TARGET_SECTORS = frozenset(
+    {ViewSector.UNKNOWN.value, ViewSector.CONTEXT.value, ViewSector.TRANSITION.value}
+)
+
+
+def validate_targets(
+    manifest: CaptureDemandManifest,
+    site_object_ids: set[str],
+    corridor_ids: set[str] | None = None,
+    forbidden_zone_ids: set[str] | None = None,
+) -> list[str]:
+    """Confronte chaque référence au vocabulaire officiel et au site réel.
+
+    Un registre **absent** et un registre **vide** ne disent pas la même
+    chose : le premier signifie qu'on ne peut pas valider, le second que rien
+    n'existe et donc que toute référence est fausse. Les confondre — par un
+    simple `and corridors` — laissait passer sans contrôle toutes les
+    références de corridor.
+    """
+    sectors = {s.value for s in ViewSector} - _NON_TARGET_SECTORS
+    problems: list[str] = []
+
+    for demand in manifest.demands:
+        ref, kind = demand.target_ref, demand.target_kind
+
+        if kind is TargetKind.SITE_OBJECT and ref not in site_object_ids:
+            problems.append(f"{demand.demand_id} : objet de site inconnu {ref!r}")
+        elif kind is TargetKind.VIEW_SECTOR and ref not in sectors:
+            problems.append(
+                f"{demand.demand_id} : secteur inconnu ou non ciblable {ref!r} ; "
+                f"attendu l'un de {sorted(sectors)}"
+            )
+        elif kind in (TargetKind.CONTEXT_CORRIDOR, TargetKind.TRANSITION):
+            if corridor_ids is None:
+                problems.append(
+                    f"{demand.demand_id} : cible {ref!r} invérifiable — aucun "
+                    "registre de corridors fourni"
+                )
+            elif ref not in corridor_ids:
+                problems.append(f"{demand.demand_id} : corridor inconnu {ref!r}")
+
+        for zone in demand.forbidden_zone_refs:
+            if forbidden_zone_ids is None:
+                problems.append(
+                    f"{demand.demand_id} : zone interdite {zone!r} invérifiable — "
+                    "aucun registre de zones fourni"
+                )
+            elif zone not in forbidden_zone_ids:
+                problems.append(f"{demand.demand_id} : zone interdite inconnue {zone!r}")
+
+    return problems
+
+
+def bind_evaluations(
+    candidates: CandidateManifest, demands: CaptureDemandManifest
+) -> list[str]:
+    """Ferme la relation entre évaluations et besoins.
+
+    Une évaluation qui cite un besoin inexistant, ou qui lui prête une autre
+    intention, décrit un objectif que personne n'a formulé.
+    """
+    by_id = {d.demand_id: d for d in demands.demands}
+    problems: list[str] = []
+
+    if candidates.hotel_id != demands.hotel_id:
+        problems.append(
+            f"candidats de {candidates.hotel_id!r} confrontés aux besoins de "
+            f"{demands.hotel_id!r}"
+        )
+
+    for evaluation in candidates.evaluations:
+        demand = by_id.get(evaluation.demand_id)
+        if demand is None:
+            problems.append(
+                f"{evaluation.candidate_id} : évalué pour un besoin inconnu "
+                f"{evaluation.demand_id!r}"
+            )
+            continue
+        if evaluation.intent is not demand.intent:
+            problems.append(
+                f"{evaluation.candidate_id}/{evaluation.demand_id} : intention "
+                f"{evaluation.intent.value!r} ≠ {demand.intent.value!r} du besoin"
+            )
+    return problems
+
+
+def bind_plan(
+    plan: AcquisitionPlan,
+    candidates: CandidateManifest,
+    demands: CaptureDemandManifest,
+) -> list[str]:
+    """Ferme la relation entre le plan, les candidats et les besoins.
+
+    Un plan est une promesse de dépense : chacun de ses éléments doit désigner
+    un candidat qui existe, un besoin qui existe, une évaluation qui ne l'a pas
+    rejeté, et une résolution que le fournisseur propose.
+    """
+    known_candidates = {c.candidate_id: c for c in candidates.candidates}
+    known_demands = {d.demand_id for d in demands.demands}
+    eligible: dict[str, set[str]] = {}
+    for evaluation in candidates.evaluations:
+        if evaluation.eligibility is not Eligibility.REJECTED:
+            eligible.setdefault(evaluation.candidate_id, set()).add(evaluation.demand_id)
+
+    problems: list[str] = []
+    if plan.hotel_id != candidates.hotel_id:
+        problems.append(
+            f"plan de {plan.hotel_id!r} sur des candidats de {candidates.hotel_id!r}"
+        )
+
+    planned = {a.candidate_id for a in plan.acquisitions}
+    for item in plan.acquisitions:
+        candidate = known_candidates.get(item.candidate_id)
+        if candidate is None:
+            problems.append(f"{item.candidate_id} : au plan sans candidat correspondant")
+            continue
+
+        served = eligible.get(item.candidate_id, set())
+        if not served:
+            problems.append(
+                f"{item.candidate_id} : retenu sans aucune évaluation favorable"
+            )
+
+        unknown = [d for d in item.serves_demands if d not in known_demands]
+        if unknown:
+            problems.append(f"{item.candidate_id} : besoins inconnus {sorted(unknown)}")
+
+        not_eligible = [
+            d for d in item.serves_demands if d in known_demands and d not in served
+        ]
+        if not_eligible:
+            problems.append(
+                f"{item.candidate_id} : prétend servir {sorted(not_eligible)}, "
+                "dont l'évaluation l'a écarté"
+            )
+
+        if candidate.available_resolutions and item.resolution not in candidate.available_resolutions:
+            problems.append(
+                f"{item.candidate_id} : résolution {item.resolution!r} indisponible ; "
+                f"le fournisseur propose {candidate.available_resolutions}"
+            )
+
+        missing_overlap = [c for c in item.overlap_with if c not in planned]
+        if missing_overlap:
+            problems.append(
+                f"{item.candidate_id} : recouvrement annoncé avec {sorted(missing_overlap)}, "
+                "absent(s) du plan"
+            )
+
+    return problems
+
+
+# --- candidats ---------------------------------------------------------------
+
+
+class CaptureCandidate(BaseModel):
+    """Une prise de vue possible : métadonnées fournisseur et caméra, rien de plus.
+
+    Pas de fichier, pas d'empreinte, pas de rôle — et pas davantage de verdict :
+    ce qu'elle vaut dépend du besoin, et se dit dans `CandidateEvaluation`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    source: str
+
+    #: Identifiant **stable** chez le fournisseur.
+    provider_id: str
+
+    #: Position interrogée et position réellement rendue. Street View rabat la
+    #: requête sur le panorama le plus proche, parfois ailleurs ; ne garder que
+    #: l'une des deux rend la sélection irreproductible.
+    queried_lat: float | None = Field(default=None, ge=-90, le=90)
+    queried_lon: float | None = Field(default=None, ge=-180, le=180)
+    camera_lat: float | None = Field(default=None, ge=-90, le=90)
+    camera_lon: float | None = Field(default=None, ge=-180, le=180)
+
+    #: Cap rapporté par le fournisseur, et cap qu'il recalcule. Conserver les
+    #: deux : le second est meilleur, le premier est la mesure.
+    original_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    computed_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    heading_is_measured: bool = True
+
+    #: Cadrage demandé pour une extraction panoramique : une vue Street View
+    #: n'existe qu'au moment où on la cadre.
+    requested_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    requested_fov_deg: float | None = Field(default=None, gt=0, le=120)
+    requested_pitch_deg: float | None = Field(default=None, ge=-90, le=90)
+
+    sequence_id: str | None = None
+    panorama_id: str | None = None
+    camera_type: str | None = None
+
+    #: Dimensions **annoncées par le fournisseur**, à ne pas confondre avec
+    #: celles du fichier acquis : elles seront mesurées, pas recopiées.
+    advertised_width: int | None = Field(default=None, gt=0)
+    advertised_height: int | None = Field(default=None, gt=0)
+
+    captured_at: datetime | None = None
+    quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: Résolutions disponibles, par nom. Aucune adresse : elle se reconstruit
+    #: au téléchargement à partir de `request_spec`.
+    available_resolutions: list[str] = Field(default_factory=list)
+
+    #: Paramètres non secrets nécessaires au résolveur d'URL.
+    request_spec: dict[str, str] = Field(default_factory=dict)
+
+    #: Preuve fournisseur que la vue est extérieure. Sans elle, l'asset restera
+    #: `unknown` : déclarer `exterior` par défaut serait une mesure inventée.
+    outdoor_evidence: str | None = None
+
+    @model_validator(mode="after")
+    def _no_urls_are_persisted(self) -> "CaptureCandidate":
+        # Une URL de CDN expire, une URL signée porte la clé d'API : ni l'une
+        # ni l'autre n'a sa place dans un manifeste conservé.
+        for key, value in self.request_spec.items():
+            text = str(value)
+            if "://" in text or text.lower().startswith("www."):
+                raise ValueError(
+                    f"candidat {self.candidate_id!r} : {key!r} contient une URL ; "
+                    "l'adresse se reconstruit au téléchargement"
+                )
+            if any(secret in key.lower() for secret in ("key", "token", "signature")):
+                raise ValueError(
+                    f"candidat {self.candidate_id!r} : {key!r} ressemble à un secret"
+                )
+        return self
+
+
+class CandidateGeometry(BaseModel):
+    """Ce que la géométrie dit d'un candidat **pour une cible donnée**.
+
+    Tout est calculé sur des métadonnées : rien n'est mesuré sur l'image, qui
+    n'a pas été acquise. Ces valeurs portent donc des espérances, et sont
+    nommées comme telles.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    distance_m: float | None = Field(default=None, ge=0)
+
+    #: Intervalle angulaire occupé par l'empreinte depuis la caméra. Sur un
+    #: bâtiment oblique, il ne se déduit ni du centroïde ni de la boîte.
+    angular_span_deg: float | None = Field(default=None, ge=0, le=360)
+    target_offset_deg: float | None = Field(default=None, ge=0, le=180)
+
+    #: Taille projetée espérée : le critère décisif, la distance n'étant qu'un
+    #: garde-fou extérieur. Non bornées à 1 et nommées `unclipped` : une cible
+    #: plus large que le champ de vision déborde légitimement du cadre, et
+    #: écrêter la mesure effacerait cette information.
+    unclipped_width_fraction: float | None = Field(default=None, ge=0.0)
+    unclipped_height_fraction: float | None = Field(default=None, ge=0.0)
+
+    #: Dimensions attendues de la cible dans l'image, en pixels. Deux mesures
+    #: plutôt qu'une aire : « 40 000 pixels » ne dit pas si la façade fait
+    #: 200×200 ou 800×50.
+    expected_width_px: int | None = Field(default=None, ge=0)
+    expected_height_px: int | None = Field(default=None, ge=0)
+
+    #: Part de la silhouette utile non masquée, estimée par plusieurs rayons —
+    #: jamais par le seul rayon vers le point le plus proche.
+    visible_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: Obstacle de hauteur inconnue : le risque est signalé, il n'est pas
+    #: transformé en certitude.
+    occlusion_risk: bool = False
+    occluded_by: list[str] = Field(default_factory=list)
+
+    #: Contrôle 2,5D mené avec MNT et MNS. Sans lui, la visibilité reste plane,
+    #: donc optimiste.
+    used_elevation: bool = False
+    elevation_provenance: str | None = None
+
+    @model_validator(mode="after")
+    def _elevation_is_stated_or_absent(self) -> "CandidateGeometry":
+        # Un contrôle 2,5D sans provenance ne se rejoue pas ; une provenance
+        # sans contrôle laisse croire qu'il a eu lieu.
+        if self.used_elevation and not (self.elevation_provenance or "").strip():
+            raise ValueError(
+                "contrôle d'élévation déclaré sans provenance : on ne saurait "
+                "pas de quel MNT ni de quel MNS il procède"
+            )
+        if self.elevation_provenance and not self.used_elevation:
+            raise ValueError(
+                "provenance d'élévation sans contrôle d'élévation"
+            )
+        return self
+
+    #: Secteur du vocabulaire officiel, jamais une chaîne libre.
+    view_sector: ViewSector | None = None
+
+    #: Identifiant de la voie sur laquelle se trouve la caméra. `on_road`
+    #: laissait croire à un booléen alors que le champ porte une référence.
+    road_ref: str | None = None
+
+
+class CandidateEvaluation(BaseModel):
+    """Ce qu'un candidat vaut **pour un besoin**, et pourquoi.
+
+    Un candidat peut cadrer la façade avant, manquer l'entrée et documenter la
+    voie d'accès : trois verdicts pour une même image. Les réduire à un seul
+    obligeait à choisir lequel taire.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    demand_id: str
+    intent: CaptureIntent
+    eligibility: Eligibility = Eligibility.ELIGIBLE
+    geometry: CandidateGeometry = Field(default_factory=CandidateGeometry)
+
+    #: Obligatoire dès qu'il y a rejet : un candidat écarté sans raison
+    #: n'apprend rien à la recherche suivante.
+    rejection_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _rejection_needs_a_reason(self) -> "CandidateEvaluation":
+        rejected = self.eligibility is Eligibility.REJECTED
+        if rejected and not (self.rejection_reason or "").strip():
+            raise ValueError(
+                f"évaluation {self.candidate_id!r}/{self.demand_id!r} : rejet sans motif"
+            )
+        if not rejected and self.rejection_reason:
+            raise ValueError(
+                f"évaluation {self.candidate_id!r}/{self.demand_id!r} : motif de "
+                "rejet sans rejet"
+            )
+        return self
+
+
+class CandidateManifest(BaseModel):
+    """Tout ce qui a été découvert, et ce qu'on en a pensé, besoin par besoin.
+
+    Ne conserver que les retenus interdirait de comprendre une absence :
+    « aucune vue de la façade arrière » ne se distinguerait pas de « aucune
+    recherche de ce côté ».
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hotel_id: str
+    discovered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    candidates: list[CaptureCandidate] = Field(default_factory=list)
+    evaluations: list[CandidateEvaluation] = Field(default_factory=list)
+
+    #: Requêtes réellement émises, par source : sans elles, un zéro ne dit pas
+    #: si la source a été interrogée.
+    queries: dict[str, int] = Field(default_factory=dict)
+
+    demand_digest: str | None = None
+    policy_digest: str | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "CandidateManifest":
+        ids = [c.candidate_id for c in self.candidates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("identifiants de candidat dupliqués")
+
+        known = set(ids)
+        pairs = set()
+        for evaluation in self.evaluations:
+            if evaluation.candidate_id not in known:
+                raise ValueError(
+                    f"évaluation d'un candidat absent : {evaluation.candidate_id!r}"
+                )
+            pair = (evaluation.candidate_id, evaluation.demand_id)
+            if pair in pairs:
+                raise ValueError(f"deux évaluations pour le couple {pair}")
+            pairs.add(pair)
+        return self
+
+    def eligible_for(self, demand_id: str) -> list[CandidateEvaluation]:
+        return [
+            e
+            for e in self.evaluations
+            if e.demand_id == demand_id and e.eligibility is not Eligibility.REJECTED
+        ]
+
+    def rejections_by_reason(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for evaluation in self.evaluations:
+            if evaluation.eligibility is Eligibility.REJECTED:
+                reason = evaluation.rejection_reason or "sans motif"
+                counts[reason] = counts.get(reason, 0) + 1
+        return dict(sorted(counts.items()))
+
+
+# --- plan --------------------------------------------------------------------
+
+
+class PlannedAcquisition(BaseModel):
+    """Un candidat retenu, et ce qu'on s'engage à en télécharger.
+
+    Une seule acquisition peut servir plusieurs besoins — cadrer la façade et
+    documenter la voie d'accès. Ne porter qu'une intention obligeait à taire
+    l'autre, et le contexte redevenait un sous-produit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    intents: list[CaptureIntent] = Field(min_length=1)
+
+    #: Celle qui classe l'acquisition quand il faut trancher.
+    primary_intent: CaptureIntent | None = None
+
+    #: Résolution demandée. Une vérification de contenu se fait en 256 ou 1024 ;
+    #: la pleine résolution ne vient qu'après sélection.
+    resolution: str = "2048"
+
+    #: Volume attendu. `None` signifie **inconnu**, jamais zéro : compter une
+    #: taille absente comme nulle annonçait un total « exact » faux.
+    expected_bytes: int | None = Field(default=None, ge=0)
+
+    #: Pourquoi ce candidat plutôt qu'un autre, et ce qu'il apporte au graphe :
+    #: sa valeur propre et son recouvrement avec ses voisins.
+    selection_rationale: str = Field(min_length=1)
+    overlap_with: list[str] = Field(default_factory=list)
+
+    #: Obligatoire : télécharger sans savoir quel besoin on sert, c'est
+    #: revenir à collecter d'abord et justifier ensuite.
+    serves_demands: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _intents_are_distinct(self) -> "PlannedAcquisition":
+        if len(set(self.intents)) != len(self.intents):
+            raise ValueError(
+                f"acquisition {self.candidate_id!r} : intentions dupliquées"
+            )
+        if self.primary_intent and self.primary_intent not in self.intents:
+            raise ValueError(
+                f"acquisition {self.candidate_id!r} : intention principale "
+                f"{self.primary_intent.value!r} absente de ses intentions"
+            )
+        return self
+
+
+class AcquisitionPlan(BaseModel):
+    """Ce qui sera téléchargé, arrêté avant tout appel réseau.
+
+    Un plan exécutable porte **toutes** ses empreintes. Les rendre facultatives
+    permettait de déclarer courant un plan sans lien avec le site, et donc
+    d'acquérir des images choisies pour un autre état.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    hotel_id: str
+    status: PlanStatus = PlanStatus.DRAFT
+    planned_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    acquisitions: list[PlannedAcquisition] = Field(default_factory=list)
+
+    candidate_manifest_digest: str | None = None
+    demand_digest: str | None = None
+    policy_digest: str | None = None
+    site_manifest_digest: str | None = None
+    spatial_manifest_digest: str | None = None
+    corpus_digest: str | None = None
+    road_geometry_digest: str | None = None
+    obstacle_geometry_digest: str | None = None
+
+    @property
+    def known_bytes(self) -> int:
+        return sum(a.expected_bytes for a in self.acquisitions if a.expected_bytes is not None)
+
+    @property
+    def unknown_size_items(self) -> list[str]:
+        return [a.candidate_id for a in self.acquisitions if a.expected_bytes is None]
+
+    @property
+    def volume_status(self) -> VolumeStatus:
+        if not self.acquisitions:
+            return VolumeStatus.EXACT
+        if not self.unknown_size_items:
+            return VolumeStatus.EXACT
+        if len(self.unknown_size_items) == len(self.acquisitions):
+            return VolumeStatus.UNKNOWN
+        return VolumeStatus.PARTIAL
+
+    def missing_digests(self) -> list[str]:
+        return [name for name in REQUIRED_PLAN_DIGESTS if not getattr(self, name)]
+
+    @model_validator(mode="after")
+    def _executable_is_complete(self) -> "AcquisitionPlan":
+        ids = [a.candidate_id for a in self.acquisitions]
+        if len(set(ids)) != len(ids):
+            raise ValueError("un candidat figure deux fois au plan")
+
+        if self.status is PlanStatus.EXECUTABLE:
+            missing = self.missing_digests()
+            if missing:
+                raise ValueError(
+                    f"plan {self.plan_id!r} exécutable sans empreinte(s) : {missing} — "
+                    "un plan qu'on ne peut pas rattacher à un état ne s'acquiert pas"
+                )
+            if not self.acquisitions:
+                raise ValueError(f"plan {self.plan_id!r} exécutable et vide")
+        return self
+
+
+# --- provenance ---------------------------------------------------------------
+
+
+class AcquisitionProvenance(BaseModel):
+    """D'où vient réellement un fichier acquis.
+
+    `source_url_or_id` recevait l'URL temporaire du CDN : l'identité durable de
+    l'asset dépendait d'un lien qui expire, et les métadonnées du collecteur
+    étaient perdues à la conversion.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_id: str
+    plan_id: str
+    plan_digest: str
+    candidate_id: str
+    intents: list[CaptureIntent] = Field(min_length=1)
+    primary_intent: CaptureIntent | None = None
+
+    queried_lat: float | None = Field(default=None, ge=-90, le=90)
+    queried_lon: float | None = Field(default=None, ge=-180, le=180)
+    returned_lat: float | None = Field(default=None, ge=-90, le=90)
+    returned_lon: float | None = Field(default=None, ge=-180, le=180)
+
+    original_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    computed_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    requested_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    requested_fov_deg: float | None = Field(default=None, gt=0, le=120)
+    requested_pitch_deg: float | None = Field(default=None, ge=-90, le=90)
+
+    sequence_id: str | None = None
+    panorama_id: str | None = None
+    camera_type: str | None = None
+    resolution: str | None = None
+    acquired_at: datetime | None = None
+
+    #: Dimensions annoncées par le fournisseur, conservées **à côté** de celles
+    #: mesurées sur le fichier : les faire coïncider d'office masquerait un
+    #: rendu tronqué ou redimensionné.
+    advertised_width: int | None = Field(default=None, gt=0)
+    advertised_height: int | None = Field(default=None, gt=0)
+
+    #: Répertoire d'exécution où le fichier a été publié : les acquisitions ne
+    #: se mélangent pas aux fichiers historiques.
+    run_id: str | None = None
+
+
+# --- identité ------------------------------------------------------------------
+
+
+class IdentityStrategy(StrEnum):
+    """Comment une source nomme ses prises de vue."""
+
+    #: L'image existe telle quelle chez le fournisseur.
+    PROVIDER_IMAGE = "provider_image"
+    #: Le fournisseur rend une sphère : c'est le cadrage qui fait l'image.
+    PANORAMA_FRAMING = "panorama_framing"
+
+
+#: Stratégie par source. Une source inconnue ne se rabat pas silencieusement
+#: sur `provider_image` : deux cadrages y porteraient le même identifiant, et
+#: l'un écraserait l'autre.
+IDENTITY_STRATEGIES: dict[str, IdentityStrategy] = {
+    "mapillary": IdentityStrategy.PROVIDER_IMAGE,
+    "commons": IdentityStrategy.PROVIDER_IMAGE,
+    "flickr": IdentityStrategy.PROVIDER_IMAGE,
+    "website": IdentityStrategy.PROVIDER_IMAGE,
+    "places": IdentityStrategy.PROVIDER_IMAGE,
+    "tripadvisor": IdentityStrategy.PROVIDER_IMAGE,
+    "street_view": IdentityStrategy.PANORAMA_FRAMING,
+}
+
+
+def capture_identity(
+    source: str,
+    provider_id: str,
+    *,
+    heading_deg: float | None = None,
+    fov_deg: float | None = None,
+    pitch_deg: float | None = None,
+    size: str | None = None,
+    strategy: IdentityStrategy | None = None,
+) -> str:
+    """Identifiant durable d'une prise de vue, selon la nature de la source.
+
+    Pour Mapillary, l'identifiant d'image suffit : elle existe telle quelle, et
+    y adjoindre un cadrage fabriquerait une identité qui ne correspond à rien.
+    Pour Street View, le panorama n'est pas une image mais une sphère : deux
+    cadrages sont deux prises de vue, et les nommer pareil en écraserait une.
+
+    Une source inconnue exige une stratégie déclarée. Le défaut implicite
+    aurait été le plus dangereux des deux.
+    """
+    chosen = strategy or IDENTITY_STRATEGIES.get(source)
+    if chosen is None:
+        raise ValueError(
+            f"source inconnue {source!r} : déclarez sa stratégie d'identité, "
+            "elle ne peut pas être devinée"
+        )
+
+    framing = {"heading_deg": heading_deg, "fov_deg": fov_deg,
+               "pitch_deg": pitch_deg, "size": size}
+
+    if chosen is IdentityStrategy.PROVIDER_IMAGE:
+        given = sorted(k for k, v in framing.items() if v is not None)
+        if given:
+            raise ValueError(
+                f"{source} nomme ses images par identifiant : le cadrage "
+                f"{given} n'entre pas dans leur identité"
+            )
+        return f"{source}-{provider_id}"
+
+    missing = sorted(k for k, v in framing.items() if v is None)
+    if missing:
+        raise ValueError(
+            f"{source} rend un panorama : son identité exige le cadrage complet, "
+            f"or {missing} manque(nt)"
+        )
+
+    spec = "|".join(
+        f"{value:.3f}" if isinstance(value, float) else str(value)
+        for value in (heading_deg, fov_deg, pitch_deg, size)
+    )
+    digest = hashlib.sha256(f"{provider_id}|{spec}".encode("utf-8")).hexdigest()[:12]
+    return f"{source}-{provider_id}-{digest}"
