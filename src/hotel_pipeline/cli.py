@@ -1859,6 +1859,151 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     )
 
 
+@visibility_app.command("apply")
+def visibility_apply(
+    hotel_id: str = typer.Argument(...),
+    run_id: str = typer.Argument(..., help="Exécution exacte à projeter."),
+) -> None:
+    """Projette une exécution vers les assets. Atomique, et sans promotion."""
+    from .geo import visibility_apply as projection
+    from .geo.visibility_run import digest
+    from .intake import sha256_file
+    from .schemas.geometry import CaptureGeometryManifest, GeometryRole
+    from .schemas.visibility import VisibilityRun
+
+    workspace = Workspace(hotel_id)
+    context = _context(hotel_id)
+
+    # Le `run_id` est exigé : « le dernier rapport » appliquerait ce qui vient
+    # d'être mesuré sans que personne ne l'ait lu.
+    path = workspace.path("06_geo", f"visibility_run_{run_id}.json")
+    if not path.is_file():
+        typer.secho(f"{KO} exécution introuvable : {path.name}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    run = VisibilityRun.model_validate(json.loads(path.read_text("utf-8")))
+    run_digest = sha256_file(path)[:16]
+
+    manifest = workspace.read_assets()
+    site = workspace.read_site()
+    raw_geometry = workspace.read_json("06_geo/capture_geometry.json")
+    if manifest is None or raw_geometry is None:
+        typer.secho(
+            "manifeste d'assets et manifeste géométrique requis",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    geometry = CaptureGeometryManifest.model_validate(raw_geometry)
+
+    # Les images sont relues : un checksum déclaré ne prouve pas le contenu.
+    altered = [
+        asset.id
+        for asset in manifest.assets
+        if asset.local_path
+        and Path(asset.local_path).is_file()
+        and sha256_file(Path(asset.local_path)) != asset.checksum
+    ]
+    if altered:
+        typer.secho(
+            f"{KO} {len(altered)} image(s) diffèrent de leur empreinte : {altered[:5]}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=4)
+
+    for source in run.elevation_sources:
+        source_path = Path(source.path)
+        if not source_path.is_file():
+            typer.secho(f"{KO} source d'élévation absente : {source.path}",
+                        fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=4)
+        if sha256_file(source_path) != source.sha256:
+            typer.secho(
+                f"{KO} {source_path.name} : contenu différent de l'empreinte citée "
+                f"par l'exécution ({source.role})",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+
+    current = {
+        "policy": context.provenance["policy_digest"],
+        "capture_geometry": digest(raw_geometry),
+        "site_manifest": digest(json.loads(site.model_dump_json())) if site else "sans-site",
+        "asset_files": digest(sorted(f"{a.id}:{a.checksum}" for a in manifest.assets)),
+        "obstacles": digest(
+            sorted(
+                g.geometry_digest or ""
+                for g in geometry.by_role(GeometryRole.OBSTACLE_BUILDING)
+            )
+        ),
+        "roads": digest(
+            sorted(
+                g.geometry_digest or ""
+                for g in geometry.geometries
+                if g.role.value in ("access_road", "road_candidate")
+            )
+        ),
+    }
+
+    receipt = workspace.path("06_geo", projection.receipt_name(run_id, run_digest))
+    idempotent, divergent = projection.already_applied(manifest, run)
+    if idempotent:
+        # Une commande interrompue après l'écriture du manifeste doit pouvoir
+        # se rejouer : le reçu manquant se reconstruit sans rien remuter.
+        typer.secho(f"  {OK} exécution déjà appliquée — assets inchangés",
+                    fg=typer.colors.GREEN)
+        if not receipt.is_file():
+            report, _ = projection.project(manifest, run, run_digest, context.policy)
+            report.status = "already_applied"
+            workspace.write_report(f"06_geo/{receipt.name}", report, context)
+            typer.echo(f"  reçu manquant reconstruit : {receipt.name}")
+        raise typer.Exit(code=0)
+    if divergent:
+        typer.secho(f"{KO} application refusée :", fg=typer.colors.RED, err=True)
+        for problem in divergent[:8]:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
+    problems = projection.verify(run, manifest, hotel_id, current)
+    if problems:
+        typer.secho(f"{KO} exécution non applicable :", fg=typer.colors.RED, err=True)
+        for problem in problems:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
+    try:
+        report, projected = projection.project(manifest, run, run_digest, context.policy)
+    except projection.ApplicationRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4) from exc
+
+    # Dernière écriture, et seule mutation : le manifeste d'abord, le reçu
+    # ensuite — un reçu sans manifeste décrirait une application qui n'a pas eu
+    # lieu.
+    workspace.write_assets(projected)
+    workspace.write_report(f"06_geo/{receipt.name}", report, context)
+
+    typer.echo("")
+    typer.echo(f"  exécution {run_id} ({run_digest}) appliquée")
+    typer.echo(f"  {report.assets_updated} asset(s) mis à jour")
+    typer.echo(f"  champs écrits : {', '.join(report.fields_written)}")
+    typer.echo("")
+    typer.secho(
+        f"  {len(report.former_occlusions)} occultation(s) déclarée(s) retirée(s) "
+        f"faute de preuve · {len(report.occluded_by_kept)} conservée(s)",
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("")
+    typer.echo(f"  rôles avant : {report.roles_before}")
+    typer.echo(f"  rôles après : {report.roles_after}")
+    if report.roles_before != report.roles_after:
+        typer.secho(f"{KO} les rôles ont changé", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+    typer.secho(
+        "  aucun rôle modifié, aucune décision humaine touchée",
+        fg=typer.colors.GREEN,
+    )
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 
