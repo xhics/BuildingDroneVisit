@@ -29,6 +29,26 @@ def digest(payload: object) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def base_manifest_digest(manifest) -> str:  # noqa: ANN001
+    """Empreinte du manifeste **hors résultats de visibilité**.
+
+    Sans cette normalisation, appliquer un run le périmerait aussitôt : les
+    champs qu'il vient d'écrire changeraient l'empreinte qu'il déclare. Tout le
+    reste — cap, position, revue humaine, aptitude, scores — reste dans le
+    calcul, et doit bien périmer le run.
+
+    Employée par `assess` comme par `apply` : deux définitions divergentes
+    rendraient la comparaison inutile.
+    """
+    from ..schemas.assets import VISIBILITY_PROJECTED_FIELDS
+
+    payload = json.loads(manifest.model_dump_json())
+    for asset in payload.get("assets", []):
+        for field_name in VISIBILITY_PROJECTED_FIELDS:
+            asset.pop(field_name, None)
+    return digest(payload)
+
+
 @dataclass
 class RunReport:
     run_id: str = ""
@@ -160,6 +180,7 @@ def run_assessment(
     target_vertical=None,  # noqa: ANN001 — TargetVertical enrichie
     camera_ground=None,  # noqa: ANN001 — callable (x, y) -> Sample | None
     obstacle_heights: dict | None = None,
+    elevation_sources: list | None = None,
 ) -> tuple[VisibilityRun, RunReport]:
     """Mesure la visibilité de chaque asset situé et de chaque corridor."""
     from pyproj import Transformer
@@ -191,10 +212,12 @@ def run_assessment(
         capture_geometry_digest=digests["capture_geometry"],
         policy_digest=digests["policy"],
         site_manifest_digest=digests["site_manifest"],
-        assets_digest=digests["assets"],
+        asset_files_digest=digests["asset_files"],
+        asset_manifest_digest=digests["asset_manifest"],
         target_digest=target_geometry.geometry_digest,
         obstacles_digest=digests["obstacles"],
         road_geometry_digest=digests["roads"],
+        elevation_sources=list(elevation_sources or []),
     )
 
     # --- assets ---------------------------------------------------------------

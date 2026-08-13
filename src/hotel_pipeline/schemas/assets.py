@@ -47,6 +47,21 @@ VISIBILITY_OF: dict[ReviewDecision, bool | None] = {
     ReviewDecision.UNRESOLVED: None,
 }
 
+#: Champs écrits par `visibility apply`. Exclus de l'empreinte de base : leur
+#: ajout ne doit pas périmer le run qui vient de les produire, alors qu'un cap
+#: corrigé ou une revue humaine, eux, le doivent.
+VISIBILITY_PROJECTED_FIELDS: frozenset[str] = frozenset(
+    {
+        "visibility_run_id",
+        "visibility_run_digest",
+        "visibility_assessment_id",
+        "line_of_sight_status",
+        "occlusion_risk_by",
+        "occlusion_blocked_by",
+        "occluded_by",
+    }
+)
+
 #: Statuts qu'une personne seule peut poser.
 _HUMAN_STATUSES = frozenset({ReviewStatus.HUMAN_ACCEPTED, ReviewStatus.REJECTED})
 
@@ -352,6 +367,19 @@ class Asset(BaseModel):
     target_distance_m: float | None = Field(default=None, ge=0)
     target_offset_deg: float | None = Field(default=None, ge=0, le=180)
     local_path: str | None = None
+    #: Résultats projetés par `visibility apply`. Ils décrivent la géométrie,
+    #: jamais le contenu : aucun d'eux ne dit que la caméra vise le bâtiment,
+    #: ni qu'il entre dans l'image.
+    visibility_run_id: str | None = None
+    visibility_run_digest: str | None = None
+    visibility_assessment_id: str | None = None
+    line_of_sight_status: str | None = None
+
+    #: Obstacles dont une donnée verticale manque, et obstacles prouvés
+    #: masquants. Le premier n'est pas une occultation.
+    occlusion_risk_by: list[str] = Field(default_factory=list)
+    occlusion_blocked_by: list[str] = Field(default_factory=list)
+
     #: D'où vient réellement le fichier : identifiant fournisseur, positions
     #: interrogée et rendue, cadrage demandé, plan qui l'a retenu. Sans elle,
     #: `source_url_or_id` portait une URL de CDN, et l'identité durable de

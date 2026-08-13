@@ -595,8 +595,8 @@ def visibility_run(**overrides):
         run_id="r", hotel_id="h", engine_version="multiray-1.0.0",
         method="uniform_angular_cells", parameters={"max_angular_step_deg": "0.25"},
         capture_geometry_digest="a", policy_digest="b", site_manifest_digest="c",
-        assets_digest="d", target_digest="e", obstacles_digest="f",
-        road_geometry_digest="g",
+        asset_files_digest="d1", asset_manifest_digest="d2", target_digest="e",
+        obstacles_digest="f", road_geometry_digest="g",
     )
     fields.update(overrides)
     return VisibilityRun(**fields)
@@ -605,6 +605,22 @@ def visibility_run(**overrides):
 def test_a_run_without_its_digests_is_refused() -> None:
     with pytest.raises(ValueError):
         visibility_run(obstacles_digest="")
+
+
+def test_the_files_digest_does_not_stand_for_the_manifest() -> None:
+    """Une revue humaine ou un cap corrigé ne changent aucune image.
+
+    Une empreinte unique laissait donc un run se croire courant après une
+    décision qui, elle, avait tout changé.
+    """
+    from hotel_pipeline.schemas.visibility import VisibilityRun
+
+    fields = set(VisibilityRun.model_fields)
+    assert {"asset_files_digest", "asset_manifest_digest"} <= fields
+    assert "assets_digest" not in fields
+
+    with pytest.raises(ValueError):
+        visibility_run(asset_manifest_digest="")
 
 
 def test_a_run_without_parameters_is_refused() -> None:
@@ -651,9 +667,132 @@ def test_a_vertical_verdict_requires_a_cited_source() -> None:
         camera=known_camera(), target_vertical=known_target(),
     )
 
+    from hotel_pipeline.schemas.visibility import ElevationSource
+
     with pytest.raises(ValueError, match="sans citer la moindre source"):
         visibility_run(assessments=[decided])
 
-    assert visibility_run(
-        assessments=[decided], elevation_artifacts=["dtm@20260813T124251Z"]
+    source = ElevationSource(
+        kind="raster", role="target_ground", artifact_id="dtm@20260813T124251Z",
+        path="06_geo/derived/dtm.tif", sha256="a" * 64,
+        horizontal_crs="EPSG:2950", vertical_crs="CGVD 1928",
+        sampling_method="rasterio.sample",
     )
+    assert visibility_run(assessments=[decided], elevation_sources=[source])
+
+
+def test_an_elevation_source_must_be_verifiable() -> None:
+    """« 9/27 mesurés dans le nuage » explique un calcul, ne le vérifie pas."""
+    from hotel_pipeline.schemas.visibility import ElevationSource
+
+    for missing in ("path", "sha256", "horizontal_crs", "sampling_method"):
+        fields = dict(
+            kind="point_cloud", role="obstacle_height", path="tuile.LAZ",
+            sha256="b" * 64, horizontal_crs="EPSG:2950",
+            sampling_method="médiane classe 2",
+        )
+        fields[missing] = ""
+        with pytest.raises(ValueError):
+            ElevationSource(**fields)
+
+
+# --- provenance d'élévation vérifiable ---------------------------------------
+
+
+def elevation_source(**overrides):
+    from hotel_pipeline.schemas.visibility import ElevationSource
+
+    fields = dict(
+        kind="point_cloud", role="obstacle_height", tile_id="23_3095048F08_DC",
+        path="06_geo/lidar_raw/23_3095048F08_DC.LAZ", sha256="f" * 64,
+        horizontal_crs="EPSG:2950", vertical_crs="CGVD 1928",
+        sampling_method="médiane classe 2 et p95 classe 6",
+    )
+    fields.update(overrides)
+    return ElevationSource(**fields)
+
+
+def test_an_elevation_source_must_be_identifiable() -> None:
+    with pytest.raises(ValueError, match="sans identifiant d'artefact ni de tuile"):
+        elevation_source(tile_id=None)
+
+
+def test_an_elevation_without_vertical_datum_is_refused() -> None:
+    """CGVD 1928 et NAD83 diffèrent de plusieurs mètres : sans datum, un
+    nombre n'est pas une altitude."""
+    with pytest.raises(ValueError, match="sans référentiel vertical"):
+        elevation_source(vertical_crs=None)
+
+
+def test_a_truncated_digest_is_refused() -> None:
+    with pytest.raises(ValueError, match="qui n'est pas un SHA-256"):
+        elevation_source(sha256="fc6407b2fa28")
+    with pytest.raises(ValueError, match="qui n'est pas un SHA-256"):
+        elevation_source(sha256="z" * 64)
+
+
+def test_a_qualification_report_and_its_digest_go_together() -> None:
+    with pytest.raises(ValueError, match="vont ensemble ou pas du tout"):
+        elevation_source(qualification_report="qualification_report_x.json")
+    with pytest.raises(ValueError, match="vont ensemble ou pas du tout"):
+        elevation_source(qualification_digest="d0e78d7bc5edac57")
+
+
+# --- empreinte de base et péremption ------------------------------------------
+
+
+def asset_manifest(tmp_path, **overrides):
+    from hotel_pipeline.schemas import Asset, AssetManifest
+
+    fields = dict(
+        id="mapillary-1", source="mapillary", source_url_or_id="1",
+        rights="open_data", ai_eligible=False, confidence=0.5, category="facade",
+        checksum="a" * 64, camera_lat=45.5730, camera_lon=-73.4433,
+        heading_deg=45.0,
+    )
+    fields.update(overrides)
+    return AssetManifest(hotel_id="h", assets=[Asset(**fields)])
+
+
+def test_the_projected_fields_do_not_perish_their_own_run(tmp_path) -> None:
+    """Sans normalisation, appliquer un run le périmerait aussitôt."""
+    from hotel_pipeline.geo.visibility_run import base_manifest_digest
+
+    before = asset_manifest(tmp_path)
+    after = asset_manifest(
+        tmp_path,
+        visibility_run_id="r1", visibility_run_digest="d1",
+        visibility_assessment_id="vis-mapillary-1", line_of_sight_status="clear",
+        occlusion_risk_by=["OBSTACLE_1"], occlusion_blocked_by=[],
+    )
+
+    assert base_manifest_digest(before) == base_manifest_digest(after)
+
+
+def test_everything_else_still_perishes_the_run(tmp_path) -> None:
+    """Un cap corrigé ou une revue humaine doivent bien périmer la mesure."""
+    from hotel_pipeline.geo.visibility_run import base_manifest_digest
+
+    reference = base_manifest_digest(asset_manifest(tmp_path))
+
+    assert base_manifest_digest(asset_manifest(tmp_path, heading_deg=200.0)) != reference
+    assert base_manifest_digest(asset_manifest(tmp_path, camera_lat=45.58)) != reference
+    assert base_manifest_digest(
+        asset_manifest(tmp_path, geometry_suitability="primary",
+                       geometry_history=[{
+                           "suitability": "primary", "decided_by": "hm",
+                           "rationale": "façade franche", "evidence": ["cadrage"],
+                           "reviewed_checksum": "a" * 64,
+                       }])
+    ) != reference
+
+
+def test_the_old_single_occlusion_field_is_now_projected(tmp_path) -> None:
+    """`occluded_by` fait partie des champs écrits : le remettre à `None` ne
+    doit pas non plus périmer le run qui l'a corrigé."""
+    from hotel_pipeline.geo.visibility_run import base_manifest_digest
+
+    occluded = asset_manifest(tmp_path, occluded_by="way/999")
+    cleared = asset_manifest(tmp_path, occluded_by=None)
+
+    assert base_manifest_digest(occluded) == base_manifest_digest(cleared)

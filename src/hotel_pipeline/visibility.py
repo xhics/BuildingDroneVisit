@@ -146,54 +146,10 @@ def obstacles_from(elements: list[dict], exclude_id: str) -> list:
     return obstacles
 
 
-def annotate(
-    assets: list,  # noqa: ANN001
-    building_wkt: str,
-    obstacles: list | None = None,
-    policy: PipelinePolicy = DEFAULT_POLICY,
-) -> int:
-    """Marque chaque asset géolocalisé. Retourne le nombre de vues du bâtiment."""
-    from shapely import wkt as shapely_wkt
-    from shapely.geometry import Point
-    from shapely.ops import nearest_points
-
-    building = shapely_wkt.loads(building_wkt)
-    visible_count = 0
-    occluded_count = 0
-
-    for index, asset in enumerate(assets):
-        if asset.camera_lat is None or asset.camera_lon is None:
-            continue
-
-        result = assess(
-            asset.camera_lat,
-            asset.camera_lon,
-            asset.heading_deg,
-            building_wkt,
-            half_fov_deg=policy.geometry.half_fov_deg,
-            max_distance_m=policy.geometry.max_distance_m,
-        )
-        blocker = None
-        if result.visible and obstacles:
-            target = nearest_points(building, Point(asset.camera_lon, asset.camera_lat))[0]
-            blocker = is_occluded(
-                asset.camera_lat, asset.camera_lon, target.y, target.x, obstacles
-            )
-            if blocker:
-                occluded_count += 1
-
-        assets[index] = asset.model_copy(
-            update={
-                "sees_building": result.visible and blocker is None,
-                "target_distance_m": round(result.distance_m, 1),
-                "target_offset_deg": round(result.offset_deg, 1),
-                "occluded_by": blocker,
-            }
-        )
-        visible_count += int(result.visible and blocker is None)
-
-    if obstacles:
-        log.info("occultation : %d vue(s) masquée(s) par un bâtiment voisin", occluded_count)
-
-    log.info("visibilité : %d image(s) cadrent le bâtiment confirmé", visible_count)
-    return visible_count
+#: `annotate()` a été **supprimé**. Il jugeait la visibilité sur un seul rayon
+#: vers le point le plus proche de l'empreinte : une tour devant ce point
+#: condamnait la vue entière, un hangar masquant les trois quarts de la façade
+#: passait inaperçu, et les 29 occultations qu'il avait déclarées se sont
+#: toutes révélées non prouvées. La visibilité se produit désormais par
+#: `visibility assess`, et s'applique par `visibility apply`.
+REPLACED_BY = "hotel_pipeline.geo.visibility_engine"

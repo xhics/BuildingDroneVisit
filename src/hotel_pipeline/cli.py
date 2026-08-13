@@ -1564,7 +1564,8 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     import hashlib
     from datetime import datetime, timezone
 
-    from .geo.visibility_run import digest, run_assessment
+    from .geo.visibility_run import base_manifest_digest, digest, run_assessment
+    from .intake import sha256_file
     from .schemas.geometry import CaptureGeometryManifest
 
     workspace = Workspace(hotel_id)
@@ -1602,7 +1603,12 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
         "capture_geometry": digest(raw),
         "policy": context.provenance["policy_digest"],
         "site_manifest": digest(json.loads(site.model_dump_json())) if site else "sans-site",
-        "assets": digest([a.checksum for a in assets_manifest.assets]),
+        # Deux empreintes : les fichiers, et le manifeste entier. Une revue
+        # humaine ou un cap corrigé ne changent pas les images.
+        "asset_files": digest(sorted(f"{a.id}:{a.checksum}" for a in assets_manifest.assets)),
+        # Empreinte **de base** : les champs que `visibility apply` écrira en
+        # sont exclus, sans quoi l'application périmerait son propre run.
+        "asset_manifest": base_manifest_digest(assets_manifest),
         "obstacles": digest(
             sorted(
                 g.geometry_digest or ""
@@ -1629,14 +1635,81 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     obstacle_heights: dict[str, dict] = {}
     enrichment: dict[str, str] = {}
 
-    derived = sorted(workspace.path("06_geo", "derived").glob("*"))
-    if derived:
-        latest_derivation = derived[-1]
+    # Les rasters sont choisis parmi les artefacts **actifs** du manifeste de
+    # site, non par « dernier répertoire trié » : un répertoire plus récent
+    # peut porter une dérivation invalidée.
+    from .schemas.visibility import ElevationSource
+
+    elevation_sources: list[ElevationSource] = []
+    active = {a.role: a for a in (site.artifacts if site else []) if a.is_active}
+    dtm_artifact, roof_artifact = active.get("dtm"), active.get("dsm_roof")
+
+    # Le rapport de qualification vient des objets qualifiés eux-mêmes, non du
+    # dernier fichier d'un glob : c'est `TERRAIN_MAIN` et `ROOFLINE_MAIN` qui
+    # disent sur quelle décision ils reposent, et quels artefacts ils citent.
+    qualified = {
+        o.kind: o for o in (site.objects if site else []) if o.qualification_report
+    }
+    terrain, roofline = qualified.get("TERRAIN_MAIN"), qualified.get("ROOFLINE_MAIN")
+
+    if dtm_artifact and roof_artifact and terrain and roofline:
+        cited = set(terrain.artifact_ids) | set(roofline.artifact_ids)
+        uncited = [
+            artifact.artifact_id
+            for artifact in (dtm_artifact, roof_artifact)
+            if artifact.artifact_id not in cited
+        ]
+        if uncited:
+            typer.secho(
+                f"{KO} artefacts non cités par les objets qualifiés : {uncited} — "
+                "un raster prétendument qualifié doit l'être par la décision",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+
+        reports = {
+            name: workspace.path("06_geo", name)
+            for name in {terrain.qualification_report, roofline.qualification_report}
+        }
+        missing = [name for name, path in reports.items() if not path.is_file()]
+        if missing:
+            typer.secho(
+                f"{KO} rapport(s) de qualification introuvable(s) : {missing}",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+
+        for name, path in reports.items():
+            recorded = (
+                terrain.qualification_report_digest
+                if name == terrain.qualification_report
+                else roofline.qualification_report_digest
+            )
+            if recorded and sha256_file(path)[:16] != recorded:
+                typer.secho(
+                    f"{KO} {name} : empreinte différente de celle inscrite à l'objet",
+                    fg=typer.colors.RED, err=True,
+                )
+                raise typer.Exit(code=4)
+
+        qualification = next(iter(reports.values()))
+        latest_derivation = Path(dtm_artifact.path).parent
         sampler = RasterSampler(
-            latest_derivation / "dtm.tif",
-            latest_derivation / "dsm_roof_class6.tif",
-            f"derivation:{latest_derivation.name}",
+            Path(dtm_artifact.path), Path(roof_artifact.path),
+            f"artefacts {dtm_artifact.artifact_id} / {roof_artifact.artifact_id}",
         )
+        for artifact, role in ((dtm_artifact, "target_ground"), (roof_artifact, "target_top")):
+            elevation_sources.append(
+                ElevationSource(
+                    kind="raster", role=role, artifact_id=artifact.artifact_id,
+                    path=artifact.path, sha256=artifact.sha256,
+                    horizontal_crs=artifact.crs_horizontal,
+                    vertical_crs=artifact.crs_vertical,
+                    sampling_method="rasterio.sample au point visé, puis 0,5/1,5/3 m à l'intérieur",
+                    qualification_report=qualification.name,
+                    qualification_digest=sha256_file(qualification)[:16],
+                )
+            )
 
         def _sample(point):  # noqa: ANN001
             ground, roof = sampler.at(point[0], point[1])
@@ -1649,11 +1722,44 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
             sampler=_sample, provenance=f"TERRAIN_MAIN+ROOFLINE_MAIN@{latest_derivation.name}"
         )
         enrichment["target"] = f"rasters qualifiés {latest_derivation.name}"
+    else:
+        enrichment["target"] = (
+            "aucun couple artefact actif / objet qualifié pour la cible"
+        )
 
     acquisition = workspace.read_json("06_geo/acquisition_report.json") or {}
-    laz = (acquisition.get("acquisitions") or [{}])[0].get("path")
+    entry = (acquisition.get("acquisitions") or [{}])[0]
+    # La jointure se fait par empreinte, non par position : les deux listes
+    # n'ont aucune raison d'être dans le même ordre, et les métadonnées de
+    # tuile — identifiant, référentiel vertical — vivent du côté `sources`.
+    tile = next(
+        (
+            source
+            for source in acquisition.get("sources", [])
+            if source.get("file_digest") == entry.get("sha256")
+        ),
+        {},
+    )
+    laz = entry.get("path")
     if laz and Path(laz).is_file():
-        cloud = CloudSampler.load(Path(laz), "laz:23_3095048F08_DC")
+        # Le nuage est relu et son empreinte recalculée : une source verticale
+        # dont on n'a pas vérifié le contenu ne prouve rien.
+        laz_digest = sha256_file(Path(laz))
+        declared = entry.get("sha256")
+        if declared and declared != laz_digest:
+            typer.secho(
+                f"{KO} le nuage {Path(laz).name} diffère de son empreinte déclarée",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+        if not tile:
+            typer.secho(
+                f"{KO} aucune source ne correspond à l'empreinte du nuage acquis — "
+                "la provenance verticale serait invérifiable",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+        cloud = CloudSampler.load(Path(laz), f"laz:{tile['tile_id']}")
         from shapely import wkt as shapely_wkt
 
         from .schemas.geometry import GeometryResolutionStatus
@@ -1675,6 +1781,23 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
         camera_ground = cloud.ground_near
         enrichment["camera_ground"] = "classe 2 au voisinage de la position"
 
+        obstacles_total = len(manifest.by_role(GeometryRole.OBSTACLE_BUILDING))
+        for role, method in (
+            ("obstacle_height", "médiane classe 2 et p95 classe 6 sous l'emprise"),
+            ("camera_ground", "médiane classe 2 dans un rayon de 8 m"),
+        ):
+            elevation_sources.append(
+                ElevationSource(
+                    kind="point_cloud", role=role,
+                    tile_id=tile["tile_id"], path=str(laz), sha256=laz_digest,
+                    horizontal_crs=tile["crs_horizontal"],
+                    vertical_crs=tile["crs_vertical"],
+                    sampling_method=method,
+                    measured=len(obstacle_heights) if role == "obstacle_height" else None,
+                    attempted=obstacles_total if role == "obstacle_height" else None,
+                )
+            )
+
     enrichment["camera_height"] = (
         "inconnue : aucune source ne publie la hauteur de capteur"
     )
@@ -1689,13 +1812,13 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
             front_azimuth_deg=front, target_vertical=target_vertical,
             camera_ground=lambda origin: camera_ground(*origin) if camera_ground else None,
             obstacle_heights=obstacle_heights,
+            elevation_sources=elevation_sources,
         )
     except ValueError as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
     report.enrichment = enrichment
-    run.elevation_artifacts = sorted(enrichment.values())
 
     workspace.write_json(
         f"06_geo/visibility_run_{run_id}.json", json.loads(run.model_dump_json())

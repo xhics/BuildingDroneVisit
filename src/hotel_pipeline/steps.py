@@ -255,9 +255,14 @@ def _gather(workspace, project, spatial: SpatialManifest, context) -> None:  # n
 
     report = triage(manifest.assets, classifier=classifier)
 
-    from .visibility import annotate
-
-    annotate(manifest.assets, building.wkt, policy=context.policy)
+    # Aucune visibilité n'est produite ici. L'ancien annotateur tirait un seul
+    # rayon vers le point le plus proche et écrivait `sees_building` et
+    # `occluded_by` : c'est exactement ce que le moteur multi-rayons a corrigé,
+    # et le laisser accessible permettait à une collecte de le réintroduire.
+    log.info(
+        "visibilité non calculée à la collecte — enchaînez : geo resolve, "
+        "visibility assess, puis visibility apply"
+    )
 
     workspace.write_assets(manifest)
     workspace.write_report(

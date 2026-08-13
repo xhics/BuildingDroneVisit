@@ -374,6 +374,69 @@ class CorridorVisibilityAssessment(BaseModel):
     rationale: str = ""
 
 
+class ElevationSource(BaseModel):
+    """Une source verticale réellement employée, vérifiable point par point.
+
+    Des descriptions comme « 9/27 mesurés dans le nuage » expliquent le
+    calcul ; elles ne permettent pas d'en contrôler les entrées. Un lecteur
+    doit pouvoir rouvrir le fichier, recalculer son empreinte, et savoir dans
+    quel référentiel vertical la valeur était exprimée.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: `raster` ou `point_cloud`.
+    kind: str = Field(min_length=1)
+    #: Ce qu'elle a servi à établir : `target_ground`, `target_top`,
+    #: `obstacle_height`, `camera_ground`.
+    role: str = Field(min_length=1)
+
+    artifact_id: str | None = None
+    tile_id: str | None = None
+    path: str = Field(min_length=1)
+    sha256: str = Field(min_length=1)
+
+    horizontal_crs: str = Field(min_length=1)
+    vertical_crs: str | None = None
+    sampling_method: str = Field(min_length=1)
+
+    #: Rapport de qualification et son empreinte, lorsque l'artefact en a un.
+    qualification_report: str | None = None
+    qualification_digest: str | None = None
+
+    #: Ce que la source a réellement fourni : neuf mesures sur vingt-sept
+    #: obstacles n'est pas la même chose que vingt-sept.
+    measured: int | None = Field(default=None, ge=0)
+    attempted: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _identifiable_and_verifiable(self) -> "ElevationSource":
+        if not (self.artifact_id or self.tile_id):
+            raise ValueError(
+                f"source d'élévation {self.role!r} sans identifiant d'artefact ni "
+                "de tuile : on ne saurait pas laquelle a servi"
+            )
+        # Une élévation sans référentiel vertical n'est pas une altitude :
+        # c'est un nombre. CGVD 1928 et NAD83 diffèrent de plusieurs mètres.
+        if not (self.vertical_crs or "").strip():
+            raise ValueError(
+                f"source d'élévation {self.role!r} sans référentiel vertical"
+            )
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in self.sha256
+        ):
+            raise ValueError(
+                f"source d'élévation {self.role!r} : empreinte {self.sha256[:12]}… "
+                "qui n'est pas un SHA-256"
+            )
+        if bool(self.qualification_report) != bool(self.qualification_digest):
+            raise ValueError(
+                f"source d'élévation {self.role!r} : rapport de qualification et "
+                "empreinte vont ensemble ou pas du tout"
+            )
+        return self
+
+
 class VisibilityRun(BaseModel):
     """Une exécution du moteur, et tout ce dont elle dépend."""
 
@@ -395,12 +458,16 @@ class VisibilityRun(BaseModel):
     capture_geometry_digest: str = Field(min_length=1)
     policy_digest: str = Field(min_length=1)
     site_manifest_digest: str = Field(min_length=1)
-    assets_digest: str = Field(min_length=1)
+    #: Deux empreintes distinctes. Les fichiers peuvent être identiques quand
+    #: une position, un cap, une revue ou une aptitude ont changé : n'en garder
+    #: qu'une laissait un run se croire courant après une décision humaine.
+    asset_files_digest: str = Field(min_length=1)
+    asset_manifest_digest: str = Field(min_length=1)
     target_digest: str = Field(min_length=1)
     obstacles_digest: str = Field(min_length=1)
     road_geometry_digest: str = Field(min_length=1)
 
-    elevation_artifacts: list[str] = Field(default_factory=list)
+    elevation_sources: list[ElevationSource] = Field(default_factory=list)
 
     assessments: list[VisibilityAssessment] = Field(default_factory=list)
     framings: list[FramingAssessment] = Field(default_factory=list)
@@ -437,7 +504,7 @@ class VisibilityRun(BaseModel):
             for assessment in self.assessments
             for ray in assessment.rays
         )
-        if decided and not self.elevation_artifacts:
+        if decided and not self.elevation_sources:
             raise ValueError(
                 "des verdicts verticaux ont été rendus sans citer la moindre "
                 "source d'élévation"

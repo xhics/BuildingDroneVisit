@@ -27,7 +27,7 @@ from hotel_pipeline.schemas import (
     TemporalStatus,
 )
 from hotel_pipeline.schemas.spatial import GeocodeResult
-from hotel_pipeline.visibility import annotate
+from hotel_pipeline.visibility import assess as assess_view
 
 BUILDING = (
     "POLYGON ((-73.44380 45.57355, -73.44280 45.57355, "
@@ -51,22 +51,61 @@ def make(asset_id="a", **overrides) -> Asset:
 
 
 class TestGeometryPolicyIsHonoured:
+    """La politique décide toujours du cadrage, mais plus de la visibilité.
+
+    `annotate()` a été supprimé : il jugeait sur un seul rayon vers le point le
+    plus proche, et ses 29 occultations se sont toutes révélées non prouvées.
+    Ce qui reste ici est le calcul de cadrage, seul usage légitime du champ de
+    vision.
+    """
+
     def test_narrow_fov_rejects_what_wide_fov_accepts(self):
-        assets = [make(camera_lat=45.5725, camera_lon=-73.4433, heading_deg=30.0)]
-        wide = annotate(list(assets), BUILDING, policy=DEFAULT_POLICY)
+        wide = assess_view(45.5725, -73.4433, 30.0, BUILDING,
+                           half_fov_deg=DEFAULT_POLICY.geometry.half_fov_deg,
+                           max_distance_m=DEFAULT_POLICY.geometry.max_distance_m)
+        narrow = assess_view(45.5725, -73.4433, 30.0, BUILDING,
+                             half_fov_deg=10.0,
+                             max_distance_m=DEFAULT_POLICY.geometry.max_distance_m)
 
-        strict = DEFAULT_POLICY.model_copy(deep=True)
-        strict.geometry.half_fov_deg = 10.0
-        narrow = annotate(list(assets), BUILDING, policy=strict)
-
-        assert wide == 1
-        assert narrow == 0
+        assert wide.visible is True
+        assert narrow.visible is False
 
     def test_short_max_distance_rejects_distant_cameras(self):
-        assets = [make(camera_lat=45.5715, camera_lon=-73.4433, heading_deg=0.0)]
-        close = DEFAULT_POLICY.model_copy(deep=True)
-        close.geometry.max_distance_m = 50.0
-        assert annotate(list(assets), BUILDING, policy=close) == 0
+        result = assess_view(45.5715, -73.4433, 0.0, BUILDING,
+                             half_fov_deg=DEFAULT_POLICY.geometry.half_fov_deg,
+                             max_distance_m=50.0)
+        assert result.visible is False
+
+
+class TestTheOldAnnotatorIsGone:
+    """Tant qu'il restait accessible, une collecte pouvait le rappeler."""
+
+    def test_no_module_calls_the_single_ray_annotator(self):
+        import pathlib
+
+        from hotel_pipeline import visibility
+
+        assert not hasattr(visibility, "annotate")
+
+        # Un appel se reconnaît à son import ou à son accès qualifié : les
+        # commentaires qui expliquent la suppression, eux, doivent rester.
+        callers = []
+        for path in pathlib.Path("src/hotel_pipeline").rglob("*.py"):
+            for number, line in enumerate(path.read_text("utf-8").splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if "import annotate" in code or "visibility.annotate" in code:
+                    callers.append(f"{path.name}:{number}")
+        assert callers == []
+
+    def test_gathering_no_longer_produces_visibility(self):
+        import pathlib
+
+        source = pathlib.Path("src/hotel_pipeline/steps.py").read_text("utf-8")
+        code = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+
+        assert "annotate" not in code
+        # La collecte dit désormais où la visibilité se calcule.
+        assert "visibility assess" in source
 
 
 class TestDedupPolicyIsHonoured:
