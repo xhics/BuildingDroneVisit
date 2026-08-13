@@ -69,6 +69,14 @@ def role_for(
     contains = bool(asset.contains_building or Subject.BUILDING in asset.subjects)
 
     if positioned:
+        # Un blocage intégral peut être partagé entre plusieurs obstacles :
+        # `occluded_by`, singulier, reste alors vide, et ne consulter que lui
+        # laisserait passer une vue prouvée bouchée.
+        if asset.line_of_sight_status == "blocked":
+            return (
+                ReconstructionRole.CONTEXT_LOCK,
+                "ligne de vue intégralement bloquée, mesurée",
+            )
         if asset.occluded_by:
             return ReconstructionRole.CONTEXT_LOCK, "ligne de visée masquée par un voisin"
         if asset.target_building_visible is not True:

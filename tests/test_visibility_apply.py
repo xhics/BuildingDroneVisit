@@ -263,8 +263,8 @@ def test_only_the_declared_fields_change() -> None:
     assert base_manifest_digest(projected) == base_manifest_digest(manifest)
 
 
-def test_a_role_change_aborts_everything() -> None:
-    """La visibilité géométrique ne promeut rien : un rôle qui bouge est un bug."""
+def test_an_unjustified_promotion_aborts_everything() -> None:
+    """La visibilité géométrique ne promeut rien : un rôle qui monte est un bug."""
     manifest = AssetManifest(hotel_id="h", assets=[asset()])
     assessment = assessment_for("mapillary-1")
 
@@ -283,7 +283,7 @@ def test_a_role_change_aborts_everything() -> None:
 
     roles_module.role_for = shifting
     try:
-        with pytest.raises(projection.ApplicationRefused, match="le rôle passerait"):
+        with pytest.raises(projection.ApplicationRefused, match="promotion"):
             projection.project(manifest, run_for(manifest, [assessment]), "d1", POLICY)
     finally:
         roles_module.role_for = original
@@ -399,3 +399,198 @@ def test_a_reconstructed_receipt_says_what_it_cannot_know() -> None:
 
     report.status = "already_applied"
     assert "n'était plus observable" in report.as_dict()["note"]
+
+
+# --- ordre des contrôles ------------------------------------------------------
+
+
+def test_verification_precedes_idempotence() -> None:
+    """Un run déjà appliqué peut être devenu invalide entre-temps.
+
+    Conclure à l'idempotence en premier le déclarerait valide après un
+    changement de politique, de site ou de géométrie.
+    """
+    manifest = AssetManifest(hotel_id="h", assets=[asset(occluded_by="way/999")])
+    run = run_for(manifest, [assessment_for("mapillary-1", [wall("OBSTACLE_1", 20, 25)])])
+    _, projected = projection.project(manifest, run, "d1", POLICY)
+
+    # Le run est bien idempotent…
+    idempotent, _ = projection.already_applied(projected, run)
+    assert idempotent is True
+
+    # …et pourtant invalide : la géométrie a changé depuis.
+    current = current_digests(run)
+    current["capture_geometry"] = "geometrie-modifiee"
+    problems = projection.verify(run, projected, "h", current)
+
+    assert any("capture_geometry_digest" in p for p in problems)
+
+
+def test_the_target_digest_is_confronted() -> None:
+    manifest = AssetManifest(hotel_id="h", assets=[asset()])
+    run = run_for(manifest, [assessment_for("mapillary-1")])
+    current = current_digests(run)
+    current["target"] = "empreinte-cible-differente"
+
+    assert any("target_digest" in p for p in projection.verify(run, manifest, "h", current))
+
+
+# --- rétrogradation, promotion, conflit ---------------------------------------
+
+
+def carrier(**overrides) -> Asset:
+    """Un asset porteur : tous les prédicats satisfaits."""
+    from hotel_pipeline.geo.visibility_engine import TargetVertical
+    from hotel_pipeline.review import assessment_fields
+    from hotel_pipeline.schemas import GeometrySuitability
+
+    fields = dict(
+        target_building_visible=True, review_status=ReviewStatus.AUTOMATIC_ACCEPTED,
+        target_in_frame_fraction=0.4,
+    )
+    fields.update(
+        assessment_fields(
+            GeometrySuitability.PRIMARY, "hm", "façade franche",
+            ["cadrage vérifié"], "a" * 64,
+        )
+    )
+    fields.update(overrides)
+    return asset(**fields)
+
+
+def blocked_assessment(subject: str = "mapillary-1"):
+    tower = wall("TOUR", 20, 25, height_m=30.0, ground_m=10.0)
+    return assessment_for(
+        subject, [tower],
+        camera=engine.CameraVertical(ground_m=10.0, height_above_ground_m=2.5),
+        target_vertical=engine.TargetVertical(ground_m=10.0, height_m=12.0),
+    )
+
+
+def test_a_proven_block_may_demote() -> None:
+    """Une rétrogradation prouvée doit pouvoir s'appliquer.
+
+    Refuser tout changement de rôle rendait un blocage futur inapplicable.
+    """
+    manifest = AssetManifest(hotel_id="h", assets=[carrier()])
+    assessment = blocked_assessment()
+
+    report, projected = projection.project(
+        manifest, run_for(manifest, [assessment]), "d1", POLICY
+    )
+
+    assert report.roles_before["photo_geometry"] == 1
+    assert "photo_geometry" not in report.roles_after
+    assert report.demotions[0]["to"] == "context_lock"
+    assert "intégralement bloquée" in report.demotions[0]["reason"]
+    assert projected.assets[0].line_of_sight_status == "blocked"
+
+
+def test_a_full_block_shared_by_two_obstacles_still_demotes() -> None:
+    """`occluded_by` reste vide : ne consulter que lui laissait passer la vue."""
+    left = engine.Obstacle(
+        "GAUCHE", Polygon([(-12, 20), (0, 20), (0, 25), (-12, 25)]),
+        height_m=30.0, ground_m=10.0,
+    )
+    right = engine.Obstacle(
+        "DROITE", Polygon([(0, 20), (12, 20), (12, 25), (0, 25)]),
+        height_m=30.0, ground_m=10.0,
+    )
+    assessment = assessment_for(
+        "mapillary-1", [left, right],
+        camera=engine.CameraVertical(ground_m=10.0, height_above_ground_m=2.5),
+        target_vertical=engine.TargetVertical(ground_m=10.0, height_m=12.0),
+    )
+    manifest = AssetManifest(hotel_id="h", assets=[carrier()])
+
+    report, projected = projection.project(
+        manifest, run_for(manifest, [assessment]), "d1", POLICY
+    )
+
+    assert projected.assets[0].occluded_by is None
+    assert report.demotions[0]["blocked_by"] == ["DROITE", "GAUCHE"]
+    assert "photo_geometry" not in report.roles_after
+
+
+def test_a_demotion_without_proof_is_refused() -> None:
+    manifest = AssetManifest(hotel_id="h", assets=[carrier()])
+    # Un risque, non un blocage : le rôle ne doit pas bouger, et s'il bougeait
+    # ce serait un défaut.
+    assessment = assessment_for("mapillary-1", [wall("OBSTACLE_1", 20, 25)])
+
+    report, projected = projection.project(
+        manifest, run_for(manifest, [assessment]), "d1", POLICY
+    )
+    assert report.roles_before == report.roles_after
+    assert report.demotions == []
+
+
+def test_a_human_confirmation_contradicted_is_a_conflict() -> None:
+    """La contradiction n'est pas tranchée en silence."""
+    entry = ReviewEntry(
+        decision=ReviewDecision.CONFIRMED, decided_by="Claude (Opus 5)",
+        rationale="pylône lisible", evidence=["enseigne"], reviewed_checksum="a" * 64,
+    )
+    reviewed = carrier(
+        review_history=[entry], target_visibility_decision=entry.decision,
+        review_status=DECISION_STATUS[entry.decision],
+        target_building_visible=VISIBILITY_OF[entry.decision],
+        reviewer=entry.decided_by, review_rationale=entry.rationale,
+        review_evidence=entry.evidence,
+    )
+    manifest = AssetManifest(hotel_id="h", assets=[reviewed])
+
+    with pytest.raises(projection.ApplicationRefused, match="conflit à arbitrer"):
+        projection.project(manifest, run_for(manifest, [blocked_assessment()]), "d1", POLICY)
+
+
+def test_a_promotion_is_never_allowed() -> None:
+    from hotel_pipeline.schemas import ReconstructionRole
+
+    report = projection.ApplicationReport()
+    with pytest.raises(projection.ApplicationRefused, match="promotion"):
+        projection._check_role_change(
+            asset(), blocked_assessment(), ReconstructionRole.CONTEXT_LOCK,
+            ReconstructionRole.PHOTO_GEOMETRY, report,
+        )
+
+
+# --- supersession ---------------------------------------------------------------
+
+
+def test_a_newer_run_may_supersede_an_applied_one() -> None:
+    """Après une revue, le manifeste change et une nouvelle mesure s'impose."""
+    manifest = AssetManifest(hotel_id="h", assets=[asset(visibility_run_id="20260813T120000000000Z")])
+    newer = run_for(manifest, [assessment_for("mapillary-1")],
+                    digests={"run_id": "20260814T090000000000Z"})
+
+    assert projection.supersedes(newer, "20260813T120000000000Z", manifest) == []
+
+
+def test_an_older_run_cannot_supersede() -> None:
+    manifest = AssetManifest(hotel_id="h", assets=[asset(visibility_run_id="20260814T090000000000Z")])
+    older = run_for(manifest, [assessment_for("mapillary-1")],
+                    digests={"run_id": "20260813T120000000000Z"})
+
+    problems = projection.supersedes(older, "20260814T090000000000Z", manifest)
+    assert any("antérieure" in p for p in problems)
+
+
+def test_superseding_an_unapplied_run_is_refused() -> None:
+    manifest = AssetManifest(hotel_id="h", assets=[asset(visibility_run_id="run-en-place")])
+    newer = run_for(manifest, [assessment_for("mapillary-1")],
+                    digests={"run_id": "20260814T090000000000Z"})
+
+    assert any(
+        "n'est pas l'exécution appliquée" in p
+        for p in projection.supersedes(newer, "run-fantome", manifest)
+    )
+
+
+def test_a_supersession_is_recorded_in_the_receipt() -> None:
+    manifest = AssetManifest(hotel_id="h", assets=[asset()])
+    run = run_for(manifest, [assessment_for("mapillary-1")])
+
+    report, _ = projection.project(manifest, run, "d1", POLICY, superseded="run-precedent")
+
+    assert report.as_dict()["superseded_run_id"] == "run-precedent"

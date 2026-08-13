@@ -58,6 +58,7 @@ VISIBILITY_PROJECTED_FIELDS: frozenset[str] = frozenset(
         "line_of_sight_status",
         "occlusion_risk_by",
         "occlusion_blocked_by",
+        "target_in_frame_fraction",
         "occluded_by",
     }
 )
@@ -294,6 +295,10 @@ class Asset(BaseModel):
     #: `heading_is_measured`.
     sees_building: bool | None = None
 
+    #: Ancien verdict de cadrage, produit par l'annotateur mono-rayon
+    #: supprimé. Conservé comme trace, **non probant** : la cascade ne s'en
+    #: sert plus, seul un cadrage calculé fait foi.
+    #:
     #: **Un** bâtiment quelconque est-il visible ? Réponse du modèle, qui ne
     #: distingue pas le WelcomINNS d'un concessionnaire Toyota.
     contains_building: bool | None = None
@@ -379,6 +384,11 @@ class Asset(BaseModel):
     #: masquants. Le premier n'est pas une occultation.
     occlusion_risk_by: list[str] = Field(default_factory=list)
     occlusion_blocked_by: list[str] = Field(default_factory=list)
+
+    #: Part de la silhouette réellement dans le cadre, quand les paramètres de
+    #: caméra permettent de la calculer. `None` signifie « non calculable »,
+    #: jamais « hors cadre » : le corpus actuel n'en a aucune.
+    target_in_frame_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
 
     #: D'où vient réellement le fichier : identifiant fournisseur, positions
     #: interrogée et rendue, cadrage demandé, plan qui l'a retenu. Sans elle,

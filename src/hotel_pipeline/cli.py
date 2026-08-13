@@ -592,8 +592,21 @@ def review_queue(
         raise typer.Exit(code=1)
 
     context = _context(hotel_id)
+
+    # Les mesures de la dernière exécution appliquée accompagnent la file : le
+    # réviseur doit voir ce que la géométrie établit, et ce qu'elle n'établit
+    # pas.
+    measures: dict[str, dict] = {}
+    applied = {a.visibility_run_id for a in manifest.assets if a.visibility_run_id}
+    for identifier in sorted(applied):
+        raw = workspace.read_json(f"06_geo/visibility_run_{identifier}.json") or {}
+        for assessment in raw.get("assessments", []):
+            measures[assessment["subject_ref"]] = assessment
+
     try:
-        built = review_module.build_queue(manifest.assets, queue, context.policy)
+        built = review_module.build_queue(
+            manifest.assets, queue, context.policy, visibility=measures
+        )
     except review_module.ReviewRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -1863,6 +1876,9 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
 def visibility_apply(
     hotel_id: str = typer.Argument(...),
     run_id: str = typer.Argument(..., help="Exécution exacte à projeter."),
+    supersede: str = typer.Option(
+        None, "--supersede", help="Exécution appliquée que celle-ci remplace."
+    ),
 ) -> None:
     """Projette une exécution vers les assets. Atomique, et sans promotion."""
     from .geo import visibility_apply as projection
@@ -1896,16 +1912,21 @@ def visibility_apply(
     geometry = CaptureGeometryManifest.model_validate(raw_geometry)
 
     # Les images sont relues : un checksum déclaré ne prouve pas le contenu.
-    altered = [
-        asset.id
-        for asset in manifest.assets
-        if asset.local_path
-        and Path(asset.local_path).is_file()
-        and sha256_file(Path(asset.local_path)) != asset.checksum
-    ]
-    if altered:
+    altered, absent = [], []
+    for asset in manifest.assets:
+        if not asset.local_path:
+            continue
+        path_ = Path(asset.local_path)
+        if not path_.is_file():
+            # Un fichier déclaré mais absent n'est pas « inchangé » : rien ne
+            # dit ce qu'il contenait quand la mesure a été prise.
+            absent.append(asset.id)
+        elif sha256_file(path_) != asset.checksum:
+            altered.append(asset.id)
+    if altered or absent:
         typer.secho(
-            f"{KO} {len(altered)} image(s) diffèrent de leur empreinte : {altered[:5]}",
+            f"{KO} {len(altered)} image(s) modifiée(s) et {len(absent)} absente(s) : "
+            f"{(altered + absent)[:5]}",
             fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=4)
@@ -1942,9 +1963,53 @@ def visibility_apply(
                 if g.role.value in ("access_road", "road_candidate")
             )
         ),
+        "target": next(
+            (
+                g.geometry_digest
+                for g in geometry.by_role(GeometryRole.TARGET_BUILDING)
+                if g.geometry_digest
+            ),
+            None,
+        ),
     }
 
+    # Le rapport de qualification cité par les sources d'élévation doit encore
+    # exister, porter la même empreinte, et rester celui des objets qualifiés.
+    qualified = {
+        o.kind: o for o in (site.objects if site else []) if o.qualification_report
+    }
+    for source in run.elevation_sources:
+        if not source.qualification_report:
+            continue
+        report_path = workspace.path("06_geo", source.qualification_report)
+        if not report_path.is_file() or sha256_file(report_path)[:16] != source.qualification_digest:
+            typer.secho(
+                f"{KO} rapport de qualification {source.qualification_report} absent "
+                "ou d'empreinte différente",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+        cited = {o.qualification_report for o in qualified.values()}
+        if source.qualification_report not in cited:
+            typer.secho(
+                f"{KO} {source.qualification_report} n'est plus le rapport cité par "
+                "les objets qualifiés",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=4)
+
     receipt = workspace.path("06_geo", projection.receipt_name(run_id, run_digest))
+
+    # La vérification précède la détection d'idempotence : sinon une politique
+    # ou une géométrie modifiée depuis laisserait déclarer « déjà appliqué » un
+    # run devenu invalide.
+    problems = projection.verify(run, manifest, hotel_id, current)
+    if problems:
+        typer.secho(f"{KO} exécution non applicable :", fg=typer.colors.RED, err=True)
+        for problem in problems:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
     idempotent, divergent = projection.already_applied(manifest, run)
     if idempotent:
         # Une commande interrompue après l'écriture du manifeste doit pouvoir
@@ -1957,21 +2022,29 @@ def visibility_apply(
             workspace.write_report(f"06_geo/{receipt.name}", report, context)
             typer.echo(f"  reçu manquant reconstruit : {receipt.name}")
         raise typer.Exit(code=0)
-    if divergent:
+    if divergent and not supersede:
         typer.secho(f"{KO} application refusée :", fg=typer.colors.RED, err=True)
         for problem in divergent[:8]:
             typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  une revue humaine impose une nouvelle mesure : relancez "
+            "`visibility assess`, puis appliquez-la avec --supersede",
+            fg=typer.colors.YELLOW, err=True,
+        )
         raise typer.Exit(code=4)
 
-    problems = projection.verify(run, manifest, hotel_id, current)
-    if problems:
-        typer.secho(f"{KO} exécution non applicable :", fg=typer.colors.RED, err=True)
-        for problem in problems:
-            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=4)
+    if supersede:
+        stale = projection.supersedes(run, supersede, manifest)
+        if stale:
+            typer.secho(f"{KO} remplacement refusé :", fg=typer.colors.RED, err=True)
+            for problem in stale:
+                typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=4)
 
     try:
-        report, projected = projection.project(manifest, run, run_digest, context.policy)
+        report, projected = projection.project(
+            manifest, run, run_digest, context.policy, superseded=supersede
+        )
     except projection.ApplicationRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=4) from exc
@@ -1993,13 +2066,19 @@ def visibility_apply(
         fg=typer.colors.YELLOW,
     )
     typer.echo("")
+    if supersede:
+        typer.echo(f"  remplace l'exécution {supersede}, conservée avec son reçu")
     typer.echo(f"  rôles avant : {report.roles_before}")
     typer.echo(f"  rôles après : {report.roles_after}")
-    if report.roles_before != report.roles_after:
-        typer.secho(f"{KO} les rôles ont changé", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=4)
+    for demotion in report.demotions:
+        typer.secho(
+            f"    ↓ {demotion['asset_id']} {demotion['from']} → {demotion['to']} "
+            f"({demotion['reason']})",
+            fg=typer.colors.YELLOW,
+        )
     typer.secho(
-        "  aucun rôle modifié, aucune décision humaine touchée",
+        f"  {len(report.demotions)} rétrogradation(s) prouvée(s), aucune promotion, "
+        "aucune décision humaine touchée",
         fg=typer.colors.GREEN,
     )
 

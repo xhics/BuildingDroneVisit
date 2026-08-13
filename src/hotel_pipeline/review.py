@@ -201,6 +201,18 @@ class QueueItem:
     subject_scores: dict[str, float]
     reviews: int
 
+    #: Ce que la mesure géométrique dit de cette vue. Sans ces chiffres, le
+    #: réviseur jugerait le cadrage à l'œil alors qu'il est calculé — ou non
+    #: calculable, ce qui compte tout autant.
+    line_of_sight: str | None = None
+    clear_fraction: float | None = None
+    risk_fraction: float | None = None
+    blocked_fraction: float | None = None
+    distance_m: float | None = None
+    obstacles_at_risk: list[str] = field(default_factory=list)
+    framing: str | None = None
+    suitability: str | None = None
+
     def as_dict(self) -> dict:
         return {
             "asset_id": self.asset_id,
@@ -219,6 +231,16 @@ class QueueItem:
             "contains_building": self.contains_building,
             "subject_scores": self.subject_scores,
             "previous_reviews": self.reviews,
+            "visibility": {
+                "line_of_sight": self.line_of_sight,
+                "clear_fraction": self.clear_fraction,
+                "risk_fraction": self.risk_fraction,
+                "blocked_fraction": self.blocked_fraction,
+                "distance_m": self.distance_m,
+                "obstacles_at_risk": self.obstacles_at_risk,
+                "framing": self.framing,
+            },
+            "geometry_suitability": self.suitability,
         }
 
 
@@ -266,8 +288,15 @@ def manifest_digest(assets: list[Asset]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def build_queue(assets: list[Asset], name: str, policy) -> ReviewQueue:  # noqa: ANN001
-    """Assemble une file, avec tout ce qu'il faut pour juger sans le code."""
+def build_queue(  # noqa: ANN001
+    assets: list[Asset], name: str, policy, visibility: dict | None = None
+) -> ReviewQueue:
+    """Assemble une file, avec tout ce qu'il faut pour juger sans le code.
+
+    Les mesures de visibilité y sont jointes quand une exécution a été
+    appliquée : un réviseur doit voir ce que la géométrie établit — et surtout
+    ce qu'elle n'établit pas.
+    """
     from .roles import role_for
 
     if name not in QUEUES:
@@ -284,8 +313,10 @@ def build_queue(assets: list[Asset], name: str, policy) -> ReviewQueue:  # noqa:
         manifest_digest=manifest_digest(assets),
         counts=counts(assets, policy),
     )
+    measures = visibility or {}
     for asset in selected:
         role, reason = role_for(asset, policy)
+        measure = measures.get(asset.id, {})
         queue.items.append(
             QueueItem(
                 asset_id=asset.id,
@@ -304,9 +335,31 @@ def build_queue(assets: list[Asset], name: str, policy) -> ReviewQueue:  # noqa:
                 contains_building=asset.contains_building,
                 subject_scores=asset.subject_scores,
                 reviews=len(asset.review_history),
+                line_of_sight=asset.line_of_sight_status,
+                clear_fraction=measure.get("proven_clear_fraction"),
+                risk_fraction=measure.get("risk_unknown_height_fraction"),
+                blocked_fraction=measure.get("proven_blocked_fraction"),
+                distance_m=measure.get("distance_m"),
+                obstacles_at_risk=list(asset.occlusion_risk_by),
+                framing=(
+                    f"{asset.target_in_frame_fraction:.0%} du cadre"
+                    if asset.target_in_frame_fraction is not None
+                    else "non calculable"
+                ),
+                suitability=asset.geometry_suitability.value,
             )
         )
     return queue
+
+
+def _fractions(item: QueueItem) -> str:
+    """Les trois fractions, ou rien si la vue n'a pas été mesurée."""
+    if item.clear_fraction is None:
+        return ""
+    return (
+        f"<small> — dégagé {item.clear_fraction:.0%}, risque "
+        f"{item.risk_fraction:.0%}, bloqué {item.blocked_fraction:.0%}</small>"
+    )
 
 
 def to_html(queue: ReviewQueue) -> str:
@@ -339,7 +392,13 @@ def to_html(queue: ReviewQueue) -> str:
           <dt>statut</dt><dd>{escape(item.review_status)} ·
               décision {escape(item.decision)} ({item.reviews} revue(s))</dd>
           <dt>preuve</dt><dd>{escape(item.target_evidence or '—')}</dd>
-          <dt>occlusion</dt><dd>{escape(item.occluded_by or 'aucune')}</dd>
+          <dt>ligne de vue</dt><dd>{escape(item.line_of_sight or 'non mesurée')}
+              {_fractions(item)}</dd>
+          <dt>distance</dt><dd>{f'{item.distance_m:.0f} m' if item.distance_m else '—'}</dd>
+          <dt>cadrage</dt><dd>{escape(item.framing or '—')}</dd>
+          <dt>aptitude</dt><dd>{escape(item.suitability or '—')}</dd>
+          <dt>à risque</dt><dd>{escape(', '.join(item.obstacles_at_risk) or 'aucun')}</dd>
+          <dt>occlusion</dt><dd>{escape(item.occluded_by or 'aucune prouvée')}</dd>
           <dt>empreinte</dt><dd><code>{escape(item.checksum[:16])}…</code></dd>
         </dl>
         <ul class="scores">{scores}</ul>

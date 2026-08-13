@@ -227,7 +227,12 @@ def classify(
             methods.append(method)
             report.by_stage["ocr"] = report.by_stage.get("ocr", 0) + 1
 
-        scores: dict[str, float] = {}
+        # Les scores déjà mesurés servent de repli : rejouer la cascade après
+        # une correction de cadrage ne doit pas exiger de relancer OpenCLIP,
+        # ni faire disparaître ce que le modèle avait vu.
+        scores: dict[str, float] = dict(asset.subject_scores)
+        if scores:
+            methods.append("openclip:scores_conservés")
         if classifier is not None and asset.local_path and Path(asset.local_path).is_file():
             try:
                 result = classifier.multi_label(Path(asset.local_path))
@@ -252,7 +257,12 @@ def classify(
                 scores.get(Subject.BUILDING.value, 0.0) >= policy.model.subject_accept
             )
 
-        target_in_fov = bool(asset.sees_building and asset.heading_is_measured)
+        # `sees_building` vient de l'ancien annotateur mono-rayon : il est
+        # conservé comme trace historique, non comme preuve. Seul un cadrage
+        # réellement calculé dit que la cible entre dans l'image — et le corpus
+        # n'en compte aujourd'hui aucun.
+        framed = asset.target_in_frame_fraction
+        target_in_fov = bool(framed and framed > 0 and asset.heading_is_measured)
         target, evidence = _target_visibility(asset, model_contains, target_in_fov)
         contains = model_contains
 

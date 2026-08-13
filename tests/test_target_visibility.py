@@ -78,11 +78,31 @@ class TestNoGeometryLeak:
         assert "aucun bâtiment détecté" in asset.target_evidence
 
     def test_measured_fov_with_strong_model_score_is_the_target(self, image):
-        assets = [make(sees_building=True, heading_is_measured=True, local_path=image)]
+        """Le cadrage doit être **mesuré**, non hérité de l'ancien annotateur.
+
+        `sees_building` venait d'un unique rayon vers le point le plus proche :
+        s'en servir laissait trois vues Mapillary conserver leur visibilité sur
+        la foi d'un moteur supprimé.
+        """
+        assets = [
+            make(
+                sees_building=True, heading_is_measured=True, local_path=image,
+                target_in_frame_fraction=0.6,
+            )
+        ]
         classify(assets, classifier=FakeClassifier({"building": 0.95}))
 
         assert assets[0].contains_building is True
         assert assets[0].target_building_visible is True
+
+    def test_the_old_single_ray_verdict_no_longer_establishes_the_target(self, image):
+        assets = [make(sees_building=True, heading_is_measured=True, local_path=image)]
+        classify(assets, classifier=FakeClassifier({"building": 0.95}))
+
+        assert assets[0].contains_building is True
+        # Un bâtiment est là ; rien ne dit que c'est le nôtre.
+        assert assets[0].target_building_visible is None
+        assert "identité non établie" in assets[0].target_evidence
 
     def test_contains_building_ignores_geometry_added_subject(self, image):
         """`subjects` contient BUILDING par la géométrie, pas `contains_building`."""
@@ -196,7 +216,10 @@ class TestHumanDecisionWins:
         assert assets[0].target_building_visible is False
 
     def test_unresolved_leaves_the_automatic_path_intact(self, image):
-        assets = [make(local_path=image, sees_building=True, heading_is_measured=True)]
+        assets = [
+            make(local_path=image, heading_is_measured=True,
+                 target_in_frame_fraction=0.5)
+        ]
         classify(assets, classifier=FakeClassifier({"building": 0.99}))
         assert assets[0].target_building_visible is True
 

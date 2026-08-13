@@ -36,6 +36,9 @@ class ApplicationReport:
     roles_before: dict[str, int] = field(default_factory=dict)
     roles_after: dict[str, int] = field(default_factory=dict)
     former_occlusions: list[dict] = field(default_factory=list)
+    demotions: list[dict] = field(default_factory=list)
+    conflicts: list[dict] = field(default_factory=list)
+    superseded_run_id: str | None = None
     fields_written: list[str] = field(default_factory=list)
     occluded_by_kept: list[str] = field(default_factory=list)
 
@@ -71,6 +74,9 @@ class ApplicationReport:
             # Le cœur de l'affaire : ce que deviennent les 29 affirmations
             # d'occultation que l'ancien annotateur avait posées.
             "former_occlusions": self.former_occlusions,
+            "demotions": self.demotions,
+            "conflicts": self.conflicts,
+            "superseded_run_id": self.superseded_run_id,
             "occluded_by_kept": self.occluded_by_kept,
             "fields_written": self.fields_written,
         }
@@ -78,6 +84,7 @@ class ApplicationReport:
 
 PROJECTED = [
     "visibility_run_id",
+    "target_in_frame_fraction",
     "visibility_run_digest",
     "visibility_assessment_id",
     "line_of_sight_status",
@@ -105,11 +112,16 @@ def sole_blocker(assessment) -> str | None:  # noqa: ANN001
     return next(iter(blockers)) if len(blockers) == 1 else None
 
 
-def projection_for(assessment) -> dict:  # noqa: ANN001
-    """Champs qu'une évaluation pose sur son asset."""
+def projection_for(assessment, framing=None) -> dict:  # noqa: ANN001
+    """Champs qu'une évaluation pose sur son asset.
+
+    Le cadrage n'est projeté que s'il a pu être **calculé** : `None` y signifie
+    « non calculable », jamais « hors cadre ».
+    """
     blocked = sorted({name for ray in assessment.rays for name in ray.blocking})
     return {
         "visibility_assessment_id": assessment.assessment_id,
+        "target_in_frame_fraction": None,
         "line_of_sight_status": assessment.status.value,
         "occlusion_risk_by": list(assessment.obstacles_at_risk),
         "occlusion_blocked_by": blocked,
@@ -118,7 +130,11 @@ def projection_for(assessment) -> dict:  # noqa: ANN001
         # une intersection en plan sans aucune donnée verticale, retombent donc
         # à `None`.
         "occluded_by": sole_blocker(assessment),
-    }
+    } | (
+        {"target_in_frame_fraction": framing.target_in_frame_fraction}
+        if framing is not None and framing.horizontal_computable
+        else {}
+    )
 
 
 def verify(
@@ -153,6 +169,13 @@ def verify(
             problems.append(
                 f"{name} : exécution {recorded[:12]}… ≠ courant {current[:12]}…"
             )
+
+    if run.target_digest != current_digests.get("target"):
+        problems.append(
+            f"target_digest : exécution {run.target_digest[:12]}… ≠ courant "
+            f"{str(current_digests.get('target'))[:12]}… — l'empreinte cible "
+            "était enregistrée sans être confrontée"
+        )
 
     base = base_manifest_digest(manifest)
     if run.asset_manifest_digest != base:
@@ -190,6 +213,33 @@ def verify(
     return problems
 
 
+def supersedes(run: VisibilityRun, previous_id: str, manifest) -> list[str]:  # noqa: ANN001
+    """Contrôles propres au remplacement d'une exécution appliquée.
+
+    Après une revue humaine, le manifeste change et une nouvelle mesure
+    s'impose : refuser toute exécution différente bloquerait le pipeline sur
+    la première appliquée. Le remplacement reste explicite, et ne touche que
+    les champs projetés — les anciennes exécutions et leurs reçus demeurent.
+    """
+    problems: list[str] = []
+    applied = {a.visibility_run_id for a in manifest.assets if a.visibility_run_id}
+
+    if previous_id not in applied:
+        problems.append(
+            f"{previous_id} n'est pas l'exécution appliquée ; en place : {sorted(applied)}"
+        )
+    if run.run_id == previous_id:
+        problems.append("une exécution ne se remplace pas elle-même")
+    elif run.run_id < previous_id:
+        # Les identifiants sont des horodatages : l'ordre lexicographique est
+        # l'ordre chronologique.
+        problems.append(
+            f"{run.run_id} est antérieure à {previous_id} — une mesure plus "
+            "ancienne ne remplace pas une plus récente"
+        )
+    return problems
+
+
 def already_applied(manifest, run: VisibilityRun) -> tuple[bool, list[str]]:  # noqa: ANN001
     """Ce run est-il déjà posé, à l'identique ?
 
@@ -218,7 +268,9 @@ def already_applied(manifest, run: VisibilityRun) -> tuple[bool, list[str]]:  # 
     return not divergent, divergent
 
 
-def project(manifest, run: VisibilityRun, run_digest: str, policy) -> ApplicationReport:  # noqa: ANN001
+def project(  # noqa: ANN001
+    manifest, run: VisibilityRun, run_digest: str, policy, superseded: str | None = None
+) -> ApplicationReport:
     """Construit le manifeste projeté **en mémoire**, rôles vérifiés.
 
     Aucun rôle ne doit changer : la visibilité géométrique ne promeut rien, et
@@ -228,12 +280,15 @@ def project(manifest, run: VisibilityRun, run_digest: str, policy) -> Applicatio
     from ..schemas import Asset, AssetManifest
     from .visibility_run import base_manifest_digest, digest
 
-    report = ApplicationReport(run_id=run.run_id, run_digest=run_digest)
+    report = ApplicationReport(
+        run_id=run.run_id, run_digest=run_digest, superseded_run_id=superseded
+    )
     report.manifest_digest_before = digest(manifest.model_dump(mode="json"))
     report.base_digest = base_manifest_digest(manifest)
     report.fields_written = list(PROJECTED)
 
     by_id = {a.subject_ref: a for a in run.assessments}
+    framings = {f.subject_ref: f for f in run.framings}
     updated: list[Asset] = []
     roles_before: dict[str, int] = {}
     roles_after: dict[str, int] = {}
@@ -248,7 +303,7 @@ def project(manifest, run: VisibilityRun, run_digest: str, policy) -> Applicatio
             roles_after[role_before.value] = roles_after.get(role_before.value, 0) + 1
             continue
 
-        projection = projection_for(assessment)
+        projection = projection_for(assessment, framings.get(asset.id))
         if asset.occluded_by and not projection["occluded_by"]:
             report.former_occlusions.append(
                 {
@@ -272,11 +327,17 @@ def project(manifest, run: VisibilityRun, run_digest: str, policy) -> Applicatio
                 }
             ).model_dump()
         )
-        role_after, _ = role_for(candidate, policy)
+        role_after, reason_after = role_for(candidate, policy)
         if role_after is not role_before:
-            raise ApplicationRefused(
-                f"{asset.id} : le rôle passerait de {role_before.value!r} à "
-                f"{role_after.value!r} — la visibilité géométrique ne promeut rien"
+            _check_role_change(asset, assessment, role_before, role_after, report)
+            report.demotions.append(
+                {
+                    "asset_id": asset.id,
+                    "from": role_before.value,
+                    "to": role_after.value,
+                    "reason": reason_after,
+                    "blocked_by": projection["occlusion_blocked_by"],
+                }
             )
         roles_after[role_after.value] = roles_after.get(role_after.value, 0) + 1
         updated.append(candidate)
@@ -294,6 +355,53 @@ def project(manifest, run: VisibilityRun, run_digest: str, policy) -> Applicatio
             "la projection a modifié un champ hors de son périmètre"
         )
     return report, projected
+
+
+#: Ordre de préférence des rôles, du plus porteur au moins. Sert uniquement à
+#: distinguer une rétrogradation d'une promotion.
+_ROLE_RANK = {
+    "photo_geometry": 0,
+    "texture_reference": 1,
+    "identity_evidence": 2,
+    "context_lock": 3,
+    "reference_only": 4,
+    "reject": 5,
+}
+
+
+def _check_role_change(asset, assessment, before, after, report) -> None:  # noqa: ANN001
+    """Une mesure géométrique peut rétrograder, jamais promouvoir.
+
+    Rétrograder demande une preuve : un blocage intégral. Promouvoir n'est
+    jamais permis — la visibilité ne dit ni que la caméra vise le bâtiment, ni
+    qu'il entre dans l'image. Et lorsqu'une personne a confirmé voir la cible,
+    la contradiction n'est pas tranchée en silence : elle est déclarée.
+    """
+    from ..schemas import ReviewDecision
+
+    if _ROLE_RANK.get(after.value, 9) < _ROLE_RANK.get(before.value, 9):
+        raise ApplicationRefused(
+            f"{asset.id} : promotion de {before.value!r} vers {after.value!r} — "
+            "la visibilité géométrique ne promeut rien"
+        )
+    if assessment is None or assessment.proven_blocked_fraction < 1.0:
+        raise ApplicationRefused(
+            f"{asset.id} : rétrogradation de {before.value!r} vers {after.value!r} "
+            "sans blocage intégral prouvé"
+        )
+    if asset.target_visibility_decision is ReviewDecision.CONFIRMED:
+        report.conflicts.append(
+            {
+                "asset_id": asset.id,
+                "human_decision": "confirmed",
+                "measured": "blocage intégral prouvé",
+                "obstacles": assessment.obstacles_blocking,
+            }
+        )
+        raise ApplicationRefused(
+            f"{asset.id} : une personne a confirmé voir la cible, la mesure la "
+            "dit intégralement bloquée — conflit à arbitrer, non à trancher ici"
+        )
 
 
 def receipt_name(run_id: str, run_digest: str) -> str:
