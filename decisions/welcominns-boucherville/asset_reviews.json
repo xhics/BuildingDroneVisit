@@ -1,0 +1,283 @@
+{
+  "hotel_id": "welcominns-boucherville",
+  "exported_at": "2026-08-13T14:07:57.115084+00:00",
+  "note": "Décisions humaines seules. Les images ne sont pas versionnées ; leur empreinte l'est, et conditionne l'application du registre.",
+  "decisions": [
+    {
+      "asset_id": "mapillary-1119227939221649",
+      "checksum": "83c662bb0c7f6c70c4abd7cbccf02bfbc4e960e816b183886b18fd294744790c",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An-YS8QkaG1frep2D9Msf5V_MaVvDq02qimZTlBnRG28aQGpy9v1FoeHYdz93mGzvHy3ChRPRW_MqO5ZPVwVHnUTBfN6PkPrxT2BqSS-egXp2_6eHam5KI_u8Nbrv27lfT-1AcquwhO96F4szcSqyMk?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=AdqfFggk1cRdIPrSEyNcWkpW_3njOIQXwx8tAh5LAcVQ6HuL8MDmxulCs-qrzX9V5eUn3GtN-xJ2bPC87GRqJlr_&ccb=10-5&oh=00_AQHiVyDo3S3jE8US5f4a6RH5XBZMWDAJpiIDxB-Lf-ioow&oe=6AA40A40&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:42:44.889850Z",
+          "rationale": "bâtiment voisin — bureaux du 1205 rue Ampère, pas l'hôtel",
+          "evidence": [
+            "intersection Ampère, pylône TETRA TECH et façade du 1205 à gauche ; hôtel hors champ"
+          ],
+          "reviewed_checksum": "83c662bb0c7f6c70c4abd7cbccf02bfbc4e960e816b183886b18fd294744790c",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-1631807524316929",
+      "checksum": "c2de9d5e9239acd50f2f837235543d58614eeff3908fc7d42934e89ca698cc07",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An-Z546io1dxzxlj0K0_7oMbjA5jz5aOd_ehHY1qZZqporuJUJuzViD2zcB3ahokYAcMa_TYWm6aNdklb5Vp58ZFN8D3gW9OGSunVbQfzdbhHdRrAwtJFj86gjLR2ebnEsQWUgnZYzJvhKaYqXC1Zw?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=AdqNXjEF7xXuvl2VySO106QXhw0oOiVDgw7XP8cwmneKcCJMy1Wf-mzvtwBAN8eQxvKhQEcGlmCLYhkwIdcaw1Ig&ccb=10-5&oh=00_AQEXsN36HdKrHqb6g9AFjcr2Z-zItBDSc-vkk_n84Ne3rg&oe=6AA3E364&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:42:43.201272Z",
+          "rationale": "bâtiment voisin — bureaux du 1205 rue Ampère, pas l'hôtel",
+          "evidence": [
+            "1205 rue Ampère et pylône TETRA TECH au premier plan, aucun bâtiment du WelcomINNS dans le cadre"
+          ],
+          "reviewed_checksum": "c2de9d5e9239acd50f2f837235543d58614eeff3908fc7d42934e89ca698cc07",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-421139700627202",
+      "checksum": "b62ca5c43c18e37f9cd50682cc5398105e73cbe19c57d0b29b12ce951bc4ba1e",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An9ZyWj9hwLtFTVU4b39kiu0Gpd92VE4MMebEncvw5GCoP8Fu6EJaCeRT2mAugcdayt-0rkDhDQbG8_rG9GCpd45bYzxnA65xM_mELIiRnp9prcq4up1W8UTGyUUiuWGXKP8zM6Xj8JTjxld7gP7eQ?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=Adp4SvQTILAiHdvZR5UjHGqaVZKIrewXutUk6hiZ5h63FHNEASqebIHUV4OOCOx2GIusglV9T3d_xzCJGQhp0s0d&ccb=10-5&oh=00_AQEfcJMvpWdHRi3zlHZ3BfjGR6_3pmBVDv3E9T9sdeL8MA&oe=6AA3E9D4&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:42:43.734096Z",
+          "rationale": "bâtiment voisin — bureaux du 1205 rue Ampère, pas l'hôtel",
+          "evidence": [
+            "numéro civique 1205 en façade et enseigne TETRA TECH à droite ; l'hôtel est au 1195"
+          ],
+          "reviewed_checksum": "b62ca5c43c18e37f9cd50682cc5398105e73cbe19c57d0b29b12ce951bc4ba1e",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-432414699304425",
+      "checksum": "cc2f285bf3c6c0edde5969449debe7324c9bdafe91569b098c16ad0139d27b0d",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An-O6zIOY1ysec3Fmaf0j3mXdce2z4Yzb1c0VcYdrlDJJWY-3gIi9ffEAQPpy7cwuCA_cADMftgu1OHh_Z5n1RjGkb5uGpgdDHB1vTbOb0bYLeGE9DCt2sCPQ5Dl077Pp6lMvcZcvnLRoCxJduqrSg?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=AdqoerWzhxO2ZoHlITAbYOUWrKexUwHVLkl1xUXCxvgAyynCVeBBjaPIVe6D5v9L_MXx2UX5DEy8KIMFsBJQkzxX&ccb=10-5&oh=00_AQFA27x5tmRKLi39Nd8vo5VL335McWaLXesXugEkN0OdSQ&oe=6AA41446&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:43:00.651086Z",
+          "rationale": "vue de stationnement et d'artère commerciale, l'hôtel n'y figure pas",
+          "evidence": [
+            "clôture, bancs de neige et lampadaires au premier plan ; bâti lointain non identifiable, aucune enseigne WelcomINNS"
+          ],
+          "reviewed_checksum": "cc2f285bf3c6c0edde5969449debe7324c9bdafe91569b098c16ad0139d27b0d",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-747881027527558",
+      "checksum": "090d2ea122bb30cceb1f5d17d8e78dbd1ae98b635e1d91bcc18d3a3c7c1975ca",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An9k49zL6XRycLMR2RtoPZq1V6Ipux5d9nv5wcZrYQruPWJuOG1upYfpzAYaub4pTMujJtyXMXc1jrxJeqjeDugfMzYfLvzISmXB-A9JAUZ4TpX1FpChBmBAcuI5ovk8Vjve2-9LBYtnfIppDUUH8Z8?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=Adogof69nfZMufu8TTCu3AsJY5EF5c_Pk0WrVsjF8SrQava0Vv6kj4ThUNuLmWEtLcvcy8vzaZPgg19LHWkL3dUv&ccb=10-5&oh=00_AQHc8zwRt2WWgXWNjg_Q2LV-DBoYRGW8bF_awTL8E3yNbQ&oe=6AA40E00&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:43:01.186956Z",
+          "rationale": "immeuble de brique à toit mansardé sombre compatible avec l'hôtel, mais aucune enseigne lisible pour le confirmer",
+          "evidence": [
+            "vue de côté depuis le boulevard, concessionnaire automobile au premier plan, façade partiellement masquée par arbres et poteaux"
+          ],
+          "reviewed_checksum": "090d2ea122bb30cceb1f5d17d8e78dbd1ae98b635e1d91bcc18d3a3c7c1975ca",
+          "supersedes_index": null,
+          "decision": "unresolved"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-7688979294475178",
+      "checksum": "ca683cac3ec60788aaf40d66ad9c93f53dde8c996b681651b34d6bde4ced0f42",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An9ziT26cS65NTxA882R_7Is0vIUglKLKd7Bt6gAb92EO4w_W42JoxKNEFCqtcvbIoNannPrIOzLAtPUBCXV0F_PrTOk21Fi15twEjDN1TVLL-J95GuBEgxOmLZDTgIPvv9WAQU0fKlFi7H1zcwpvA?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=Adpmf8zB3Z85WDYys-XCcaqWFcejEvuTTb5v8kASzlj9z-EWO-NpQtcj92RfW-l0Cd3YwvFHy2kFsQ2mdht12y6D&ccb=10-5&oh=00_AQEMdiQcjg4X40I8PzohpCqi37iC-VhnWQ3lSMNyKKzYdg&oe=6AA3EEDC&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Hicham",
+          "decided_at": "2026-08-13T13:55:20.167074Z",
+          "rationale": "WelcomINNS identifiable : pylône « HW HÔTEL WELCOMINNS » lisible et bâtiment de brique à toitures en pente derrière",
+          "evidence": [
+            "enseigne sur pylône bleu au tiers gauche du cadre",
+            "arbitrage écrit du 13 août 2026, transcrit par Claude (Opus 5) : cible à ~117 m, ~40 % de la largeur et ~20 % de la hauteur du cadre"
+          ],
+          "reviewed_checksum": "ca683cac3ec60788aaf40d66ad9c93f53dde8c996b681651b34d6bde4ced0f42",
+          "supersedes_index": null,
+          "decision": "confirmed"
+        },
+        {
+          "decided_by": "OpenAI Codex — arbitrage architectural",
+          "decided_at": "2026-08-13T14:07:37.690787Z",
+          "rationale": "correction d'attribution : décision inchangée (WelcomINNS identifiable, pylône « HW HÔTEL WELCOMINNS » lisible), l'auteur inscrit précédemment était erroné",
+          "evidence": [
+            "supersède l'entrée précédente attribuée à « Hicham » : arbitrage rendu par OpenAI Codex, transcrit par Claude (Opus 5)",
+            "enseigne sur pylône bleu au tiers gauche du cadre ; cible à ~117 m, ~40 % de la largeur du cadre"
+          ],
+          "reviewed_checksum": "ca683cac3ec60788aaf40d66ad9c93f53dde8c996b681651b34d6bde4ced0f42",
+          "supersedes_index": 0,
+          "decision": "confirmed"
+        }
+      ],
+      "geometry_history": [
+        {
+          "decided_by": "Hicham",
+          "decided_at": "2026-08-13T13:55:32.230792Z",
+          "rationale": "cible reconnaissable et non ponctuelle, mais recul, arbres et clôture privent la façade de détail raccordable : utile au raccord bâtiment-environnement et à l'enregistrement, pas à la structure",
+          "evidence": [
+            "arbitrage écrit du 13 août 2026, transcrit par Claude (Opus 5)",
+            "cible à ~117 m, ~40 % de la largeur et ~20 % de la hauteur du cadre ; même point de vue que l'autre vue, à 2° près"
+          ],
+          "reviewed_checksum": "ca683cac3ec60788aaf40d66ad9c93f53dde8c996b681651b34d6bde4ced0f42",
+          "supersedes_index": null,
+          "suitability": "auxiliary",
+          "measurements": {
+            "frame_width_fraction": 0.4,
+            "frame_height_fraction": 0.2,
+            "target_distance_m": 117.1
+          }
+        },
+        {
+          "decided_by": "OpenAI Codex — arbitrage architectural",
+          "decided_at": "2026-08-13T14:07:38.602658Z",
+          "rationale": "correction d'attribution : appréciation inchangée (cible reconnaissable, façade trop reculée pour porter la structure)",
+          "evidence": [
+            "supersède l'entrée précédente attribuée à « Hicham » : arbitrage rendu par OpenAI Codex, transcrit par Claude (Opus 5)",
+            "recul, arbres et clôture ; même point de vue que l'autre vue, à 2° près"
+          ],
+          "reviewed_checksum": "ca683cac3ec60788aaf40d66ad9c93f53dde8c996b681651b34d6bde4ced0f42",
+          "supersedes_index": 0,
+          "suitability": "auxiliary",
+          "measurements": {
+            "frame_width_fraction": 0.4,
+            "frame_height_fraction": 0.2,
+            "target_distance_m": 117.1
+          }
+        }
+      ]
+    },
+    {
+      "asset_id": "mapillary-7727915623941925",
+      "checksum": "a2b8a30d8245603476b1c4c1a2b34319452b8b12b22b445818a540cea56acc62",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An-cr132bkx2kRZeU0VQ9dX3pDC6uYd8DfKPJeTporpPpTIG97qQE_hNRcVdcZprvZ1pXYSp43Hw9ZgYM7BCPNBh_c20akWWcEiqKcKeSFzrBBdvoNUCPc0vdXVsiVz0_9TzlR50jFEHO7TKL-Gg7FM?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=AdruPxejCtKj9yqzgic_KT77wBuRPiYEys4NUrzwDYTmFwaWy50h3IxtGlcc74X8MNLHM0d82OZTCFEOYU1W3OAm&ccb=10-5&oh=00_AQF1hR6MN_PEcAfhn01RgyiYiROs4OonuuH52g0Y_DK-tg&oe=6AA40966&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:42:44.342353Z",
+          "rationale": "bâtiment voisin — bureaux du 1205 rue Ampère, pas l'hôtel",
+          "evidence": [
+            "même immeuble de bureaux vitré au 1205, pancarte À LOUER ; aucune trace de l'hôtel"
+          ],
+          "reviewed_checksum": "a2b8a30d8245603476b1c4c1a2b34319452b8b12b22b445818a540cea56acc62",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    },
+    {
+      "asset_id": "mapillary-949396083308163",
+      "checksum": "0bdb4d7333e3dd2471a87c1899532cc0ee5fb4eb940ffc389f0360c250897f25",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An-P0DO7wexlb2ESUV7LmNKnOtqxOzNeBtZIzJ6W4Auk0VwzdFmIfyoxqRAlBig3iLYpoBTlbSk-MX0vlEReTRzkvq0lm1GXG9w2CObQWqMKCsfLWxE4N4k_DvCglz6d-v0TL0TMrHmUEjKZtRwFIaU?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=Adql1gdw1nK7aSR8zqYqpyKuO81kqzyqY_nGhXXMt2s1vV-kqfOQ8XeHyj-bFnu4A6mNSXIm4zsoX64Mnr3-bOjA&ccb=10-5&oh=00_AQG5i7BI4i41H5fONX72XLuNGwCxarGXxH5-I4xCrhRTbA&oe=6AA401C4&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Hicham",
+          "decided_at": "2026-08-13T13:55:20.704659Z",
+          "rationale": "WelcomINNS identifiable : pylône « HW HÔTEL WELCOMINNS » lisible et bâtiment de brique à toitures en pente derrière",
+          "evidence": [
+            "enseigne sur pylône bleu au tiers gauche du cadre",
+            "arbitrage écrit du 13 août 2026, transcrit par Claude (Opus 5) : cible à ~117 m, ~40 % de la largeur et ~20 % de la hauteur du cadre"
+          ],
+          "reviewed_checksum": "0bdb4d7333e3dd2471a87c1899532cc0ee5fb4eb940ffc389f0360c250897f25",
+          "supersedes_index": null,
+          "decision": "confirmed"
+        },
+        {
+          "decided_by": "OpenAI Codex — arbitrage architectural",
+          "decided_at": "2026-08-13T14:07:39.843731Z",
+          "rationale": "correction d'attribution : décision inchangée (WelcomINNS identifiable, pylône « HW HÔTEL WELCOMINNS » lisible), l'auteur inscrit précédemment était erroné",
+          "evidence": [
+            "supersède l'entrée précédente attribuée à « Hicham » : arbitrage rendu par OpenAI Codex, transcrit par Claude (Opus 5)",
+            "enseigne sur pylône bleu au tiers gauche du cadre ; cible à ~117 m, ~40 % de la largeur du cadre"
+          ],
+          "reviewed_checksum": "0bdb4d7333e3dd2471a87c1899532cc0ee5fb4eb940ffc389f0360c250897f25",
+          "supersedes_index": 0,
+          "decision": "confirmed"
+        }
+      ],
+      "geometry_history": [
+        {
+          "decided_by": "Hicham",
+          "decided_at": "2026-08-13T13:55:32.779183Z",
+          "rationale": "cible reconnaissable et non ponctuelle, mais recul, arbres et clôture privent la façade de détail raccordable : utile au raccord bâtiment-environnement et à l'enregistrement, pas à la structure",
+          "evidence": [
+            "arbitrage écrit du 13 août 2026, transcrit par Claude (Opus 5)",
+            "cible à ~117 m, ~40 % de la largeur et ~20 % de la hauteur du cadre ; même point de vue que l'autre vue, à 2° près"
+          ],
+          "reviewed_checksum": "0bdb4d7333e3dd2471a87c1899532cc0ee5fb4eb940ffc389f0360c250897f25",
+          "supersedes_index": null,
+          "suitability": "auxiliary",
+          "measurements": {
+            "frame_width_fraction": 0.4,
+            "frame_height_fraction": 0.2,
+            "target_distance_m": 117.1
+          }
+        },
+        {
+          "decided_by": "OpenAI Codex — arbitrage architectural",
+          "decided_at": "2026-08-13T14:07:40.915432Z",
+          "rationale": "correction d'attribution : appréciation inchangée (cible reconnaissable, façade trop reculée pour porter la structure)",
+          "evidence": [
+            "supersède l'entrée précédente attribuée à « Hicham » : arbitrage rendu par OpenAI Codex, transcrit par Claude (Opus 5)",
+            "recul, arbres et clôture ; même point de vue que l'autre vue, à 2° près"
+          ],
+          "reviewed_checksum": "0bdb4d7333e3dd2471a87c1899532cc0ee5fb4eb940ffc389f0360c250897f25",
+          "supersedes_index": 0,
+          "suitability": "auxiliary",
+          "measurements": {
+            "frame_width_fraction": 0.4,
+            "frame_height_fraction": 0.2,
+            "target_distance_m": 117.1
+          }
+        }
+      ]
+    },
+    {
+      "asset_id": "mapillary-956904309420722",
+      "checksum": "574fb287ca6889de9593f8edfd82c8ed9e5a9bb7662a0ff7ef216b5f1022ea92",
+      "source": "mapillary",
+      "source_url_or_id": "https://scontent-yyz1-1.xx.fbcdn.net/m1/v/t6/An_GyxgIQI7kF9iIqipM0FTy8_W071zQQDhiLuNat0pI42uGzqyLkvwhgJDo4CiSx775GJuAtEWWBduZB23UQjyfvb89Vr1rUbqntTsAsvFBF4sZVnhAR0EBHNb1u4ZHMB3jTaBPeeTm6NNmmZCoNzA?stp=s2048x1536&edm=AOnQwmMEAAAA&_nc_gid=xDbUmo5hzonjopkse-a-8w&_nc_oc=AdoFMBunq9RNAlzD3UcHBeb0DKW2aavaNBPHlb157cCvPrHaZ0Xa_P7xR2YxfIJzv87oUIPx-DcXnucBv0GFV68H&ccb=10-5&oh=00_AQGnzFypTjlN7LO_gOSnravjFZfIoEtkvRgQFWeshLK37w&oe=6AA3F4D3&_nc_sid=201bca",
+      "review_history": [
+        {
+          "decided_by": "Claude (Opus 5)",
+          "decided_at": "2026-08-13T13:43:00.126971Z",
+          "rationale": "autobus du RTL occupant tout le cadre ; aucun bâtiment de l'hôtel visible",
+          "evidence": [
+            "flanc d'autobus 21502 « Voyagez vert » sur toute la largeur, enseigne Tetra Tech dépassant à gauche"
+          ],
+          "reviewed_checksum": "574fb287ca6889de9593f8edfd82c8ed9e5a9bb7662a0ff7ef216b5f1022ea92",
+          "supersedes_index": null,
+          "decision": "rejected"
+        }
+      ],
+      "geometry_history": []
+    }
+  ]
+}

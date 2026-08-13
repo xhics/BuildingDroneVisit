@@ -837,3 +837,47 @@ def test_a_register_entry_for_an_unknown_asset_is_refused(tmp_path) -> None:
 
     with pytest.raises(decisions.RegisterRefused, match="sans asset correspondant"):
         decisions.apply([asset(tmp_path, name="b.jpg", id="autre")], register)
+def test_the_register_reproduces_the_welcominns_state() -> None:
+    """Le corpus de base plus le registre donnent l'état après revue.
+
+    Le corpus reste sans décision : c'est le registre, versionné à part, qui
+    prouve ce qui a été jugé. Rejouer l'un sur l'autre doit rendre exactement
+    les mêmes nombres, sans quoi « l'état après revue » ne serait qu'un
+    souvenir.
+    """
+    from pathlib import Path as _Path
+
+    from hotel_pipeline import decisions, dedup_levels, roles
+    from hotel_pipeline.schemas import Asset as _Asset, ClusterRole as _CR
+
+    snapshot = json.loads(_Path("tests/fixtures/corpus_snapshot.json").read_text("utf-8"))
+    assets = [_Asset.model_validate(a) for a in snapshot["assets"]]
+    register = json.loads(
+        _Path("decisions/welcominns-boucherville/asset_reviews.json").read_text("utf-8")
+    )
+
+    assert all(not a.review_history and not a.geometry_history for a in assets)
+
+    decisions.apply(assets, register)
+    building = snapshot["building"]
+    dedup_levels.run(assets, building["lat"], building["lon"])
+    report = roles.assign(assets)
+
+    assert report.counts.get("photo_geometry") == 2
+    viewpoints = review.viewpoints_by_suitability(assets)
+    # Deux fichiers porteurs, mais **un** point de vue : ils sont pris du même
+    # endroit à deux degrés près. Aucun point de vue `primary` à ce jour.
+    assert viewpoints["auxiliary"] == 1
+    assert "primary" not in viewpoints
+
+    cluster = next(
+        a.viewpoint_cluster for a in assets if a.id == "mapillary-7688979294475178"
+    )
+    canonical = [
+        a.id for a in assets
+        if a.viewpoint_cluster == cluster and a.cluster_role is _CR.CANONICAL
+    ]
+    assert canonical == ["mapillary-7688979294475178"]
+
+    numbers = review.counts(assets, policy())
+    assert (numbers.pending, numbers.blocking, numbers.cohort) == (33, 11, 25)
