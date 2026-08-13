@@ -663,7 +663,7 @@ def viewpoints_by_suitability(assets: list[Asset]) -> dict[str, int]:
     return dict(sorted(counted.items()))
 
 
-def recompute(assets: list[Asset], policy) -> dict[str, int]:  # noqa: ANN001
+def recompute(assets: list[Asset], policy):  # noqa: ANN001, ANN201
     """Réarbitre les grappes **puis** les rôles, sans relancer le classifieur.
 
     Une décision de revue ne change pas ce que le modèle a vu ; relancer
@@ -680,4 +680,6 @@ def recompute(assets: list[Asset], policy) -> dict[str, int]:  # noqa: ANN001
     from .roles import assign
 
     assign_roles(assets, max_overlap=policy.dedup.max_overlap_per_cluster)
-    return assign(assets, policy).counts
+    # Le rapport complet, motifs compris : un compte de rôles ne dit pas
+    # *pourquoi*, et c'est le motif qui rend un avant/après lisible.
+    return assign(assets, policy)

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .logging import get_logger
 from .schemas import Asset, GeometryEntry, ReviewEntry
 from .schemas.assets import DECISION_STATUS, VISIBILITY_OF
@@ -97,7 +99,9 @@ def export(assets: list[Asset], hotel_id: str) -> Register:
     return register
 
 
-def apply(assets: list[Asset], payload: dict, strict: bool = True) -> dict:  # noqa: A001
+def apply(  # noqa: A001
+    assets: list[Asset], payload: dict, strict: bool = True, hotel_id: str | None = None
+) -> dict:
     """Réapplique un registre à un manifeste, empreintes vérifiées.
 
     Une décision porte sur une image précise. Si l'empreinte du manifeste
@@ -108,12 +112,47 @@ def apply(assets: list[Asset], payload: dict, strict: bool = True) -> dict:  # n
     Rien n'est modifié tant que tout n'a pas été vérifié.
     """
     by_id = {a.id: index for index, a in enumerate(assets)}
-    planned: list[tuple[int, dict]] = []
     problems: list[str] = []
     unknown: list[str] = []
 
-    for record in payload.get("decisions", []):
+    # Chaque candidat est **construit et validé** ici, jamais posé dans
+    # `assets`. La version précédente revalidait dans la boucle d'écriture :
+    # un registre dont la seconde entrée violait la filiation laissait la
+    # première appliquée, et le manifeste sortait à demi modifié d'un appel
+    # annoncé comme atomique.
+    candidates: list[tuple[int, Asset]] = []
+
+    if not isinstance(payload, dict):
+        raise RegisterRefused("registre illisible : un objet JSON est attendu")
+
+    # Un registre appartient à un établissement. L'appliquer à un autre
+    # produirait des décisions plausibles sur les mauvaises images.
+    declared = payload.get("hotel_id")
+    if hotel_id is not None and declared != hotel_id:
+        raise RegisterRefused(
+            f"registre de {declared!r} appliqué à {hotel_id!r} — "
+            "les décisions ne portent pas sur ce corpus"
+        )
+
+    records = payload.get("decisions")
+    if not isinstance(records, list):
+        raise RegisterRefused("registre sans liste 'decisions'")
+
+    seen: set[str] = set()
+    for position, record in enumerate(records):
+        if not isinstance(record, dict) or "asset_id" not in record or "checksum" not in record:
+            problems.append(f"entrée n° {position + 1} : 'asset_id' ou 'checksum' manquant")
+            continue
+
         asset_id = record["asset_id"]
+        if asset_id in seen:
+            # Deux entrées pour le même asset : la seconde écraserait
+            # silencieusement la première, et l'ordre du fichier déciderait de
+            # l'historique retenu.
+            problems.append(f"{asset_id} : entrée dupliquée dans le registre")
+            continue
+        seen.add(asset_id)
+
         index = by_id.get(asset_id)
         if index is None:
             unknown.append(asset_id)
@@ -127,43 +166,26 @@ def apply(assets: list[Asset], payload: dict, strict: bool = True) -> dict:  # n
             )
             continue
 
-        update: dict = {}
-        reviews = [ReviewEntry.model_validate(e) for e in record.get("review_history", [])]
-        if reviews:
-            for entry in reviews:
-                if entry.reviewed_checksum != asset.checksum:
-                    problems.append(
-                        f"{asset_id} : une décision de visibilité porte sur "
-                        f"{entry.reviewed_checksum[:12]}…, pas sur l'image actuelle"
-                    )
-            last = reviews[-1]
-            update.update(
-                review_history=reviews,
-                target_visibility_decision=last.decision,
-                review_status=DECISION_STATUS[last.decision],
-                target_building_visible=VISIBILITY_OF[last.decision],
-                reviewer=last.decided_by,
-                reviewed_at=last.decided_at,
-                review_rationale=last.rationale,
-                review_evidence=last.evidence,
-                target_evidence=f"revue humaine : {last.rationale}",
-            )
+        try:
+            update = _update_for(asset, record, problems)
+        except ValidationError as exc:
+            # Une erreur de schéma dans le registre est un refus, pas une
+            # exception qui traverse l'appelant : elle décrit une donnée, non
+            # un défaut de programme.
+            problems.append(f"{asset_id} : entrée de registre invalide — {exc}")
+            continue
 
-        geometry = [GeometryEntry.model_validate(e) for e in record.get("geometry_history", [])]
-        if geometry:
-            for entry in geometry:
-                if entry.reviewed_checksum != asset.checksum:
-                    problems.append(
-                        f"{asset_id} : une appréciation d'aptitude porte sur "
-                        f"{entry.reviewed_checksum[:12]}…, pas sur l'image actuelle"
-                    )
-            update.update(
-                geometry_history=geometry,
-                geometry_suitability=geometry[-1].suitability,
-            )
+        if not update:
+            continue
 
-        if update:
-            planned.append((index, update))
+        try:
+            candidates.append(
+                (index, Asset.model_validate(asset.model_copy(update=update).model_dump()))
+            )
+        except ValidationError as exc:
+            problems.append(
+                f"{asset_id} : décisions incohérentes avec le manifeste — {exc}"
+            )
 
     if unknown and strict:
         problems.append(
@@ -172,15 +194,91 @@ def apply(assets: list[Asset], payload: dict, strict: bool = True) -> dict:  # n
     if problems:
         raise RegisterRefused("; ".join(problems))
 
-    for index, update in planned:
-        # Revalidation systématique : `model_copy` ne vérifie rien, et un
-        # registre corrompu passerait les invariants du manifeste.
-        assets[index] = Asset.model_validate(
-            assets[index].model_copy(update=update).model_dump()
+    # Seul point d'écriture, atteint uniquement si tout a été vérifié.
+    for index, candidate in candidates:
+        assets[index] = candidate
+
+    log.info("registre appliqué à %d asset(s)", len(candidates))
+    return {"applied": len(candidates), "unknown": sorted(unknown)}
+
+
+def _update_for(asset: Asset, record: dict, problems: list[str]) -> dict:
+    """Champs qu'une entrée de registre poserait sur cet asset.
+
+    Les empreintes sont vérifiées entrée par entrée : une décision porte sur
+    une image précise, et un historique dont une seule entrée vise autre chose
+    n'est pas rejouable.
+    """
+    update: dict = {}
+
+    reviews = [ReviewEntry.model_validate(e) for e in record.get("review_history", [])]
+    for entry in reviews:
+        if entry.reviewed_checksum != asset.checksum:
+            problems.append(
+                f"{asset.id} : une décision de visibilité porte sur "
+                f"{entry.reviewed_checksum[:12]}…, pas sur l'image actuelle"
+            )
+    if reviews:
+        last = reviews[-1]
+        update.update(
+            review_history=reviews,
+            target_visibility_decision=last.decision,
+            review_status=DECISION_STATUS[last.decision],
+            target_building_visible=VISIBILITY_OF[last.decision],
+            reviewer=last.decided_by,
+            reviewed_at=last.decided_at,
+            review_rationale=last.rationale,
+            review_evidence=last.evidence,
+            target_evidence=f"revue humaine : {last.rationale}",
         )
 
-    log.info("registre appliqué à %d asset(s)", len(planned))
-    return {"applied": len(planned), "unknown": sorted(unknown)}
+    geometry = [GeometryEntry.model_validate(e) for e in record.get("geometry_history", [])]
+    for entry in geometry:
+        if entry.reviewed_checksum != asset.checksum:
+            problems.append(
+                f"{asset.id} : une appréciation d'aptitude porte sur "
+                f"{entry.reviewed_checksum[:12]}…, pas sur l'image actuelle"
+            )
+    if geometry:
+        update.update(
+            geometry_history=geometry,
+            geometry_suitability=geometry[-1].suitability,
+        )
+
+    return update
+
+
+def verify_files(assets: list[Asset], workspace_root: Path | None = None) -> list[str]:
+    """Confronte l'empreinte déclarée au **contenu réel** des fichiers jugés.
+
+    L'accord registre/manifeste ne prouve que la cohérence de deux
+    déclarations. Si l'image sur disque a changé depuis, les deux restent
+    d'accord et la décision porte pourtant sur autre chose.
+    """
+    import hashlib
+
+    problems: list[str] = []
+    for asset in assets:
+        if not (asset.review_history or asset.geometry_history) or not asset.local_path:
+            continue
+        path = Path(asset.local_path)
+        if workspace_root and not path.is_absolute():
+            path = workspace_root / path
+        if not path.is_file():
+            problems.append(f"{asset.id} : image jugée absente ({path})")
+            continue
+
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != asset.checksum:
+            problems.append(
+                f"{asset.id} : fichier {actual[:12]}… au lieu de "
+                f"{asset.checksum[:12]}… — l'image a changé depuis sa revue"
+            )
+    return problems
 
 
 def path_for(hotel_id: str, root: Path | None = None) -> Path:

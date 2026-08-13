@@ -881,3 +881,156 @@ def test_the_register_reproduces_the_welcominns_state() -> None:
 
     numbers = review.counts(assets, policy())
     assert (numbers.pending, numbers.blocking, numbers.cohort) == (33, 11, 25)
+
+
+# --- atomicité du registre --------------------------------------------------
+
+
+def test_a_corrupt_second_record_leaves_the_first_asset_untouched(tmp_path) -> None:
+    """Le défaut : la revalidation tombait pendant l'écriture, pas avant.
+
+    Premier enregistrement valide, second dont la filiation est fausse : le
+    premier asset était déjà muté quand l'exception partait. Un appel annoncé
+    comme atomique laissait le manifeste à demi modifié.
+    """
+    from hotel_pipeline import decisions
+
+    first = asset(tmp_path, name="a.jpg", id="m-1", suitability=None)
+    second = asset(tmp_path, name="b.jpg", id="m-2", suitability=None)
+    decided = [first, second]
+    decide(decided, asset_id="m-1")
+    decide(decided, asset_id="m-2")
+    register = decisions.export(decided, "hotel-test").as_dict()
+
+    # La seconde entrée prétend corriger une décision qui n'existe pas.
+    register["decisions"][1]["review_history"][0]["supersedes_index"] = 0
+
+    fresh = [asset(tmp_path, name="a.jpg", id="m-1", suitability=None),
+             asset(tmp_path, name="b.jpg", id="m-2", suitability=None)]
+    before = [a.model_dump_json() for a in fresh]
+
+    with pytest.raises(decisions.RegisterRefused):
+        decisions.apply(fresh, register)
+
+    # Toute la liste, octet pour octet.
+    assert [a.model_dump_json() for a in fresh] == before
+
+
+def test_a_register_of_another_hotel_is_refused(tmp_path) -> None:
+    from hotel_pipeline import decisions
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    register = decisions.export(decided, "un-autre-hotel").as_dict()
+
+    fresh = [asset(tmp_path, suitability=None)]
+    with pytest.raises(decisions.RegisterRefused, match="ne portent pas sur ce corpus"):
+        decisions.apply(fresh, register, hotel_id="hotel-test")
+    assert not fresh[0].has_been_reviewed
+
+
+def test_duplicate_records_are_refused(tmp_path) -> None:
+    """Deux entrées pour un même asset : l'ordre du fichier déciderait."""
+    from hotel_pipeline import decisions
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    register = decisions.export(decided, "hotel-test").as_dict()
+    register["decisions"].append(dict(register["decisions"][0]))
+
+    fresh = [asset(tmp_path, suitability=None)]
+    with pytest.raises(decisions.RegisterRefused, match="entrée dupliquée"):
+        decisions.apply(fresh, register)
+    assert not fresh[0].has_been_reviewed
+
+
+def test_a_malformed_register_is_refused_as_data_not_as_a_crash(tmp_path) -> None:
+    from hotel_pipeline import decisions
+
+    fresh = [asset(tmp_path, suitability=None)]
+
+    with pytest.raises(decisions.RegisterRefused, match="objet JSON"):
+        decisions.apply(fresh, ["pas un objet"])
+    with pytest.raises(decisions.RegisterRefused, match="sans liste 'decisions'"):
+        decisions.apply(fresh, {"hotel_id": "hotel-test"})
+    with pytest.raises(decisions.RegisterRefused, match="manquant"):
+        decisions.apply(fresh, {"decisions": [{"asset_id": "m-1"}]})
+
+    decided = [asset(tmp_path, suitability=None)]
+    decide(decided)
+    register = decisions.export(decided, "hotel-test").as_dict()
+    del register["decisions"][0]["review_history"][0]["evidence"]
+    with pytest.raises(decisions.RegisterRefused, match="entrée de registre invalide"):
+        decisions.apply(fresh, register)
+
+    assert not fresh[0].has_been_reviewed
+
+
+def test_a_file_altered_since_the_review_is_detected(tmp_path) -> None:
+    """Registre et manifeste peuvent s'accorder sur une image qui a changé."""
+    from hotel_pipeline import decisions
+
+    assets = [asset(tmp_path, suitability=None)]
+    decide(assets)
+    assert decisions.verify_files(assets) == []
+
+    Path(assets[0].local_path).write_bytes(b"image-remplacee")
+    problems = decisions.verify_files(assets)
+
+    assert len(problems) == 1
+    assert "l'image a changé depuis sa revue" in problems[0]
+
+
+def test_cli_import_refuses_an_altered_image_and_keeps_the_manifest(
+    tmp_path, monkeypatch
+) -> None:
+    from hotel_pipeline import decisions
+    from hotel_pipeline.cli import app
+
+    runner, workspace, subject = cli_workspace(tmp_path, monkeypatch)
+    manifest = workspace.read_assets()
+    decide(manifest.assets, asset_id=subject.id)
+    workspace.write_assets(manifest)
+
+    register_root = tmp_path / "registre"
+    assert runner.invoke(app, ["assets", "review", "export", "hotel-test",
+                               "--root", str(register_root)]).exit_code == 0
+
+    # Le manifeste est remis à zéro, puis l'image est réécrite.
+    fresh = workspace.read_assets()
+    fresh.assets = [asset(tmp_path, suitability=None, id=subject.id)]
+    workspace.write_assets(fresh)
+    Path(subject.local_path).write_bytes(b"image-remplacee")
+    before = workspace.assets_path.read_text("utf-8")
+
+    result = runner.invoke(app, ["assets", "review", "import", "hotel-test",
+                                 "--root", str(register_root)])
+
+    assert result.exit_code == 4
+    assert workspace.assets_path.read_text("utf-8") == before
+    assert not list(workspace.path("01_sources").glob("review_import_*.json"))
+
+
+def test_cli_import_publishes_a_report_and_the_roles(tmp_path, monkeypatch) -> None:
+    from hotel_pipeline.cli import app
+
+    runner, workspace, subject = cli_workspace(tmp_path, monkeypatch)
+    manifest = workspace.read_assets()
+    decide(manifest.assets, asset_id=subject.id)
+    workspace.write_assets(manifest)
+
+    register_root = tmp_path / "registre"
+    runner.invoke(app, ["assets", "review", "export", "hotel-test",
+                        "--root", str(register_root)])
+    result = runner.invoke(app, ["assets", "review", "import", "hotel-test",
+                                 "--root", str(register_root)])
+
+    assert result.exit_code == 0, result.output
+    reports = list(workspace.path("01_sources").glob("review_import_*.json"))
+    assert len(reports) == 1
+    payload = json.loads(reports[0].read_text("utf-8"))
+    assert payload["applied"] == 1
+    assert payload["register_digest"] in reports[0].name
+    assert set(payload["roles"]) == {"before", "after"}
+    assert set(payload["viewpoints_by_suitability"]) == {"before", "after"}
+    assert (workspace.path("01_sources") / "roles_report.json").is_file()

@@ -654,7 +654,7 @@ def review_set(
         raise typer.Exit(code=1) from exc
 
     context = _context(hotel_id)
-    before_roles = review_module.recompute(manifest.assets, context.policy)
+    before_roles = review_module.recompute(manifest.assets, context.policy).counts
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
 
@@ -671,7 +671,7 @@ def review_set(
     from .roles import role_for
 
     role_before, reason_before = role_for(before, context.policy)
-    after_roles = review_module.recompute(manifest.assets, context.policy)
+    after_roles = review_module.recompute(manifest.assets, context.policy).counts
     updated = next(a for a in manifest.assets if a.id == asset_id)
     role_after, reason_after = role_for(updated, context.policy)
 
@@ -764,7 +764,7 @@ def review_geometry(
             raise typer.Exit(code=1) from exc
 
     context = _context(hotel_id)
-    before_roles = review_module.recompute(manifest.assets, context.policy)
+    before_roles = review_module.recompute(manifest.assets, context.policy).counts
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
 
@@ -780,7 +780,7 @@ def review_geometry(
     from .roles import role_for
 
     role_before, reason_before = role_for(before, context.policy)
-    after_roles = review_module.recompute(manifest.assets, context.policy)
+    after_roles = review_module.recompute(manifest.assets, context.policy).counts
     updated = next(a for a in manifest.assets if a.id == asset_id)
     role_after, reason_after = role_for(updated, context.policy)
 
@@ -876,21 +876,67 @@ def review_import(
         typer.secho(f"{KO} registre introuvable : {source}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
+    from datetime import datetime, timezone
+
+    from .intake import sha256_file
+
     context = _context(hotel_id)
+    before_roles = review_module.recompute(manifest.assets, context.policy).counts
+    before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
+    before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
+
+    raw = source.read_text("utf-8")
     try:
-        result = register_module.apply(
-            manifest.assets, json.loads(source.read_text("utf-8"))
-        )
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        typer.secho(f"{KO} registre illisible : {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4) from exc
+
+    try:
+        result = register_module.apply(manifest.assets, payload, hotel_id=hotel_id)
     except register_module.RegisterRefused as exc:
         typer.secho(f"{KO} registre refusé — rien n'a été modifié :", fg=typer.colors.RED, err=True)
         typer.secho(f"    {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=4) from exc
 
-    roles = review_module.recompute(manifest.assets, context.policy)
+    # L'accord registre/manifeste ne confronte que deux déclarations : le
+    # fichier sur disque, lui, a pu changer depuis la revue.
+    altered = register_module.verify_files(manifest.assets, workspace.root)
+    if altered:
+        typer.secho(f"{KO} images jugées modifiées depuis leur revue :",
+                    fg=typer.colors.RED, err=True)
+        for problem in altered:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        typer.secho("  manifeste laissé intact", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=4)
+
+    role_report = review_module.recompute(manifest.assets, context.policy)
+    roles = role_report.counts
     workspace.write_assets(manifest)
+
+    stamp = datetime.now(timezone.utc).isoformat().replace(":", "").replace("-", "").replace(".", "")
+    digest = sha256_file(source)[:16]
+    report = {
+        "register": str(source),
+        "register_digest": digest,
+        "applied": result["applied"],
+        "unknown": result["unknown"],
+        "roles": {"before": before_roles, "after": roles},
+        "review_counts": {
+            "before": before_counts,
+            "after": review_module.counts(manifest.assets, context.policy).as_dict(),
+        },
+        "viewpoints_by_suitability": {
+            "before": before_viewpoints,
+            "after": review_module.viewpoints_by_suitability(manifest.assets),
+        },
+    }
+    workspace.write_report(f"01_sources/review_import_{stamp}_{digest}.json", report, context)
+    workspace.write_report("01_sources/roles_report.json", role_report, context)
 
     typer.echo("")
     typer.echo(f"  {result['applied']} asset(s) mis à jour depuis {source}")
+    typer.echo(f"  empreinte du registre : {digest}")
     typer.echo(f"  rôles : {roles}")
     typer.echo(
         f"  points de vue : {review_module.viewpoints_by_suitability(manifest.assets)}"
