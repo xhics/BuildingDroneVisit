@@ -20,10 +20,12 @@ from hotel_pipeline.schemas import (
     PropertyMatchStatus,
     ReconstructionRole,
     ReviewDecision,
+    ReviewEntry,
     ReviewStatus,
     Rights,
     Subject,
 )
+from hotel_pipeline.schemas.assets import DECISION_STATUS, VISIBILITY_OF
 from hotel_pipeline.triage.classify import MultiLabelResult
 
 
@@ -144,14 +146,38 @@ class TestIdentityAndVisibilityAreSeparateAxes:
         assert assets[0].target_building_visible is False
 
 
+def reviewed(decision: ReviewDecision, rationale: str, **overrides) -> dict:
+    """Champs d'un asset réellement passé en revue.
+
+    Le manifeste refuse désormais une décision humaine sans historique : elle
+    serait invérifiable, et rien ne dirait qui l'a prise ni sur quoi.
+    """
+    return dict(
+        target_visibility_decision=decision,
+        target_building_visible=VISIBILITY_OF[decision],
+        review_status=DECISION_STATUS[decision],
+        reviewer="hm",
+        review_rationale=rationale,
+        review_evidence=["capture annotée"],
+        review_history=[
+            ReviewEntry(
+                decision=decision,
+                decided_by="hm",
+                rationale=rationale,
+                evidence=["capture annotée"],
+                reviewed_checksum="a" * 64,
+            )
+        ],
+        **overrides,
+    )
+
+
 class TestHumanDecisionWins:
     def test_confirmed_decision_survives_a_reclassification(self, image):
         assets = [
             make(
                 local_path=image,
-                target_visibility_decision=ReviewDecision.CONFIRMED,
-                reviewer="hm",
-                review_rationale="façade visible à gauche du cadre",
+                **reviewed(ReviewDecision.CONFIRMED, "façade visible à gauche du cadre"),
             )
         ]
         classify(assets, classifier=FakeClassifier({"building": 0.001}))
@@ -163,9 +189,7 @@ class TestHumanDecisionWins:
             make(
                 local_path=image,
                 sees_building=True,
-                target_visibility_decision=ReviewDecision.REJECTED,
-                reviewer="hm",
-                review_rationale="c'est le concessionnaire voisin",
+                **reviewed(ReviewDecision.REJECTED, "c'est le concessionnaire voisin"),
             )
         ]
         classify(assets, classifier=FakeClassifier({"building": 0.99}))

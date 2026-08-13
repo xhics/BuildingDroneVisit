@@ -39,6 +39,17 @@ log = get_logger("cascade")
 #: secteur, donc de ce qu'une caméra future aura le droit de montrer.
 DECISIVE_SUBJECTS = frozenset({Subject.BUILDING, Subject.ENTRANCE, Subject.ROOF})
 
+#: Correspondance stricte entre la décision humaine et le statut de revue.
+#: Les deux champs ne peuvent pas diverger : `confirmed` ne peut pas coexister
+#: avec `needs_review`, ni `rejected` avec `automatic_accepted`.
+_HUMAN_STATUS: dict[ReviewDecision, ReviewStatus] = {
+    ReviewDecision.CONFIRMED: ReviewStatus.HUMAN_ACCEPTED,
+    ReviewDecision.REJECTED: ReviewStatus.REJECTED,
+    # Examiné sans conclure : c'est une information, pas une absence de revue.
+    # L'acceptation automatique ne peut pas la recouvrir.
+    ReviewDecision.UNRESOLVED: ReviewStatus.NEEDS_REVIEW,
+}
+
 
 @dataclass
 class CascadeReport:
@@ -256,6 +267,21 @@ def classify(
             and (subjects or asset.sees_building is not None)
         ):
             review = ReviewStatus.AUTOMATIC_ACCEPTED
+
+        # Une décision humaine emporte **les deux** champs. Ne préserver que
+        # `target_visibility_decision` laissait la cascade recalculer le
+        # statut : le verdict de visibilité survivait, tandis que
+        # `human_accepted` ou `rejected` retombait en `needs_review` ou en
+        # `automatic_accepted`. Une revue aurait été à refaire sans que rien
+        # ne le dise, et une acceptation automatique aurait pu se substituer à
+        # un rejet humain.
+        #
+        # `target_visibility_decision` vaut `unresolved` par défaut sur tout
+        # asset : s'y fier seul ferait passer chaque image jamais examinée pour
+        # une revue sans conclusion. Seul l'historique dit qu'une personne a
+        # réellement regardé.
+        if asset.has_been_reviewed:
+            review = _HUMAN_STATUS[asset.target_visibility_decision]
 
         deduped = sorted(set(subjects), key=lambda s: s.value)
         assets[index] = asset.model_copy(

@@ -29,6 +29,25 @@ from .enums import (
 #: Droits autorisant l'usage d'un asset en production (reconstruction).
 PRODUCTION_RIGHTS = frozenset({Rights.OWNED, Rights.LICENSED, Rights.OPEN_DATA})
 
+#: Correspondances imposées entre une décision humaine et ce qu'elle emporte.
+#: Les tenir dans le schéma les rend opposables à tout appelant, y compris à
+#: un `model_copy` distrait : la cascade et la revue les réappliquent, le
+#: manifeste les vérifie.
+DECISION_STATUS: dict[ReviewDecision, ReviewStatus] = {
+    ReviewDecision.CONFIRMED: ReviewStatus.HUMAN_ACCEPTED,
+    ReviewDecision.REJECTED: ReviewStatus.REJECTED,
+    ReviewDecision.UNRESOLVED: ReviewStatus.NEEDS_REVIEW,
+}
+
+VISIBILITY_OF: dict[ReviewDecision, bool | None] = {
+    ReviewDecision.CONFIRMED: True,
+    ReviewDecision.REJECTED: False,
+    ReviewDecision.UNRESOLVED: None,
+}
+
+#: Statuts qu'une personne seule peut poser.
+_HUMAN_STATUSES = frozenset({ReviewStatus.HUMAN_ACCEPTED, ReviewStatus.REJECTED})
+
 
 class GpsPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -53,6 +72,51 @@ class TemporalDecision(BaseModel):
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     rationale: str
     evidence: list[str] = Field(default_factory=list)
+
+
+class ReviewEntry(BaseModel):
+    """Un arbitrage humain de visibilité, tel qu'il a été rendu.
+
+    Immuable par convention : on n'édite jamais une entrée, on en ajoute une
+    qui la corrige. L'empreinte de l'image jugée y figure — une décision porte
+    sur ce qui a été vu, et si le fichier change, la décision ne le suit pas.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ReviewDecision
+    decided_by: str = Field(min_length=1)
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    rationale: str = Field(min_length=1)
+
+    #: Au moins une preuve, obligatoire. Un motif dit ce que la personne a
+    #: conclu ; la preuve dit sur quoi. Sans elle, une revue ne se rejoue pas :
+    #: relire « c'est bien l'hôtel » six mois plus tard n'apprend rien.
+    evidence: list[str] = Field(min_length=1)
+
+    #: Empreinte de l'image au moment de la décision. Obligatoire : une
+    #: décision qui ne dit pas sur quoi elle portait ne peut pas être opposée
+    #: à un fichier modifié depuis.
+    reviewed_checksum: str = Field(min_length=1)
+
+    #: Ce que cette entrée corrige : l'index de l'entrée antérieure. La
+    #: première n'en a pas.
+    supersedes_index: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _no_blank_text(self) -> "ReviewEntry":
+        if not self.decided_by.strip():
+            raise ValueError("revue sans auteur — une décision anonyme n'engage rien")
+        if not self.rationale.strip():
+            raise ValueError(
+                "revue sans justification — le verdict seul ne s'audite pas"
+            )
+        blank = [e for e in self.evidence if not e.strip()]
+        if blank or not self.evidence:
+            raise ValueError(
+                "revue sans preuve : une preuve vide n'en est pas une"
+            )
+        return self
 
 
 class Asset(BaseModel):
@@ -187,6 +251,23 @@ class Asset(BaseModel):
     review_rationale: str | None = None
     review_evidence: list[str] = Field(default_factory=list)
 
+    #: Historique **append-only** des arbitrages. Les champs ci-dessus ne
+    #: gardent que le dernier : une revue corrigée effacerait sans trace la
+    #: décision qu'elle corrige, et l'on ne saurait plus ni ce qui avait été
+    #: conclu, ni par qui, ni sur quelle preuve. Le dernier élément et les
+    #: champs plats disent toujours la même chose.
+    review_history: list["ReviewEntry"] = Field(default_factory=list)
+
+    @property
+    def has_been_reviewed(self) -> bool:
+        """Une personne a-t-elle regardé cet asset ?
+
+        `target_visibility_decision` vaut `unresolved` par défaut : sans cette
+        distinction, « jamais examiné » et « examiné sans conclusion » se
+        confondraient, et le second perdrait toute valeur.
+        """
+        return bool(self.review_history)
+
     #: Score par sujet, conservé tel quel. Une confiance agrégée masquait la
     #: qualité réelle de la décision décisive.
     subject_scores: dict[str, float] = Field(default_factory=dict)
@@ -226,6 +307,83 @@ class Asset(BaseModel):
             raise ValueError(
                 f"asset {self.id!r} : rights_encumbered n'a pas de sens avec "
                 f"des droits déjà suffisants ({self.rights.value!r})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _review_history_is_append_only(self) -> "Asset":
+        """L'historique de revue est append-only **par le schéma**, non par usage.
+
+        Une convention tenue par un seul module cède au premier appelant qui
+        l'ignore. Trois choses sont donc imposées ici : la filiation des
+        entrées, leur accord avec les champs plats, et l'impossibilité
+        d'afficher une décision humaine que rien n'atteste.
+        """
+        history = self.review_history
+
+        for position, entry in enumerate(history):
+            if position == 0:
+                if entry.supersedes_index is not None:
+                    raise ValueError(
+                        f"asset {self.id!r} : la première revue ne corrige rien, "
+                        f"mais désigne l'entrée {entry.supersedes_index}"
+                    )
+                continue
+            if entry.supersedes_index is None:
+                raise ValueError(
+                    f"asset {self.id!r} : la revue n° {position + 1} ne dit pas "
+                    "laquelle elle corrige"
+                )
+            if entry.supersedes_index >= position:
+                raise ValueError(
+                    f"asset {self.id!r} : la revue n° {position + 1} corrige "
+                    f"l'entrée {entry.supersedes_index}, qui ne lui est pas "
+                    "antérieure"
+                )
+
+        if not history:
+            # Aucune revue : les champs plats ne peuvent pas prétendre le
+            # contraire. Sans cela, un statut humain se poserait sur du vide.
+            if self.review_status in _HUMAN_STATUSES:
+                raise ValueError(
+                    f"asset {self.id!r} porte le statut {self.review_status.value!r} "
+                    "sans aucune revue à l'appui"
+                )
+            if self.target_visibility_decision is not ReviewDecision.UNRESOLVED:
+                raise ValueError(
+                    f"asset {self.id!r} porte la décision "
+                    f"{self.target_visibility_decision.value!r} sans aucune revue"
+                )
+            if self.reviewer or self.review_rationale:
+                raise ValueError(
+                    f"asset {self.id!r} : auteur ou motif de revue sans historique"
+                )
+            return self
+
+        last = history[-1]
+        if self.target_visibility_decision is not last.decision:
+            raise ValueError(
+                f"asset {self.id!r} : décision courante "
+                f"{self.target_visibility_decision.value!r} ≠ dernière revue "
+                f"{last.decision.value!r}"
+            )
+        if self.review_status is not DECISION_STATUS[last.decision]:
+            raise ValueError(
+                f"asset {self.id!r} : statut {self.review_status.value!r} "
+                f"incompatible avec la décision {last.decision.value!r} ; "
+                f"attendu {DECISION_STATUS[last.decision].value!r}"
+            )
+        expected_visible = VISIBILITY_OF[last.decision]
+        if self.target_building_visible is not expected_visible:
+            raise ValueError(
+                f"asset {self.id!r} : visibilité {self.target_building_visible!r} "
+                f"incompatible avec la décision {last.decision.value!r} ; "
+                f"attendu {expected_visible!r}"
+            )
+        if self.reviewer != last.decided_by or self.review_rationale != last.rationale:
+            raise ValueError(
+                f"asset {self.id!r} : auteur ou motif courant divergent de la "
+                "dernière revue"
             )
         return self
 

@@ -561,6 +561,144 @@ def assets_classify(
     typer.echo(f"  secteurs: {report.sectors_assigned}")
 
 
+review_app = typer.Typer(no_args_is_help=True, help="Revue humaine de visibilité (Lot 1B §6).")
+assets_app.add_typer(review_app, name="review")
+
+
+@review_app.command("queue")
+def review_queue(
+    hotel_id: str = typer.Argument(...),
+    queue: str = typer.Option("blocking", "--queue", help="blocking, pending ou mapillary-candidates."),
+) -> None:
+    """Produit une file versionnée et une planche HTML à examiner."""
+    from datetime import datetime, timezone
+
+    from . import review as review_module
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    try:
+        built = review_module.build_queue(manifest.assets, queue, context.policy)
+    except review_module.ReviewRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    # Le nom porte la date **et** l'empreinte du manifeste : une file décrit
+    # un état, et deux exécutions dans la même seconde ne doivent pas s'écraser.
+    json_path = workspace.write_report(
+        f"01_sources/review_queue_{built.slug}.json", built, context
+    )
+    board = workspace.path("01_sources", f"review_board_{built.slug}.html")
+    board.write_text(review_module.to_html(built), encoding="utf-8")
+
+    numbers = built.counts
+    typer.echo("")
+    typer.secho(f"  en attente  {numbers.pending:>4}", fg=typer.colors.YELLOW)
+    typer.secho(f"  bloquants   {numbers.blocking:>4}", fg=typer.colors.YELLOW)
+    typer.secho(f"  cohorte     {numbers.cohort:>4}", fg=typer.colors.YELLOW)
+    typer.echo("  trois populations distinctes — ne pas additionner")
+    typer.echo("")
+    for source, total in numbers.pending_by_source.items():
+        typer.echo(f"    en attente · {source:<14} {total:>4}")
+    typer.echo("")
+    typer.echo(f"  file « {queue} » : {len(built.items)} image(s)")
+    typer.echo(f"    {json_path}")
+    typer.echo(f"    {board}")
+
+
+@review_app.command("set")
+def review_set(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    decision: str = typer.Option(..., "--decision", help="confirmed, rejected ou unresolved."),
+    by: str = typer.Option(..., "--by", help="Auteur de la décision."),
+    rationale: str = typer.Option(..., "--rationale", help="Motif, obligatoire."),
+    evidence: list[str] = typer.Option(
+        ..., "--evidence",
+        help="Preuve(s) à l'appui, au moins une. Répétable.",
+    ),
+) -> None:
+    """Inscrit **une** décision humaine. Aucune acceptation en masse."""
+    from . import review as review_module
+    from .schemas import ReviewDecision
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        verdict = ReviewDecision(decision)
+    except ValueError as exc:
+        typer.secho(
+            f"{KO} décision inconnue : {decision!r} ; attendu "
+            f"{[d.value for d in ReviewDecision]}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    context = _context(hotel_id)
+    before_roles = review_module.recompute(manifest.assets, context.policy)
+    before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
+
+    try:
+        before, after = review_module.decide(
+            manifest.assets, asset_id, verdict, by, rationale, list(evidence),
+            workspace_root=workspace.root,
+        )
+    except review_module.ReviewRefused as exc:
+        # Rien n'a été écrit : le manifeste sur disque est intact.
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    from .roles import role_for
+
+    role_before, reason_before = role_for(before, context.policy)
+    after_roles = review_module.recompute(manifest.assets, context.policy)
+    updated = next(a for a in manifest.assets if a.id == asset_id)
+    role_after, reason_after = role_for(updated, context.policy)
+
+    impact = review_module.Impact(
+        asset_id=asset_id,
+        decision=verdict.value,
+        role_before=role_before.value,
+        role_after=role_after.value,
+        reason_before=reason_before,
+        reason_after=reason_after,
+        roles_before=before_roles,
+        roles_after=after_roles,
+        counts_before=before_counts,
+        counts_after=review_module.counts(manifest.assets, context.policy).as_dict(),
+    )
+
+    workspace.write_assets(manifest)
+    workspace.write_report(
+        f"01_sources/review_decision_{asset_id}_"
+        f"{after.reviewed_at.strftime('%Y%m%dT%H%M%SZ')}.json",
+        impact, context,
+    )
+
+    typer.echo("")
+    typer.secho(
+        f"  {asset_id} · {verdict.value} · par {after.reviewer}", fg=typer.colors.GREEN
+    )
+    typer.echo(f"  revue n° {len(after.review_history)} — les précédentes sont conservées")
+    typer.echo(f"  statut  : {before.review_status.value} → {after.review_status.value}")
+    typer.echo(f"  rôle    : {role_before.value} ({reason_before})")
+    typer.echo(f"            {role_after.value} ({reason_after})")
+    typer.echo("")
+    for role in sorted(set(before_roles) | set(after_roles)):
+        was, now = before_roles.get(role, 0), after_roles.get(role, 0)
+        marker = "  " if was == now else " ←"
+        typer.echo(f"    {role:<20} {was:>4} → {now:>4}{marker}")
+
+
 geo_app = typer.Typer(no_args_is_help=True, help="Sources géospatiales (Lot 1B §9).")
 app.add_typer(geo_app, name="geo")
 
