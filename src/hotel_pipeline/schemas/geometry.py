@@ -75,6 +75,14 @@ class AccessStatus(StrEnum):
 
     PUBLIC_CONFIRMED = "public_confirmed"
     PUBLIC_INFERRED = "public_inferred"
+
+    #: Accès conditionnel — `customers`, `permit`, `delivery`, `destination`.
+    #: Ce n'est pas une interdiction : une capture autorisée par
+    #: l'établissement y reste possible, et confondre les deux fermait par
+    #: avance l'allée qui longe l'hôtel.
+    RESTRICTED = "restricted"
+
+    #: Interdiction franche — `private`, `no`.
     PRIVATE = "private"
     UNKNOWN = "unknown"
 

@@ -1389,6 +1389,7 @@ def geo_resolve(
         radius_m=float(radius_m),
         parking_ref=parking_ref,
         policy_digest=context.provenance["policy_digest"],
+        adjacency_max_m=context.policy.geometry.adjacency_max_m,
     )
 
     workspace.write_json(

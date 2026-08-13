@@ -91,13 +91,107 @@ def test_the_access_road_is_really_there_and_really_a_line() -> None:
     assert shapely_wkt.loads(road.wgs84_wkt).is_closed
 
 
-def test_the_access_road_carries_its_restriction_as_a_caveat() -> None:
-    """`access=customers` : la voie porte la géométrie, pas l'autorisation."""
+def test_the_access_road_is_restricted_not_forbidden() -> None:
+    """`access=customers` est un accès conditionnel, non une interdiction.
+
+    Le confondre avec `private` fermait par avance l'allée qui longe l'hôtel,
+    alors qu'une capture autorisée par l'établissement y reste envisageable.
+    """
     manifest, _ = run()
     road = next(g for g in manifest.geometries if g.feature_id == "ACCESS_ROAD_MAIN")
+    corridor = next(
+        c for c in manifest.corridors if c.corridor_id == "CORRIDOR_ACCESS_ROAD_MAIN"
+    )
 
-    assert any("accès restreint" in c for c in road.caveats)
+    assert corridor.access_status is AccessStatus.RESTRICTED
+    assert any("accès conditionnel" in c for c in road.caveats)
     assert road.resolution_status is GeometryResolutionStatus.RESOLVED
+
+
+def test_access_values_are_graded_not_binary() -> None:
+    for value, expected in [
+        ("private", AccessStatus.PRIVATE),
+        ("no", AccessStatus.PRIVATE),
+        ("customers", AccessStatus.RESTRICTED),
+        ("permit", AccessStatus.RESTRICTED),
+        ("delivery", AccessStatus.RESTRICTED),
+        ("destination", AccessStatus.RESTRICTED),
+        ("yes", AccessStatus.PUBLIC_CONFIRMED),
+    ]:
+        status, _ = cg.access_status_of({"highway": "service", "access": value})
+        assert status is expected, value
+
+
+def test_the_access_road_has_its_own_corridor_without_duplicating_its_shape() -> None:
+    """Écartée du réseau candidat pour ne pas être résolue deux fois, elle
+    disparaissait du classement : la voie la plus importante du site n'y
+    figurait pas."""
+    manifest, report = run()
+
+    corridor = next(
+        c for c in manifest.corridors if c.corridor_id == "CORRIDOR_ACCESS_ROAD_MAIN"
+    )
+    assert corridor.corridor_class is CorridorClass.ACCESS_MAIN
+    assert corridor.feature_id == "ACCESS_ROAD_MAIN"
+    assert corridor.admissible_for_building is False
+    assert corridor.distance_to_building_m is not None
+
+    # Une seule géométrie pour cette voie, malgré son corridor.
+    shapes = [g for g in manifest.geometries if g.source_ref == "way/938806358"]
+    assert len(shapes) == 1
+    assert len(manifest.corridors) == len(
+        [g for g in manifest.geometries
+         if g.role in (GeometryRole.ACCESS_ROAD, GeometryRole.ROAD_CANDIDATE)]
+    )
+
+
+def test_an_unresolved_access_road_gets_no_corridor() -> None:
+    """Un corridor sans géométrie ne décrirait rien."""
+    manifest, _ = run(access_element=[])
+    assert not any(
+        c.corridor_id == "CORRIDOR_ACCESS_ROAD_MAIN" for c in manifest.corridors
+    )
+
+
+def test_the_adjacency_threshold_comes_from_the_policy() -> None:
+    """Une politique posée doit changer le classement, non décorer un rapport."""
+    element = {"id": 1, "tags": {"highway": "residential"}}
+
+    strict, _ = cg.classify(element, 12.0, None, None, adjacency_max_m=5.0)
+    lenient, _ = cg.classify(element, 12.0, None, None, adjacency_max_m=30.0)
+
+    assert strict is CorridorClass.NON_ADJACENT_POTENTIAL
+    assert lenient is CorridorClass.ADJACENT_ROAD
+
+
+def test_the_policy_threshold_reaches_the_whole_resolution() -> None:
+    wide, _ = run(adjacency_max_m=200.0)
+    narrow, _ = run(adjacency_max_m=1.0)
+
+    def adjacent(manifest):
+        return len([c for c in manifest.corridors
+                    if c.corridor_class is CorridorClass.ADJACENT_ROAD])
+
+    assert adjacent(wide) > adjacent(narrow)
+
+
+def test_every_target_exclusion_is_traced() -> None:
+    """Une empreinte voisine retirée par erreur serait autrement invisible."""
+    target = shapely_wkt.loads(BUILDING_WKT)
+    coords = [{"lat": y, "lon": x} for x, y in target.exterior.coords]
+    elements = [
+        {"id": 54581348, "type": "way", "tags": {"building": "hotel"}, "geometry": coords},
+        # La même empreinte sous une autre référence : recouvrement total.
+        {"id": 777, "type": "way", "tags": {"building": "yes"}, "geometry": coords},
+    ]
+
+    _, report = run(elements=elements)
+
+    methods = {e["method"]: e for e in report.target_exclusions}
+    assert methods["exact_source_ref"]["source_ref"] == "way/54581348"
+    doubled = methods.get("equals") or methods.get("overlap_fallback")
+    assert doubled["source_ref"] == "way/777"
+    assert all(e["target_ref"] == "way/54581348" for e in report.target_exclusions)
 
 
 def test_a_network_failure_is_never_an_absence() -> None:
@@ -155,7 +249,7 @@ def test_a_parking_aisle_is_classified_by_its_service_tag() -> None:
 
     assert corridor_class is CorridorClass.PARKING_AISLE
     assert "parking_aisle" in why
-    assert status is AccessStatus.PRIVATE
+    assert status is AccessStatus.RESTRICTED
 
 
 def test_a_private_access_is_read_from_the_tag() -> None:
@@ -197,7 +291,7 @@ def test_adjacency_is_measured_on_the_shape_not_on_the_box() -> None:
 def test_a_road_beyond_the_threshold_stays_potential() -> None:
     corridor_class, why = cg.classify(
         {"id": 1, "tags": {"highway": "residential"}},
-        distance_to_building_m=cg.ADJACENCY_M + 1, distance_to_parking_m=None,
+        distance_to_building_m=cg.DEFAULT_ADJACENCY_M + 1, distance_to_parking_m=None,
         access_ref=None,
     )
     assert corridor_class is CorridorClass.NON_ADJACENT_POTENTIAL
@@ -205,7 +299,7 @@ def test_a_road_beyond_the_threshold_stays_potential() -> None:
 
     adjacent, _ = cg.classify(
         {"id": 2, "tags": {"highway": "residential"}},
-        distance_to_building_m=cg.ADJACENCY_M - 1, distance_to_parking_m=None,
+        distance_to_building_m=cg.DEFAULT_ADJACENCY_M - 1, distance_to_parking_m=None,
         access_ref=None,
     )
     assert adjacent is CorridorClass.ADJACENT_ROAD

@@ -16,6 +16,7 @@ from ..schemas.geometry import (
     AccessStatus,
     CaptureGeometryManifest,
     CorridorClass,
+    GeometryResolutionStatus,
     GeometryRole,
     ResolvedGeometry,
     RoadCorridor,
@@ -45,6 +46,7 @@ def resolve(
     radius_m: float,
     parking_ref: str | None = None,
     policy_digest: str | None = None,
+    adjacency_max_m: float = cg.DEFAULT_ADJACENCY_M,
 ) -> tuple[CaptureGeometryManifest, cg.ResolutionReport]:
     """Construit le manifeste géométrique à partir de réponses déjà obtenues.
 
@@ -138,12 +140,39 @@ def resolve(
 
     # --- voie d'accès --------------------------------------------------------
     if access_road_ref:
-        geometries.append(
-            _resolve_access_road(
-                access_road_ref, access_element, access_error,
-                access_snapshot.snapshot_id if access_snapshot else None,
-            )
+        access_geometry = _resolve_access_road(
+            access_road_ref, access_element, access_error,
+            access_snapshot.snapshot_id if access_snapshot else None,
         )
+        geometries.append(access_geometry)
+
+        # La voie d'accès est écartée du réseau candidat pour ne pas être
+        # résolue deux fois — mais sans corridor, elle disparaissait du
+        # classement, et la voie la plus importante du site n'y figurait pas.
+        if access_geometry.resolution_status is GeometryResolutionStatus.RESOLVED:
+            tags = {}
+            if access_element:
+                tags = {k: str(v) for k, v in (access_element[0].get("tags") or {}).items()}
+            status, access_why = cg.access_status_of(tags)
+            target_projected_for_access = cg.project(target)
+            projected_access = shapely_wkt.loads(access_geometry.projected_wkt)
+            corridors.append(
+                RoadCorridor(
+                    corridor_id="CORRIDOR_ACCESS_ROAD_MAIN",
+                    feature_id=access_geometry.feature_id,
+                    corridor_class=CorridorClass.ACCESS_MAIN,
+                    access_status=status,
+                    distance_to_building_m=round(
+                        projected_access.distance(target_projected_for_access), 2
+                    ),
+                    osm_tags=tags,
+                    rationale=(
+                        "voie d'accès déclarée au manifeste de site ; "
+                        f"accès : {access_why}"
+                    ),
+                    admissible_for_building=False,
+                )
+            )
 
     # --- réseau routier ------------------------------------------------------
     if roads_error:
@@ -165,7 +194,7 @@ def resolve(
         )
         new_geometries, new_corridors = _resolve_roads(
             roads or [], target_projected, parking_shape, access_road_ref,
-            roads_snapshot.snapshot_id,
+            roads_snapshot.snapshot_id, adjacency_max_m,
         )
         geometries.extend(new_geometries)
         corridors.extend(new_corridors)
@@ -275,8 +304,13 @@ def _resolve_access_road(
     caveats = []
     if status is AccessStatus.PRIVATE:
         caveats.append(
-            f"accès restreint ({why}) : la voie porte la géométrie, pas "
+            f"accès interdit ({why}) : la voie porte la géométrie, pas "
             "l'autorisation d'y capturer"
+        )
+    elif status is AccessStatus.RESTRICTED:
+        caveats.append(
+            f"accès conditionnel ({why}) : une capture autorisée par "
+            "l'établissement y reste envisageable, ce n'est pas une interdiction"
         )
     return cg.resolved_from(
         "ACCESS_ROAD_MAIN", GeometryRole.ACCESS_ROAD, ref, snapshot_id, shape,
@@ -288,7 +322,7 @@ def _resolve_access_road(
 
 def _resolve_roads(
     roads: list[dict], target_projected, parking_projected, access_ref: str | None,
-    snapshot_id: str,
+    snapshot_id: str, adjacency_max_m: float = cg.DEFAULT_ADJACENCY_M,
 ) -> tuple[list[ResolvedGeometry], list[RoadCorridor]]:
     geometries: list[ResolvedGeometry] = []
     corridors: list[RoadCorridor] = []
@@ -307,7 +341,9 @@ def _resolve_roads(
         parking_distance = (
             projected.distance(parking_projected) if parking_projected is not None else None
         )
-        corridor_class, why = cg.classify(element, distance, parking_distance, access_ref)
+        corridor_class, why = cg.classify(
+            element, distance, parking_distance, access_ref, adjacency_max_m
+        )
         tags = {k: str(v) for k, v in (element.get("tags") or {}).items()}
         status, access_why = cg.access_status_of(tags)
 
@@ -357,6 +393,12 @@ def _resolve_obstacles(
             continue
         ref = f"way/{element.get('id')}"
         if target_ref and ref == target_ref:
+            report.target_exclusions.append(
+                {
+                    "source_ref": ref, "method": "exact_source_ref",
+                    "overlap_ratio": None, "target_ref": target_ref,
+                }
+            )
             continue
 
         shape = cg.shape_of(element)
@@ -366,8 +408,25 @@ def _resolve_obstacles(
         if not shape.is_valid:
             report.invalid_geometries.append(f"{ref} : polygone invalide")
             continue
-        if shape.equals(target) or shape.intersection(target).area / max(target.area, 1e-12) >= 0.8:
-            # Même empreinte que la cible sous une autre référence.
+        ratio = shape.intersection(target).area / max(target.area, 1e-12)
+        if shape.equals(target):
+            report.target_exclusions.append(
+                {
+                    "source_ref": ref, "method": "equals", "overlap_ratio": 1.0,
+                    "target_ref": target_ref,
+                }
+            )
+            continue
+        if ratio >= 0.8:
+            # Même empreinte que la cible sous une autre référence. Le repli
+            # est nécessaire, mais une empreinte voisine retirée par erreur
+            # serait autrement invisible.
+            report.target_exclusions.append(
+                {
+                    "source_ref": ref, "method": "overlap_fallback",
+                    "overlap_ratio": round(ratio, 4), "target_ref": target_ref,
+                }
+            )
             continue
 
         height, source = _height_of(tags)

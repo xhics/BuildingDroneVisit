@@ -36,9 +36,13 @@ from ..schemas.geometry import (
 
 log = get_logger("capture-geometry")
 
-#: Valeurs du tag `access` qui ferment une voie. `private` et `no` sont
-#: explicites ; le silence, lui, ne dit rien — et surtout pas « public ».
-_CLOSED_ACCESS = frozenset({"private", "no", "customers", "permit", "delivery"})
+#: Interdiction franche.
+_PRIVATE_ACCESS = frozenset({"private", "no"})
+
+#: Accès conditionnel : l'usage est encadré, non fermé. `customers` dit que
+#: les clients de l'établissement y passent — ce qui, pour l'hôtel lui-même,
+#: est plutôt un argument.
+_RESTRICTED_ACCESS = frozenset({"customers", "permit", "delivery", "destination"})
 
 #: Types de voies dont l'usage public est établi par l'usage même du tag.
 _PUBLIC_HIGHWAYS = frozenset(
@@ -48,10 +52,10 @@ _PUBLIC_HIGHWAYS = frozenset(
     }
 )
 
-#: Au-delà, une voie n'est plus adjacente à la propriété. Provisoire, calibré
-#: sur un seul site : c'est un seuil de classement, non une décision de
-#: visibilité — celle-ci viendra des rayons.
-ADJACENCY_M = 30.0
+#: Valeur de repli, employée seulement si aucune politique n'est fournie. Le
+#: seuil réel vient de `policy.geometry.adjacency_max_m` : le tenir en double
+#: ici garantissait qu'un jour les deux divergent.
+DEFAULT_ADJACENCY_M = 30.0
 
 
 def canonical_digest(geometry) -> str:  # noqa: ANN001 — shapely
@@ -246,8 +250,13 @@ def access_status_of(tags: dict[str, str]) -> tuple[AccessStatus, str]:
     access = (tags.get("access") or "").strip().lower()
     highway = (tags.get("highway") or "").strip().lower()
 
-    if access in _CLOSED_ACCESS:
+    if access in _PRIVATE_ACCESS:
         return AccessStatus.PRIVATE, f"tag access={access!r}"
+    if access in _RESTRICTED_ACCESS:
+        return (
+            AccessStatus.RESTRICTED,
+            f"tag access={access!r} : accès conditionnel, non interdiction",
+        )
     if access in {"yes", "public", "permissive"}:
         return AccessStatus.PUBLIC_CONFIRMED, f"tag access={access!r}"
     if highway in _PUBLIC_HIGHWAYS:
@@ -261,8 +270,14 @@ def classify(
     distance_to_building_m: float | None,
     distance_to_parking_m: float | None,
     access_ref: str | None,
+    adjacency_max_m: float = DEFAULT_ADJACENCY_M,
 ) -> tuple[CorridorClass, str]:
-    """Classe une voie, sans jamais la rendre admissible d'office."""
+    """Classe une voie, sans jamais la rendre admissible d'office.
+
+    Le seuil d'adjacence est reçu, non lu dans une constante : une politique
+    posée dans l'espace de travail doit changer le classement, faute de quoi
+    elle décorerait un rapport sans rien décider.
+    """
     tags = element.get("tags") or {}
     highway = (tags.get("highway") or "").lower()
     service = (tags.get("service") or "").lower()
@@ -274,17 +289,18 @@ def classify(
         return CorridorClass.PARKING_AISLE, "allée de stationnement (service=parking_aisle)"
     if distance_to_building_m is None:
         return CorridorClass.EXCLUDED, "distance au bâtiment non calculable"
-    if distance_to_building_m <= ADJACENCY_M:
+    if distance_to_building_m <= adjacency_max_m:
         return (
             CorridorClass.ADJACENT_ROAD,
             f"à {distance_to_building_m:.0f} m de l'empreinte, sous le seuil "
-            f"d'adjacence de {ADJACENCY_M:.0f} m",
+            f"d'adjacence de {adjacency_max_m:.0f} m",
         )
     if highway in _PUBLIC_HIGHWAYS or highway == "service":
         return (
             CorridorClass.NON_ADJACENT_POTENTIAL,
-            f"à {distance_to_building_m:.0f} m : hors adjacence, utilité à "
-            "établir par la visibilité multi-rayons",
+            f"à {distance_to_building_m:.0f} m : au-delà du seuil de "
+            f"{adjacency_max_m:.0f} m, hors adjacence ; utilité à établir par "
+            "la visibilité multi-rayons",
         )
     return CorridorClass.EXCLUDED, f"type de voie {highway!r} sans usage de capture"
 
@@ -302,6 +318,11 @@ class ResolutionReport:
     corridors: dict[str, int] = field(default_factory=dict)
     corridor_details: list[dict] = field(default_factory=list)
     invalid_geometries: list[str] = field(default_factory=list)
+
+    #: Empreintes retirées des obstacles parce qu'elles décrivent la cible, et
+    #: par quelle méthode. Une voisine supprimée par erreur serait sinon
+    #: invisible.
+    target_exclusions: list[dict] = field(default_factory=list)
     crs_problems: list[str] = field(default_factory=list)
     road_geometry_digest: str = ""
     obstacle_geometry_digest: str = ""
@@ -317,6 +338,7 @@ class ResolutionReport:
             "corridors_by_class": self.corridors,
             "corridors": self.corridor_details,
             "invalid_geometries": self.invalid_geometries,
+            "target_exclusions": self.target_exclusions,
             "crs_problems": self.crs_problems,
             # Deux empreintes distinctes : le plan d'acquisition les cite
             # séparément, et une route ajoutée ne doit pas se confondre avec un
