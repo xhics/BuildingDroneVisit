@@ -1552,6 +1552,190 @@ def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
     )
 
 
+visibility_app = typer.Typer(
+    no_args_is_help=True, help="Visibilité multi-rayons (Lot 1B V2 §3)."
+)
+app.add_typer(visibility_app, name="visibility")
+
+
+@visibility_app.command("assess")
+def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
+    """Mesure la visibilité géométrique. **Ne modifie aucun asset.**"""
+    import hashlib
+    from datetime import datetime, timezone
+
+    from .geo.visibility_run import digest, run_assessment
+    from .schemas.geometry import CaptureGeometryManifest
+
+    workspace = Workspace(hotel_id)
+    context = _context(hotel_id)
+
+    # Les réglages du moteur doivent figurer dans la politique du projet :
+    # calculés depuis les valeurs du code, ils ne se rejoueraient pas.
+    implicit = context.implicit_under("visibility")
+    if implicit:
+        typer.secho(
+            f"{KO} la politique effective ({context.policy.version}) ne porte pas "
+            f"ces réglages, qui viendraient du code : {', '.join(implicit)}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    raw = workspace.read_json("06_geo/capture_geometry.json")
+    if raw is None:
+        typer.secho(
+            f"{KO} aucun manifeste géométrique — lancez d'abord : geo resolve",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    manifest = CaptureGeometryManifest.model_validate(raw)
+
+    assets_manifest = workspace.read_assets()
+    site = workspace.read_site()
+    if assets_manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    from .schemas.geometry import GeometryRole
+
+    digests = {
+        "capture_geometry": digest(raw),
+        "policy": context.provenance["policy_digest"],
+        "site_manifest": digest(json.loads(site.model_dump_json())) if site else "sans-site",
+        "assets": digest([a.checksum for a in assets_manifest.assets]),
+        "obstacles": digest(
+            sorted(
+                g.geometry_digest or ""
+                for g in manifest.by_role(GeometryRole.OBSTACLE_BUILDING)
+            )
+        ),
+        "roads": digest(
+            sorted(
+                g.geometry_digest or ""
+                for g in manifest.geometries
+                if g.role.value in ("access_road", "road_candidate")
+            )
+        ),
+    }
+
+    # --- verticales mesurées -------------------------------------------------
+    # Six données manquaient à chaque rayon à risque ; trois sont dérivables de
+    # ce qui est déjà acquis. La quatrième — la hauteur d'œil — ne l'est pas.
+    from .geo.elevation import CloudSampler, RasterSampler
+    from .geo.visibility_engine import TargetVertical
+
+    target_vertical = None
+    camera_ground = None
+    obstacle_heights: dict[str, dict] = {}
+    enrichment: dict[str, str] = {}
+
+    derived = sorted(workspace.path("06_geo", "derived").glob("*"))
+    if derived:
+        latest_derivation = derived[-1]
+        sampler = RasterSampler(
+            latest_derivation / "dtm.tif",
+            latest_derivation / "dsm_roof_class6.tif",
+            f"derivation:{latest_derivation.name}",
+        )
+
+        def _sample(point):  # noqa: ANN001
+            ground, roof = sampler.at(point[0], point[1])
+            return (
+                ground.value_m if ground else None,
+                roof.value_m if roof else None,
+            )
+
+        target_vertical = TargetVertical(
+            sampler=_sample, provenance=f"TERRAIN_MAIN+ROOFLINE_MAIN@{latest_derivation.name}"
+        )
+        enrichment["target"] = f"rasters qualifiés {latest_derivation.name}"
+
+    acquisition = workspace.read_json("06_geo/acquisition_report.json") or {}
+    laz = (acquisition.get("acquisitions") or [{}])[0].get("path")
+    if laz and Path(laz).is_file():
+        cloud = CloudSampler.load(Path(laz), "laz:23_3095048F08_DC")
+        from shapely import wkt as shapely_wkt
+
+        from .schemas.geometry import GeometryResolutionStatus
+
+        for geometry in manifest.by_role(GeometryRole.OBSTACLE_BUILDING):
+            if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
+                continue
+            ground, top = cloud.within(shapely_wkt.loads(geometry.projected_wkt))
+            if ground and top:
+                obstacle_heights[geometry.feature_id] = {
+                    "ground_m": ground.value_m,
+                    "height_m": max(top.value_m - ground.value_m, 0.0),
+                    "provenance": top.provenance,
+                }
+        enrichment["obstacles"] = (
+            f"{len(obstacle_heights)}/{len(manifest.by_role(GeometryRole.OBSTACLE_BUILDING))} "
+            "mesurés dans le nuage"
+        )
+        camera_ground = cloud.ground_near
+        enrichment["camera_ground"] = "classe 2 au voisinage de la position"
+
+    enrichment["camera_height"] = (
+        "inconnue : aucune source ne publie la hauteur de capteur"
+    )
+
+    spatial = workspace.read_spatial()
+    front = spatial.front_azimuth_deg if spatial else None
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    try:
+        run, report = run_assessment(
+            run_id, hotel_id, assets_manifest.assets, manifest, context.policy, digests,
+            front_azimuth_deg=front, target_vertical=target_vertical,
+            camera_ground=lambda origin: camera_ground(*origin) if camera_ground else None,
+            obstacle_heights=obstacle_heights,
+        )
+    except ValueError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    report.enrichment = enrichment
+    run.elevation_artifacts = sorted(enrichment.values())
+
+    workspace.write_json(
+        f"06_geo/visibility_run_{run_id}.json", json.loads(run.model_dump_json())
+    )
+    workspace.write_report(f"06_geo/visibility_report_{run_id}.json", report, context)
+
+    typer.echo("")
+    typer.echo(f"  exécution {run_id} · moteur {run.engine_version}")
+    for key, value in enrichment.items():
+        typer.echo(f"    verticale · {key:<14} {value}")
+    typer.echo(f"  {report.assets_assessed} asset(s) situé(s) évalué(s)")
+    for status, total in sorted(report.by_status.items()):
+        typer.echo(f"    {status:<20} {total:>4}")
+    typer.echo("")
+    typer.secho(
+        f"  occultations déclarées auparavant : {report.previously_occluded} → "
+        f"{report.previously_occluded_now}",
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo(f"  blocages prouvés : {report.proven_blocked}")
+    typer.echo("")
+    typer.echo("  données verticales manquantes :")
+    for missing, total in sorted(
+        report.missing_vertical_counts.items(), key=lambda item: -item[1]
+    )[:6]:
+        typer.echo(f"    {missing:<44} {total:>4} asset(s)")
+    typer.echo("")
+    typer.echo(f"  cadrages calculables : {report.framing_computable}")
+    for reason, total in sorted(report.framing_not_computable.items()):
+        typer.echo(f"    non calculable · {reason:<36} {total:>4}")
+    typer.echo("")
+    typer.echo(f"  corridors évalués : {report.corridors_assessed} · "
+               f"utilité {report.corridors_useful}")
+    typer.echo("")
+    typer.secho(
+        "  aucun asset modifié : la projection est une commande distincte",
+        fg=typer.colors.YELLOW,
+    )
+
+
 site_app = typer.Typer(no_args_is_help=True, help="Instances du site (Lot 1B §4).")
 app.add_typer(site_app, name="site")
 

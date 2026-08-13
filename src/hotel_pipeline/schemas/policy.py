@@ -48,6 +48,45 @@ class GeometryPolicy(BaseModel):
     adjacency_max_m: float = Field(default=30.0, gt=0)
 
 
+class VisibilityPolicy(BaseModel):
+    """Réglages numériques du moteur de visibilité.
+
+    Ce sont des paramètres de calcul, non des seuils d'acceptation : rien ici
+    ne décide qu'une vue est bonne. Les fixer dans la politique les rend
+    inspectables et reproductibles — un pas angulaire choisi dans le code
+    changerait les fractions sans laisser de trace.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Pas angulaire maximal d'échantillonnage de la silhouette. Plus fin
+    #: qu'utile coûte du temps ; plus grossier manque un obstacle étroit.
+    max_angular_step_deg: float = Field(default=0.25, gt=0, le=10)
+
+    #: Nombre minimal de cellules, quel que soit l'intervalle : une cible
+    #: lointaine n'occupe qu'un demi-degré, et deux rayons n'en diraient rien.
+    min_angular_cells: int = Field(default=48, ge=8)
+
+    #: Pas d'échantillonnage des corridors, en mètres de projection.
+    corridor_sample_step_m: float = Field(default=10.0, gt=0)
+
+    #: Tolérance d'intersection, en mètres : en deçà, deux formes se touchent
+    #: sans se couper.
+    intersection_tolerance_m: float = Field(default=0.05, gt=0)
+
+    #: Décimales des mesures publiées, fixées pour que deux exécutions
+    #: identiques rendent des rapports identiques.
+    output_precision: int = Field(default=4, ge=1, le=12)
+
+    #: Méthode d'échantillonnage, inscrite au rapport.
+    sampling_method: str = "uniform_angular_cells"
+
+    #: Modèle de projection du cadrage. La règle des trois tangentes n'est
+    #: valable que pour une caméra perspective : un panorama équirectangulaire
+    #: demanderait un autre calcul, et le nommer permet de le refuser.
+    projection_model: str = "pinhole_tangent"
+
+
 class DedupPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -202,9 +241,10 @@ class PipelinePolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: str = "1.2.0"
+    version: str = "1.3.0"
     model: ModelPolicy = Field(default_factory=ModelPolicy)
     geometry: GeometryPolicy = Field(default_factory=GeometryPolicy)
+    visibility: VisibilityPolicy = Field(default_factory=VisibilityPolicy)
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)
     collection: CollectionPolicy = Field(default_factory=CollectionPolicy)
     terrain: TerrainPolicy = Field(default_factory=TerrainPolicy)
