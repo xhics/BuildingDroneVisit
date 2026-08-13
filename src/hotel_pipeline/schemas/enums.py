@@ -10,11 +10,17 @@ from enum import StrEnum
 
 
 class ObjectState(StrEnum):
-    """État d'un objet critique (plan directeur §4)."""
+    """État d'un objet critique (plan directeur §4).
+
+    `STALE` désigne un objet dont la décision reposait sur un artefact
+    depuis remplacé. Sa décision antérieure et son motif sont conservés : la
+    qualification n'est pas fausse, elle porte sur une production périmée.
+    """
 
     CONFIRMED = "confirmed"
     INFERRED = "inferred"
     CONFLICTED = "conflicted"
+    STALE = "stale"
     UNRESOLVED = "unresolved"
 
 

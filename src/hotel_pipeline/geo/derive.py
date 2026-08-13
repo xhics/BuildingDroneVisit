@@ -273,11 +273,22 @@ def derive(
     result.metrics = _metrics(
         grid, footprint_mask, dtm, dsm_roof, class1, ndsm, ndsm_valid,
         masks, disagreement, rejected, distances, px, py, pz, footprint_projected,
-        pseudo_result, search_within_tile,
+        pseudo_result, search_within_tile, int(roof.sum()),
     )
     result.qa_flags = _qa_flags(result.metrics, ndsm, limits)
     result.artifacts = _artifacts(
-        result, grid, crs, crs_vertical, source_id, domain_cells, masks, ndsm_valid
+        result, grid, crs, crs_vertical, source_id, domain_cells, masks, ndsm_valid,
+        # Les paramètres inscrits sur l'artefact doivent être ceux du calcul.
+        # Lus depuis les constantes du module, ils décrivaient la dérivation par
+        # défaut, jamais celle qui vient d'avoir lieu.
+        parameters={
+            "cell_m": str(cell_m),
+            "ring_m": str(ring_m),
+            "search_radius_m": str(search_radius_m),
+            "aggregation": "median",
+            "interpolation": "tin_linear",
+            "policy_version": (policy or DEFAULT_POLICY).version,
+        },
     )
     return result
 
@@ -304,10 +315,13 @@ def _median_grid(x, y, z, grid: GridSpec) -> np.ndarray:  # noqa: ANN001
 def _metrics(
     grid, footprint_mask, dtm, dsm_roof, class1, ndsm, ndsm_valid,
     masks, disagreement, rejected, distances, px, py, pz, footprint,  # noqa: ANN001
-    pseudo_result, search_within_tile,  # noqa: ANN001
+    pseudo_result, search_within_tile, roof_points: int = 0,  # noqa: ANN001
 ) -> dict:
+    from .qualify import roof_gaps
+
     domain = int(footprint_mask.sum())
     interior_distances = distances[footprint_mask]
+    footprint_m2 = domain * grid.cell_m**2
 
     block = terrain.block_cross_validation(px, py, pz)
     pseudo, pseudo_rejected = pseudo_result
@@ -321,6 +335,11 @@ def _metrics(
             "class1_candidates": _fraction(np.isfinite(class1) & footprint_mask, domain),
             "ndsm_valid": _fraction(ndsm_valid, domain),
         },
+        # Densité rapportée à l'emprise, non aux seules cellules observées :
+        # rapportée aux cellules observées, une toiture à moitié vue afficherait
+        # la même densité qu'une toiture entièrement vue.
+        "roof_density_per_m2": round(roof_points / footprint_m2, 2) if footprint_m2 else 0.0,
+        "roof_gaps": roof_gaps(np.isfinite(dsm_roof), footprint_mask, grid.cell_m),
         "definition_masks": masks.counts(),
         "tin_vs_idw": disagreement.as_dict(),
         "extrapolation_rejected": rejected.as_dict(),
@@ -396,8 +415,14 @@ def _qa_flags(metrics: dict, ndsm, limits) -> list[str]:  # noqa: ANN001
 def _artifacts(
     result: DeriveResult, grid: GridSpec, crs: str, crs_vertical: str,
     source_id: str, domain_cells: int, masks, ndsm_valid,  # noqa: ANN001
+    parameters: dict[str, str] | None = None,
 ) -> list[DerivedArtifact]:
     """Assemble les artefacts, avec leur filiation réelle."""
+    if not parameters:
+        raise ValueError(
+            "artefacts sans paramètres effectifs : un raster dont on ignore la "
+            "taille de cellule et l'anneau d'appui n'est pas reproductible"
+        )
     parents = {
         "ndsm_valid": ["dtm", "dsm_roof_class6"],
         "ndsm": ["dtm", "dsm_roof_class6", "ndsm_valid"],
@@ -431,12 +456,7 @@ def _artifacts(
                 resolution_m=grid.cell_m,
                 nodata=NODATA if role != "mask" else None,
                 algorithm_id=ALGORITHM,
-                parameters={
-                    "cell_m": str(grid.cell_m),
-                    "ring_m": str(terrain.RING_M),
-                    "aggregation": "median",
-                    "interpolation": "tin_linear",
-                },
+                parameters=dict(parameters or {}),
                 measured_fraction=measured,
                 interpolated_fraction=interpolated,
                 coverage_domain="footprint",

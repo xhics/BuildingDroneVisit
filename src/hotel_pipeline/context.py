@@ -34,12 +34,75 @@ class ProfileNotFound(FileNotFoundError):
     pass
 
 
+def implicit_paths(model, raw: object, prefix: str = "") -> list[str]:  # noqa: ANN001
+    """Chemins pointés des champs absents du fichier, à toute profondeur.
+
+    Un contrôle au premier niveau ne voit qu'une section entière manquante.
+    Le cas le plus probable est pourtant l'inverse : un seuil ajouté dans une
+    section déjà présente. `qualification.terrain.max_new_metric` serait rempli
+    par le code, dans un fichier qui paraît complet.
+    """
+    if not isinstance(raw, dict):
+        return []
+
+    missing: list[str] = []
+    for name in type(model).model_fields:
+        path = f"{prefix}{name}"
+        if name not in raw:
+            missing.append(path)
+            continue
+        value = getattr(model, name, None)
+        if hasattr(type(value), "model_fields"):
+            missing.extend(implicit_paths(value, raw[name], prefix=f"{path}."))
+    return missing
+
+
+def _read_policy(policy_path: Path | None) -> tuple[PipelinePolicy, tuple[str, ...]]:
+    """Lit la politique et signale ce que le fichier ne contenait pas.
+
+    Une politique gelée avant l'ajout d'une section se relit sans erreur : les
+    champs manquants prennent les valeurs du code, tandis que le fichier
+    continue d'annoncer son ancienne version. Le rapport afficherait alors des
+    seuils qui ne figurent nulle part sur le disque.
+    """
+    if not (policy_path and policy_path.is_file()):
+        return DEFAULT_POLICY, ()
+
+    raw = json.loads(policy_path.read_text("utf-8"))
+    policy = PipelinePolicy.model_validate(raw)
+    filled = tuple(implicit_paths(policy, raw))
+    log.info("politique chargée depuis %s (version %s)", policy_path, policy.version)
+    if filled:
+        log.warning(
+            "politique %s : section(s) absente(s) du fichier, comblée(s) par les "
+            "valeurs du code : %s",
+            policy.version,
+            ", ".join(filled),
+        )
+    return policy, filled
+
+
 @dataclass(frozen=True)
 class PipelineContext:
     """Ce que toute étape doit connaître, et rien de plus."""
 
     policy: PipelinePolicy
     profile: PropertyProfile | None = None
+
+    #: Sections que la politique matérialisée ne contenait pas, et qui ont donc
+    #: été comblées par les valeurs du code. Une politique gelée en 1.1.0 se
+    #: relit sans erreur en 1.2.0 : Pydantic remplit les manques, la version
+    #: écrite reste l'ancienne, et le rapport annonce des seuils que le fichier
+    #: ne porte pas. Ce qui a été comblé doit donc être dit.
+    policy_defaults_applied: tuple[str, ...] = ()
+
+    def implicit_under(self, section: str) -> tuple[str, ...]:
+        """Valeurs implicites dans une section, la section elle-même comprise."""
+        return tuple(
+            path
+            for path in self.policy_defaults_applied
+            if path == section or path.startswith(f"{section}.")
+        )
 
     @property
     def provenance(self) -> dict[str, str]:
@@ -59,10 +122,7 @@ class PipelineContext:
         Un profil absent est une erreur explicite : le pipeline tournerait
         sinon avec des valeurs de secours, silencieusement.
         """
-        policy = DEFAULT_POLICY
-        if policy_path and policy_path.is_file():
-            policy = PipelinePolicy.model_validate_json(policy_path.read_text("utf-8"))
-            log.info("politique chargée depuis %s (version %s)", policy_path, policy.version)
+        policy, filled = _read_policy(policy_path)
 
         profile = None
         if property_id:
@@ -74,7 +134,7 @@ class PipelineContext:
                 profile.room_count or "nombre inconnu de",
             )
 
-        return cls(policy=policy, profile=profile)
+        return cls(policy=policy, profile=profile, policy_defaults_applied=filled)
 
     @staticmethod
     def _load_profile(property_id: str, profiles_dir: Path | None) -> PropertyProfile:
@@ -105,17 +165,14 @@ class PipelineContext:
         c'était le cas, et une politique posée sur le disque était ignorée dès
         qu'aucun profil ne l'accompagnait.
         """
-        policy = DEFAULT_POLICY
-        if policy_path and policy_path.is_file():
-            policy = PipelinePolicy.model_validate_json(policy_path.read_text("utf-8"))
-            log.info("politique chargée depuis %s (version %s)", policy_path, policy.version)
+        policy, filled = _read_policy(policy_path)
 
         try:
             profile = cls._load_profile(property_id, profiles_dir)
         except ProfileNotFound as exc:
-            return cls(policy=policy), str(exc)
+            return cls(policy=policy, policy_defaults_applied=filled), str(exc)
 
-        return cls(policy=policy, profile=profile), None
+        return cls(policy=policy, profile=profile, policy_defaults_applied=filled), None
 
     @classmethod
     def for_workspace(cls, workspace) -> tuple["PipelineContext", str | None]:  # noqa: ANN001

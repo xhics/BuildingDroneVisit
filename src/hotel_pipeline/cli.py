@@ -855,6 +855,19 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         if replaced:
             typer.echo(f"  · {replaced} artefact(s) de la série précédente remplacé(s)")
 
+        # La supersession prive de support les objets qui citaient ces
+        # artefacts. Ne pas le dire ici laisserait un manifeste où un objet
+        # « inferred » repose sur une production écartée — invalide à la
+        # relecture, et faux entre-temps.
+        from .geo.qualify import mark_stale
+
+        for object_id in mark_stale(site):
+            typer.secho(
+                f"  · {object_id} repassé en 'stale' — sa dérivation a été remplacée ; "
+                "relancez : geo qualify",
+                fg=typer.colors.YELLOW,
+            )
+
         artifacts = {a.artifact_id: a for a in site.artifacts}
         artifacts.update({a.artifact_id: a for a in result.artifacts})
         site.artifacts = list(artifacts.values())
@@ -919,6 +932,118 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     typer.echo("")
     typer.secho(
         "  aucun objet qualifié — TERRAIN_MAIN et ROOFLINE_MAIN restent en l'état",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@geo_app.command("qualify")
+def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
+    """Confronte la dernière dérivation aux seuils. N'écrit jamais `confirmed`."""
+    from .geo import qualify as qualification
+    from .intake import sha256_file
+
+    workspace = Workspace(hotel_id)
+    site = workspace.read_site()
+    if site is None:
+        typer.secho("aucun manifeste de site", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    reports = sorted(workspace.path("06_geo").glob("derivation_report_*.json"))
+    if not reports:
+        typer.secho(
+            "aucun rapport de dérivation — lancez d'abord : geo derive",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # La plus récente dérivation, et elle seule : qualifier sur une série
+    # antérieure reviendrait à juger des rasters que la supersession a écartés.
+    latest = reports[-1]
+    derivation = workspace.read_json(f"06_geo/{latest.name}")
+    context = _context(hotel_id)
+
+    # Qualifier sur des seuils que la politique du projet ne porte pas
+    # reviendrait à calibrer en silence depuis le code — à n'importe quelle
+    # profondeur : un seuil ajouté dans une section déjà présente passerait
+    # tout aussi inaperçu qu'une section entière absente.
+    implicit = context.implicit_under("qualification")
+    if implicit:
+        typer.secho(
+            f"{KO} la politique effective ({context.policy.version}) ne porte pas "
+            f"ces valeurs, qui viendraient du code : {', '.join(implicit)}",
+            fg=typer.colors.RED, err=True,
+        )
+        typer.secho(
+            f"  révisez puis remplacez {workspace.policy_path}",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Les artefacts remplacés emportent les décisions qu'ils fondaient.
+    for object_id in qualification.mark_stale(site):
+        typer.secho(
+            f"  · {object_id} repassé en 'stale' — artefact cité remplacé",
+            fg=typer.colors.YELLOW,
+        )
+
+    # Le rapport le plus récent et la série active pourraient ne pas se
+    # correspondre : chacun est cohérent séparément, et rien ne le dirait.
+    run_id = latest.stem.removeprefix("derivation_report_")
+    mismatches = qualification.check_series(site, derivation, run_id)
+    if mismatches:
+        typer.secho(
+            f"{KO} le rapport jugé et la série active ne concordent pas :",
+            fg=typer.colors.RED, err=True,
+        )
+        for problem in mismatches:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
+    mapping = qualification.select_artifacts(site)
+    report = qualification.report(
+        derivation["metrics"],
+        context.policy,
+        digest=sha256_file(latest)[:16],
+        artifacts=sorted({a for ids in mapping.values() for a in ids}),
+        run_id=run_id,
+    )
+
+    # Le rapport est publié avant d'être cité : un objet doit pouvoir renvoyer
+    # à l'empreinte d'un fichier qui existe.
+    published = workspace.write_report(f"06_geo/{report.name}", report, context)
+    qualified = qualification.apply(
+        site, report, mapping, report_digest=sha256_file(published)[:16]
+    )
+    workspace.write_site(site)
+
+    typer.echo("")
+    typer.echo(f"  rapport publié   : {report.name}")
+    typer.echo(f"  dérivation jugée : {latest.name} ({report.qualified_derivation_digest})")
+    typer.echo(
+        f"  politique {report.policy_version} · {report.qualification_status} · "
+        f"{report.intended_use} · calibrée sur {report.calibrated_on_sites} site(s)"
+    )
+    for kind, verdict in report.verdicts.items():
+        typer.echo("")
+        colour = typer.colors.GREEN if verdict.passed else typer.colors.YELLOW
+        # `qualified` porte des identifiants d'objet, jamais des types : les
+        # comparer directement afficherait « non qualifié » sur un objet qui
+        # vient d'être inscrit comme inféré.
+        inscribed = [o.object_id for o in site.objects if o.kind == kind and o.object_id in qualified]
+        state = "inferred" if inscribed else "non qualifié"
+        typer.secho(f"  {kind:<14} {state} · confiance {verdict.confidence}", fg=colour)
+        for criterion in verdict.criteria:
+            mark = OK if criterion.passed else KO
+            typer.echo(
+                f"      {mark} {criterion.name:<26} {criterion.threshold:<12} "
+                f"mesuré {criterion.measured}"
+            )
+        for reservation in verdict.reservations:
+            typer.secho(f"      réserve : {reservation}", fg=typer.colors.YELLOW)
+
+    typer.echo("")
+    typer.secho(
+        "  aucun objet confirmé : une dérivation reste une inférence",
         fg=typer.colors.YELLOW,
     )
 

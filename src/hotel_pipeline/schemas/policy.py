@@ -109,6 +109,75 @@ class TerrainPolicy(BaseModel):
     calibrated_on_sites: int = 0
 
 
+class TerrainQualificationThresholds(BaseModel):
+    """Seuils de qualification d'un terrain **interpolé**.
+
+    Aucune cellule de sol n'est mesurée sous l'emprise : ces seuils qualifient
+    une inférence, pas une observation. Ils portent donc sur la fiabilité de
+    l'interpolation, mesurée là où la vérité est connue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_dtm_defined: float = Field(default=0.98, ge=0.0, le=1.0)
+    require_search_area_within_tile: bool = True
+    min_accepted_trials: int = Field(default=3, ge=1)
+
+    #: Sur le **pire** essai, non sur la moyenne : une moyenne dissimulerait
+    #: un essai médiocre derrière deux bons.
+    max_worst_trial_rmse_m: float = Field(default=0.50, gt=0)
+    max_worst_trial_p95_m: float = Field(default=1.00, gt=0)
+    max_abs_bias_m: float = Field(default=0.25, gt=0)
+
+    max_support_distance_m: float = Field(default=15.0, gt=0)
+    max_rejected_extrapolation: float = Field(default=0.02, ge=0.0, le=1.0)
+    max_tin_idw_mae_m: float = Field(default=0.15, gt=0)
+
+
+class RooflineQualificationThresholds(BaseModel):
+    """Seuils d'une surface de toiture **observée**.
+
+    Contrairement au terrain, la toiture est mesurée : ces seuils portent sur
+    la couverture et la densité de l'observation, non sur une erreur d'inférence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_roof_observed: float = Field(default=0.95, ge=0.0, le=1.0)
+    min_main_component: float = Field(default=0.95, ge=0.0, le=1.0)
+    min_point_density_per_m2: float = Field(default=10.0, gt=0)
+    min_ndsm_valid: float = Field(default=0.95, ge=0.0, le=1.0)
+    max_negative_height_fraction: float = Field(default=0.001, ge=0.0, le=1.0)
+
+    #: Une hauteur ne vaut pas mieux que le terrain qui la fonde.
+    require_qualified_terrain: bool = True
+
+
+class QualificationPolicy(BaseModel):
+    """Seuils de passage en `inferred`, et ce qu'ils autorisent à en faire.
+
+    `intended_use` n'est pas décoratif : ces seuils qualifient un proxy visuel,
+    pas une donnée d'arpentage. Les citer hors de cet usage serait un abus.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = "provisional"
+    intended_use: str = "visual_proxy_not_survey"
+
+    #: Distincte de `terrain.calibration_id`, qui décrit la validation de la
+    #: méthode. Celle-ci décrit le choix des seuils.
+    calibration_id: str = "welcominns-pilot-qualification-v1"
+    calibrated_on_sites: int = 1
+
+    terrain: TerrainQualificationThresholds = Field(
+        default_factory=TerrainQualificationThresholds
+    )
+    roofline: RooflineQualificationThresholds = Field(
+        default_factory=RooflineQualificationThresholds
+    )
+
+
 class TemporalPolicy(BaseModel):
     """Ce qu'une datation inconnue autorise, selon l'usage.
 
@@ -133,12 +202,13 @@ class PipelinePolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: str = "1.1.0"
+    version: str = "1.2.0"
     model: ModelPolicy = Field(default_factory=ModelPolicy)
     geometry: GeometryPolicy = Field(default_factory=GeometryPolicy)
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)
     collection: CollectionPolicy = Field(default_factory=CollectionPolicy)
     terrain: TerrainPolicy = Field(default_factory=TerrainPolicy)
+    qualification: QualificationPolicy = Field(default_factory=QualificationPolicy)
     temporal: TemporalPolicy = Field(default_factory=TemporalPolicy)
 
 

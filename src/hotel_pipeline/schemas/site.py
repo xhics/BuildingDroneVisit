@@ -315,6 +315,26 @@ class SiteObject(BaseModel):
     #: est une information perdue.
     unresolved_reason: str | None = None
 
+    #: Décision de qualification : sur quel rapport elle se fonde, ce qu'elle
+    #: affirme, et ce qu'elle ne couvre pas. Les réserves comptent autant que le
+    #: verdict — « surface principale observée » n'est pas « toiture relevée ».
+    #: Nom du rapport de qualification, son empreinte, et celle du rapport de
+    #: **dérivation** jugé. Les deux empreintes sont distinctes : la première
+    #: identifie la décision, la seconde les mesures sur lesquelles elle porte.
+    #: Un seul champ pour les deux laisserait croire qu'on peut retrouver la
+    #: décision à partir des mesures.
+    qualification_report: str | None = None
+    qualification_report_digest: str | None = None
+    qualified_derivation_digest: str | None = None
+    qualification_rationale: str | None = None
+    qualification_confidence: str | None = None
+    qualification_reservations: list[str] = Field(default_factory=list)
+
+    #: État tenu avant péremption. Un artefact remplacé ne rend pas la décision
+    #: antérieure fausse : il la prive de son support. La perdre reviendrait à
+    #: redemander un travail déjà fait.
+    previous_state: ObjectState | None = None
+
     confirmed_by: str | None = None
     confirmed_at: datetime | None = None
     confirmation_rationale: str | None = None
@@ -328,6 +348,26 @@ class SiteObject(BaseModel):
         if self.state is ObjectState.UNRESOLVED and self.geometry_wkt:
             raise ValueError(
                 f"objet {self.object_id!r} porte une géométrie mais reste 'unresolved'"
+            )
+        if self.state is ObjectState.STALE:
+            if self.previous_state is None:
+                raise ValueError(
+                    f"objet {self.object_id!r} périmé sans décision antérieure — "
+                    "la péremption doit conserver ce qui avait été décidé"
+                )
+            if self.previous_state is ObjectState.STALE:
+                raise ValueError(
+                    f"objet {self.object_id!r} : 'stale' ne peut pas être sa propre "
+                    "décision antérieure"
+                )
+            if not (self.qualification_rationale or self.unresolved_reason):
+                raise ValueError(
+                    f"objet {self.object_id!r} périmé sans motif conservé"
+                )
+        elif self.previous_state is not None:
+            raise ValueError(
+                f"objet {self.object_id!r} porte une décision antérieure sans être "
+                "périmé — un état courant se lit dans 'state'"
             )
         return self
 
@@ -471,10 +511,16 @@ class SiteManifest(BaseModel):
             inactive = [
                 a for a in obj.artifact_ids if not by_artifact[a].is_active
             ]
-            if inactive:
+            # Un objet peut légitimement citer un artefact remplacé, à une
+            # condition : le dire. C'est exactement ce que 'stale' déclare.
+            # L'interdire sans réserve obligerait à effacer la décision
+            # antérieure pour rester valide — le manifeste mentirait par
+            # omission au lieu de mentir par excès.
+            if inactive and obj.state is not ObjectState.STALE:
                 raise ValueError(
                     f"objet {obj.object_id!r} référence des artefacts non actifs : "
-                    f"{inactive} — une qualification en dépendrait sans le savoir"
+                    f"{inactive} — une qualification en dépendrait sans le savoir ; "
+                    "l'état 'stale' est prévu pour cela"
                 )
         return self
 

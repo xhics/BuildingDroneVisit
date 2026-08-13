@@ -42,6 +42,9 @@ def provenance(
         "model_calibrated_on_sites": str(policy.model.calibrated_on_sites),
         "terrain_calibration_id": policy.terrain.calibration_id,
         "terrain_calibrated_on_sites": str(policy.terrain.calibrated_on_sites),
+        "qualification_status": policy.qualification.status,
+        "qualification_intended_use": policy.qualification.intended_use,
+        "qualification_calibration_id": policy.qualification.calibration_id,
         "policy_digest": policy_digest(policy),
     }
     if profile is not None:
