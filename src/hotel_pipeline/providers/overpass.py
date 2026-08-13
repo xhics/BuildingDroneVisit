@@ -104,6 +104,22 @@ def roads_around(lat: float, lon: float, radius_m: int = 350) -> list[dict[str, 
     return elements
 
 
+def way_by_id(way_id: int) -> list[dict[str, Any]]:
+    """Résout une voie précise, avec sa géométrie complète.
+
+    Le cache de collecte ne contient que bâtiments et stationnements : y
+    chercher une voie rendrait une absence qui n'en est pas une.
+    """
+    ql = f"""
+    [out:json][timeout:{TIMEOUT}];
+    way({way_id});
+    out geom tags;
+    """.strip()
+
+    payload = cached_call(f"overpass-way::{way_id}", lambda: _query(ql))
+    return payload["elements"]
+
+
 def features_around(lat: float, lon: float, radius_m: int = 500) -> list[dict[str, Any]]:
     """Bâtiments et stationnements dans un rayon, avec leur géométrie.
 

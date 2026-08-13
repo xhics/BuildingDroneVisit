@@ -1318,6 +1318,116 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
     )
 
 
+@geo_app.command("resolve")
+def geo_resolve(
+    hotel_id: str = typer.Argument(...),
+    radius_m: int = typer.Option(350, "--radius", help="Périmètre du réseau routier."),
+) -> None:
+    """Résout les géométries de capture. **Ne modifie aucun objet du site.**"""
+    import hashlib
+
+    from .geo import capture_geometry as cg
+    from .geo.resolve_geometry import resolve
+    from .providers import overpass
+    from .providers.cache import OfflineError
+    from .steps import ELEMENTS_FILE
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    site = workspace.read_site()
+    if spatial is None or not spatial.confirmed_building_id:
+        typer.secho("bâtiment confirmé requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    building = spatial.candidate(spatial.confirmed_building_id)
+    elements = workspace.read_json(ELEMENTS_FILE) or []
+    elements_digest = hashlib.sha256(
+        json.dumps(elements, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+
+    def _ref(kind: str) -> str | None:
+        if site is None:
+            return None
+        return next(
+            (o.source_ref for o in site.objects if o.kind == kind and o.source_ref), None
+        )
+
+    access_ref = _ref("ACCESS_ROAD_MAIN")
+    parking_ref = _ref("PARKING_HOTEL")
+
+    # Deux interrogations distinctes : le cache de collecte ne contient ni
+    # route ni voie d'accès, et y chercher l'une aurait rendu une absence
+    # inventée.
+    roads = roads_error = None
+    try:
+        roads = overpass.roads_around(
+            building.centroid_lat, building.centroid_lon, radius_m=radius_m
+        )
+    except (OverpassError, OfflineError, requests.RequestException) as exc:
+        roads_error = str(exc)
+        typer.secho(f"  ! réseau routier indisponible : {exc}", fg=typer.colors.YELLOW)
+
+    access_element = access_error = None
+    if access_ref:
+        try:
+            access_element = overpass.way_by_id(int(access_ref.split("/")[-1]))
+        except (OverpassError, OfflineError, requests.RequestException, ValueError) as exc:
+            access_error = str(exc)
+            typer.secho(f"  ! voie d'accès indisponible : {exc}", fg=typer.colors.YELLOW)
+
+    manifest, report = resolve(
+        hotel_id=hotel_id,
+        building_wkt=building.wkt,
+        access_road_ref=access_ref,
+        elements=elements,
+        elements_digest=elements_digest,
+        roads=roads,
+        roads_error=roads_error,
+        access_element=access_element,
+        access_error=access_error,
+        radius_m=float(radius_m),
+        parking_ref=parking_ref,
+        policy_digest=context.provenance["policy_digest"],
+    )
+
+    workspace.write_json(
+        "06_geo/capture_geometry.json", json.loads(manifest.model_dump_json())
+    )
+    workspace.write_report("06_geo/geometry_resolution_report.json", report, context)
+
+    typer.echo("")
+    for snap in manifest.snapshots:
+        mark = OK if snap.status.value == "success" else KO
+        colour = typer.colors.GREEN if snap.status.value == "success" else typer.colors.YELLOW
+        typer.secho(
+            f"  {mark} {snap.snapshot_id:<26} {snap.status.value:<16} "
+            f"{snap.element_count:>4} élément(s)",
+            fg=colour,
+        )
+    typer.echo("")
+    typer.echo(f"  résolues     {report.resolved}")
+    for missing in report.unresolved:
+        typer.secho(
+            f"  · {missing.get('feature_id')} non résolu — {missing.get('reason')}",
+            fg=typer.colors.YELLOW,
+        )
+    typer.echo("")
+    typer.echo(f"  corridors    {report.corridors}")
+    typer.echo(f"  empreintes   routes {report.road_geometry_digest} · "
+               f"obstacles {report.obstacle_geometry_digest}")
+    if report.crs_problems:
+        typer.secho(f"{KO} incohérences de référentiel :", fg=typer.colors.RED, err=True)
+        for problem in report.crs_problems:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+    typer.secho(
+        "  aucun objet du site modifié : une géométrie absente ne conteste pas "
+        "l'existence de l'objet",
+        fg=typer.colors.YELLOW,
+    )
+
+
 @geo_app.command("qualify")
 def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
     """Confronte la dernière dérivation aux seuils. N'écrit jamais `confirmed`."""
