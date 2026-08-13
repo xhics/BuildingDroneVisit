@@ -418,10 +418,15 @@ def _artifacts(
     parameters: dict[str, str] | None = None,
 ) -> list[DerivedArtifact]:
     """Assemble les artefacts, avec leur filiation réelle."""
-    if not parameters:
+    # Un dictionnaire non vide ne suffit pas : c'est chacun de ces paramètres
+    # qui manque pour rejouer la dérivation. Un artefact déclarant sa cellule
+    # mais pas son anneau d'appui reste irreproductible, et la lacune serait
+    # invisible à la relecture.
+    missing = [key for key in REQUIRED_PARAMETERS if not (parameters or {}).get(key)]
+    if missing:
         raise ValueError(
-            "artefacts sans paramètres effectifs : un raster dont on ignore la "
-            "taille de cellule et l'anneau d'appui n'est pas reproductible"
+            f"artefacts sans paramètres effectifs : {missing} — un raster dont on "
+            "ignore ces valeurs n'est pas reproductible"
         )
     parents = {
         "ndsm_valid": ["dtm", "dsm_roof_class6"],
@@ -470,6 +475,17 @@ def _artifacts(
 
 #: Rôles dont les valeurs sont des altitudes ou des différences d'altitude.
 _ELEVATION = {"dtm", "dsm_roof", "ndsm", "unclassified_roof_candidates"}
+
+#: Paramètres sans lesquels un artefact n'est pas rejouable : la géométrie de
+#: la grille, l'étendue des appuis, la méthode, et la politique qui les fixe.
+REQUIRED_PARAMETERS: tuple[str, ...] = (
+    "cell_m",
+    "ring_m",
+    "search_radius_m",
+    "policy_version",
+    "aggregation",
+    "interpolation",
+)
 
 
 def verify_written(

@@ -11,12 +11,14 @@ Trois familles y sont éprouvées, dans cet ordre :
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 
 import numpy as np
 import pytest
 
 from hotel_pipeline.geo import qualify
+from hotel_pipeline.geo.derive import REQUIRED_PARAMETERS
 from hotel_pipeline.schemas import (
     DerivedArtifact,
     GeoSourceProvenance,
@@ -545,11 +547,20 @@ def test_artifacts_declare_the_parameters_actually_used(tmp_path) -> None:
     assert all(a.parameters == parameters for a in result.artifacts)
 
 
-def test_artifacts_without_effective_parameters_are_refused() -> None:
+@pytest.mark.parametrize("omitted", REQUIRED_PARAMETERS)
+def test_each_effective_parameter_is_required(omitted) -> None:
+    """Un dictionnaire non vide ne suffit pas.
+
+    Un artefact déclarant sa cellule mais pas son anneau d'appui reste
+    irreproductible, et la lacune serait invisible à la relecture.
+    """
     from hotel_pipeline.geo.derive import _artifacts
 
-    with pytest.raises(ValueError, match="sans paramètres effectifs"):
-        _artifacts(None, None, "EPSG:2950", "CGVD 1928", "s", 1, None, None)
+    parameters = {key: "x" for key in REQUIRED_PARAMETERS if key != omitted}
+
+    with pytest.raises(ValueError, match=omitted):
+        _artifacts(None, None, "EPSG:2950", "CGVD 1928", "s", 1, None, None,
+                   parameters=parameters)
 
 
 # --- lien entre le rapport jugé et la série active --------------------------
@@ -681,6 +692,26 @@ def test_report_carries_policy_and_derivation_digest() -> None:
 # --- intégration : la CLI refuse une série incompatible ---------------------
 
 
+def on_disk(tmp_path, *artifacts: DerivedArtifact) -> list[DerivedArtifact]:
+    """Écrit un vrai GeoTIFF par artefact et inscrit son empreinte réelle.
+
+    Des chemins fictifs suffisaient tant que seules les déclarations étaient
+    confrontées entre elles. Vérifier le contenu exige des fichiers.
+    """
+    from hotel_pipeline.geo.raster import GridSpec, sha256_file, write_geotiff
+
+    grid = GridSpec(origin_x=0.0, origin_y=0.0, cell_m=1.0, width=4, height=4,
+                    crs="EPSG:2950")
+    written = []
+    for index, item in enumerate(artifacts):
+        path = tmp_path / f"{item.artifact_id.replace('@', '_')}.tif"
+        write_geotiff(path, np.full((4, 4), float(index + 1)), grid)
+        written.append(
+            item.model_copy(update={"path": str(path), "sha256": sha256_file(path)})
+        )
+    return written
+
+
 def workspace_with(tmp_path, monkeypatch, artifacts, report_artifacts, run_id):
     """Un espace de travail où le rapport et la série sont posés à la main."""
     from typer.testing import CliRunner
@@ -715,16 +746,16 @@ def test_cli_refuses_a_report_that_does_not_describe_the_active_series(
     """Le rapport décrit r2, le manifeste porte r1 : chacun est cohérent seul."""
     from hotel_pipeline.cli import app
 
-    active = [artifact("dtm@r1", "dtm"), artifact("dsm@r1", "dsm_roof"),
-              artifact("ndsm@r1", "ndsm")]
-    described = [artifact("dtm@r2", "dtm"), artifact("dsm@r2", "dsm_roof"),
-                 artifact("ndsm@r2", "ndsm")]
+    active = on_disk(tmp_path, artifact("dtm@r1", "dtm"),
+                       artifact("dsm@r1", "dsm_roof"), artifact("ndsm@r1", "ndsm"))
+    described = on_disk(tmp_path, artifact("dtm@r2", "dtm"),
+                          artifact("dsm@r2", "dsm_roof"), artifact("ndsm@r2", "ndsm"))
     runner, workspace = workspace_with(tmp_path, monkeypatch, active, described, "r2")
 
     result = runner.invoke(app, ["geo", "qualify", "hotel-test"])
 
     assert result.exit_code == 4
-    assert "ne concordent pas" in result.output
+    assert "n'est pas en état d'être jugée" in result.output
     # Rien n'a été décidé, et aucun rapport n'a été publié.
     assert all(o.state is ObjectState.UNRESOLVED for o in workspace.read_site().objects)
     assert not list(workspace.path("06_geo").glob("qualification_report_*.json"))
@@ -733,8 +764,8 @@ def test_cli_refuses_a_report_that_does_not_describe_the_active_series(
 def test_cli_publishes_one_report_per_run_and_policy(tmp_path, monkeypatch) -> None:
     from hotel_pipeline.cli import app
 
-    series = [artifact("dtm@r1", "dtm"), artifact("dsm@r1", "dsm_roof"),
-              artifact("ndsm@r1", "ndsm")]
+    series = on_disk(tmp_path, artifact("dtm@r1", "dtm"),
+                       artifact("dsm@r1", "dsm_roof"), artifact("ndsm@r1", "ndsm"))
     runner, workspace = workspace_with(tmp_path, monkeypatch, series, series, "r1")
 
     assert runner.invoke(app, ["geo", "qualify", "hotel-test"]).exit_code == 0
@@ -762,8 +793,8 @@ def test_cli_publishes_one_report_per_run_and_policy(tmp_path, monkeypatch) -> N
 def test_cli_refuses_an_implicit_threshold(tmp_path, monkeypatch) -> None:
     from hotel_pipeline.cli import app
 
-    series = [artifact("dtm@r1", "dtm"), artifact("dsm@r1", "dsm_roof"),
-              artifact("ndsm@r1", "ndsm")]
+    series = on_disk(tmp_path, artifact("dtm@r1", "dtm"),
+                       artifact("dsm@r1", "dsm_roof"), artifact("ndsm@r1", "ndsm"))
     runner, workspace = workspace_with(tmp_path, monkeypatch, series, series, "r1")
 
     frozen = json.loads(PipelinePolicy().model_dump_json())
@@ -774,3 +805,32 @@ def test_cli_refuses_an_implicit_threshold(tmp_path, monkeypatch) -> None:
 
     assert result.exit_code == 1
     assert "qualification.roofline.min_main_component" in result.output
+
+
+def test_cli_refuses_a_geotiff_altered_after_publication(tmp_path, monkeypatch) -> None:
+    """Les deux déclarations concordent ; le fichier, lui, a changé.
+
+    Comparer l'empreinte du manifeste à celle du rapport ne compare que deux
+    déclarations entre elles. Un GeoTIFF réécrit après publication les laisse
+    toutes deux intactes — seule la relecture du contenu le révèle.
+    """
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.geo.raster import GridSpec, write_geotiff
+
+    series = on_disk(tmp_path, artifact("dtm@r1", "dtm"),
+                     artifact("dsm@r1", "dsm_roof"), artifact("ndsm@r1", "ndsm"))
+    runner, workspace = workspace_with(tmp_path, monkeypatch, series, series, "r1")
+    before = workspace.read_site().model_dump_json()
+
+    # Le DTM est réellement réécrit, avec d'autres valeurs.
+    grid = GridSpec(origin_x=0.0, origin_y=0.0, cell_m=1.0, width=4, height=4,
+                    crs="EPSG:2950")
+    write_geotiff(Path(series[0].path), np.full((4, 4), 99.0), grid)
+
+    result = runner.invoke(app, ["geo", "qualify", "hotel-test"])
+
+    assert result.exit_code == 4
+    assert "le fichier a changé" in result.output
+    # Ni décision ni rapport : le refus précède toute écriture.
+    assert workspace.read_site().model_dump_json() == before
+    assert not list(workspace.path("06_geo").glob("qualification_report_*.json"))

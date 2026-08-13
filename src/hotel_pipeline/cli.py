@@ -979,25 +979,36 @@ def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
+    # Tout est contrôlé avant la moindre mutation : les fichiers cités existent,
+    # leur contenu réel correspond à l'empreinte déclarée, et la série active
+    # est bien celle que le rapport décrit.
+    #
+    # `check_series` confronte deux **déclarations** — l'empreinte du manifeste
+    # et celle du rapport. Toutes deux peuvent concorder pendant que le GeoTIFF,
+    # lui, a été réécrit depuis ; seule la relecture du contenu le dit.
+    from .geo.derive import verify_digests, verify_publication
+
+    run_id = latest.stem.removeprefix("derivation_report_")
+    mismatches = (
+        verify_publication(site)
+        + verify_digests(site)
+        + qualification.check_series(site, derivation, run_id)
+    )
+    if mismatches:
+        typer.secho(
+            f"{KO} la série active n'est pas en état d'être jugée :",
+            fg=typer.colors.RED, err=True,
+        )
+        for problem in mismatches:
+            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=4)
+
     # Les artefacts remplacés emportent les décisions qu'ils fondaient.
     for object_id in qualification.mark_stale(site):
         typer.secho(
             f"  · {object_id} repassé en 'stale' — artefact cité remplacé",
             fg=typer.colors.YELLOW,
         )
-
-    # Le rapport le plus récent et la série active pourraient ne pas se
-    # correspondre : chacun est cohérent séparément, et rien ne le dirait.
-    run_id = latest.stem.removeprefix("derivation_report_")
-    mismatches = qualification.check_series(site, derivation, run_id)
-    if mismatches:
-        typer.secho(
-            f"{KO} le rapport jugé et la série active ne concordent pas :",
-            fg=typer.colors.RED, err=True,
-        )
-        for problem in mismatches:
-            typer.secho(f"    {problem}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=4)
 
     mapping = qualification.select_artifacts(site)
     report = qualification.report(
