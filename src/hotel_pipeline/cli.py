@@ -702,6 +702,161 @@ def _query_sources(profile, radius_m: int) -> dict:  # noqa: ANN001
     return queries
 
 
+@assets_app.command("plan")
+def assets_plan(
+    hotel_id: str = typer.Argument(...),
+    candidates_file: Path | None = typer.Option(
+        None, "--candidates", help="Manifeste de candidats ; défaut : le plus récent."
+    ),
+    consent_bytes: int | None = typer.Option(
+        None, "--consent-bytes",
+        help="Volume exact accepté, en octets. Rend le plan exécutable.",
+    ),
+) -> None:
+    """Choisit ce qui sera acquis. **Ne télécharge rien.**
+
+    Le plan naît brouillon. Il ne devient exécutable qu'avec `--consent-bytes`,
+    et seulement si le volume annoncé est exact : consentir à un total dont une
+    part est inconnue serait consentir à ce qu'on n'a pas montré.
+    """
+    from .plan import PlanRefused, build, consent
+    from .provenance import digest_of
+    from .schemas.acquisition import (
+        CandidateManifest, CaptureDemandManifest, PlanStatus, VolumeStatus,
+    )
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+
+    demands_payload = workspace.read_json("01_sources/capture_demands.json")
+    if not demands_payload:
+        typer.secho(f"{KO} aucun besoin déclaré", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    path = candidates_file or _latest_candidates(workspace)
+    if path is None:
+        typer.secho(
+            f"{KO} aucun manifeste de candidats — lancez : assets discover",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    candidates_payload = json.loads(Path(path).read_text("utf-8"))
+    candidates = CandidateManifest.model_validate(candidates_payload)
+    demands = CaptureDemandManifest.model_validate(demands_payload)
+
+    digests = _plan_digests(workspace, context, candidates_payload, demands_payload)
+
+    try:
+        plan, evaluations, report = build(
+            hotel_id, candidates.candidates, demands.demands, digests,
+        )
+    except PlanRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"  candidats   {report.candidates}")
+    typer.echo(f"  évaluations {report.evaluations}")
+    typer.echo(f"  retenues    {report.selected}")
+    if report.preview_required:
+        typer.echo(f"  à vérifier  {report.preview_required} (miniature d'abord)")
+    for reason, count in sorted(report.rejected_by_reason.items()):
+        typer.echo(f"    écarté · {reason[:52]:<52} {count:>4}")
+    if report.demands_unserved:
+        typer.secho(
+            f"  besoins non servis : {', '.join(report.demands_unserved)}",
+            fg=typer.colors.YELLOW,
+        )
+
+    typer.echo("")
+    typer.echo(f"  volume connu    {report.known_bytes:,} octets".replace(",", " "))
+    typer.echo(f"  taille inconnue {report.unknown_size_items} acquisition(s)")
+    typer.echo(f"  statut          {report.volume_status}")
+
+    if consent_bytes is not None:
+        if plan.volume_status is not VolumeStatus.EXACT:
+            typer.secho(
+                f"{KO} consentement refusé : le volume est « "
+                f"{plan.volume_status.value} ». Consentir à un total dont une "
+                f"part est inconnue serait consentir à ce qui n'a pas été montré.",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=2)
+        if consent_bytes != plan.known_bytes:
+            typer.secho(
+                f"{KO} consentement refusé : {consent_bytes} octets acceptés, "
+                f"{plan.known_bytes} annoncés. Le consentement porte sur le "
+                f"volume exact, non sur un ordre de grandeur.",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=2)
+        try:
+            plan = consent(plan, digests)
+        except PlanRefused as exc:
+            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+
+    workspace.write_json(
+        f"01_sources/acquisition_plan_{plan.plan_id}.json",
+        json.loads(plan.model_dump_json()),
+    )
+    workspace.write_report(f"01_sources/plan_report_{plan.plan_id}.json", report, context)
+
+    typer.echo("")
+    if plan.status is PlanStatus.EXECUTABLE:
+        typer.echo(f"{OK} plan {plan.plan_id} — exécutable, {plan.known_bytes} octets consentis")
+        typer.echo("    prochaine étape : assets acquire")
+    else:
+        typer.echo(f"{OK} plan {plan.plan_id} — brouillon, rien ne sera téléchargé")
+        typer.echo(
+            f"    pour l'exécuter : assets plan {hotel_id} "
+            f"--consent-bytes {plan.known_bytes}"
+        )
+
+
+def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
+    found = sorted(workspace.path("01_sources").glob("candidates_*.json"))
+    return found[-1] if found else None
+
+
+def _plan_digests(workspace, context, candidates_payload, demands_payload) -> dict:  # noqa: ANN001
+    """Toutes les empreintes qu'un plan exécutable doit porter.
+
+    Une absente n'est pas comblée : le plan restera brouillon, et le dira.
+    """
+    from .provenance import digest_of
+
+    site = _safe_read(workspace.read_site)
+    spatial = _safe_read(workspace.read_spatial)
+    assets = _safe_read(workspace.read_assets)
+    geometry = workspace.read_json("06_geo/capture_geometry.json") or {}
+
+    roads = [g for g in geometry.get("geometries", []) if g.get("role") == "road_candidate"]
+    obstacles = [
+        g for g in geometry.get("geometries", []) if g.get("role") == "obstacle_building"
+    ]
+
+    return {
+        "candidate_manifest_digest": digest_of(candidates_payload),
+        "demand_digest": digest_of(demands_payload),
+        "policy_digest": context.provenance["policy_digest"],
+        "site_manifest_digest": digest_of(json.loads(site.model_dump_json())) if site else None,
+        "spatial_manifest_digest": (
+            digest_of(json.loads(spatial.model_dump_json())) if spatial else None
+        ),
+        "corpus_digest": digest_of(json.loads(assets.model_dump_json())) if assets else None,
+        "road_geometry_digest": digest_of(roads) if roads else None,
+        "obstacle_geometry_digest": digest_of(obstacles) if obstacles else None,
+    }
+
+
+def _safe_read(reader):  # noqa: ANN001, ANN201
+    try:
+        return reader()
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""
