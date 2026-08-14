@@ -1148,7 +1148,7 @@ def test_a_blind_decision_must_be_bound_to_a_protocol(tmp_path) -> None:
 
     assert entry.blinding is Blinding.BLIND
     assert entry.review_protocol_id.startswith("blind-")
-    assert entry.blind_queue_digest == "p1"
+    assert entry.review_protocol_digest == "p1"
     # Le défaut reste `unblinded` : les sept décisions déjà prises l'ont été en
     # voyant le diagnostic.
     assert review.ReviewEntry.model_fields["blinding"].default is Blinding.UNBLINDED
@@ -1165,12 +1165,29 @@ def test_a_protocol_that_does_not_cover_the_asset_is_refused(tmp_path) -> None:
 
 def test_a_protocol_with_another_checksum_is_refused(tmp_path) -> None:
     """L'image a changé depuis la constitution de la file."""
+    from hotel_pipeline import cohort
+
     assets = [asset(tmp_path)]
     stale = protocol_for(assets)
     stale.members[0]["checksum"] = "f" * 64
+    # L'identifiant est recalculé : sans cela, c'est la cohérence du protocole
+    # qui échouerait avant même le contrôle d'empreinte d'image.
+    stale.protocol_id = cohort.protocol_id_for(
+        stale.cohort_digest, stale.content_digest()
+    )
 
     with pytest.raises(review.ReviewRefused, match="l'image a changé"):
         decide(assets, blinding="blind", protocol=stale, protocol_digest="p1")
+
+
+def test_a_rewritten_protocol_is_detected(tmp_path) -> None:
+    """Une planche ancienne ne doit pas charger un protocole réécrit depuis."""
+    assets = [asset(tmp_path)]
+    tampered = protocol_for(assets)
+    tampered.reference = {"asset_id": "autre", "checksum": "c" * 64}
+
+    with pytest.raises(review.ReviewRefused, match="ne correspond pas à son contenu"):
+        decide(assets, blinding="blind", protocol=tampered, protocol_digest="p1")
 
 
 def test_a_non_blind_protocol_cannot_carry_a_blind_decision(tmp_path) -> None:
@@ -1369,7 +1386,7 @@ def test_a_command_copied_from_the_blind_board_records_the_protocol(
     entry = workspace.read_assets().assets[0].review_history[0]
     assert entry.blinding is Blinding.BLIND
     assert entry.review_protocol_id.startswith("blind-")
-    assert entry.blind_queue_digest
+    assert entry.review_protocol_digest
 
 
 def test_the_blind_order_uses_the_cohort_digest(tmp_path, monkeypatch) -> None:
@@ -1399,7 +1416,67 @@ def test_the_blind_order_uses_the_cohort_digest(tmp_path, monkeypatch) -> None:
     expected = cohort.cohort_digest(cohort.members(manifest.assets))
 
     assert protocol["cohort_digest"] == expected
-    assert protocol["protocol_id"] == f"blind-{expected}"
+    assert protocol["protocol_id"].startswith(f"blind-{expected}-")
     assert protocol["presentation_order"] == [
         a.id for a in cohort.blind_order(cohort.members(manifest.assets), expected)
     ]
+
+
+def test_two_references_produce_two_coexisting_protocols(tmp_path) -> None:
+    """Une planche ancienne doit continuer d'employer le sien.
+
+    Un identifiant qui ne dépendait que de la cohorte faisait réécrire le même
+    fichier : la planche déjà distribuée chargeait alors un contenu qu'elle
+    n'avait jamais montré.
+    """
+    from hotel_pipeline import cohort
+
+    assets = [asset(tmp_path), asset(tmp_path, name="b.jpg", id="mapillary-2")]
+    first = cohort.build_protocol(
+        assets, "h", reference={"asset_id": "places-000", "checksum": "a" * 64}
+    )
+    second = cohort.build_protocol(
+        assets, "h", reference={"asset_id": "mapillary-9", "checksum": "b" * 64}
+    )
+
+    assert first.protocol_id != second.protocol_id
+    assert first.cohort_digest == second.cohort_digest
+    assert first.matches_its_id() and second.matches_its_id()
+
+    directory = tmp_path / "protocoles"
+    directory.mkdir()
+    for protocol in (first, second):
+        path = directory / f"review_protocol_{protocol.protocol_id}.json"
+        assert cohort.publish(protocol, path) == "created"
+
+    # Les deux coexistent : chaque planche retrouve exactement le sien.
+    assert len(list(directory.glob("review_protocol_*.json"))) == 2
+
+
+def test_publication_is_create_only(tmp_path) -> None:
+    from hotel_pipeline import cohort
+
+    assets = [asset(tmp_path)]
+    protocol = cohort.build_protocol(assets, "h")
+    path = tmp_path / "review_protocol.json"
+
+    assert cohort.publish(protocol, path) == "created"
+    # Un contenu identique se réutilise sans réécriture.
+    assert cohort.publish(protocol, path) == "reused"
+
+    other = cohort.build_protocol(
+        assets, "h", reference={"asset_id": "places-000", "checksum": "c" * 64}
+    )
+    with pytest.raises(cohort.ProtocolConflict, match="contenu différent"):
+        cohort.publish(other, path)
+
+
+def test_the_queue_records_the_protocol_it_came_from(tmp_path) -> None:
+    queue = review.build_queue([asset(tmp_path)], "mapillary-candidates", policy())
+    queue.protocol_id = "blind-abc-def"
+    queue.protocol_digest = "0123456789abcdef"
+
+    payload = queue.as_dict(blind=True)
+
+    assert payload["protocol_id"] == "blind-abc-def"
+    assert payload["protocol_digest"] == "0123456789abcdef"

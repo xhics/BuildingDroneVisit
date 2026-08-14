@@ -660,9 +660,18 @@ def review_queue(
                 workspace.path("01_sources", f"sequence_register_{cohort_key}.json")
             ),
         )
-        workspace.write_json(
-            f"01_sources/review_protocol_{protocol.protocol_id}.json", protocol.as_dict()
+        protocol_path = workspace.path(
+            "01_sources", f"review_protocol_{protocol.protocol_id}.json"
         )
+        try:
+            outcome = cohort_module.publish(protocol, protocol_path)
+        except cohort_module.ProtocolConflict as exc:
+            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=4) from exc
+
+        built.protocol_id = protocol.protocol_id
+        built.protocol_digest = _digest_of(protocol_path)
+        typer.echo(f"  protocole {protocol.protocol_id} ({outcome})")
 
     # Le nom porte la date **et** l'empreinte du manifeste : une file décrit
     # un état, et deux exécutions dans la même seconde ne doivent pas s'écraser.
@@ -916,7 +925,7 @@ def review_geometry(
 
 
 def _load_protocol(workspace, protocol_id: str | None):  # noqa: ANN001
-    """Charge un protocole d'étiquetage et son empreinte réelle."""
+    """Charge un protocole d'étiquetage, et vérifie qu'il dit ce qu'il est."""
     from . import cohort as cohort_module
 
     if not protocol_id:
@@ -935,6 +944,11 @@ def _load_protocol(workspace, protocol_id: str | None):  # noqa: ANN001
         sequence_register_digest=payload.get("sequence_register_digest"),
         order=payload.get("presentation_order", []),
     )
+    if not protocol.matches_its_id():
+        raise typer.BadParameter(
+            f"{path.name} ne correspond pas à son identifiant : contenu "
+            f"{protocol.content_digest()}"
+        )
     return protocol, _digest_of(path)
 
 

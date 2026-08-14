@@ -262,6 +262,10 @@ class ReviewQueue:
     name: str
     description: str
     built_at: str = ""
+    #: Protocole d'étiquetage dont cette file procède, le cas échéant.
+    protocol_id: str | None = None
+    protocol_digest: str | None = None
+
     #: Empreinte du manifeste au moment de la construction. Une file décrit un
     #: état ; sans cette empreinte, une file périmée ne se distingue pas d'une
     #: file courante — la première annonçait une cohorte de 189 quand le code
@@ -295,6 +299,8 @@ class ReviewQueue:
             "built_at": self.built_at,
             "manifest_digest": self.manifest_digest,
             "blinding": "blind" if blind else "analysis",
+            "protocol_id": self.protocol_id,
+            "protocol_digest": self.protocol_digest,
             # Les comptes globaux restent : ils ne disent rien d'une image en
             # particulier.
             "counts": self.counts.as_dict(),
@@ -429,7 +435,10 @@ def to_blind_html(
   <p><small><code>{escape(reference['asset_id'])}</code> ·
      empreinte <code>{escape(reference['checksum'][:16])}…</code> ·
      {escape(reference['rationale'])}</small></p>
-  <p><small>{'Appartient à la cohorte évaluée : aide intra-séquence, à déclarer au rapport.' if reference.get('in_cohort') else 'Hors cohorte évaluée.'}</small></p>
+  <p><strong>Référence d'identité seulement</strong> — état temporel et entrée
+     actuelle non établis : cette vue dit à quoi ressemble le bâtiment, non à
+     quelle époque, ni quelle entrée est la sienne aujourd'hui.</p>
+  <p><small>{'Appartient à la cohorte évaluée : aide intra-séquence, à déclarer au rapport.' if reference.get('in_cohort') else 'Hors cohorte évaluée : aucune aide intra-séquence.'}</small></p>
  </section>"""
 
     return f"""<!doctype html>
@@ -609,7 +618,8 @@ def _prepare(
 
 
 def _protocol_fields(
-    asset: Asset, blinding: str, protocol, digest: str | None  # noqa: ANN001
+    asset: Asset, blinding: str, protocol, digest: str | None,  # noqa: ANN001
+    queue_digest: str | None = None,
 ) -> dict:
     """Champs de protocole, après vérification qu'ils disent vrai.
 
@@ -641,6 +651,11 @@ def _protocol_fields(
             f"le protocole {protocol.protocol_id} n'est pas aveugle "
             f"({protocol.blinding})"
         )
+    if not protocol.matches_its_id():
+        raise ReviewRefused(
+            f"le protocole {protocol.protocol_id} ne correspond pas à son contenu "
+            f"({protocol.content_digest()}) — il a été réécrit depuis"
+        )
     problems = protocol.covers(asset.id, asset.checksum)
     if problems:
         raise ReviewRefused("; ".join(problems))
@@ -648,7 +663,8 @@ def _protocol_fields(
     return {
         "blinding": mode,
         "review_protocol_id": protocol.protocol_id,
-        "blind_queue_digest": digest,
+        "review_protocol_digest": digest,
+        "blind_queue_digest": queue_digest,
     }
 
 
@@ -677,6 +693,7 @@ def decide(
     blinding: str = "unblinded",
     protocol: object = None,
     protocol_digest: str | None = None,
+    queue_digest: str | None = None,
 ) -> tuple[Asset, Asset]:
     """Inscrit une décision, après avoir vérifié qu'elle porte sur la bonne image.
 
@@ -694,7 +711,7 @@ def decide(
 
     entry = ReviewEntry(
         decision=decision,
-        **_protocol_fields(before, blinding, protocol, protocol_digest),
+        **_protocol_fields(before, blinding, protocol, protocol_digest, queue_digest),
         decided_by=by.strip(),
         rationale=rationale.strip(),
         evidence=kept,
@@ -771,6 +788,7 @@ def assess(
     blinding: str = "unblinded",
     protocol: object = None,
     protocol_digest: str | None = None,
+    queue_digest: str | None = None,
 ) -> tuple[Asset, Asset]:
     """Inscrit une appréciation d'aptitude géométrique.
 
@@ -786,7 +804,7 @@ def assess(
             suitability, by, rationale,
             [e.strip() for e in evidence if e.strip()],
             digest, measurements, previous=before.geometry_history,
-            **_protocol_fields(before, blinding, protocol, protocol_digest),
+            **_protocol_fields(before, blinding, protocol, protocol_digest, queue_digest),
         )
     )
     after = _revalidate(candidate, asset_id)

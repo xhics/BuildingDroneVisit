@@ -173,6 +173,7 @@ class ReviewProtocol:
     def as_dict(self) -> dict:
         return {
             "protocol_id": self.protocol_id,
+            "content_digest": self.content_digest(),
             "hotel_id": self.hotel_id,
             "cohort_digest": self.cohort_digest,
             "blinding": self.blinding,
@@ -183,6 +184,35 @@ class ReviewProtocol:
             "sequence_register_digest": self.sequence_register_digest,
             "presentation_order": self.order,
         }
+
+    def content_digest(self) -> str:
+        """Empreinte de ce qui définit le protocole, `created_at` exclu.
+
+        L'horodatage change à chaque génération : l'inclure aurait rendu deux
+        protocoles identiques différents, et empêché de réutiliser le premier.
+        """
+        payload = json.dumps(
+            {
+                "cohort_digest": self.cohort_digest,
+                "blinding": self.blinding,
+                "members": self.members,
+                "order": self.order,
+                "reference": self.reference,
+                "predictions_digest": self.predictions_digest,
+                "sequence_register_digest": self.sequence_register_digest,
+            },
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def matches_its_id(self) -> bool:
+        """L'identifiant décrit-il bien ce contenu ?
+
+        Un identifiant qui ne dépendait que de la cohorte laissait une planche
+        ancienne charger un protocole réécrit depuis — même nom, autre
+        contenu, et l'aveuglement n'était plus celui qu'elle annonçait.
+        """
+        return self.protocol_id == protocol_id_for(self.cohort_digest, self.content_digest())
 
     def covers(self, asset_id: str, checksum: str) -> list[str]:
         """L'asset fait-il partie du protocole, et est-ce bien la même image ?"""
@@ -195,6 +225,11 @@ class ReviewProtocol:
                 f"{entry['checksum'][:12]}… au protocole — l'image a changé"
             ]
         return []
+
+
+def protocol_id_for(cohort_key: str, content: str) -> str:
+    """Identifiant adressé par contenu : deux protocoles distincts coexistent."""
+    return f"blind-{cohort_key}-{content}"
 
 
 def build_protocol(
@@ -213,8 +248,8 @@ def build_protocol(
     """
     digest_value = cohort_key or cohort_digest(assets)
     ordered = blind_order(assets, digest_value)
-    return ReviewProtocol(
-        protocol_id=f"blind-{digest_value}",
+    protocol = ReviewProtocol(
+        protocol_id="",
         hotel_id=hotel_id,
         cohort_digest=digest_value,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -224,6 +259,36 @@ def build_protocol(
         sequence_register_digest=sequence_register_digest,
         order=[a.id for a in ordered],
     )
+    protocol.protocol_id = protocol_id_for(digest_value, protocol.content_digest())
+    return protocol
+
+
+class ProtocolConflict(RuntimeError):
+    """Un protocole différent porte déjà cet identifiant."""
+
+
+def publish(protocol: ReviewProtocol, path) -> str:  # noqa: ANN001
+    """Publication **create-only** : un protocole ne se réécrit pas.
+
+    Réécrire le même fichier laissait une planche déjà distribuée charger un
+    contenu qu'elle n'avait jamais montré. Un contenu identique est réutilisé
+    tel quel ; un contenu différent sous le même nom est un conflit.
+    """
+    payload = protocol.as_dict()
+    if path.is_file():
+        existing = json.loads(path.read_text("utf-8"))
+        if existing.get("content_digest") != payload["content_digest"]:
+            raise ProtocolConflict(
+                f"{path.name} existe avec un contenu différent "
+                f"({existing.get('content_digest')} ≠ {payload['content_digest']})"
+            )
+        return "reused"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return "created"
 
 
 # --- instantané des prédictions ------------------------------------------------

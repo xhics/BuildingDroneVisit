@@ -133,15 +133,20 @@ class DecisionEntry(BaseModel):
     #: les mêmes précautions, et devait être traçable de la même façon.
     blinding: Blinding = Blinding.UNBLINDED
 
-    #: Protocole d'étiquetage suivi, et empreinte du fichier qui le fixe. Une
-    #: décision `blind` sans eux serait une déclaration invérifiable.
+    #: Protocole d'étiquetage suivi, et empreinte du **protocole** — non de la
+    #: file, que le nom précédent laissait croire. Une décision `blind` sans
+    #: eux serait une déclaration invérifiable.
     review_protocol_id: str | None = None
+    review_protocol_digest: str | None = None
+
+    #: Empreinte de la file réellement présentée, quand elle est connue : deux
+    #: files peuvent partager un protocole et différer par leur contenu.
     blind_queue_digest: str | None = None
 
     @model_validator(mode="after")
     def _blind_needs_a_protocol(self) -> "DecisionEntry":
         if self.blinding is Blinding.BLIND and not (
-            self.review_protocol_id and self.blind_queue_digest
+            self.review_protocol_id and self.review_protocol_digest
         ):
             raise ValueError(
                 "décision déclarée aveugle sans protocole ni empreinte de file — "
