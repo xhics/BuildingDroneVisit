@@ -666,7 +666,7 @@ def assets_discover(
         f"01_sources/candidates_{report.run_id}.json",
         json.loads(manifest.model_dump_json()),
     )
-    workspace.write_report(f"01_sources/discovery_{report.run_id}.json", report, context)
+    workspace.write_report(f"01_sources/discovery_{report.run_id}.json", report, context, production="CandidateManifest")
 
     for source in report.sources_queried:
         typer.echo(f"    {source:<14} {report.candidates_by_source[source]:>5} candidat(s)")
@@ -826,7 +826,7 @@ def assets_plan(
         f"01_sources/acquisition_plan_{plan.plan_id}.json",
         json.loads(plan.model_dump_json()),
     )
-    workspace.write_report(f"01_sources/plan_report_{plan.plan_id}.json", report, context)
+    workspace.write_report(f"01_sources/plan_report_{plan.plan_id}.json", report, context, production="AcquisitionPlan")
 
     typer.echo("")
     if plan.status is PlanStatus.EXECUTABLE:
@@ -1030,7 +1030,7 @@ def assets_acquire(
     merged = merge(manifest.assets, acquired)
     manifest.assets = merged.assets
     workspace.write_assets(manifest)
-    workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context)
+    workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context, production="AcquiredImage")
 
     for candidate_id, reason in sorted(report.failed.items()):
         typer.secho(f"    échec · {candidate_id} — {reason[:60]}", fg=typer.colors.YELLOW)

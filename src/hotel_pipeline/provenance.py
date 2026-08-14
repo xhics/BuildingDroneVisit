@@ -66,6 +66,24 @@ def provenance(
     return block
 
 
+def with_dependencies(
+    report: dict, policy: PipelinePolicy, production: str,
+    profile: PropertyProfile | None = None,
+) -> dict:
+    """Provenance complète **et** dépendances de facette, côte à côte.
+
+    Les deux niveaux ne se remplacent pas : la première dit avec quels réglages
+    le rapport a été produit, les secondes disent lesquels le périment. Publier
+    la seule empreinte complète ferait périmer un nuage LiDAR parce qu'une
+    ouverture sectorielle a bougé.
+    """
+    from .policy_facets import dependency_digests
+
+    stamped = stamp(report, policy, profile)
+    stamped["policy_dependency_digests"] = dependency_digests(policy, production)
+    return stamped
+
+
 def stamp(report: dict, policy: PipelinePolicy, profile: PropertyProfile | None = None) -> dict:
     """Appose la provenance sur un rapport déjà sérialisé."""
     return {**report, "provenance": provenance(policy, profile)}

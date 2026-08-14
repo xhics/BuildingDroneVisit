@@ -109,18 +109,29 @@ class Workspace:
         _atomic_write(target, json.dumps(payload, indent=2, ensure_ascii=False))
         return target
 
-    def write_report(self, relative: str, report, context) -> Path:  # noqa: ANN001
+    def write_report(
+        self, relative: str, report, context, production: str | None = None  # noqa: ANN001
+    ) -> Path:
         """Écrit un rapport en y apposant sa provenance.
 
         Point de passage **obligatoire** : `write_json` reste disponible pour
         les données brutes, mais tout rapport doit dire avec quelle politique
         et quel profil il a été produit. Sans cela, un chiffre n'est pas
         reproductible — les rapports du WelcomINNS n'en portaient aucune.
+
+        `production` ajoute les empreintes des facettes **lues** par ce type de
+        production. L'empreinte complète reste inscrite quoi qu'il arrive : les
+        deux niveaux ne se remplacent pas.
         """
-        from .provenance import stamp
+        from .provenance import stamp, with_dependencies
 
         payload = report.as_dict() if hasattr(report, "as_dict") else dict(report)
-        return self.write_json(relative, stamp(payload, context.policy, context.profile))
+        stamped = (
+            with_dependencies(payload, context.policy, production, context.profile)
+            if production
+            else stamp(payload, context.policy, context.profile)
+        )
+        return self.write_json(relative, stamped)
 
     def read_json(self, relative: str) -> object | None:
         target = self.root / relative
