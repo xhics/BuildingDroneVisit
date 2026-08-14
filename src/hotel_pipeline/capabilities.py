@@ -11,13 +11,22 @@ oublier un ; c'est exactement ainsi que `blocking()` avait divergé de
 `role_for`. Les prérequis se déclarent donc **par capacité**, une fois, et le
 contexte les valide avant toute mutation.
 
-Deux règles tiennent l'ensemble :
+La règle exacte tient en une phrase :
 
-- `load_lenient` n'est plus la voie d'accès par défaut : seules les capacités
-  `BOOTSTRAP` et `INSPECTION` y ont droit ;
-- « lecture partielle autorisée » n'est pas « silencieuse » — une inspection
-  sans profil doit dire ce qu'elle ne peut pas établir, sinon elle redevient
-  le faux succès qu'on corrige.
+> une capacité ne peut manquer aucun de ses prérequis déclarés ; l'absence de
+> profil n'est une erreur que si `PROFILE` figure dans ses prérequis.
+
+Ce n'est pas la même chose que « seules `BOOTSTRAP` et `INSPECTION` tournent
+sans profil », qui serait faux : la qualification géospatiale n'exige aucune
+identité d'établissement — des seuils de terrain ne dépendent pas du nom de
+l'hôtel — et tourne donc légitimement sans profil tout en ayant, elle, des
+prérequis stricts.
+
+`PARTIAL_CONTEXT_ALLOWED` décrit autre chose encore : la possibilité de rendre
+un résultat **partiel**, en disant ce qui manque. Ce n'est ni une dispense de
+prérequis, ni une autorisation générale de tourner sans profil. Et « partiel »
+n'est pas « silencieux » — une inspection qui tait ce qu'elle ne peut pas
+établir redevient le faux succès qu'on corrige.
 """
 
 from __future__ import annotations
@@ -48,8 +57,10 @@ class Capability(StrEnum):
     #: Territoire et référentiels résolus.
     GEOSPATIAL = "geospatial"
 
-    #: Seuils matérialisés sur le disque, non des défauts implicites.
-    QUALIFICATION = "qualification"
+    #: Qualifier un terrain ou une toiture. Nommée « géospatiale » parce
+    #: qu'une qualification **photographique** viendra, et qu'elle n'aura pas
+    #: besoin du contexte spatial : les deux ne partagent que le mot.
+    GEOSPATIAL_QUALIFICATION = "geospatial_qualification"
 
 
 class Requirement(StrEnum):
@@ -60,6 +71,16 @@ class Requirement(StrEnum):
     POLICY = "policy"
     MATERIALISED_POLICY = "materialised_policy"
     SPATIAL_CONTEXT = "spatial_context"
+    SITE_MANIFEST = "site_manifest"
+
+    #: Les artefacts attendus **et** leurs empreintes. Qualifier une dérivation
+    #: dont on ne peut pas nommer les entrées produirait un verdict qu'aucun
+    #: rapport ne pourrait rattacher à ce qui l'a fondé.
+    EXPECTED_ARTIFACTS = "expected_artifacts"
+
+    #: Provenance verticale suffisante pour les critères qui en dépendent.
+    #: Sans elle, une hauteur qualifiée reposerait sur un référentiel supposé.
+    VERTICAL_PROVENANCE = "vertical_provenance"
 
 
 #: La matrice. Elle est la seule autorité : une commande ne redéclare rien.
@@ -71,11 +92,21 @@ REQUIREMENTS: dict[Capability, tuple[Requirement, ...]] = {
         Requirement.PROFILE, Requirement.POSITION, Requirement.POLICY,
     ),
     Capability.GEOSPATIAL: (Requirement.SPATIAL_CONTEXT,),
-    Capability.QUALIFICATION: (Requirement.MATERIALISED_POLICY,),
+    Capability.GEOSPATIAL_QUALIFICATION: (
+        Requirement.MATERIALISED_POLICY,
+        Requirement.SITE_MANIFEST,
+        Requirement.EXPECTED_ARTIFACTS,
+        Requirement.SPATIAL_CONTEXT,
+        Requirement.VERTICAL_PROVENANCE,
+    ),
 }
 
-#: Capacités autorisées à travailler sans profil. Ailleurs, son absence arrête.
-LENIENT: frozenset[Capability] = frozenset(
+#: Capacités pouvant rendre un résultat **partiel** en disant ce qui manque.
+#: Ce n'est ni une dispense de prérequis — elles n'en ont aucun — ni la liste
+#: des capacités tournant sans profil : `GEOSPATIAL_QUALIFICATION` n'exige
+#: aucune identité et n'y figure pourtant pas, parce qu'elle ne rend rien de
+#: partiel : ses prérequis sont satisfaits ou elle s'arrête.
+PARTIAL_CONTEXT_ALLOWED: frozenset[Capability] = frozenset(
     {Capability.BOOTSTRAP, Capability.INSPECTION}
 )
 
@@ -104,6 +135,20 @@ REMEDY: dict[Requirement, tuple[str, str]] = {
     Requirement.SPATIAL_CONTEXT: (
         "territoire et référentiels non résolus",
         "hotel-pipeline geo sources <hotel_id>",
+    ),
+    Requirement.SITE_MANIFEST: (
+        "aucun manifeste de site : les instances à qualifier ne sont pas nommées",
+        "hotel-pipeline site build <hotel_id>",
+    ),
+    Requirement.EXPECTED_ARTIFACTS: (
+        "artefacts attendus absents ou sans empreinte : le verdict ne pourrait "
+        "pas être rattaché à ce qui l'a fondé",
+        "hotel-pipeline geo derive <hotel_id>",
+    ),
+    Requirement.VERTICAL_PROVENANCE: (
+        "provenance verticale insuffisante : une hauteur qualifiée reposerait "
+        "sur un référentiel supposé",
+        "hotel-pipeline geo acquire <hotel_id> puis geo derive",
     ),
 }
 
@@ -160,7 +205,7 @@ def available(context, capability: Capability) -> CapabilityCheck:  # noqa: ANN0
     check.satisfied = not check.missing
 
     # Une capacité permissive reste permissive, mais dit ce qui lui manque.
-    if capability in LENIENT:
+    if capability in PARTIAL_CONTEXT_ALLOWED:
         check.partial = [
             REMEDY[item][0]
             for item in (Requirement.PROFILE, Requirement.SPATIAL_CONTEXT)
@@ -194,6 +239,16 @@ def _satisfied(context, requirement: Requirement) -> bool:  # noqa: ANN001
         )
     if requirement is Requirement.SPATIAL_CONTEXT:
         return getattr(context, "spatial_reference", None) is not None
+    if requirement is Requirement.SITE_MANIFEST:
+        return getattr(context, "site_manifest", None) is not None
+    if requirement is Requirement.EXPECTED_ARTIFACTS:
+        return bool(getattr(context, "artifact_digests", None))
+    if requirement is Requirement.VERTICAL_PROVENANCE:
+        # Un référentiel vertical **connu**, ou une transformation déclarée.
+        # « Inconnu » n'interdit pas de mesurer ; il interdit de qualifier une
+        # hauteur, car le seuil porterait sur une origine supposée.
+        reference = getattr(context, "spatial_reference", None)
+        return reference is not None and reference.vertical_is_usable
     return False  # pragma: no cover — l'énumération est close
 
 

@@ -1337,6 +1337,86 @@ def geo_route(hotel_id: str = typer.Argument(...)) -> None:
         typer.echo(f"  {KO} {source_id:<20} {reason}")
 
 
+@geo_app.command("reference")
+def geo_reference(
+    hotel_id: str = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", help="Réécrit un contexte existant."),
+) -> None:
+    """Résout territoire et référentiels du site, et les fige.
+
+    Le référentiel de calcul était une constante de module — `EPSG:2950`, le
+    fuseau MTM 8 du Québec — appliquée partout. Il devient un fait spatial du
+    site, résolu depuis sa position et opposable aux calculs.
+    """
+    from .geo import territory
+    from .schemas.spatial_reference import TerritoryState
+
+    context = _context(hotel_id, Capability.INSPECTION)
+    workspace = Workspace(hotel_id)
+
+    position = _reference_position(context, workspace)
+    if position is None:
+        typer.secho(
+            f"{KO} aucune position de référence : renseignez lat/lon au profil "
+            f"ou au manifeste de projet",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    path = workspace.path("00_manifest", "spatial_reference.json")
+    if path.is_file() and not force:
+        typer.secho(f"  contexte spatial déjà résolu : {path}", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+
+    lat, lon = position
+    # Le référentiel vertical vient des données déjà acquises, s'il y en a.
+    acquisition = workspace.read_json("06_geo/acquisition_report.json")
+    resolved = territory.resolve(
+        hotel_id, lat, lon,
+        vertical=territory.vertical_from_acquisition(acquisition),
+    )
+
+    typer.echo(f"  position    {lat:.6f}, {lon:.6f}")
+    typer.echo(f"  territoire  {resolved.territory_state.value}")
+    for code in resolved.jurisdictions:
+        typer.echo(f"    · {code}")
+
+    if resolved.territory_state is not TerritoryState.RESOLVED:
+        typer.secho(
+            f"  · aucun référentiel de travail — le géospatial restera "
+            f"indisponible pour ce site",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.echo(f"  référentiel {resolved.working_crs} ({resolved.working_unit})")
+        typer.echo(f"    emprise   {resolved.working_area_of_use}")
+        typer.echo(f"    choix     {resolved.selection_method}")
+
+    vertical = resolved.vertical
+    typer.echo(
+        f"  vertical    {vertical.crs or 'inconnu'} — "
+        f"qualification {'possible' if resolved.vertical_is_usable else 'impossible'}"
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(resolved.model_dump_json(indent=2) + "\n", "utf-8")
+    typer.echo(f"{OK} {path}")
+
+
+def _reference_position(context, workspace) -> tuple[float, float] | None:  # noqa: ANN001
+    """Position servant à résoudre le territoire, profil d'abord."""
+    profile = context.profile
+    if profile is not None and profile.lat is not None and profile.lon is not None:
+        return profile.lat, profile.lon
+    try:
+        project = workspace.read_manifest()
+    except FileNotFoundError:
+        return None
+    if project.lat is None or project.lon is None:
+        return None
+    return project.lat, project.lon
+
+
 @geo_app.command("discover")
 def geo_discover(
     hotel_id: str = typer.Argument(...),
@@ -1820,7 +1900,7 @@ def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
     # antérieure reviendrait à juger des rasters que la supersession a écartés.
     latest = reports[-1]
     derivation = workspace.read_json(f"06_geo/{latest.name}")
-    context = _context(hotel_id, Capability.QUALIFICATION)
+    context = _context(hotel_id, Capability.GEOSPATIAL_QUALIFICATION)
 
     # Qualifier sur des seuils que la politique du projet ne porte pas
     # reviendrait à calibrer en silence depuis le code — à n'importe quelle

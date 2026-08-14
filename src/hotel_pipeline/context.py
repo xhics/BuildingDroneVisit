@@ -13,7 +13,7 @@ Le contexte porte aussi la provenance, pour qu'aucun rapport ne puisse être
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .logging import get_logger
@@ -95,6 +95,18 @@ class PipelineContext:
     #: écrite reste l'ancienne, et le rapport annonce des seuils que le fichier
     #: ne porte pas. Ce qui a été comblé doit donc être dit.
     policy_defaults_applied: tuple[str, ...] = ()
+
+    #: Territoire et référentiels du site, résolus. `None` tant qu'ils ne le
+    #: sont pas — et non « EPSG:2950 en attendant », qui était le défaut.
+    spatial_reference: object = None
+
+    #: Manifeste du site, quand il existe : les instances à qualifier.
+    site_manifest: object = None
+
+    #: Empreintes des artefacts dérivés. Distinctes de la provenance générale :
+    #: ce sont celles dont dépend réellement un calcul, donc celles qui le
+    #: périment. Un digest présent dans la provenance ne périme rien à lui seul.
+    artifact_digests: dict[str, str] = field(default_factory=dict)
 
     def implicit_under(self, section: str) -> tuple[str, ...]:
         """Valeurs implicites dans une section, la section elle-même comprise."""
@@ -194,7 +206,26 @@ class PipelineContext:
         else:
             property_id = project.property_profile_id or project.hotel_id
 
-        return cls.load_lenient(property_id, policy_path=workspace.policy_path)
+        context, warning = cls.load_lenient(
+            property_id, policy_path=workspace.policy_path
+        )
+        return context.with_workspace_state(workspace), warning
+
+    def with_workspace_state(self, workspace) -> "PipelineContext":  # noqa: ANN001
+        """Complète le contexte avec ce que l'espace de travail porte déjà.
+
+        Ces éléments ne sont pas chargés à l'aveugle : leur absence est un
+        état, pas une erreur. Ce sont les capacités qui décident si elle arrête
+        une commande — la lecture, elle, ne juge rien.
+        """
+        from dataclasses import replace
+
+        return replace(
+            self,
+            spatial_reference=_read_spatial_reference(workspace),
+            site_manifest=_safe(workspace.read_site),
+            artifact_digests=_artifact_digests(workspace),
+        )
 
     @classmethod
     def default(cls) -> "PipelineContext":
@@ -209,8 +240,58 @@ class PipelineContext:
     def excluded_terms(self) -> list[str]:
         return self.profile.excluded_terms() if self.profile else []
 
-    def ocr_languages(self) -> list[str]:
-        return self.profile.ocr_languages if self.profile else ["fr", "en"]
+    def ocr_languages(self) -> list[str] | None:
+        """Langues d'OCR déclarées, ou `None` si aucun profil ne les porte.
+
+        Le repli « fr, en » était celui du pilote. Un établissement dont
+        personne n'a déclaré la langue ne doit pas être lu comme s'il était
+        québécois : l'appelant reçoit `None` et refuse de lire.
+        """
+        return self.profile.ocr_languages if self.profile else None
+
+
+def _safe(reader):  # noqa: ANN001, ANN201
+    try:
+        return reader()
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def _read_spatial_reference(workspace):  # noqa: ANN001, ANN201
+    from .schemas.spatial_reference import SpatialReferenceContext
+
+    path = workspace.path("00_manifest", "spatial_reference.json")
+    if not path.is_file():
+        return None
+    try:
+        return SpatialReferenceContext.model_validate_json(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _artifact_digests(workspace) -> dict[str, str]:  # noqa: ANN001
+    """Empreintes des artefacts dérivés, s'ils ont été publiés.
+
+    Les rapports de dérivation sont horodatés — `derivation_report_<run>.json`.
+    Ne lire que le nom générique rendait un dictionnaire vide sur tout projet
+    ayant plusieurs runs, c'est-à-dire tous.
+    """
+    directory = workspace.path("06_geo")
+    if not directory.is_dir():
+        return {}
+
+    reports = sorted(directory.glob("derivation_report*.json"))
+    digests: dict[str, str] = {}
+    for path in reports:
+        report = _safe(lambda p=path: json.loads(p.read_text("utf-8"))) or {}
+        for artifact in report.get("artifacts", []):
+            identifier = artifact.get("artifact_id")
+            # `DerivedArtifact` nomme son empreinte `sha256` : chercher
+            # « digest » rendait un dictionnaire vide sur tous les projets.
+            digest = artifact.get("sha256") or artifact.get("digest")
+            if identifier and digest:
+                digests[identifier] = digest
+    return digests
 
 
 def write_context_snapshot(path: Path, context: PipelineContext) -> None:

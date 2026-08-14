@@ -53,6 +53,11 @@ def base_manifest_digest(manifest) -> str:  # noqa: ANN001
 class RunReport:
     run_id: str = ""
     assets_assessed: int = 0
+
+    #: Contrôles de projection effectués avant tout calcul : emprise, finitude
+    #: et aller-retour. Vide quand aucun contexte spatial n'a été fourni.
+    projection_check: dict = field(default_factory=dict)
+
     by_status: dict[str, int] = field(default_factory=dict)
     by_source: dict[str, dict[str, int]] = field(default_factory=dict)
     by_sector: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -94,6 +99,7 @@ class RunReport:
     def as_dict(self) -> dict:
         return {
             "run_id": self.run_id,
+            "projection_check": self.projection_check,
             "assets": {
                 "assessed": self.assets_assessed,
                 "by_status": self.by_status,
@@ -181,9 +187,15 @@ def run_assessment(
     camera_ground=None,  # noqa: ANN001 — callable (x, y) -> Sample | None
     obstacle_heights: dict | None = None,
     elevation_sources: list | None = None,
+    spatial_reference=None,  # noqa: ANN001 — SpatialReferenceContext
 ) -> tuple[VisibilityRun, RunReport]:
-    """Mesure la visibilité de chaque asset situé et de chaque corridor."""
-    from pyproj import Transformer
+    """Mesure la visibilité de chaque asset situé et de chaque corridor.
+
+    `spatial_reference` fournit le référentiel de travail. Sans lui, ce module
+    projetait en `EPSG:2950` littéral, sans contrôle d'emprise : une position
+    lyonnaise se plaçait à 5 637 km à l'est, et distances, azimuts et
+    occlusions se calculaient là-dessus sans qu'une seule erreur ne soit levée.
+    """
     from shapely.geometry import Point
     from shapely.ops import transform as shapely_transform
     from shapely import wkt as shapely_wkt
@@ -202,7 +214,17 @@ def run_assessment(
     report.parameters = {k: str(v) for k, v in settings.model_dump().items()}
     report.digests = dict(digests)
 
-    forward = Transformer.from_crs("EPSG:4326", "EPSG:2950", always_xy=True)
+    projection = _projection_for(spatial_reference)
+
+    # Toutes les positions caméra, pas seulement la cible : un asset hors du
+    # fuseau produirait des mètres finis et faux.
+    positions = [
+        (a.camera_lat, a.camera_lon) for a in assets
+        if a.camera_lat is not None and a.camera_lon is not None
+    ]
+    if projection is not None and positions:
+        report.projection_check = projection.verify(positions, "positions caméra")
+
     visibility = VisibilityRun(
         run_id=run_id,
         hotel_id=hotel_id,
@@ -224,7 +246,7 @@ def run_assessment(
     for asset in assets:
         if asset.camera_lat is None or asset.camera_lon is None:
             continue
-        origin = forward.transform(asset.camera_lon, asset.camera_lat)
+        origin = _project(projection, asset.camera_lat, asset.camera_lon)
         ground = camera_ground(origin) if camera_ground else None
         camera = engine.CameraVertical(
             ground_m=ground.value_m if ground else None,
@@ -237,6 +259,7 @@ def run_assessment(
         assessment = engine.assess(
             f"vis-{asset.id}", asset.id, "BUILDING_MAIN", origin, target_shape,
             obstacles, settings, camera=camera, target_vertical=target_vertical,
+            vertical=getattr(spatial_reference, "vertical", None),
         )
         visibility.assessments.append(assessment)
         _tally(report, asset, assessment)
@@ -270,6 +293,33 @@ def run_assessment(
         report.corridors_useful[key] = report.corridors_useful.get(key, 0) + 1
 
     return visibility, report
+
+
+def _projection_for(spatial_reference):  # noqa: ANN001, ANN201
+    """Service de projection du site, ou `None` si aucun contexte n'est fourni.
+
+    `None` conserve le comportement antérieur — projection directe en
+    EPSG:2950 — pour les runs déjà produits et rejouables. Un site hors du
+    Québec n'y a pas droit : sans contexte, `run_assessment` refuserait tout
+    aussi bien, puisque la géométrie de capture, elle, contrôle son emprise.
+    """
+    if spatial_reference is None:
+        return None
+
+    from .projection import ProjectionService
+
+    return ProjectionService(spatial_reference)
+
+
+def _project(projection, lat: float, lon: float) -> tuple[float, float]:  # noqa: ANN001
+    if projection is not None:
+        return projection.point(lat, lon)
+
+    from pyproj import Transformer
+    from ..schemas.geometry import GEOGRAPHIC_CRS, PROJECTED_CRS
+
+    forward = Transformer.from_crs(GEOGRAPHIC_CRS, PROJECTED_CRS, always_xy=True)
+    return forward.transform(lon, lat)
 
 
 def _sector_reader(target_shape, front_azimuth_deg: float | None):  # noqa: ANN001

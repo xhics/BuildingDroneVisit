@@ -178,16 +178,31 @@ def test_targeted_collection_also_needs_a_position() -> None:
     assert located.satisfied
 
 
-def test_qualification_refuses_implicit_thresholds() -> None:
+def test_geospatial_qualification_refuses_implicit_thresholds() -> None:
     """Un rapport citerait des seuils qu'aucun fichier ne porte."""
     implicit = Context(policy=PipelinePolicy(), defaults=("terrain.ring_m",))
 
-    check = available(implicit, Capability.QUALIFICATION)
+    check = available(implicit, Capability.GEOSPATIAL_QUALIFICATION)
 
-    assert check.missing == [Requirement.MATERIALISED_POLICY]
-    assert available(
-        Context(policy=PipelinePolicy()), Capability.QUALIFICATION
-    ).satisfied
+    assert Requirement.MATERIALISED_POLICY in check.missing
+
+
+def test_geospatial_qualification_needs_no_identity_but_much_else() -> None:
+    """Des seuils de terrain ne dépendent pas du nom de l'hôtel.
+
+    C'est pourquoi la capacité s'appelle « géospatiale » : une qualification
+    photographique viendra, et elle n'aura pas besoin du contexte spatial.
+    """
+    needs = capabilities.REQUIREMENTS[Capability.GEOSPATIAL_QUALIFICATION]
+
+    assert Requirement.PROFILE not in needs
+    assert set(needs) == {
+        Requirement.MATERIALISED_POLICY,
+        Requirement.SITE_MANIFEST,
+        Requirement.EXPECTED_ARTIFACTS,
+        Requirement.SPATIAL_CONTEXT,
+        Requirement.VERTICAL_PROVENANCE,
+    }
 
 
 def test_bootstrap_requires_nothing_and_inspection_says_what_it_lacks() -> None:
@@ -203,9 +218,17 @@ def test_bootstrap_requires_nothing_and_inspection_says_what_it_lacks() -> None:
     assert any("établissement visé" in item for item in inspection.partial)
 
 
-def test_only_bootstrap_and_inspection_are_lenient() -> None:
-    """`load_lenient` cesse d'être la voie d'accès par défaut."""
-    assert capabilities.LENIENT == {Capability.BOOTSTRAP, Capability.INSPECTION}
+def test_partial_results_are_allowed_only_where_declared() -> None:
+    """« Partiel » n'est ni « sans prérequis » ni « sans profil ».
+
+    La qualification géospatiale n'exige aucune identité et n'y figure
+    pourtant pas : elle ne rend rien de partiel, ses prérequis sont
+    satisfaits ou elle s'arrête.
+    """
+    assert capabilities.PARTIAL_CONTEXT_ALLOWED == {
+        Capability.BOOTSTRAP, Capability.INSPECTION
+    }
+    assert Capability.GEOSPATIAL_QUALIFICATION not in capabilities.PARTIAL_CONTEXT_ALLOWED
 
 
 def test_every_capability_needing_an_identity_refuses_to_run_without_one() -> None:
@@ -226,7 +249,7 @@ def test_every_capability_needing_an_identity_refuses_to_run_without_one() -> No
 
     assert needing_identity <= blocked
     assert Capability.IDENTITY_CLASSIFICATION in blocked
-    assert Capability.QUALIFICATION not in needing_identity
+    assert Capability.GEOSPATIAL_QUALIFICATION not in needing_identity
 
 
 # --- bout en bout ------------------------------------------------------------

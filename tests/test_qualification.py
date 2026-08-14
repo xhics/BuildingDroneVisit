@@ -739,7 +739,38 @@ def workspace_with(tmp_path, monkeypatch, artifacts, report_artifacts, run_id):
         {"metrics": metrics(), "artifacts": [json.loads(a.model_dump_json())
                                              for a in report_artifacts]},
     )
+    # Qualifier une hauteur exige désormais de savoir de quelle origine elle
+    # part : un seuil posé sur une altitude de référentiel inconnu porterait
+    # sur une origine supposée.
+    write_spatial_reference(workspace)
     return runner, workspace
+
+
+def write_spatial_reference(workspace, **overrides):
+    """Contexte spatial résolu, référentiel vertical déclaré."""
+    from hotel_pipeline.schemas.spatial_reference import (
+        HeightType, SpatialReferenceContext, TerritoryState, VerticalReference,
+    )
+
+    fields = dict(
+        hotel_id=workspace.hotel_id, reference_lat=45.574128, reference_lon=-73.443289,
+        territory_state=TerritoryState.RESOLVED,
+        jurisdictions=["CA", "QC", "QC-CMM", "QC-MONTEREGIE"],
+        territory_evidence=["QC : emprise approchée du Québec"],
+        working_crs="EPSG:2950", working_unit="m", working_axes="easting,northing",
+        working_area_of_use=[-75.0, 44.98, -72.0, 62.53],
+        selection_method="juridiction QC et emprise du référentiel",
+        vertical=VerticalReference(
+            crs="CGVD2013", height_type=HeightType.ORTHOMETRIC,
+            provenance="SYSREF_ALTIMETRIQUE de la tuile LiDAR",
+        ),
+    )
+    fields.update(overrides)
+    context = SpatialReferenceContext(**fields)
+    path = workspace.path("00_manifest", "spatial_reference.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(context.model_dump_json(indent=2), "utf-8")
+    return context
 
 
 def test_cli_refuses_a_report_that_does_not_describe_the_active_series(

@@ -187,29 +187,39 @@ class Routing:
 def territories_for(lat: float, lon: float) -> set[str]:
     """Appartenances territoriales d'un point.
 
-    Implémentation volontairement minimale et explicite : une boîte englobante
-    approchée de la CMM, suffisante pour router ce pilote. Elle sera remplacée
-    par une intersection avec les limites administratives officielles dès leur
-    acquisition — et le catalogue n'aura pas à changer.
+    Déléguée à l'adaptateur territorial. Cette fonction partait de `{"QC"}`
+    inconditionnellement : tout point de la Terre appartenait au Québec, et
+    Lyon se voyait proposer le LiDAR québécois. Un point hors des juridictions
+    déclarées rend désormais un ensemble **vide**, ce qui n'est pas la même
+    chose qu'un territoire sans source.
     """
-    territories = {"QC"}
+    from .territory import jurisdictions_for
 
-    # Communauté métropolitaine de Montréal, emprise approchée.
-    if 45.30 <= lat <= 45.90 and -74.35 <= lon <= -73.20:
-        territories.add("QC-CMM")
-
-    # Montérégie, emprise approchée. Les deux se recouvrent : l'appartenance
-    # à la CMM prime pour l'exclusion GéoMont.
-    if 44.98 <= lat <= 45.85 and -74.10 <= lon <= -72.40:
-        territories.add("QC-MONTEREGIE")
-
-    return territories
+    return set(jurisdictions_for(lat, lon))
 
 
 def route(lat: float, lon: float) -> Routing:
-    """Sources réellement utilisables à cette position."""
+    """Sources réellement utilisables à cette position.
+
+    Un territoire inconnu ne propose **rien**. C'est un état distinct de
+    « territoire connu sans source » : le premier dit qu'on ne sait pas où on
+    est, le second qu'il n'y a rien à télécharger ici.
+    """
     territories = territories_for(lat, lon)
     routing = Routing(territories=territories)
+
+    if not territories:
+        log.info(
+            "routage géospatial : territoire non résolu en (%.5f, %.5f) — "
+            "aucune source proposée",
+            lat, lon,
+        )
+        for source in SOURCES:
+            routing.rejected[source.source_id] = (
+                "territoire non résolu : aucune juridiction déclarée ne "
+                "contient ce point"
+            )
+        return routing
 
     for source in SOURCES:
         if source.serves(territories):

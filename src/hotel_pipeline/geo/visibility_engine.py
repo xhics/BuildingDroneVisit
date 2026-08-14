@@ -72,6 +72,10 @@ class Obstacle:
     height_m: float | None = None
     ground_m: float | None = None
 
+    #: Référentiel vertical de `ground_m`. Sans lui, sa soustraction à une
+    #: autre altitude suppose une origine commune que rien n'établit.
+    vertical_crs: str | None = None
+
     @property
     def height_known(self) -> bool:
         return self.height_m is not None
@@ -88,6 +92,7 @@ class CameraVertical:
     ground_m: float | None = None
     height_above_ground_m: float | None = None
     provenance: str | None = None
+    vertical_crs: str | None = None
 
     @property
     def elevation_m(self) -> float | None:
@@ -108,6 +113,7 @@ class TargetVertical:
     ground_m: float | None = None
     height_m: float | None = None
     provenance: str | None = None
+    vertical_crs: str | None = None
 
     #: Renvoie (terrain, sommet, provenance) au point d'impact. Prioritaire sur
     #: les valeurs scalaires quand il est fourni.
@@ -221,6 +227,35 @@ def _first_hit(origin, ray, shape) -> float | None:  # noqa: ANN001
     return Point(origin).distance(crossing)
 
 
+def _incomparable_references(
+    camera: CameraVertical, obstacle: Obstacle, target: TargetVertical,
+    vertical: object,
+) -> list[str]:
+    """Quelles altitudes ne peuvent pas être comparées sans supposition ?
+
+    Sans référence de site déclarée, on n'exige rien : c'est l'état antérieur,
+    et le rendre bloquant périmerait des runs déjà produits sur une source
+    verticale unique. Dès qu'une référence existe, elle fait autorité.
+    """
+    if vertical is None or not getattr(vertical, "is_known", False):
+        return []
+
+    problems = []
+    for label, declared in (
+        ("caméra", camera.vertical_crs),
+        (f"obstacle {obstacle.feature_id}", obstacle.vertical_crs),
+        ("cible", target.vertical_crs),
+    ):
+        if declared is None:
+            problems.append(f"référentiel vertical non déclaré pour {label}")
+        elif not vertical.comparable_with(declared):
+            problems.append(
+                f"référentiel {declared!r} de {label} sans transformation "
+                f"déclarée vers {vertical.crs!r}"
+            )
+    return problems
+
+
 def vertical_verdict(
     origin,  # noqa: ANN001
     obstacle: Obstacle,
@@ -228,6 +263,7 @@ def vertical_verdict(
     target_distance: float,
     camera: CameraVertical,
     target: TargetVertical,
+    vertical: object = None,
 ) -> tuple[bool, VerticalVisibilityStatus, list[str]]:
     """L'obstacle masque-t-il **prouvablement** la cible sur ce rayon ?
 
@@ -235,7 +271,17 @@ def vertical_verdict(
     d'obstacle. Une seule absence laisse un risque — et l'obstacle ne masque
     que s'il couvre **toute** la bande utile de la cible, un toit dépassant
     au-dessus suffisant à laisser voir la silhouette.
+
+    `vertical` est le `VerticalReference` du site. Les trois altitudes ne se
+    soustraient qu'à référentiel identique, ou via une transformation déclarée :
+    orthométrique et ellipsoïdal diffèrent ici de plusieurs dizaines de mètres,
+    et les mélanger produirait un blocage « prouvé » qui n'existe pas.
     """
+    incomparable = _incomparable_references(camera, obstacle, target, vertical)
+    if incomparable:
+        # Ni blocage ni certitude : on ne sait pas, et on dit pourquoi.
+        return False, VerticalVisibilityStatus.UNKNOWN, incomparable
+
     missing: list[str] = []
     if camera.ground_m is None:
         missing.append("terrain à la caméra")
@@ -282,6 +328,7 @@ def assess(
     policy,  # noqa: ANN001 — VisibilityPolicy
     camera: CameraVertical | None = None,
     target_vertical: TargetVertical | None = None,
+    vertical: object = None,
 ) -> VisibilityAssessment:
     """Évalue une ligne de vue, cellule par cellule. **Sans cadrage.**
 
@@ -329,7 +376,7 @@ def assess(
     for bearing, width in cells(start, span, policy):
         partition, ray = _assess_cell(
             origin, bearing, width, target_shape, obstacles, camera, target_vertical,
-            policy, reach,
+            policy, reach, vertical,
         )
         weights[partition] += width
         rays.append(ray)
@@ -378,6 +425,7 @@ def _reach(origin, target_shape) -> float:  # noqa: ANN001
 def _assess_cell(
     origin, bearing: float, width: float, target_shape, obstacles: list[Obstacle],  # noqa: ANN001
     camera: CameraVertical, target_vertical: TargetVertical, policy, reach: float,  # noqa: ANN001
+    vertical: object = None,
 ) -> tuple[RayPartition, RayAssessment]:
     precision = policy.output_precision
     ray = _ray(origin, bearing, reach)
@@ -411,8 +459,9 @@ def _assess_cell(
     blocked = False
     incomplete: list[str] = []
     for distance, obstacle in interposed:
-        proven, vertical, absent = vertical_verdict(
-            origin, obstacle, distance, target_distance, camera, local_target
+        proven, vertical_status, absent = vertical_verdict(
+            origin, obstacle, distance, target_distance, camera, local_target,
+            vertical,
         )
         verdict = (
             HitVerdict.UNDECIDABLE if absent
@@ -423,7 +472,7 @@ def _assess_cell(
             ObstacleHit(
                 obstacle_ref=obstacle.feature_id,
                 distance_m=round(distance, precision),
-                vertical_status=vertical,
+                vertical_status=vertical_status,
                 verdict=verdict,
                 missing_vertical=sorted(set(absent)),
             )
