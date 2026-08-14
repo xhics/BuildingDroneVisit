@@ -1,0 +1,46 @@
+{
+  "description": "Les huit rejets de la première passe aveugle sur la cohorte welcominns-boucherville, extraits du rapport conditionnel (cohorte 08570c8d21d9b56f). Fixture de non-régression : le corpus réel vit hors dépôt, ce cas doit survivre au dépôt.",
+  "cohort_digest": "08570c8d21d9b56f",
+  "rejects": [
+    {
+      "asset_id": "mapillary-1338281626865323",
+      "rationale": "enseigne « HÔTEL MORTAGNE » lisible au fond : établissement concurrent, non la cible",
+      "expected_kind": "competitor_same_kind"
+    },
+    {
+      "asset_id": "mapillary-1371510450143256",
+      "rationale": "immeuble de bureaux vitré portant le numéro 1201 et l'enseigne « Isomed » : autre adresse, autre établissement",
+      "expected_kind": "neighbouring_office"
+    },
+    {
+      "asset_id": "mapillary-1436083030352972",
+      "rationale": "carrefour et stationnement enneigés, commerces lointains : aucun bâtiment de la référence dans le cadre",
+      "expected_kind": "no_building"
+    },
+    {
+      "asset_id": "mapillary-387724470810456",
+      "rationale": "stationnement vide bordé d'arbres et clôture de bois, maisons résidentielles au fond : aucun bâtiment de la référence",
+      "expected_kind": "no_building"
+    },
+    {
+      "asset_id": "mapillary-388477797431032",
+      "rationale": "rond-point enneigé et abribus, bâti lointain indistinct : rien de la référence dans le cadre",
+      "expected_kind": "no_building"
+    },
+    {
+      "asset_id": "mapillary-436593065447108",
+      "rationale": "immeuble de bureaux beige et verre au-delà d'un stationnement : ni brique ni pignons de la référence",
+      "expected_kind": "neighbouring_office"
+    },
+    {
+      "asset_id": "mapillary-739518451599722",
+      "rationale": "stationnement vide et rideau d'arbres, pavillons résidentiels au fond : aucun bâtiment de la référence",
+      "expected_kind": "no_building"
+    },
+    {
+      "asset_id": "mapillary-7452291804813518",
+      "rationale": "immeuble de bureaux vitré portant le numéro 1205 rue Ampère et une pancarte À LOUER : adresse voisine, pas la cible",
+      "expected_kind": "neighbouring_office"
+    }
+  ]
+}

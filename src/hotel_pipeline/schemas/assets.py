@@ -513,12 +513,20 @@ class Asset(BaseModel):
                 f"incompatible avec la décision {last.decision.value!r} ; "
                 f"attendu {DECISION_STATUS[last.decision].value!r}"
             )
-        expected_visible = VISIBILITY_OF[last.decision]
-        if self.target_building_visible is not expected_visible:
+        # Une personne qui n'a pas conclu n'interdit pas au système de constater
+        # qu'il ne voit rien : après un `unresolved`, la déduction automatique
+        # peut rendre `False` ou `None`. Elle ne peut pas rendre `True` — ce
+        # serait établir ce que la revue a justement refusé d'établir.
+        allowed = (
+            (None, False)
+            if last.decision is ReviewDecision.UNRESOLVED
+            else (VISIBILITY_OF[last.decision],)
+        )
+        if self.target_building_visible not in allowed:
             raise ValueError(
                 f"asset {self.id!r} : visibilité {self.target_building_visible!r} "
                 f"incompatible avec la décision {last.decision.value!r} ; "
-                f"attendu {expected_visible!r}"
+                f"attendu {allowed if len(allowed) > 1 else allowed[0]!r}"
             )
         if self.reviewer != last.decided_by or self.review_rationale != last.rationale:
             raise ValueError(

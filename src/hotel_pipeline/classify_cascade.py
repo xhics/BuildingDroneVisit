@@ -168,6 +168,13 @@ def _target_visibility(
     if asset.target_visibility_decision is ReviewDecision.REJECTED:
         return False, f"revue humaine : {asset.review_rationale or 'rejeté'}"
 
+    #: Après un `unresolved` humain, le système peut constater qu'il ne voit
+    #: rien ; il ne peut pas établir la cible. La déduction est donc plafonnée.
+    reviewed_undecided = (
+        asset.has_been_reviewed
+        and asset.target_visibility_decision is ReviewDecision.UNRESOLVED
+    )
+
     if asset.property_match_status is PropertyMatchStatus.MISMATCH:
         return False, "enseigne d'un autre établissement"
 
@@ -185,9 +192,19 @@ def _target_visibility(
     identity = asset.property_match_status is PropertyMatchStatus.MATCH
 
     if target_in_fov:
+        if reviewed_undecided:
+            return None, (
+                "revue humaine non conclusive : la géométrie et le modèle ne "
+                "peuvent pas établir ce qu'une lecture directe a refusé d'établir"
+            )
         return True, "cap observé cadrant l'empreinte, bâtiment confirmé par le modèle"
 
     if identity:
+        if reviewed_undecided:
+            return None, (
+                "revue humaine non conclusive : l'enseigne ne suffit pas à "
+                "rétablir ce qu'une lecture directe a refusé d'établir"
+            )
         return True, "enseigne de l'établissement et bâtiment confirmé par le modèle"
 
     # Un bâtiment est là, mais rien ne dit que c'est le nôtre.
