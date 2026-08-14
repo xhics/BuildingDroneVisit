@@ -532,6 +532,19 @@ class CandidateGeometry(BaseModel):
     unclipped_width_fraction: float | None = Field(default=None, ge=0.0)
     unclipped_height_fraction: float | None = Field(default=None, ge=0.0)
 
+    #: Ce que l'image contiendra **réellement**, une fois le débordement coupé.
+    #: Distincte de la précédente, et il faut les deux : une cible deux fois
+    #: plus large que le champ a une largeur non écrêtée de 2,0 — elle est donc
+    #: énorme — et une part dans le cadre de 0,5, car la moitié en sort. Les
+    #: confondre ferait accepter une vue dont il manque tout un pan.
+    clipped_width_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: Part de la silhouette effectivement comprise dans le cadre. Répond à
+    #: « la cible entre-t-elle dans l'image ? », que la taille apparente ne dit
+    #: pas : une cible immense et à moitié hors champ paraît excellente sur la
+    #: seule largeur.
+    in_frame_fraction: float | None = Field(default=None, ge=0.0, le=1.0)
+
     #: Dimensions attendues de la cible dans l'image, en pixels. Deux mesures
     #: plutôt qu'une aire : « 40 000 pixels » ne dit pas si la façade fait
     #: 200×200 ou 800×50.
@@ -569,6 +582,12 @@ class CandidateGeometry(BaseModel):
 
     #: Secteur du vocabulaire officiel, jamais une chaîne libre.
     view_sector: ViewSector | None = None
+
+    #: La caméra regarde-t-elle depuis un côté que le besoin n'accepte pas ?
+    #: Une vue excellente prise de l'arrière ne montre pas la façade avant, et
+    #: sa distance n'y change rien : le secteur se juge sur la position de
+    #: l'observateur, pas sur la qualité de la vue.
+    wrong_sector: bool = False
 
     #: Identifiant de la voie sur laquelle se trouve la caméra. `on_road`
     #: laissait croire à un booléen alors que le champ porte une référence.

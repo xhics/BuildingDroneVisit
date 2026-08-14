@@ -52,8 +52,12 @@ class PlanReport:
     selected: int = 0
     rejected_by_reason: dict[str, int] = field(default_factory=dict)
     preview_required: int = 0
-    demands_served: dict[str, int] = field(default_factory=dict)
-    demands_unserved: list[str] = field(default_factory=list)
+    #: Besoins pour lesquels une acquisition est **prévue**. Jamais « servis » :
+    #: un besoin n'est servi qu'après qualification du fichier acquis, et
+    #: `preview_required` signifie précisément qu'on ne sait pas encore.
+    demands_planned: dict[str, int] = field(default_factory=dict)
+    demands_planned_pending_preview: dict[str, int] = field(default_factory=dict)
+    demands_unplanned: list[str] = field(default_factory=list)
 
     known_bytes: int = 0
     unknown_size_items: int = 0
@@ -68,8 +72,14 @@ class PlanReport:
             "rejected_by_reason": self.rejected_by_reason,
             "preview_required": self.preview_required,
             "demands": {
-                "served": self.demands_served,
-                "unserved": self.demands_unserved,
+                "planned": self.demands_planned,
+                "planned_pending_preview": self.demands_planned_pending_preview,
+                "unplanned": self.demands_unplanned,
+                "note": (
+                    "« prévu » n'est pas « servi » : un besoin n'est servi "
+                    "qu'après qualification du fichier acquis, et une "
+                    "acquisition en vérification ne l'établit pas"
+                ),
             },
             "volume": {
                 "known_bytes": self.known_bytes,
@@ -110,6 +120,19 @@ def evaluate(
             ),
         )
 
+    # Le secteur d'abord : une vue prise du mauvais côté ne montre pas la
+    # cible demandée, quelle que soit sa distance ou sa netteté.
+    if measured.wrong_sector:
+        return CandidateEvaluation(
+            candidate_id=candidate.candidate_id, demand_id=demand.demand_id,
+            intent=demand.intent, eligibility=Eligibility.REJECTED,
+            geometry=measured,
+            rejection_reason=(
+                "observée depuis un côté que le besoin n'accepte pas : le "
+                "secteur se juge sur la position de l'observateur"
+            ),
+        )
+
     width = measured.unclipped_width_fraction
     if width is not None and width < demand.min_projected_width_fraction:
         return CandidateEvaluation(
@@ -134,9 +157,29 @@ def evaluate(
             ),
         )
 
-    # Rien ne contredit le besoin, mais rien ne l'établit non plus : sans
-    # mesure de cadrage, engager la pleine résolution reviendrait à parier.
-    if width is None and demand.min_projected_width_fraction > 0:
+    # La cible entre-t-elle dans le cadre ? La largeur apparente ne le dit
+    # pas : une cible immense à moitié hors champ paraît excellente sur elle.
+    if (
+        measured.in_frame_fraction is not None
+        and demand.min_visible_fraction > 0
+        and measured.in_frame_fraction < demand.min_visible_fraction
+    ):
+        return CandidateEvaluation(
+            candidate_id=candidate.candidate_id, demand_id=demand.demand_id,
+            intent=demand.intent, eligibility=Eligibility.REJECTED,
+            geometry=measured,
+            rejection_reason=(
+                f"part dans le cadre {measured.in_frame_fraction:.3f} sous le "
+                f"minimum {demand.min_visible_fraction:.3f} du besoin"
+            ),
+        )
+
+    # Rien ne contredit le besoin, mais rien ne l'établit non plus : **toute**
+    # métrique qu'il exige et qu'on ignore impose une vérification. Ne
+    # regarder que la largeur laissait passer une vue dont la part visible
+    # était inconnue alors que le besoin en exigeait une.
+    unknown = _unknown_required_metrics(measured, demand)
+    if unknown:
         return CandidateEvaluation(
             candidate_id=candidate.candidate_id, demand_id=demand.demand_id,
             intent=demand.intent, eligibility=Eligibility.PREVIEW_REQUIRED,
@@ -149,18 +192,58 @@ def evaluate(
     )
 
 
+def _unknown_required_metrics(measured, demand) -> list[str]:  # noqa: ANN001
+    """Métriques exigées par le besoin et absentes de la mesure.
+
+    Un besoin qui n'exige rien ne rend rien inconnu : c'est l'exigence qui
+    crée l'obligation de mesurer, pas la mesure qui crée l'exigence.
+    """
+    missing = []
+    if demand.min_projected_width_fraction > 0 and measured.unclipped_width_fraction is None:
+        missing.append("taille projetée")
+    if demand.min_visible_fraction > 0 and measured.in_frame_fraction is None:
+        missing.append("part dans le cadre")
+    if demand.min_visible_fraction > 0 and measured.visible_fraction is None:
+        missing.append("part non masquée")
+    return missing
+
+
+def viewpoint_of(candidate, tolerance_m: float = 10.0) -> str:  # noqa: ANN001
+    """Point de vue d'un candidat : sa **position**, non son cadrage.
+
+    Deux cadrages d'un même panorama sont deux acquisitions et **un seul**
+    point de vue : les compter deux fois ferait croire un besoin servi par
+    deux observations indépendantes alors qu'il n'y en a qu'une, et un SfM
+    n'en tirerait aucune parallaxe.
+    """
+    if candidate.camera_lat is None or candidate.camera_lon is None:
+        return f"sans-position:{candidate.candidate_id}"
+    if candidate.panorama_id:
+        return f"pano:{candidate.panorama_id}"
+
+    # Grille au pas de la tolérance : deux positions plus proches que cela ne
+    # produisent pas d'observation indépendante.
+    degrees = tolerance_m / 111_320.0
+    return (
+        f"pos:{round(candidate.camera_lat / degrees):d}"
+        f":{round(candidate.camera_lon / degrees):d}"
+    )
+
+
 def select(
     evaluations: list[CandidateEvaluation], demands: list[CaptureDemand],
     sizes: dict[str, int] | None = None,
+    candidates: dict | None = None,
 ) -> list[PlannedAcquisition]:
     """Retient ce qui sert un besoin, en respectant le nombre attendu.
 
     Le nombre demandé porte sur des **points de vue**, non sur des fichiers :
-    on ne retient donc pas deux fois la même position. Faute de position
-    fiable à ce stade, le candidat lui-même fait office de point de vue, et le
-    dédoublonnage géométrique reste au niveau où il se mesure.
+    deux cadrages d'un même panorama ne comptent que pour un. Sans le
+    dictionnaire des candidats, la position est inconnue et chaque candidat
+    compte pour lui-même — l'appelant qui veut le décompte juste le fournit.
     """
     announced = sizes or {}
+    known = candidates or {}
     by_demand: dict[str, list[CandidateEvaluation]] = {}
     for evaluation in evaluations:
         if evaluation.eligibility is Eligibility.REJECTED:
@@ -172,12 +255,26 @@ def select(
     reasons: dict[str, list[str]] = {}
 
     for demand in demands:
-        retained = sorted(
+        ordered = sorted(
             by_demand.get(demand.demand_id, []),
             # L'éligible passe avant celui qui demande une vérification : à
             # besoin égal, mieux vaut ce qui est établi que ce qui reste à voir.
             key=lambda e: (e.eligibility is Eligibility.PREVIEW_REQUIRED, e.candidate_id),
-        )[: demand.viewpoints_required]
+        )
+
+        retained, seen_viewpoints = [], set()
+        for evaluation in ordered:
+            subject = known.get(evaluation.candidate_id)
+            viewpoint = (
+                viewpoint_of(subject) if subject is not None
+                else f"candidat:{evaluation.candidate_id}"
+            )
+            if viewpoint in seen_viewpoints:
+                continue
+            seen_viewpoints.add(viewpoint)
+            retained.append(evaluation)
+            if len(retained) >= demand.viewpoints_required:
+                break
 
         for evaluation in retained:
             wanted.setdefault(evaluation.candidate_id, []).append(demand.demand_id)
@@ -242,7 +339,10 @@ def build(
                 )
             )
 
-    planned = select(evaluations, demands, sizes)
+    planned = select(
+        evaluations, demands, sizes,
+        candidates={c.candidate_id: c for c in candidates},
+    )
     plan = AcquisitionPlan(
         plan_id=plan_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),
         hotel_id=hotel_id,
@@ -287,13 +387,23 @@ def _report(
         elif evaluation.eligibility is Eligibility.PREVIEW_REQUIRED:
             report.preview_required += 1
 
-    served: dict[str, int] = {}
+    pending = {
+        (e.candidate_id, e.demand_id)
+        for e in evaluations
+        if e.eligibility is Eligibility.PREVIEW_REQUIRED
+    }
+    planned: dict[str, int] = {}
+    to_verify: dict[str, int] = {}
     for acquisition in plan.acquisitions:
         for demand_id in acquisition.serves_demands:
-            served[demand_id] = served.get(demand_id, 0) + 1
-    report.demands_served = dict(sorted(served.items()))
-    report.demands_unserved = sorted(
-        demand.demand_id for demand in demands if demand.demand_id not in served
+            planned[demand_id] = planned.get(demand_id, 0) + 1
+            if (acquisition.candidate_id, demand_id) in pending:
+                to_verify[demand_id] = to_verify.get(demand_id, 0) + 1
+
+    report.demands_planned = dict(sorted(planned.items()))
+    report.demands_planned_pending_preview = dict(sorted(to_verify.items()))
+    report.demands_unplanned = sorted(
+        demand.demand_id for demand in demands if demand.demand_id not in planned
     )
 
     report.known_bytes = plan.known_bytes

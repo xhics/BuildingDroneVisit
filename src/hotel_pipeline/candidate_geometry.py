@@ -38,6 +38,14 @@ class GeometryReport:
     with_framing: int = 0
     without_framing: dict[str, int] = field(default_factory=dict)
 
+    #: Besoins dont la cible n'a pas été trouvée. Comptés à part : un besoin
+    #: non mesurable n'est pas un besoin non servi, et le rabattre sur le
+    #: bâtiment principal serait le défaut qu'on corrige.
+    unresolved_targets: dict[str, str] = field(default_factory=dict)
+
+    #: Couples mesurés depuis un côté que le besoin n'accepte pas.
+    wrong_sector: int = 0
+
     def as_dict(self) -> dict:
         return {
             "measured": self.measured,
@@ -46,6 +54,8 @@ class GeometryReport:
                 "computable": self.with_framing,
                 "not_computable": self.without_framing,
             },
+            "unresolved_targets": self.unresolved_targets,
+            "wrong_sector": self.wrong_sector,
             "note": (
                 "espérances calculées sur métadonnées : aucune image n'a été "
                 "acquise, et aucune de ces valeurs n'est une mesure sur pixels"
@@ -55,7 +65,7 @@ class GeometryReport:
 
 def measure(
     candidate,  # noqa: ANN001 — CaptureCandidate
-    target_shape,  # noqa: ANN001 — empreinte projetée
+    target_shape,  # noqa: ANN001 — empreinte projetée de **cette** cible
     projection,  # noqa: ANN001 — ProjectionService
     policy,  # noqa: ANN001 — VisibilityPolicy
     obstacles: list | None = None,
@@ -126,10 +136,19 @@ def _framing(candidate, start: float, span: float, heading, policy) -> dict | No
     if framed is None or not framed.horizontal_computable:
         return None
 
-    update = {"unclipped_width_fraction": framed.unclipped_width_fraction}
-    if width_px and framed.unclipped_width_fraction is not None:
+    # Deux grandeurs distinctes, que confondre rendrait un tri faux : la
+    # largeur **non écrêtée** dit la taille apparente de la cible, y compris
+    # quand elle déborde ; la fraction **dans le cadre** dit ce que l'image
+    # contiendra réellement. Une cible deux fois plus large que le champ a une
+    # largeur de 2,0 et une fraction dans le cadre de 0,5.
+    update = {
+        "unclipped_width_fraction": framed.unclipped_width_fraction,
+        "clipped_width_fraction": framed.clipped_width_fraction,
+        "in_frame_fraction": framed.target_in_frame_fraction,
+    }
+    if width_px and framed.clipped_width_fraction is not None:
         update["expected_width_px"] = int(
-            round(min(framed.unclipped_width_fraction, 1.0) * width_px)
+            round(framed.clipped_width_fraction * width_px)
         )
     return update
 
@@ -186,45 +205,83 @@ def _occlusion(origin, target_shape, obstacles: list, policy) -> tuple[bool, set
 
 def measure_all(
     candidates: list,
-    target_shape,  # noqa: ANN001
+    manifest,  # noqa: ANN001 — CaptureGeometryManifest
     projection,  # noqa: ANN001
     policy,  # noqa: ANN001
     demands: list,
     obstacles: list | None = None,
+    front_azimuth_deg: float | None = None,
+    site=None,  # noqa: ANN001
 ) -> tuple[dict, GeometryReport]:
-    """Mesure chaque candidat, pour chaque besoin.
+    """Mesure chaque candidat **contre la cible de chaque besoin**.
 
-    La géométrie ne dépend pas du besoin — une distance est une distance — mais
-    le dictionnaire rendu est indexé par paire, parce que c'est ce que `plan`
-    consomme, et parce qu'un besoin futur pourra viser une autre cible.
+    La version précédente calculait une géométrie sur le bâtiment principal et
+    la recopiait à tous les besoins : un besoin d'entrée était mesuré contre la
+    façade entière, et deux secteurs opposés recevaient la même réponse. Ici,
+    chaque besoin résout sa propre cible, et un besoin dont la cible n'est pas
+    résolue n'est pas mesuré du tout — il n'est pas rabattu sur le bâtiment.
     """
+    from .demand_targets import TargetUnresolved, observer_bearing, resolve
+
     report = GeometryReport()
     measured: dict[tuple[str, str], CandidateGeometry] = {}
 
-    for candidate in candidates:
+    targets = {}
+    for demand in demands:
         try:
-            geometry = measure(
-                candidate, target_shape, projection, policy, obstacles
+            targets[demand.demand_id] = resolve(
+                demand, manifest, front_azimuth_deg, site
             )
-        except GeometryUnavailable as exc:
-            report.skipped[candidate.candidate_id] = str(exc).split(" : ", 1)[-1]
+        except TargetUnresolved as exc:
+            report.unresolved_targets[demand.demand_id] = str(exc).split(" : ", 1)[-1]
+
+    for candidate in candidates:
+        if candidate.camera_lat is None or candidate.camera_lon is None:
+            report.skipped[candidate.candidate_id] = "aucune position de caméra"
             continue
 
-        report.measured += 1
-        if geometry.unclipped_width_fraction is not None:
-            report.with_framing += 1
-        else:
-            reason = (
-                "cap absent" if candidate.original_heading_deg is None
-                else "champ de vision non déclaré"
-            )
-            report.without_framing[reason] = report.without_framing.get(reason, 0) + 1
-
         for demand in demands:
+            target = targets.get(demand.demand_id)
+            if target is None:
+                continue
+
+            try:
+                geometry = measure(
+                    candidate, target.shape, projection, policy, obstacles,
+                )
+            except GeometryUnavailable as exc:
+                report.skipped[candidate.candidate_id] = str(exc).split(" : ", 1)[-1]
+                break
+
+            # Le secteur ne se déduit pas de la distance : une vue excellente
+            # prise du mauvais côté ne montre pas la façade demandée.
+            origin = projection.point(candidate.camera_lat, candidate.camera_lon)
+            bearing = observer_bearing(origin, target.shape)
+            if not target.observer_is_admissible(bearing):
+                geometry = geometry.model_copy(
+                    update={"view_sector": None, "wrong_sector": True}
+                )
+                report.wrong_sector += 1
+
             measured[(candidate.candidate_id, demand.demand_id)] = geometry
+            report.measured += 1
+            if geometry.unclipped_width_fraction is not None:
+                report.with_framing += 1
+            else:
+                reason = (
+                    "cap absent"
+                    if candidate.original_heading_deg is None
+                    and candidate.requested_heading_deg is None
+                    else "champ de vision non déclaré"
+                )
+                report.without_framing[reason] = (
+                    report.without_framing.get(reason, 0) + 1
+                )
 
     log.info(
-        "géométrie de candidats : %d mesuré(s), %d avec cadrage, %d ignoré(s)",
-        report.measured, report.with_framing, len(report.skipped),
+        "géométrie de candidats : %d couple(s) mesuré(s), %d avec cadrage, "
+        "%d hors secteur, %d cible(s) non résolue(s)",
+        report.measured, report.with_framing, report.wrong_sector,
+        len(report.unresolved_targets),
     )
     return measured, report

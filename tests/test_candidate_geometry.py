@@ -46,6 +46,37 @@ def target(service):
     return service.geometry(BUILDING, label="cible")
 
 
+@pytest.fixture
+def manifest(service):
+    """Un manifeste géométrique minimal, portant la cible et rien d'autre.
+
+    `measure_all` résout désormais la cible **par besoin** : lui passer une
+    empreinte unique serait exactement le défaut corrigé.
+    """
+    from hotel_pipeline.geo import capture_geometry as cg
+    from hotel_pipeline.geo.geometry_loader import CURRENT_SCHEMA_VERSION
+    from hotel_pipeline.schemas.geometry import (
+        CaptureGeometryManifest, GeometryRole, GeometrySourceSnapshot,
+        SourceQueryStatus,
+    )
+
+    snapshot = GeometrySourceSnapshot(
+        snapshot_id="snap", source="essai", endpoint="essai", query="essai",
+        status=SourceQueryStatus.SUCCESS, element_count=1, response_digest="d",
+    )
+    building = cg.resolved_from(
+        "BUILDING_MAIN", GeometryRole.TARGET_BUILDING, "way/1", "snap",
+        BUILDING, "essai", ["preuve"], service,
+    )
+    reference = service.reference
+    return CaptureGeometryManifest(
+        schema_version=CURRENT_SCHEMA_VERSION, hotel_id="h",
+        snapshots=[snapshot], geometries=[building],
+        working_crs=reference.working_crs,
+        spatial_context_digest=reference.context_digest(),
+    )
+
+
 def candidate(candidate_id: str = "c1", **overrides) -> CaptureCandidate:
     fields = dict(
         candidate_id=candidate_id, source="mapillary", provider_id=candidate_id,
@@ -265,12 +296,13 @@ def test_no_elevation_is_claimed_without_provenance(service, target) -> None:
 # --- le lot, et ce qu'il laisse indéterminé -----------------------------------
 
 
-def test_the_batch_reports_what_it_could_not_measure(service, target) -> None:
+def test_the_batch_reports_what_it_could_not_measure(service, manifest) -> None:
     located = candidate("c1")
     lost = candidate("c2", camera_lat=None, camera_lon=None)
 
     measured, report = measure_all(
-        [located, lost], target, service, POLICY, [demand()]
+        [located, lost], manifest, service, POLICY, [demand()],
+        front_azimuth_deg=180.0,
     )
 
     assert report.measured == 1
@@ -279,15 +311,18 @@ def test_the_batch_reports_what_it_could_not_measure(service, target) -> None:
     assert ("c2", "d1") not in measured
 
 
-def test_the_batch_states_that_nothing_was_measured_on_pixels(service, target) -> None:
-    _, report = measure_all([candidate()], target, service, POLICY, [demand()])
+def test_the_batch_states_that_nothing_was_measured_on_pixels(service, manifest) -> None:
+    _, report = measure_all(
+        [candidate()], manifest, service, POLICY, [demand()], front_azimuth_deg=180.0
+    )
 
     assert "aucune image n'a été acquise" in report.as_dict()["note"]
 
 
-def test_the_report_says_why_framing_stayed_unknown(service, target) -> None:
+def test_the_report_says_why_framing_stayed_unknown(service, manifest) -> None:
     _, report = measure_all(
-        [candidate(original_heading_deg=0.0)], target, service, POLICY, [demand()]
+        [candidate(original_heading_deg=0.0)], manifest, service, POLICY,
+        [demand()], front_azimuth_deg=180.0,
     )
 
     assert report.with_framing == 0
@@ -329,3 +364,107 @@ def test_a_view_too_small_for_the_demand_is_now_rejected(service, target) -> Non
 
     assert result.eligibility is Eligibility.REJECTED
     assert "taille projetée espérée" in result.rejection_reason
+
+
+# --- la cible dépend du besoin ------------------------------------------------
+
+
+def test_two_demands_no_longer_share_one_measurement(service, manifest) -> None:
+    """Le défaut corrigé : une géométrie du bâtiment, recopiée à tous.
+
+    Deux secteurs opposés recevaient la même réponse, et un besoin d'entrée
+    était mesuré contre la façade entière.
+    """
+    front = demand("avant", target_ref="front")
+    rear = demand("arriere", target_ref="rear")
+
+    measured, report = measure_all(
+        [candidate(original_heading_deg=0.0)], manifest, service, POLICY,
+        [front, rear], front_azimuth_deg=180.0,
+    )
+
+    devant = measured[("c1", "avant")]
+    derriere = measured[("c1", "arriere")]
+
+    # La caméra est au sud du bâtiment ; avec une façade orientée au sud, elle
+    # observe l'avant. Elle ne peut pas simultanément observer l'arrière.
+    assert devant.wrong_sector is False
+    assert derriere.wrong_sector is True
+    assert report.wrong_sector == 1
+
+
+def test_an_unresolvable_target_is_never_replaced_by_the_building(
+    service, manifest
+) -> None:
+    """Le rabattre serait le défaut corrigé, avec un repli au lieu d'une copie."""
+    entrance = demand(
+        "entree", target_kind=TargetKind.SITE_OBJECT, target_ref="ENTRANCE_MAIN"
+    )
+
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [entrance],
+        front_azimuth_deg=180.0,
+    )
+
+    assert ("c1", "entree") not in measured
+    assert "entree" in report.unresolved_targets
+    assert "n'est pas remplacé par le bâtiment" in report.unresolved_targets["entree"]
+
+
+def test_sectors_need_a_facade_orientation_to_mean_anything(
+    service, manifest
+) -> None:
+    """Sans elle, « avant » et « arrière » ne se distinguent pas."""
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [demand("avant")],
+        front_azimuth_deg=None,
+    )
+
+    assert measured == {}
+    assert "orientation de façade inconnue" in report.unresolved_targets["avant"]
+
+
+def test_a_view_from_the_wrong_side_serves_no_building_demand(
+    service, manifest
+) -> None:
+    """Une distance excellente ne rachète pas un mauvais côté."""
+    from hotel_pipeline.plan import evaluate
+
+    rear = demand("arriere", target_ref="rear")
+    measured, _ = measure_all(
+        [candidate()], manifest, service, POLICY, [rear], front_azimuth_deg=180.0
+    )
+
+    result = evaluate(candidate(), rear, measured[("c1", "arriere")])
+
+    assert result.eligibility is Eligibility.REJECTED
+    assert "côté que le besoin n'accepte pas" in result.rejection_reason
+
+
+def test_an_unknown_required_metric_forces_a_preview(service, target) -> None:
+    """Ne regarder que la largeur laissait passer une part visible inconnue."""
+    from hotel_pipeline.plan import evaluate
+    from hotel_pipeline.schemas.acquisition import CandidateGeometry
+
+    demanding = demand(min_visible_fraction=0.6)
+    measured = CandidateGeometry(unclipped_width_fraction=0.8)
+
+    result = evaluate(candidate(), demanding, measured)
+
+    assert result.eligibility is Eligibility.PREVIEW_REQUIRED
+
+
+def test_the_in_frame_fraction_is_not_the_apparent_width(service, target) -> None:
+    """Une cible immense à moitié hors champ paraît excellente sur la largeur."""
+    from hotel_pipeline.plan import evaluate
+    from hotel_pipeline.schemas.acquisition import CandidateGeometry
+
+    demanding = demand(min_visible_fraction=0.9)
+    huge_but_cropped = CandidateGeometry(
+        unclipped_width_fraction=2.0, in_frame_fraction=0.5, visible_fraction=1.0
+    )
+
+    result = evaluate(candidate(), demanding, huge_but_cropped)
+
+    assert result.eligibility is Eligibility.REJECTED
+    assert "part dans le cadre" in result.rejection_reason

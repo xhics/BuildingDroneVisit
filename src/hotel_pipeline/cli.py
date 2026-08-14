@@ -773,9 +773,16 @@ def assets_plan(
         typer.echo(f"  à vérifier  {report.preview_required} (miniature d'abord)")
     for reason, count in sorted(report.rejected_by_reason.items()):
         typer.echo(f"    écarté · {reason[:52]:<52} {count:>4}")
-    if report.demands_unserved:
+    if report.demands_unplanned:
         typer.secho(
-            f"  besoins non servis : {', '.join(report.demands_unserved)}",
+            f"  besoins sans acquisition prévue : "
+            f"{', '.join(report.demands_unplanned)}",
+            fg=typer.colors.YELLOW,
+        )
+    if report.demands_planned_pending_preview:
+        pending = ", ".join(sorted(report.demands_planned_pending_preview))
+        typer.secho(
+            f"  · prévu mais non établi — vérification par miniature : {pending}",
             fg=typer.colors.YELLOW,
         )
 

@@ -115,8 +115,9 @@ def test_an_established_candidate_outranks_one_still_to_be_seen() -> None:
 def test_an_unknown_size_is_never_counted_as_zero() -> None:
     """Additionner comme nulles les tailles ignorées annoncerait un faux total."""
     plan, _, report = build(
-        "h", [candidate("c1"), candidate("c2")], [demand(viewpoints_required=2)],
-        DIGESTS, sizes={"c1": 1000},
+        "h",
+        [candidate("c1"), candidate("c2", camera_lat=45.5745, camera_lon=-73.4445)],
+        [demand(viewpoints_required=2)], DIGESTS, sizes={"c1": 1000},
     )
 
     assert plan.known_bytes == 1000
@@ -127,8 +128,9 @@ def test_an_unknown_size_is_never_counted_as_zero() -> None:
 
 def test_a_fully_announced_plan_states_an_exact_volume() -> None:
     plan, _, _ = build(
-        "h", [candidate("c1"), candidate("c2")], [demand(viewpoints_required=2)],
-        DIGESTS, sizes={"c1": 1000, "c2": 2000},
+        "h",
+        [candidate("c1"), candidate("c2", camera_lat=45.5745, camera_lon=-73.4445)],
+        [demand(viewpoints_required=2)], DIGESTS, sizes={"c1": 1000, "c2": 2000},
     )
 
     assert plan.volume_status is VolumeStatus.EXACT
@@ -163,7 +165,7 @@ def test_a_plan_without_a_candidate_names_the_missing_step() -> None:
         build("h", [], [demand()], DIGESTS)
 
 
-def test_an_unserved_demand_is_reported_rather_than_hidden() -> None:
+def test_an_unplanned_demand_is_reported_rather_than_hidden() -> None:
     """« Aucune vue de l'arrière » doit se distinguer de « pas cherché »."""
     front = demand("front")
     rear = demand("rear", target_ref="rear", min_projected_width_fraction=0.9)
@@ -173,17 +175,48 @@ def test_an_unserved_demand_is_reported_rather_than_hidden() -> None:
         geometries={("c1", "rear"): CandidateGeometry(unclipped_width_fraction=0.1)},
     )
 
-    assert report.demands_served == {"front": 1}
-    assert report.demands_unserved == ["rear"]
+    assert report.demands_planned == {"front": 1}
+    assert report.demands_unplanned == ["rear"]
 
 
-def test_the_requested_viewpoint_count_is_respected() -> None:
+def test_the_count_is_of_viewpoints_not_of_files() -> None:
+    """Cinq cadrages d'une même position ne font pas cinq observations.
+
+    Les compter séparément ferait croire un besoin servi par plusieurs vues
+    indépendantes alors qu'il n'y en a qu'une, et un SfM n'en tirerait aucune
+    parallaxe.
+    """
     wanted = demand(viewpoints_required=2)
-    candidates = [candidate(f"c{i}") for i in range(5)]
+    same_place = [candidate(f"c{i}") for i in range(5)]
 
-    plan, _, _ = build("h", candidates, [wanted], DIGESTS)
+    plan, _, _ = build("h", same_place, [wanted], DIGESTS)
+
+    assert len(plan.acquisitions) == 1
+
+
+def test_distinct_positions_do_count_separately() -> None:
+    wanted = demand(viewpoints_required=2)
+    spread = [
+        candidate("c0", camera_lat=45.5730, camera_lon=-73.4430),
+        candidate("c1", camera_lat=45.5740, camera_lon=-73.4440),
+        candidate("c2", camera_lat=45.5750, camera_lon=-73.4450),
+    ]
+
+    plan, _, _ = build("h", spread, [wanted], DIGESTS)
 
     assert len(plan.acquisitions) == 2
+
+
+def test_two_framings_of_one_panorama_are_one_viewpoint() -> None:
+    """Le cas d'acceptation de Street View, avant même son résolveur."""
+    from hotel_pipeline.plan import viewpoint_of
+
+    first = candidate("sv-1", panorama_id="pano-A", requested_heading_deg=0.0)
+    second = candidate("sv-2", panorama_id="pano-A", requested_heading_deg=180.0)
+    elsewhere = candidate("sv-3", panorama_id="pano-B")
+
+    assert viewpoint_of(first) == viewpoint_of(second)
+    assert viewpoint_of(first) != viewpoint_of(elsewhere)
 
 
 # --- rien ne s'acquiert sans consentement ni empreintes -----------------------
