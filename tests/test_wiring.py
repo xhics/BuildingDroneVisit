@@ -170,6 +170,7 @@ class TestProfileDrivesFootprintScoring:
 
     def test_matching_profile_awards_the_footprint_bonus(self, elements):
         profile = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             footprint_min_m2=1000, footprint_max_m2=5000,
         )
@@ -180,6 +181,7 @@ class TestProfileDrivesFootprintScoring:
     def test_mismatched_footprint_never_eliminates(self, elements):
         """Hors plage, le candidat perd des points mais reste examinable."""
         tiny = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             footprint_min_m2=10, footprint_max_m2=20,
         )
@@ -193,18 +195,26 @@ class TestProfileDrivesFootprintScoring:
 class TestProvenance:
     @pytest.fixture
     def profile(self) -> PropertyProfile:
-        return PropertyProfile(property_id="welcominns", address="a", official_name="X")
+        return PropertyProfile(country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"], property_id="welcominns", address="a", official_name="X")
 
     def test_report_carries_policy_and_profile_identity(self, profile):
         block = provenance(DEFAULT_POLICY, profile)
         assert block["policy_version"] == DEFAULT_POLICY.version
         assert block["model_calibration_id"] == DEFAULT_POLICY.model.calibration_id
         assert block["property_profile_id"] == "welcominns"
-        # La calibration terrain est distincte de celle du modèle photo :
-        # les confondre laisserait croire que les seuils géospatiaux reposent
-        # sur les 36 images du jeu de validation.
-        assert block["terrain_calibration_id"] != block["model_calibration_id"]
-        assert block["terrain_calibrated_on_sites"] == "0"
+        # La calibration terrain est distincte de celle du modèle photo : les
+        # confondre laisserait croire que les seuils géospatiaux reposent sur
+        # les images du jeu de validation. Les deux valant « non-calibré » par
+        # défaut, la distinction se vérifie sur une politique qui les sépare —
+        # comparer les défauts entre eux ne prouvait plus rien.
+        separated = DEFAULT_POLICY.model_copy(deep=True)
+        separated.model.calibration_id = "campagne-images"
+        separated.model.calibrated_on_sites = 2
+        distinct = provenance(separated, profile)
+
+        assert distinct["model_calibration_id"] == "campagne-images"
+        assert distinct["terrain_calibration_id"] != distinct["model_calibration_id"]
+        assert distinct["terrain_calibrated_on_sites"] == "0"
 
     def test_digest_detects_an_unversioned_edit(self):
         """Une version ne dit rien d'une modification locale non publiée."""

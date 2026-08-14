@@ -26,16 +26,44 @@ from .schemas import Asset, Blinding, ReviewDecision
 
 log = get_logger("validation")
 
-#: Ce que cette cohorte ne mesure pas, inscrit dans le rapport lui-même.
-LIMITS = [
-    "sélection issue du modèle : le rappel sur les 189 vues Mapillary n'est pas "
-    "mesurable, les faux négatifs étant exclus par construction",
-    "deux séquences seulement : aucune inférence statistique robuste, les vues "
-    "d'une même séquence n'étant pas indépendantes",
-    "un site, un réviseur : aucune généralisation à d'autres établissements",
-    "aucun seuil de modèle ne peut être réglé ici — il faudrait un échantillon "
-    "stratifié distinct, séparé réglage/validation au niveau des séquences",
-]
+def limits(
+    source_views: int | None = None,
+    sequences: int | None = None,
+    sites: int = 1,
+    reviewers: int = 1,
+) -> list[str]:
+    """Ce que cette cohorte ne mesure pas, mesuré sur cette cohorte.
+
+    Les nombres étaient écrits en dur — « les 189 vues Mapillary », « deux
+    séquences ». Un rapport lyonnais aurait donc affirmé porter sur 189 vues
+    qu'il n'avait jamais vues. Ils viennent maintenant du corpus, et ce qui
+    reste constant est la **forme** de la limite, qui, elle, est générique.
+
+    Un décompte inconnu se dit inconnu plutôt que de disparaître : une limite
+    tue serait lue comme une limite absente.
+    """
+    views = f"{source_views} vues de la source" if source_views else "les vues de la source"
+    count = (
+        "une seule séquence" if sequences == 1
+        else f"{sequences} séquences seulement" if sequences
+        else "un nombre non établi de séquences"
+    )
+    return [
+        f"sélection issue du modèle : le rappel sur {views} n'est pas mesurable, "
+        "les faux négatifs étant exclus par construction",
+        f"{count} : aucune inférence statistique robuste, les vues d'une même "
+        "séquence n'étant pas indépendantes",
+        f"{sites} site(s), {reviewers} réviseur(s) : aucune généralisation à "
+        "d'autres établissements",
+        "aucun seuil de modèle ne peut être réglé ici — il faudrait un "
+        "échantillon stratifié distinct, séparé réglage/validation au niveau "
+        "des séquences",
+    ]
+
+
+#: Limites d'un corpus dont rien n'est connu. Conservé pour les appelants qui
+#: n'ont pas de corpus sous la main ; il ne cite plus aucun nombre du pilote.
+LIMITS = limits()
 
 
 def first_blind(asset: Asset):  # noqa: ANN201
@@ -74,6 +102,10 @@ class ValidationReport:
     geometry: dict = field(default_factory=dict)
     caveats: list[str] = field(default_factory=list)
 
+    #: Limites mesurées sur ce corpus. Vides, les limites génériques
+    #: s'appliquent — elles ne citent aucun nombre.
+    limits: list[str] = field(default_factory=list)
+
     def as_dict(self) -> dict:
         return {
             "title": self.title,
@@ -93,7 +125,7 @@ class ValidationReport:
             "by_sequence": self.by_sequence,
             "confusions": self.confusions,
             "geometry_suitability": self.geometry,
-            "limits": LIMITS,
+            "limits": self.limits or LIMITS,
             "caveats": self.caveats,
         }
 

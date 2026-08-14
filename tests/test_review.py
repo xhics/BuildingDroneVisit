@@ -404,7 +404,7 @@ def cli_workspace(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     runner = CliRunner()
-    runner.invoke(app, ["init", "hotel-test", "--address", "1 rue Test"])
+    runner.invoke(app, ["init", "hotel-test", "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "1 rue Test"])
 
     workspace = Workspace("hotel-test")
     subject = asset(tmp_path, target_building_visible=None)

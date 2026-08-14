@@ -679,7 +679,9 @@ def test_report_carries_policy_and_derivation_digest() -> None:
     assert payload["selected_artifacts"] == ["dtm@r1"]
     assert payload["policy"]["status"] == "provisional"
     assert payload["policy"]["intended_use"] == "visual_proxy_not_survey"
-    assert payload["policy"]["calibrated_on_sites"] == 1
+    # Une politique par défaut ne se déclare plus calibrée : le rapport porte
+    # ce que la politique dit, et elle ne dit plus « un site » sans en avoir vu.
+    assert payload["policy"]["calibrated_on_sites"] == 0
 
     terrain = payload["verdicts"]["TERRAIN_MAIN"]
     # Chaque seuil est écrit avec sa mesure : le rapport se relit sans le code.
@@ -724,7 +726,7 @@ def workspace_with(tmp_path, monkeypatch, artifacts, report_artifacts, run_id):
     monkeypatch.chdir(tmp_path)
 
     runner = CliRunner()
-    runner.invoke(app, ["init", "hotel-test", "--address", "1 rue Test"])
+    runner.invoke(app, ["init", "hotel-test", "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "1 rue Test"])
 
     workspace = Workspace("hotel-test")
     site = manifest(artifacts)

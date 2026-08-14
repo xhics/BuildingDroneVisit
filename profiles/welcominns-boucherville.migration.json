@@ -1,0 +1,13 @@
+{
+  "property_id": "welcominns-boucherville",
+  "digest_before": "3a0047fcaa2f6aef",
+  "digest_after": "aa596171797b4241",
+  "added": {
+    "country_code": "CA",
+    "subdivision_code": "QC",
+    "timezone": "America/Toronto"
+  },
+  "decisions_unchanged": true,
+  "migrated_at": "2026-08-14T14:49:27.725813+00:00",
+  "note": "l'empreinte change parce que le profil déclare désormais son pays, son fuseau et ses langues. Aucun champ portant une décision déjà prise n'a été modifié : identité, concurrents, position et travaux sont identiques avant et après."
+}

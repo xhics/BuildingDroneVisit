@@ -173,12 +173,45 @@ def test_binary_metrics_only_cover_resolved_labels() -> None:
 
 
 def test_the_report_states_what_it_cannot_measure() -> None:
-    limits = " ".join(validation.LIMITS)
+    """La forme de la limite est générique ; ses nombres viennent du corpus."""
+    measured = " ".join(validation.limits(source_views=189, sequences=2))
 
-    assert "rappel" in limits
-    assert "faux négatifs" in limits
-    assert "deux séquences" in limits
-    assert "aucun seuil" in limits
+    assert "rappel" in measured
+    assert "faux négatifs" in measured
+    assert "189 vues" in measured
+    assert "2 séquences" in measured
+    assert "aucun seuil" in measured
+
+
+def test_an_unmeasured_corpus_says_so_rather_than_citing_the_pilot() -> None:
+    """Le défaut : « les 189 vues Mapillary » écrit en dur.
+
+    Un rapport d'un autre établissement affirmait porter sur un corpus qu'il
+    n'avait jamais vu. Sans décompte, la limite se dit inconnue — la taire la
+    ferait lire comme une limite absente.
+    """
+    generic = " ".join(validation.LIMITS)
+
+    assert "189" not in generic
+    assert "deux séquences" not in generic
+    assert "nombre non établi de séquences" in generic
+    assert "les vues de la source" in generic
+
+
+def test_no_report_text_names_the_pilot() -> None:
+    from hotel_pipeline import cohort
+
+    corpus = [asset("m-1", [entry(ReviewDecision.CONFIRMED)])]
+    published = json.dumps(
+        {
+            "limits": validation.LIMITS,
+            "scope": cohort.predictions(corpus, None)["scope"],
+        },
+        ensure_ascii=False,
+    ).lower()
+
+    for name in ("welcominns", "mortagne", "tetra", "isomed", "boucherville"):
+        assert name not in published
 
 
 def test_results_are_broken_down_by_sequence() -> None:

@@ -37,7 +37,7 @@ def project(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     hotel_id = "hotel-test"
-    runner.invoke(app, ["init", hotel_id, "--address", "1 rue Test"])
+    runner.invoke(app, ["init", hotel_id, "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "1 rue Test"])
 
     workspace = Workspace(hotel_id)
     candidate = BuildingCandidate(
@@ -70,7 +70,10 @@ def project(tmp_path, monkeypatch):
 def write_policy(tmp_path, **dedup):
     policy = DEFAULT_POLICY.model_copy(deep=True)
     policy.version = "test-9.9.9"
+    # Une campagne nommée déclare ses sites : c'est l'invariant de la
+    # politique, et une fixture ne s'en exempte pas.
     policy.model.calibration_id = "calibration-de-test"
+    policy.model.calibrated_on_sites = 1
     for key, value in dedup.items():
         setattr(policy.dedup, key, value)
     return policy
@@ -134,10 +137,22 @@ class TestPolicyOnDiskChangesTheOutcome:
 
 class TestProfileLoading:
     def test_missing_profile_is_reported_not_silent(self, project, tmp_path):
-        """Tourner sur des valeurs de secours sans le dire était le défaut."""
+        """Tourner sur des valeurs de secours sans le dire était le défaut.
+
+        `dedup` porte la capacité `inspection` : elle travaille sur la
+        géométrie interne du corpus et n'a pas besoin de savoir quel
+        établissement est visé. Elle a donc le droit de tourner sans profil —
+        mais pas celui de se taire.
+        """
         install_policy(project, write_policy(tmp_path))
+        # `init` écrit désormais un profil : on le retire, puisque c'est son
+        # absence qui est éprouvée ici.
+        (tmp_path / "profiles" / f"{project}.json").unlink(missing_ok=True)
         result = runner.invoke(app, ["assets", "dedup", project])
-        assert "profil introuvable" in result.stdout
+
+        assert result.exit_code == 0
+        assert "lecture partielle" in result.stdout
+        assert "l'établissement visé n'est pas décrit" in result.stdout
 
     def test_present_profile_is_stamped_on_the_report(self, project, tmp_path):
         write_policy(tmp_path)
@@ -149,6 +164,9 @@ class TestProfileLoading:
                     "property_id": project,
                     "address": "1 rue Test",
                     "official_name": "Hôtel Test",
+                    "country_code": "CA",
+                    "timezone": "America/Toronto",
+                    "ocr_languages": ["fr", "en"],
                     "room_count": 116,
                     "expected_levels": 3,
                 }
@@ -214,9 +232,20 @@ class TestTerrainPolicyReachesTheDerivation:
         assert tuned.version == DEFAULT_POLICY.version  # une empreinte les sépare
 
     def test_terrain_calibration_is_not_the_photo_calibration(self):
-        """Les seuils géospatiaux ne reposent pas sur 36 images d'hôtel."""
+        """Les seuils géospatiaux ne reposent pas sur les images d'un hôtel.
+
+        Les deux valant « non-calibré » par défaut, la séparation se vérifie
+        sur une politique qui les distingue : comparer deux défauts identiques
+        ne prouverait plus que les champs existent.
+        """
         from hotel_pipeline.schemas import DEFAULT_POLICY
 
-        assert DEFAULT_POLICY.terrain.calibration_id != DEFAULT_POLICY.model.calibration_id
         assert DEFAULT_POLICY.terrain.calibrated_on_sites == 0
         assert "non-calibré" in DEFAULT_POLICY.terrain.calibration_id
+
+        separated = DEFAULT_POLICY.model_copy(deep=True)
+        separated.model.calibration_id = "campagne-images"
+        separated.model.calibrated_on_sites = 3
+
+        assert separated.terrain.calibration_id != separated.model.calibration_id
+        assert separated.terrain.calibrated_on_sites == 0

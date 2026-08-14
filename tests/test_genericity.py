@@ -65,6 +65,7 @@ class TestPropertyProfile:
     def test_small_motel_is_not_excluded_by_a_hardcoded_range(self):
         """Une plage figée à 1 500 m² écartait tout établissement modeste."""
         motel = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="m", address="a", official_name="Motel", room_count=20
         )
         low, high = motel.footprint_range_m2()
@@ -77,6 +78,7 @@ class TestPropertyProfile:
         éliminait l'empreinte réelle.
         """
         tower = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="t", address="a", official_name="Tour",
             room_count=600, expected_levels=20,
         )
@@ -86,6 +88,7 @@ class TestPropertyProfile:
 
     def test_unknown_levels_widen_rather_than_exclude(self):
         tower = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="t", address="a", official_name="Tour", room_count=600
         )
         low, high = tower.footprint_range_m2()
@@ -93,13 +96,14 @@ class TestPropertyProfile:
         assert high >= 30_000
 
     def test_profile_without_size_falls_back_to_wide_bounds(self):
-        unknown = PropertyProfile(property_id="u", address="a", official_name="X")
+        unknown = PropertyProfile(country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"], property_id="u", address="a", official_name="X")
         low, high = unknown.footprint_range_m2()
         assert low < 1000 < high
 
     def test_incoherent_bounds_rejected(self):
         with pytest.raises(ValueError, match="footprint_min_m2"):
             PropertyProfile(
+                country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
                 property_id="x", address="a", official_name="X",
                 footprint_min_m2=5000, footprint_max_m2=1000,
             )
@@ -109,6 +113,7 @@ class TestRenovationEvents:
     @pytest.fixture
     def profile(self) -> PropertyProfile:
         return PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             renovation_events=[
                 RenovationEvent(
@@ -145,6 +150,7 @@ class TestRenovationEvents:
         photographie postérieure peut montrer l'ancienne entrée.
         """
         profile = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             renovation_events=[
                 RenovationEvent(
@@ -156,6 +162,7 @@ class TestRenovationEvents:
 
     def test_unconfirmed_completion_is_not_enough(self):
         profile = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             renovation_events=[
                 RenovationEvent(
@@ -179,7 +186,7 @@ class TestRenovationEvents:
 
     def test_no_declared_event_yields_no_answer(self):
         """Sans travaux connus, supposer « à jour » serait une invention."""
-        profile = PropertyProfile(property_id="p", address="a", official_name="X")
+        profile = PropertyProfile(country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"], property_id="p", address="a", official_name="X")
         assert profile.shows_current_appearance(date(2025, 1, 1)) is None
 
     def test_multiple_renovations_supported(self, profile):
@@ -195,9 +202,35 @@ class TestPipelinePolicy:
         assert DEFAULT_POLICY.version
 
     def test_calibration_provenance_is_recorded(self):
-        """Un seuil sans trace de calibration est un nombre sans autorité."""
+        """Un seuil sans trace de calibration est un nombre sans autorité.
+
+        La trace existe toujours ; ce qu'elle dit a changé. Une politique par
+        défaut ne peut plus se déclarer calibrée sur le pilote : un projet neuf
+        héritait ainsi de `welcominns-2026-08-36-images` sans avoir vu une
+        seule image.
+        """
         assert DEFAULT_POLICY.model.calibration_id
-        assert DEFAULT_POLICY.model.calibrated_on_sites >= 1
+        assert not DEFAULT_POLICY.model.is_calibrated
+        assert DEFAULT_POLICY.model.calibrated_on_sites == 0
+
+    def test_a_default_policy_names_no_property(self):
+        """Aucun établissement ne doit apparaître dans un défaut."""
+        serialised = DEFAULT_POLICY.model_dump_json().lower()
+
+        for name in ("welcominns", "boucherville", "mortagne"):
+            assert name not in serialised
+
+    def test_a_named_campaign_must_declare_its_sites(self):
+        """Nommer une campagne sans site mesuré lui donnerait une autorité nulle."""
+        with pytest.raises(ValueError, match="zéro site"):
+            PipelinePolicy.model_validate(
+                {"model": {"calibration_id": "campagne-2027", "calibrated_on_sites": 0}}
+            )
+
+        accepted = PipelinePolicy.model_validate(
+            {"model": {"calibration_id": "campagne-2027", "calibrated_on_sites": 4}}
+        )
+        assert accepted.model.is_calibrated
 
     def test_policy_is_serialisable_and_reloadable(self):
         reloaded = PipelinePolicy.model_validate_json(DEFAULT_POLICY.model_dump_json())
@@ -240,6 +273,7 @@ class TestRenovationInvariants:
         from datetime import date as _date
 
         profile = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             renovation_events=[
                 RenovationEvent(event_id="e", scope="entrance", approved_on=_date(2024, 9, 16))
@@ -251,6 +285,7 @@ class TestRenovationInvariants:
         from datetime import date as _date
 
         profile = PropertyProfile(
+            country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
             property_id="p", address="a", official_name="X",
             renovation_events=[
                 RenovationEvent(

@@ -43,6 +43,7 @@ def make(asset_id="a", **overrides) -> Asset:
 @pytest.fixture
 def profile() -> PropertyProfile:
     return PropertyProfile(
+        country_code="CA", timezone="America/Toronto", ocr_languages=["fr", "en"],
         property_id="p", address="a", official_name="X",
         renovation_events=[
             RenovationEvent(

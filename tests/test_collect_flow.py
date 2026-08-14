@@ -30,7 +30,7 @@ def hotel(tmp_path, monkeypatch, overpass_elements):
     monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path / "work"))
     hotel_id = "welcominns-boucherville"
 
-    assert runner.invoke(app, ["init", hotel_id, "--address", "1195 rue Ampère"]).exit_code == 0
+    assert runner.invoke(app, ["init", hotel_id, "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "1195 rue Ampère"]).exit_code == 0
 
     geocode = GeocodeResult(lat=45.5896, lon=-73.4372, provider="fixture")
     workspace = Workspace(hotel_id)
@@ -205,14 +205,14 @@ class TestOfflineGuard:
 class TestProvidedCoordinates:
     def test_lat_without_lon_is_refused(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path))
-        result = runner.invoke(app, ["init", "h", "--address", "a", "--lat", "45.57"])
+        result = runner.invoke(app, ["init", "h", "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "a", "--lat", "45.57"])
         assert result.exit_code == 1
 
     def test_coordinates_are_persisted(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path))
         result = runner.invoke(
             app,
-            ["init", "h", "--address", "a", "--lat", "45.574128", "--lon", "-73.443289"],
+            ["init", "h", "--name", "Hôtel Test", "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr", "--address", "a", "--lat", "45.574128", "--lon", "-73.443289"],
         )
         assert result.exit_code == 0
         assert "géocodage court-circuité" in result.stdout

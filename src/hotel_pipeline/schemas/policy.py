@@ -12,10 +12,70 @@ plusieurs établissements avant d'être modifiées.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+#: Valeur de départ de toute calibration : aucune. Un nouveau projet ne peut
+#: pas hériter du réglage d'un établissement qu'il ne connaît pas — c'est
+#: exactement ce que faisait `welcominns-2026-08-36-images` posé en défaut.
+UNCALIBRATED = "non-calibré — valeurs initiales, aucun site"
+
+#: Formulations reconnues comme « aucune calibration ». Plusieurs, parce que
+#: des politiques déjà écrites en portent d'autres : les convertir modifierait
+#: des fichiers dont l'empreinte est citée par des rapports publiés. Ce n'est
+#: pas une reconnaissance de texte libre — c'est une liste close, et tout ce
+#: qui n'y figure pas est traité comme le nom d'une campagne réelle.
+UNCALIBRATED_MARKERS: frozenset[str] = frozenset(
+    {
+        UNCALIBRATED,
+        "non-calibré — valeurs initiales, un seul site",
+    }
+)
 
 
-class ModelPolicy(BaseModel):
+class Calibrated:
+    """Règle commune aux sections portant une calibration.
+
+    Le couple identifiant/nombre de sites ne peut pas mentir dans un sens :
+    nommer une campagne sans déclarer aucun site en ferait une autorité sortie
+    de nulle part. L'inverse est permis — des sites mesurés sans nom de
+    campagne restent une information honnête.
+
+    **Ce socle n'est pas un modèle**, et c'est délibéré. En hériter placerait
+    `calibration_id` et `calibrated_on_sites` en tête du dump, y compris s'ils
+    sont redéclarés : pydantic conserve la position du parent. Or
+    `policy_digest` est l'empreinte du dump JSON, donc sensible à l'ordre — la
+    politique du pilote, sans qu'aucune valeur ne bouge, serait passée de
+    `a4564b71ddeec56e` à `1d6a92e87c91a80f`, et les rapports déjà publiés qui
+    la citent seraient devenus incohérents. Les sections déclarent donc leurs
+    deux champs à leur place ; ce mixin ne porte que la règle et sa lecture.
+
+    Il n'annote pas non plus `calibration_id` ni `calibrated_on_sites` : une
+    annotation nue sur une classe de base est collectée par pydantic comme un
+    champ, ce qui reproduirait exactement le déplacement qu'on cherche à
+    éviter. Les deux attributs sont donc supposés présents dans la section qui
+    mélange ce mixin, et leur absence se voit à la première validation.
+    """
+
+    @property
+    def names_a_campaign(self) -> bool:
+        return self.calibration_id not in UNCALIBRATED_MARKERS
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self.calibrated_on_sites > 0 and self.names_a_campaign
+
+    @model_validator(mode="after")
+    def _a_named_calibration_names_its_sites(self) -> "Calibrated":
+        if self.names_a_campaign and self.calibrated_on_sites == 0:
+            raise ValueError(
+                f"calibration {self.calibration_id!r} déclarée sur zéro site : "
+                "un identifiant de campagne sans site mesuré n'a aucune "
+                f"autorité. Laissez {UNCALIBRATED!r}, ou déclarez les sites."
+            )
+        return self
+
+
+class ModelPolicy(BaseModel, Calibrated):
     """Classifieur et ses seuils."""
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -26,13 +86,13 @@ class ModelPolicy(BaseModel):
     subject_accept: float = Field(default=0.50, ge=0.0, le=1.0)
     subject_reject: float = Field(default=0.20, ge=0.0, le=1.0)
 
-    #: Sur quoi ces seuils ont été mesurés. Sans cette trace, un seuil est un
-    #: nombre sans autorité.
     #: En deçà, une décision automatique n'est pas acceptée sans revue.
     review_confidence_floor: float = Field(default=0.60, ge=0.0, le=1.0)
 
-    calibration_id: str = "welcominns-2026-08-36-images"
-    calibrated_on_sites: int = 1
+    #: Sur quoi ces seuils ont été mesurés. Sans cette trace, un seuil est un
+    #: nombre sans autorité — et le défaut ne nomme aucun établissement.
+    calibration_id: str = UNCALIBRATED
+    calibrated_on_sites: int = Field(default=0, ge=0)
 
 
 class GeometryPolicy(BaseModel):
@@ -111,7 +171,7 @@ class CollectionPolicy(BaseModel):
     wide_fov_deg: int = Field(default=110, gt=0, le=120)
 
 
-class TerrainPolicy(BaseModel):
+class TerrainPolicy(BaseModel, Calibrated):
     """Seuils de la validation par pseudo-empreinte.
 
     Ils portent sur une **couverture spatiale**, non sur un nombre de points :
@@ -142,10 +202,10 @@ class TerrainPolicy(BaseModel):
     min_trials: int = Field(default=3, ge=1)
 
     #: Sur quoi ces seuils reposent. Distinct de la calibration du modèle
-    #: photographique : celle-ci porte sur 36 images et n'a rien à dire d'une
-    #: validation géospatiale.
-    calibration_id: str = "non-calibré — valeurs initiales, un seul site"
-    calibrated_on_sites: int = 0
+    #: photographique : une campagne mesurée sur des images n'a rien à dire
+    #: d'une validation géospatiale.
+    calibration_id: str = UNCALIBRATED
+    calibrated_on_sites: int = Field(default=0, ge=0)
 
 
 class TerrainQualificationThresholds(BaseModel):
@@ -192,7 +252,7 @@ class RooflineQualificationThresholds(BaseModel):
     require_qualified_terrain: bool = True
 
 
-class QualificationPolicy(BaseModel):
+class QualificationPolicy(BaseModel, Calibrated):
     """Seuils de passage en `inferred`, et ce qu'ils autorisent à en faire.
 
     `intended_use` n'est pas décoratif : ces seuils qualifient un proxy visuel,
@@ -204,10 +264,10 @@ class QualificationPolicy(BaseModel):
     status: str = "provisional"
     intended_use: str = "visual_proxy_not_survey"
 
-    #: Distincte de `terrain.calibration_id`, qui décrit la validation de la
-    #: méthode. Celle-ci décrit le choix des seuils.
-    calibration_id: str = "welcominns-pilot-qualification-v1"
-    calibrated_on_sites: int = 1
+    #: Distinct de `terrain.calibration_id` : ce dernier décrit la validation
+    #: de la méthode, celui-ci le choix des seuils.
+    calibration_id: str = UNCALIBRATED
+    calibrated_on_sites: int = Field(default=0, ge=0)
 
     terrain: TerrainQualificationThresholds = Field(
         default_factory=TerrainQualificationThresholds

@@ -136,6 +136,9 @@ class TestSingleProfilePerProject:
                         "property_id": name,
                         "address": "1 rue Test",
                         "official_name": f"Hôtel {name}",
+                        "country_code": "CA",
+                        "timezone": "America/Toronto",
+                        "ocr_languages": ["fr"],
                     }
                 ),
                 encoding="utf-8",

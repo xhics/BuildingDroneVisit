@@ -114,7 +114,27 @@ class PropertyProfile(BaseModel):
     #: dont les salles portent des noms de rues locales.
     competitor_names: list[str] = Field(default_factory=list)
 
-    ocr_languages: list[str] = Field(default_factory=lambda: ["fr", "en"])
+    #: Pays, en ISO 3166-1 alpha-2. Sans lui, rien ne distingue un
+    #: établissement québécois d'un établissement français, et le routage
+    #: territorial part d'une supposition. Obligatoire : c'est la donnée qui
+    #: rend le profil portable.
+    country_code: str = Field(pattern=r"^[A-Z]{2}$")
+
+    #: Subdivision administrative, en ISO 3166-2 sans le préfixe pays —
+    #: « QC », « ARA »… Facultative : tous les pays n'en ont pas d'utile, et
+    #: une valeur inventée vaudrait moins que son absence.
+    subdivision_code: str | None = Field(default=None, pattern=r"^[A-Z0-9]{1,3}$")
+
+    #: Fuseau IANA — « America/Toronto », « Europe/Paris ». L'année de capture
+    #: se compare à des dates civiles de travaux : les calculer en UTC fait
+    #: basculer d'un an les prises de vue de fin décembre.
+    timezone: str
+
+    #: Langues d'OCR attendues sur place. Sans valeur par défaut : « fr, en »
+    #: était le repli du pilote, et un établissement dont personne n'a déclaré
+    #: la langue ne doit pas être lu comme s'il était québécois.
+    ocr_languages: list[str] = Field(min_length=1)
+
     renovation_events: list[RenovationEvent] = Field(default_factory=list)
 
     #: Indices de taille, facultatifs. Le nombre de chambres suffit à borner

@@ -294,12 +294,20 @@ def publish(protocol: ReviewProtocol, path) -> str:  # noqa: ANN001
 # --- instantané des prédictions ------------------------------------------------
 
 
-def predictions(assets: list[Asset], policy, visibility: dict | None = None) -> dict:  # noqa: ANN001
+def predictions(
+    assets: list[Asset], policy, visibility: dict | None = None,
+    source_views: int | None = None,
+) -> dict:  # noqa: ANN001
     """Ce que le système prédit **avant** tout étiquetage.
 
     Publié séparément et daté : comparer ensuite les décisions humaines à des
     prédictions recalculées après coup comparerait les étiquettes à un système
     qu'elles ont déjà modifié.
+
+    `source_views` est le nombre de vues de la source dont la cohorte est
+    extraite. Il était écrit en dur — « les 189 vues Mapillary » — et un
+    rapport d'un autre site aurait donc affirmé porter sur un corpus qu'il
+    n'avait jamais vu.
     """
     from .roles import role_for
 
@@ -339,13 +347,20 @@ def predictions(assets: list[Asset], policy, visibility: dict | None = None) -> 
         "scope": {
             "measures": [
                 "précision parmi les candidats détectés",
-                "confusions WelcomINNS / Tetra Tech / Toyota",
+                # Les confusions se nomment par leur nature, non par les
+                # établissements du pilote : un rapport d'un autre site
+                # affirmait sinon avoir confondu Tetra Tech.
+                "nature des confusions, par classe générique",
                 "taux d'indécision",
                 "aptitude géométrique parmi les images confirmées",
             ],
             "cannot_measure": [
-                "le rappel sur les 189 vues Mapillary — les faux négatifs sont "
-                "exclus par construction",
+                (
+                    f"le rappel sur les {source_views} vues de la source"
+                    if source_views
+                    else "le rappel sur les vues de la source"
+                )
+                + " — les faux négatifs sont exclus par construction",
                 "un seuil OpenCLIP, qui exigerait un échantillon stratifié "
                 "distinct, séparé réglage/validation au niveau des séquences",
             ],

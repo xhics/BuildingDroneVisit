@@ -14,6 +14,7 @@ import typer
 
 from . import __version__, logging as pipeline_logging
 from .config import check_providers, load_env
+from .capabilities import Capability
 from .context import PipelineContext
 from .providers.cache import OfflineError
 from .providers.geocode import GeocodingError
@@ -76,6 +77,21 @@ def init(
     radius_m: int = typer.Option(300, "--radius", help="Rayon de collecte, en mètres."),
     place_query: str | None = typer.Option(None, "--place", help="Requête Places."),
     website_url: str | None = typer.Option(None, "--website", help="Site officiel."),
+    official_name: str | None = typer.Option(
+        None, "--name", help="Nom officiel de l'établissement, pour le profil."
+    ),
+    country: str | None = typer.Option(
+        None, "--country", help="Pays ISO 3166-1 alpha-2, ex. CA, FR."
+    ),
+    subdivision: str | None = typer.Option(
+        None, "--subdivision", help="Subdivision ISO 3166-2 sans le pays, ex. QC."
+    ),
+    tz: str | None = typer.Option(
+        None, "--timezone", help="Fuseau IANA, ex. America/Toronto, Europe/Paris."
+    ),
+    ocr_language: list[str] = typer.Option(
+        [], "--ocr-language", help="Langue d'OCR attendue ; répétable."
+    ),
     assume_rights: bool = typer.Option(
         False,
         "--assume-rights",
@@ -116,6 +132,11 @@ def init(
     )
     typer.echo(f"{OK} espace de travail créé : {workspace.root}")
     typer.echo(f"  {len(SUBDIRS)} répertoires, manifeste initialisé")
+
+    _scaffold_profile(
+        hotel_id, address, official_name, country, subdivision, tz,
+        list(ocr_language), lat, lon, place_query, website_url,
+    )
     if lat is not None:
         typer.echo(f"  position fournie : {lat:.6f}, {lon:.6f} — géocodage court-circuité")
 
@@ -262,14 +283,90 @@ def confirm_building(
     typer.echo(f"{OK} BUILDING_MAIN = {feature_id} (confirmé par {by})")
 
 
-def _context(hotel_id: str) -> PipelineContext:
+def _scaffold_profile(
+    hotel_id: str, address: str, official_name: str | None, country: str | None,
+    subdivision: str | None, tz: str | None, ocr_languages: list[str],
+    lat: float | None, lon: float | None, place_query: str | None,
+    website_url: str | None,
+) -> None:
+    """Écrit le profil de l'établissement, si de quoi le faire a été fourni.
+
+    Rien n'est déduit : ni le pays depuis l'adresse — une chaîne contenant
+    « Québec » n'établit pas un territoire — ni le fuseau depuis le pays, ni
+    les langues depuis le fuseau. Chaque déduction de ce genre est un repli
+    silencieux de plus, et c'est précisément ce que ce lot supprime.
+
+    Un profil incomplet n'est donc pas écrit à moitié : il n'est pas écrit, et
+    la commande dit ce qui manque. Les capacités qui l'exigent s'arrêteront
+    d'elles-mêmes, avec le même message.
+    """
+    import os
+
+    from .schemas import PropertyProfile
+
+    required = {
+        "--name": official_name, "--country": country, "--timezone": tz,
+        "--ocr-language": ocr_languages or None,
+    }
+    missing = [flag for flag, value in required.items() if not value]
+
+    directory = Path(os.environ.get("HOTEL_PIPELINE_PROFILES", "profiles"))
+    path = directory / f"{hotel_id}.json"
+
+    if missing:
+        typer.secho(
+            f"  · profil non créé — manquent {', '.join(missing)}. "
+            f"Les commandes d'identité et de collecte s'arrêteront tant que "
+            f"{path} n'existe pas.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    if path.is_file():
+        typer.secho(f"  · profil déjà présent : {path}", fg=typer.colors.YELLOW)
+        return
+
+    profile = PropertyProfile(
+        property_id=hotel_id, address=address, official_name=official_name,
+        country_code=country, subdivision_code=subdivision, timezone=tz,
+        ocr_languages=ocr_languages, lat=lat, lon=lon,
+        place_query=place_query, website_url=website_url,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path.write_text(profile.model_dump_json(indent=2) + "\n", "utf-8")
+    typer.echo(f"  profil créé : {path}")
+
+
+def _context(
+    hotel_id: str, capability: Capability | None = None
+) -> PipelineContext:
     """Politique et profil de l'établissement, chargés une seule fois.
 
     La politique vient de l'espace de travail : la chercher dans le répertoire
     courant faisait dépendre le résultat du lieu d'exécution.
+
+    `capability` déclare ce dont la commande a besoin. Sans elle, le contexte
+    était chargé en mode permissif et un profil manquant ne coûtait qu'un
+    avertissement jaune — ce qui désarmait le verrou d'identité en silence.
     """
+    from .capabilities import CapabilityUnavailable, require
+
     context, warning = PipelineContext.for_workspace(Workspace(hotel_id))
-    if warning:
+
+    if capability is None:
+        # Transition : une commande non déclarée est traitée au plus strict
+        # côté profil, et le dira. Elle ne bénéficie d'aucun passe-droit.
+        capability = Capability.INSPECTION
+
+    try:
+        check = require(context, capability)
+    except CapabilityUnavailable as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    for limitation in check.partial:
+        typer.secho(f"  · lecture partielle : {limitation}", fg=typer.colors.YELLOW)
+    if warning and not check.partial:
         typer.secho(f"  · {warning}", fg=typer.colors.YELLOW)
     return context
 
@@ -340,7 +437,7 @@ def assets_gather(
     lat, lon = building.centroid_lat, building.centroid_lon
     typer.echo(f"collecte autour de {lat:.6f}, {lon:.6f} (rayon {radius_m} m)")
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
     images, reports = collect_sources(
         lat, lon, place_query, radius_m, policy=context.policy, building_wkt=building.wkt
     )
@@ -525,7 +622,7 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.INSPECTION)
     building = spatial.candidate(spatial.confirmed_building_id)
     report = dedup_levels.run(
         manifest.assets, building.centroid_lat, building.centroid_lon, policy=context.policy
@@ -567,6 +664,10 @@ def assets_classify(
     from .sectors import resolve_front
     from .steps import ELEMENTS_FILE
 
+    # La capacité se vérifie avant toute lecture : un projet sans profil doit
+    # apprendre qu'il lui manque une identité, pas qu'il lui manque un fichier.
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
+
     workspace = Workspace(hotel_id)
     manifest = workspace.read_assets()
     spatial = workspace.read_spatial()
@@ -574,7 +675,6 @@ def assets_classify(
         typer.secho("manifeste d'assets et manifeste spatial requis", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
     elements = workspace.read_json(ELEMENTS_FILE) or []
     front = resolve_front(spatial, elements)
     if front is None:
@@ -649,7 +749,7 @@ def review_queue(
         typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.INSPECTION)
 
     # Les mesures de la dernière exécution appliquée accompagnent la file : le
     # réviseur doit voir ce que la géométrie établit, et ce qu'elle n'établit
@@ -790,7 +890,7 @@ def review_set(
         )
         raise typer.Exit(code=1) from exc
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
     before_roles = review_module.recompute(manifest.assets, context.policy).counts
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
@@ -909,7 +1009,7 @@ def review_geometry(
                         fg=typer.colors.RED, err=True)
             raise typer.Exit(code=1) from exc
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.INSPECTION)
     before_roles = review_module.recompute(manifest.assets, context.policy).counts
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
@@ -1051,7 +1151,7 @@ def review_cohort(
         typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
     members = cohort_module.members(manifest.assets, source)
     digest_value = cohort_module.cohort_digest(members)
 
@@ -1147,7 +1247,7 @@ def review_import(
 
     from .intake import sha256_file
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
     before_roles = review_module.recompute(manifest.assets, context.policy).counts
     before_counts = review_module.counts(manifest.assets, context.policy).as_dict()
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
@@ -1251,7 +1351,7 @@ def geo_discover(
         typer.secho("bâtiment confirmé requis", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     building = spatial.candidate(spatial.confirmed_building_id)
     result = discover(building.wkt, measure_sizes=not no_sizes)
     workspace.write_report("06_geo/lidar_discovery.json", result, context)
@@ -1323,7 +1423,7 @@ def geo_acquire(
         )
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     results = []
     for raw, tile in zip(discovery["tiles"], tiles):
         tile.acquired_on = None
@@ -1375,7 +1475,7 @@ def geo_preflight(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     building = spatial.candidate(spatial.confirmed_building_id)
     source = acquisition["sources"][0]
     laz = Path(acquisition["acquisitions"][0]["path"])
@@ -1438,7 +1538,7 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         typer.secho("tuile acquise et bâtiment confirmé requis", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     building = spatial.candidate(spatial.confirmed_building_id)
     source = acquisition["sources"][0]
     laz = Path(acquisition["acquisitions"][0]["path"])
@@ -1606,7 +1706,7 @@ def geo_resolve(
         typer.secho("bâtiment confirmé requis", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     building = spatial.candidate(spatial.confirmed_building_id)
     elements = workspace.read_json(ELEMENTS_FILE) or []
     elements_digest = hashlib.sha256(
@@ -1720,7 +1820,7 @@ def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
     # antérieure reviendrait à juger des rasters que la supersession a écartés.
     latest = reports[-1]
     derivation = workspace.read_json(f"06_geo/{latest.name}")
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.QUALIFICATION)
 
     # Qualifier sur des seuils que la politique du projet ne porte pas
     # reviendrait à calibrer en silence depuis le code — à n'importe quelle
@@ -1836,7 +1936,7 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     from .schemas.geometry import CaptureGeometryManifest
 
     workspace = Workspace(hotel_id)
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
 
     # Les réglages du moteur doivent figurer dans la politique du projet :
     # calculés depuis les valeurs du code, ils ne se rejoueraient pas.
@@ -2142,7 +2242,7 @@ def visibility_apply(
     from .schemas.visibility import VisibilityRun
 
     workspace = Workspace(hotel_id)
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
 
     # Le `run_id` est exigé : « le dernier rapport » appliquerait ce qui vient
     # d'être mesuré sans que personne ne l'ait lu.
@@ -2353,7 +2453,7 @@ def site_build(hotel_id: str = typer.Argument(...)) -> None:
         typer.secho("aucun manifeste spatial", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
     elements = workspace.read_json(ELEMENTS_FILE) or []
     roads = workspace.read_json("01_sources/road_network.json") or []
     manifest = workspace.read_assets()
@@ -2407,7 +2507,7 @@ def temporal_assess(hotel_id: str = typer.Argument(...)) -> None:
         typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    context = _context(hotel_id)
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
     report = assess(manifest.assets, context.profile, context.policy)
     workspace.write_assets(manifest)
     workspace.write_report("01_sources/temporal_report.json", report, context)

@@ -10,6 +10,9 @@
   "competitor_names": [
     "Hôtel Mortagne"
   ],
+  "country_code": "CA",
+  "subdivision_code": "QC",
+  "timezone": "America/Toronto",
   "ocr_languages": [
     "fr",
     "en"
@@ -19,6 +22,8 @@
       "event_id": "piia-2024-70127",
       "scope": "entrance",
       "approved_on": "2024-09-16",
+      "started_on": null,
+      "completed_on": null,
       "completion_confirmed": false,
       "evidence": [
         "https://www.boucherville.ca/wp-content/uploads/2024/09/PV_seance_240916.pdf"
@@ -27,9 +32,11 @@
     }
   ],
   "room_count": 116,
+  "expected_levels": 3,
+  "footprint_min_m2": null,
+  "footprint_max_m2": null,
   "lat": 45.574128,
   "lon": -73.443289,
   "website_url": "https://hotelwelcominns.com/fr/",
-  "place_query": "Hôtel WelcomINNS, 1195 rue Ampère, Boucherville, QC",
-  "expected_levels": 3
+  "place_query": "Hôtel WelcomINNS, 1195 rue Ampère, Boucherville, QC"
 }
