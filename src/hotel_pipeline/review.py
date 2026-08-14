@@ -244,6 +244,19 @@ class QueueItem:
         }
 
 
+#: Champs retirés d'une file aveugle : tout ce qui exprime une conclusion du
+#: système. La planche HTML les masque déjà ; le JSON les portait encore, et un
+#: réviseur qui l'ouvre y lirait la réponse avant de produire l'étiquette.
+BLIND_REDACTED: frozenset[str] = frozenset(
+    {
+        "role", "role_reason", "review_status", "decision", "target_evidence",
+        "occluded_by", "sees_building", "contains_building", "subject_scores",
+        "sector", "heading_is_measured", "previous_reviews", "visibility",
+        "geometry_suitability", "local_path",
+    }
+)
+
+
 @dataclass
 class ReviewQueue:
     name: str
@@ -269,14 +282,23 @@ class ReviewQueue:
         stamp = (self.built_at or "").replace(":", "").replace("-", "").replace(".", "")
         return f"{self.name}_{stamp}_{self.manifest_digest[:12]}"
 
-    def as_dict(self) -> dict:
+    def as_dict(self, blind: bool = False) -> dict:
+        items = [i.as_dict() for i in self.items]
+        if blind:
+            items = [
+                {k: v for k, v in item.items() if k not in BLIND_REDACTED}
+                for item in items
+            ]
         return {
             "queue": self.name,
             "description": self.description,
             "built_at": self.built_at,
             "manifest_digest": self.manifest_digest,
+            "blinding": "blind" if blind else "analysis",
+            # Les comptes globaux restent : ils ne disent rien d'une image en
+            # particulier.
             "counts": self.counts.as_dict(),
-            "items": [i.as_dict() for i in self.items],
+            "items": items,
         }
 
 
@@ -360,6 +382,81 @@ def _fractions(item: QueueItem) -> str:
         f"<small> — dégagé {item.clear_fraction:.0%}, risque "
         f"{item.risk_fraction:.0%}, bloqué {item.blocked_fraction:.0%}</small>"
     )
+
+
+def to_blind_html(queue: ReviewQueue, reference: dict | None = None) -> str:
+    """Planche d'étiquetage : l'image, et rien de ce que le système en pense.
+
+    Tout ce qui figure sur la planche d'analyse — rôle, motif, statut, scores,
+    ligne de vue, secteur, position, décisions voisines — est retiré. Le
+    réviseur ne dispose que de l'image et d'une référence approuvée du
+    bâtiment ; c'est la seule façon d'obtenir une étiquette qui puisse ensuite
+    juger le système.
+    """
+    cards = []
+    for index, item in enumerate(queue.items, 1):
+        image = (
+            f'<img src="{escape(item.local_path)}" alt="vue {index}">'
+            if item.local_path
+            else '<p class="missing">image absente</p>'
+        )
+        cards.append(
+            f"""
+    <article>
+      <div class="shot">{image}</div>
+      <div class="facts">
+        <h2>vue {index} / {len(queue.items)}</h2>
+        <p class="sub"><code>{escape(item.asset_id)}</code></p>
+        <dl>
+          <dt>empreinte</dt><dd><code>{escape(item.checksum[:16])}…</code></dd>
+        </dl>
+        <pre>hotel-pipeline assets review set &lt;hôtel&gt; {escape(item.asset_id)} \
+  --decision confirmed|rejected|unresolved \
+  --by "&lt;vous&gt;" --rationale "…" --evidence "…"</pre>
+      </div>
+    </article>"""
+        )
+
+    reference_block = ""
+    if reference:
+        reference_block = f"""
+ <section class="reference">
+  <h2>Référence approuvée — HÔTEL WELCOMINNS</h2>
+  <img src="{escape(reference['local_path'])}" alt="référence">
+  <p><small><code>{escape(reference['asset_id'])}</code> ·
+     empreinte <code>{escape(reference['checksum'][:16])}…</code> ·
+     {escape(reference['rationale'])}</small></p>
+ </section>"""
+
+    return f"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>Étiquetage aveugle — {escape(queue.name)}</title>
+<style>
+ body {{ font: 15px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 1100px; }}
+ .reference {{ border: 2px solid #2a6; padding: 1rem; margin-bottom: 2rem; }}
+ .reference img {{ max-width: 520px; }}
+ article {{ display: flex; gap: 1.5rem; border-top: 1px solid #ddd; padding: 1.5rem 0; }}
+ .shot img {{ max-width: 520px; border-radius: 4px; }}
+ h2 {{ font-size: 1rem; margin: 0; }}
+ .sub {{ color: #666; margin: .2rem 0 .8rem; font-family: ui-monospace, monospace; }}
+ dl {{ display: grid; grid-template-columns: 7rem 1fr; gap: .2rem .8rem; margin: 0; }}
+ dt {{ color: #666; }} dd {{ margin: 0; }}
+ pre {{ background: #f5f5f5; padding: .6rem; overflow-x: auto; font-size: 12px; }}
+ .missing {{ color: #b00; }}
+</style></head><body>
+<header>
+ <h1>Étiquetage aveugle — {len(queue.items)} vue(s)</h1>
+ <p>Aucune sortie du système n'est montrée : ni rôle, ni motif, ni statut, ni
+ scores, ni ligne de vue, ni secteur, ni position, ni décision voisine. Une
+ étiquette produite en connaissant la réponse du système ne peut pas servir à
+ le juger.</p>
+ <p><small>Ordre mélangé de façon déterministe depuis l'empreinte de cohorte
+ <code>{escape(queue.manifest_digest[:12])}</code> : les vues voisines d'une
+ même séquence ne se suivent pas.</small></p>
+</header>{reference_block}
+{"".join(cards)}
+</body></html>
+"""
 
 
 def to_html(queue: ReviewQueue) -> str:
@@ -529,6 +626,7 @@ def decide(
     rationale: str,
     evidence: list[str],
     workspace_root: Path | None = None,
+    blinding: str = "unblinded",
 ) -> tuple[Asset, Asset]:
     """Inscrit une décision, après avoir vérifié qu'elle porte sur la bonne image.
 
@@ -546,6 +644,7 @@ def decide(
 
     entry = ReviewEntry(
         decision=decision,
+        blinding=blinding,
         decided_by=by.strip(),
         rationale=rationale.strip(),
         evidence=kept,

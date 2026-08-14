@@ -148,6 +148,11 @@ class ReviewEntry(DecisionEntry):
 
     decision: ReviewDecision
 
+    #: La décision a-t-elle été prise **sans voir** la réponse du système ?
+    #: Une étiquette produite en connaissant le verdict automatique ne peut pas
+    #: servir à juger ce verdict : elle en hérite.
+    blinding: str = "unblinded"
+
 
 class GeometryEntry(DecisionEntry):
     """Arbitrage d'aptitude : l'image apporte-t-elle de la structure ?

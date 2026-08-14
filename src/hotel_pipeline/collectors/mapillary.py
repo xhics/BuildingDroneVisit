@@ -112,6 +112,36 @@ def collect(
     return images
 
 
+def image_metadata(image_ids: list[str]) -> dict[str, dict]:
+    """Métadonnées d'images précises — séquence comprise.
+
+    Les assets historiques ne portent ni `sequence_id` ni provenance : leur
+    corrélation ne peut donc pas être affirmée depuis le corpus. Elle se
+    demande à la source, image par image.
+    """
+    import requests
+
+    ensure_online("Mapillary Graph")
+    token = secret("MAPILLARY_TOKEN")
+    fields = "id,captured_at,sequence,compass_angle,computed_compass_angle,geometry"
+    found: dict[str, dict] = {}
+
+    for image_id in image_ids:
+        response = requests.get(
+            f"https://graph.mapillary.com/{image_id}",
+            params={"fields": fields},
+            headers={"Authorization": f"OAuth {token}"},
+            timeout=TIMEOUT,
+        )
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        found[image_id] = response.json()
+
+    log.info("métadonnées Mapillary : %d/%d image(s) retrouvée(s)", len(found), len(image_ids))
+    return found
+
+
 def _year(captured_at: int | None) -> int | None:
     """`captured_at` est un horodatage en millisecondes."""
     if not captured_at:

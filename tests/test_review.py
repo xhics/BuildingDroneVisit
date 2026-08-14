@@ -465,8 +465,35 @@ def test_cli_queue_writes_both_the_json_and_the_board(tmp_path, monkeypatch) -> 
 
     assert result.exit_code == 0, result.output
     assert "trois populations distinctes" in result.output
-    assert len(list(workspace.path("01_sources").glob("review_queue_pending_*.json"))) == 1
-    assert len(list(workspace.path("01_sources").glob("review_board_pending_*.html"))) == 1
+    # Le nom porte le mode : une planche d'analyse et une planche aveugle du
+    # même état ne doivent pas se confondre.
+    assert len(list(workspace.path("01_sources").glob("review_queue_analysis_*.json"))) == 1
+    assert len(list(workspace.path("01_sources").glob("review_board_analysis_*.html"))) == 1
+
+
+def test_cli_blind_mode_writes_a_separate_redacted_board(tmp_path, monkeypatch) -> None:
+    from hotel_pipeline.cli import app
+
+    runner, workspace, _ = cli_workspace(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["assets", "review", "queue", "hotel-test",
+                                 "--queue", "pending", "--mode", "blind"])
+
+    assert result.exit_code == 0, result.output
+    files = list(workspace.path("01_sources").glob("review_queue_blind_*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text("utf-8"))
+    assert payload["blinding"] == "blind"
+    assert set(payload["items"][0]) == {"asset_id", "checksum", "source"}
+
+
+def test_cli_rejects_an_unknown_mode(tmp_path, monkeypatch) -> None:
+    from hotel_pipeline.cli import app
+
+    runner, _, _ = cli_workspace(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["assets", "review", "queue", "hotel-test",
+                                 "--mode", "semi-aveugle"])
+    assert result.exit_code == 1
 
 
 # --- l'historique est append-only par le schéma -----------------------------
@@ -1034,3 +1061,149 @@ def test_cli_import_publishes_a_report_and_the_roles(tmp_path, monkeypatch) -> N
     assert set(payload["roles"]) == {"before", "after"}
     assert set(payload["viewpoints_by_suitability"]) == {"before", "after"}
     assert (workspace.path("01_sources") / "roles_report.json").is_file()
+
+
+# --- vérité terrain : aveuglement, cohorte, séquences -------------------------
+
+
+def test_the_blind_queue_shows_nothing_the_system_concluded(tmp_path) -> None:
+    """Étiqueter en voyant la réponse produirait des étiquettes qui en héritent."""
+    assets = [asset(tmp_path)]
+    queue = review.build_queue(assets, "mapillary-candidates", policy())
+
+    blind = queue.as_dict(blind=True)
+    analysis = queue.as_dict()
+
+    assert blind["blinding"] == "blind"
+    assert set(blind["items"][0]) == {"asset_id", "checksum", "source"}
+    # La planche d'analyse, elle, montre tout : les deux vues coexistent.
+    assert "role" in analysis["items"][0]
+    assert "subject_scores" in analysis["items"][0]
+
+
+def test_the_blind_board_carries_no_verdict(tmp_path) -> None:
+    assets = [asset(tmp_path)]
+    queue = review.build_queue(assets, "mapillary-candidates", policy())
+    html = review.to_blind_html(queue)
+
+    body = html.split("</header>", 1)[1]
+    for leak in ("photo_geometry", "context_lock", "0.55", "front", "clear",
+                 "automatic_accepted"):
+        assert leak not in body, leak
+    assert "mapillary-1" in body
+
+
+def test_the_blind_board_offers_an_approved_reference(tmp_path) -> None:
+    """Reconnaître le bâtiment sans rien apprendre des vues à étiqueter."""
+    queue = review.build_queue([asset(tmp_path)], "mapillary-candidates", policy())
+    html = review.to_blind_html(
+        queue,
+        reference={
+            "asset_id": "mapillary-7688979294475178",
+            "local_path": "reference.jpg",
+            "checksum": "c" * 64,
+            "rationale": "pylône HW HÔTEL WELCOMINNS lisible",
+        },
+    )
+
+    assert "Référence approuvée" in html
+    assert "mapillary-7688979294475178" in html
+
+
+def test_the_blind_order_is_deterministic_and_not_the_manifest_order(tmp_path) -> None:
+    """Les vues voisines d'une séquence ne doivent pas se suivre."""
+    from hotel_pipeline import cohort
+
+    assets = [
+        asset(tmp_path, name=f"v{i}.jpg", id=f"mapillary-{i:03d}") for i in range(12)
+    ]
+    digest = cohort.cohort_digest(assets)
+
+    first = [a.id for a in cohort.blind_order(assets, digest)]
+    second = [a.id for a in cohort.blind_order(list(reversed(assets)), digest)]
+
+    assert first == second
+    assert first != [a.id for a in assets]
+
+
+def test_a_decision_records_whether_it_was_blind(tmp_path) -> None:
+    assets = [asset(tmp_path)]
+    decide(assets, blinding="blind")
+
+    entry = assets[0].review_history[0]
+    assert entry.blinding == "blind"
+    # Le défaut reste `unblinded` : les sept décisions déjà prises l'ont été en
+    # voyant le diagnostic.
+    assert review.ReviewEntry.model_fields["blinding"].default == "unblinded"
+
+
+def test_the_cohort_states_what_it_cannot_measure(tmp_path) -> None:
+    """Sélectionnée par le modèle, elle exclut les faux négatifs."""
+    from hotel_pipeline import cohort
+
+    snapshot = cohort.predictions([asset(tmp_path)], policy())
+
+    assert "rappel" in " ".join(snapshot["scope"]["cannot_measure"])
+    assert "précision parmi les candidats détectés" in snapshot["scope"]["measures"]
+    assert "contains_building" in snapshot["cohort_definition"]
+
+
+def test_the_predictions_are_captured_before_labelling(tmp_path) -> None:
+    from hotel_pipeline import cohort
+
+    subject = asset(tmp_path)
+    snapshot = cohort.predictions([subject], policy())
+    row = snapshot["predictions"][0]
+
+    assert row["already_reviewed"] is False
+    assert row["subject_scores"] == subject.subject_scores
+    assert row["role"] and row["role_reason"]
+    assert snapshot["cohort_digest"] == cohort.cohort_digest([subject])
+
+
+def test_an_unreachable_sequence_is_declared_unknown(tmp_path) -> None:
+    """Une proximité géographique n'est pas une séquence."""
+    from hotel_pipeline import cohort
+
+    def failing(_ids):
+        raise RuntimeError("502 depuis Mapillary")
+
+    register = cohort.build_register([asset(tmp_path)], "h", failing)
+
+    assert register.correlation == "unknown"
+    assert "502" in register.error
+    assert register.entries == []
+
+
+def test_a_partial_sequence_lookup_is_not_declared_known(tmp_path) -> None:
+    from hotel_pipeline import cohort
+
+    assets = [asset(tmp_path, name="a.jpg", id="mapillary-111"),
+              asset(tmp_path, name="b.jpg", id="mapillary-222")]
+
+    register = cohort.build_register(
+        assets, "h", lambda ids: {"111": {"sequence": "SEQ-A", "captured_at": 1}}
+    )
+
+    assert register.correlation == "partial"
+    assert register.by_sequence()["SEQ-A"] == ["mapillary-111"]
+    assert register.by_sequence()["sans-séquence"] == ["mapillary-222"]
+
+
+def test_a_complete_lookup_is_known(tmp_path) -> None:
+    from hotel_pipeline import cohort
+
+    assets = [asset(tmp_path, name="a.jpg", id="mapillary-111"),
+              asset(tmp_path, name="b.jpg", id="mapillary-222")]
+
+    register = cohort.build_register(
+        assets, "h",
+        lambda ids: {
+            "111": {"sequence": "SEQ-A", "captured_at": 1},
+            "222": {"sequence": "SEQ-A", "captured_at": 2},
+        },
+    )
+
+    assert register.correlation == "known"
+    assert register.by_sequence() == {"SEQ-A": ["mapillary-111", "mapillary-222"]}
+    assert register.response_digest

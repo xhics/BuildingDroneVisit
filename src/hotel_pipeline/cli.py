@@ -579,8 +579,21 @@ assets_app.add_typer(review_app, name="review")
 def review_queue(
     hotel_id: str = typer.Argument(...),
     queue: str = typer.Option("blocking", "--queue", help="blocking, pending ou mapillary-candidates."),
+    mode: str = typer.Option(
+        "analysis", "--mode",
+        help="analysis (diagnostic complet) ou blind (étiquetage de vérité terrain).",
+    ),
+    pending_only: bool = typer.Option(
+        False, "--pending-only", help="N'inclure que les vues non encore examinées."
+    ),
 ) -> None:
-    """Produit une file versionnée et une planche HTML à examiner."""
+    """Produit une file versionnée et une planche HTML à examiner.
+
+    Deux modes, pour deux usages incompatibles : la planche d'analyse montre ce
+    que le système conclut, la planche aveugle ne montre que l'image. Étiqueter
+    depuis la première produirait des étiquettes qui héritent du verdict
+    qu'elles doivent juger.
+    """
     from datetime import datetime, timezone
 
     from . import review as review_module
@@ -603,6 +616,10 @@ def review_queue(
         for assessment in raw.get("assessments", []):
             measures[assessment["subject_ref"]] = assessment
 
+    if mode not in ("analysis", "blind"):
+        typer.secho(f"{KO} mode inconnu : {mode!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     try:
         built = review_module.build_queue(
             manifest.assets, queue, context.policy, visibility=measures
@@ -611,13 +628,47 @@ def review_queue(
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    if pending_only:
+        built.items = [i for i in built.items if not i.reviews]
+
+    if mode == "blind":
+        from . import cohort as cohort_module
+
+        by_id = {a.id: a for a in manifest.assets}
+        selected = [by_id[i.asset_id] for i in built.items if i.asset_id in by_id]
+        order = [
+            a.id for a in cohort_module.blind_order(selected, built.manifest_digest)
+        ]
+        built.items.sort(key=lambda item: order.index(item.asset_id))
+
     # Le nom porte la date **et** l'empreinte du manifeste : une file décrit
     # un état, et deux exécutions dans la même seconde ne doivent pas s'écraser.
     json_path = workspace.write_report(
-        f"01_sources/review_queue_{built.slug}.json", built, context
+        f"01_sources/review_queue_{mode}_{built.slug}.json",
+        built.as_dict(blind=mode == "blind"),
+        context,
     )
-    board = workspace.path("01_sources", f"review_board_{built.slug}.html")
-    board.write_text(review_module.to_html(built), encoding="utf-8")
+    board = workspace.path("01_sources", f"review_board_{mode}_{built.slug}.html")
+
+    if mode == "blind":
+        # La référence est une vue déjà confirmée et arbitrée : elle donne au
+        # réviseur de quoi reconnaître le bâtiment sans rien lui dire des vues
+        # à étiqueter.
+        reference = None
+        for asset in manifest.assets:
+            if asset.review_history and asset.target_visibility_decision.value == "confirmed":
+                reference = {
+                    "asset_id": asset.id,
+                    "local_path": asset.local_path,
+                    "checksum": asset.checksum,
+                    "rationale": asset.review_rationale or "",
+                }
+                break
+        board.write_text(
+            review_module.to_blind_html(built, reference), encoding="utf-8"
+        )
+    else:
+        board.write_text(review_module.to_html(built), encoding="utf-8")
 
     numbers = built.counts
     typer.echo("")
@@ -644,6 +695,10 @@ def review_set(
     evidence: list[str] = typer.Option(
         ..., "--evidence",
         help="Preuve(s) à l'appui, au moins une. Répétable.",
+    ),
+    blinding: str = typer.Option(
+        "unblinded", "--blinding",
+        help="blind si la décision a été prise sans voir la sortie du système.",
     ),
 ) -> None:
     """Inscrit **une** décision humaine. Aucune acceptation en masse."""
@@ -674,7 +729,7 @@ def review_set(
     try:
         before, after = review_module.decide(
             manifest.assets, asset_id, verdict, by, rationale, list(evidence),
-            workspace_root=workspace.root,
+            workspace_root=workspace.root, blinding=blinding,
         )
     except review_module.ReviewRefused as exc:
         # Rien n'a été écrit : le manifeste sur disque est intact.
@@ -833,6 +888,61 @@ def review_geometry(
     typer.echo("  points de vue indépendants, par aptitude :")
     for name, total in review_module.viewpoints_by_suitability(manifest.assets).items():
         typer.echo(f"    {name:<14} {total:>4}")
+
+
+@review_app.command("cohort")
+def review_cohort(
+    hotel_id: str = typer.Argument(...),
+    source: str = typer.Option("mapillary", "--source"),
+) -> None:
+    """Fige la cohorte : séquences réelles et prédictions avant étiquetage."""
+    from datetime import datetime, timezone
+
+    from . import cohort as cohort_module
+    from .collectors.mapillary import image_metadata
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    context = _context(hotel_id)
+    members = cohort_module.members(manifest.assets, source)
+    digest_value = cohort_module.cohort_digest(members)
+
+    # Les séquences se demandent à la source : les assets historiques n'en
+    # portent aucune, et une proximité géographique n'est pas une séquence.
+    register = cohort_module.build_register(members, hotel_id, image_metadata)
+    workspace.write_json(
+        f"01_sources/sequence_register_{digest_value}.json", register.as_dict()
+    )
+
+    measures: dict[str, dict] = {}
+    for identifier in sorted({a.visibility_run_id for a in manifest.assets if a.visibility_run_id}):
+        raw = workspace.read_json(f"06_geo/visibility_run_{identifier}.json") or {}
+        for assessment in raw.get("assessments", []):
+            measures[assessment["subject_ref"]] = assessment
+
+    snapshot = cohort_module.predictions(members, context.policy, measures)
+    snapshot["sequence_correlation"] = register.correlation
+    workspace.write_report(
+        f"01_sources/cohort_predictions_{digest_value}.json", snapshot, context
+    )
+
+    typer.echo("")
+    typer.echo(f"  cohorte {source} : {len(members)} membre(s) · empreinte {digest_value}")
+    typer.echo(f"  corrélation de séquence : {register.correlation}")
+    for sequence, ids in register.by_sequence().items():
+        typer.echo(f"    {sequence:<26} {len(ids):>3} image(s)")
+    reviewed = [a for a in members if a.review_history]
+    typer.echo("")
+    typer.echo(f"  déjà examinées : {len(reviewed)} · restantes : {len(members) - len(reviewed)}")
+    typer.secho(
+        "  portée : précision parmi les candidats détectés ; le rappel n'est pas "
+        "mesurable — les faux négatifs sont exclus par construction",
+        fg=typer.colors.YELLOW,
+    )
 
 
 @review_app.command("export")
