@@ -184,7 +184,11 @@ class VisibilityAssessment(BaseModel):
     #: Les degrés n'ont pas de sens ici : tout se mesure en mètres.
     camera_x: float | None = None
     camera_y: float | None = None
-    crs: str = "EPSG:2950"
+
+    #: Référentiel des coordonnées ci-dessus. **Obligatoire** : un `x` et un
+    #: `y` sans référentiel sont deux nombres, et rien n'empêcherait de les
+    #: confronter à une cible stockée dans un autre fuseau.
+    crs: str = Field(min_length=1)
 
     #: Intervalle angulaire réel occupé par la silhouette, et son passage
     #: éventuel par 0°.
@@ -466,6 +470,12 @@ class VisibilityRun(BaseModel):
     target_digest: str = Field(min_length=1)
     obstacles_digest: str = Field(min_length=1)
     road_geometry_digest: str = Field(min_length=1)
+
+    #: Contexte spatial du run, et son référentiel. Obligatoires : un run non
+    #: lié à un contexte resterait constructible, et `visibility apply` ne
+    #: pourrait pas refuser de projeter des mesures d'un fuseau sur un autre.
+    spatial_context_digest: str = Field(min_length=1)
+    crs: str = Field(min_length=1)
 
     elevation_sources: list[ElevationSource] = Field(default_factory=list)
 

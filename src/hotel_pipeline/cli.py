@@ -354,9 +354,13 @@ def _context(
     context, warning = PipelineContext.for_workspace(Workspace(hotel_id))
 
     if capability is None:
-        # Transition : une commande non déclarée est traitée au plus strict
-        # côté profil, et le dira. Elle ne bénéficie d'aucun passe-droit.
-        capability = Capability.INSPECTION
+        # Toutes les commandes déclarent la leur. En traiter une comme
+        # « inspection » par défaut rouvrirait exactement la porte que la
+        # matrice ferme : un oubli deviendrait une permission tacite.
+        raise RuntimeError(
+            "commande sans capacité déclarée : ajoutez-la à l'appel de "
+            "`_context`. La matrice de `capabilities` est la seule autorité."
+        )
 
     try:
         check = require(context, capability)
@@ -1423,7 +1427,8 @@ def geo_discover(
     no_sizes: bool = typer.Option(False, "--no-sizes", help="Ne pas mesurer les volumes."),
 ) -> None:
     """Découvre les tuiles LiDAR couvrant l'empreinte. **Ne télécharge aucun LAZ.**"""
-    from .geo import CoverageState, discover
+    from .geo import CoverageState, route
+    from .geo.adapters import elevation_adapter
 
     workspace = Workspace(hotel_id)
     spatial = workspace.read_spatial()
@@ -1433,7 +1438,32 @@ def geo_discover(
 
     context = _context(hotel_id, Capability.GEOSPATIAL)
     building = spatial.candidate(spatial.confirmed_building_id)
-    result = discover(building.wkt, measure_sizes=not no_sizes)
+
+    # Le routage décide **quoi** interroger ; l'adaptateur décide si on sait le
+    # faire. Sans adaptateur, aucune requête n'est émise : interroger un service
+    # québécois pour un site lyonnais faisait passer son silence pour une
+    # absence de couverture.
+    routing = route(building.centroid_lat, building.centroid_lon)
+    adapter, reasons = elevation_adapter(routing)
+    if adapter is None:
+        typer.secho(f"{KO} découverte non prise en charge ici", fg=typer.colors.YELLOW)
+        for reason in reasons:
+            typer.echo(f"    · {reason}")
+        typer.echo("    aucune requête émise — état « unsupported », non « non couvert »")
+        workspace.write_json(
+            "06_geo/lidar_discovery.json",
+            {
+                "coverage": "unsupported",
+                "territories": sorted(routing.territories),
+                "reasons": reasons,
+                "queries_issued": 0,
+                "provenance": context.provenance,
+            },
+        )
+        raise typer.Exit(code=3)
+
+    typer.echo(f"  source      {adapter.source_id}")
+    result = adapter(building.wkt, measure_sizes=not no_sizes)
     workspace.write_report("06_geo/lidar_discovery.json", result, context)
 
     if result.state is CoverageState.DISCOVERY_ERROR:
@@ -1774,6 +1804,7 @@ def geo_resolve(
     import hashlib
 
     from .geo import capture_geometry as cg
+    from .geo.projection import ProjectionService
     from .geo.resolve_geometry import resolve
     from .providers import overpass
     from .providers.cache import OfflineError
@@ -1837,6 +1868,7 @@ def geo_resolve(
         parking_ref=parking_ref,
         policy_digest=context.provenance["policy_digest"],
         adjacency_max_m=context.policy.geometry.adjacency_max_m,
+        projection_service=ProjectionService(context.spatial_reference),
     )
 
     workspace.write_json(
@@ -2253,6 +2285,13 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     front = spatial.front_azimuth_deg if spatial else None
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    if context.spatial_reference is None:
+        typer.secho(
+            f"{KO} aucun contexte spatial résolu — lancez d'abord : geo reference",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
     try:
         run, report = run_assessment(
             run_id, hotel_id, assets_manifest.assets, manifest, context.policy, digests,
@@ -2260,6 +2299,7 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
             camera_ground=lambda origin: camera_ground(*origin) if camera_ground else None,
             obstacle_heights=obstacle_heights,
             elevation_sources=elevation_sources,
+            spatial_reference=context.spatial_reference,
         )
     except ValueError as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -2437,7 +2477,9 @@ def visibility_apply(
     # La vérification précède la détection d'idempotence : sinon une politique
     # ou une géométrie modifiée depuis laisserait déclarer « déjà appliqué » un
     # run devenu invalide.
-    problems = projection.verify(run, manifest, hotel_id, current)
+    problems = projection.verify(
+        run, manifest, hotel_id, current, context.spatial_reference
+    )
     if problems:
         typer.secho(f"{KO} exécution non applicable :", fg=typer.colors.RED, err=True)
         for problem in problems:

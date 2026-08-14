@@ -329,6 +329,8 @@ def assess(
     camera: CameraVertical | None = None,
     target_vertical: TargetVertical | None = None,
     vertical: object = None,
+    *,
+    crs: str,
 ) -> VisibilityAssessment:
     """Évalue une ligne de vue, cellule par cellule. **Sans cadrage.**
 
@@ -352,6 +354,7 @@ def assess(
         target_ref=target_ref,
         camera_x=round(origin[0], precision),
         camera_y=round(origin[1], precision),
+        crs=crs,
         span_start_deg=round(start, precision),
         span_end_deg=round(end, precision),
         angular_span_deg=round(span, precision),

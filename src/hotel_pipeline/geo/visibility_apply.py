@@ -142,6 +142,7 @@ def verify(
     manifest,  # noqa: ANN001 — AssetManifest
     hotel_id: str,
     current_digests: dict[str, str],
+    spatial_reference=None,  # noqa: ANN001 — SpatialReferenceContext courant
 ) -> list[str]:
     """Tous les contrôles préalables, sans en écrire un seul résultat."""
     from .visibility_run import base_manifest_digest
@@ -152,6 +153,28 @@ def verify(
         problems.append(
             f"exécution de {run.hotel_id!r} appliquée à {hotel_id!r}"
         )
+
+    # Le référentiel du run doit être celui d'aujourd'hui. Sans ce contrôle,
+    # des mesures faites dans un fuseau se projetaient sur des assets d'un
+    # autre : les nombres restaient plausibles, et rien ne les démentait.
+    if spatial_reference is None:
+        problems.append(
+            "aucun contexte spatial courant : le référentiel de l'exécution ne "
+            "peut pas être confronté (« geo reference »)"
+        )
+    else:
+        current_context = spatial_reference.context_digest()
+        if run.spatial_context_digest != current_context:
+            problems.append(
+                f"contexte spatial : exécution {run.spatial_context_digest[:12]}… "
+                f"≠ courant {current_context[:12]}… — territoire ou référentiel "
+                "ont changé depuis la mesure"
+            )
+        if run.crs != spatial_reference.working_crs:
+            problems.append(
+                f"référentiel : exécution en {run.crs!r} ≠ courant "
+                f"{spatial_reference.working_crs!r}"
+            )
 
     expected = {
         "policy_digest": current_digests.get("policy"),

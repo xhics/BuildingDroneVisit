@@ -47,7 +47,10 @@ def resolve(
     parking_ref: str | None = None,
     policy_digest: str | None = None,
     adjacency_max_m: float = cg.DEFAULT_ADJACENCY_M,
+    projection_service=None,
 ) -> tuple[CaptureGeometryManifest, cg.ResolutionReport]:
+    # `projection_service` reste nommé pour la lisibilité des appels, mais il
+    # est requis : sans lui, ce module projetait en EPSG:2950 littéral.
     """Construit le manifeste géométrique à partir de réponses déjà obtenues.
 
     La fonction ne fait aucun appel réseau : elle reçoit ce que les sources ont
@@ -56,8 +59,23 @@ def resolve(
     """
     from shapely import wkt as shapely_wkt
 
+    if projection_service is None:
+        raise ValueError(
+            "aucun service de projection : le référentiel de travail se résout "
+            "depuis la position du site (« geo reference »), il ne se suppose pas"
+        )
+
+    from .geometry_loader import CURRENT_SCHEMA_VERSION
+
     manifest = CaptureGeometryManifest(
+        schema_version=CURRENT_SCHEMA_VERSION,
         hotel_id=hotel_id,
+        source_crs=projection_service.reference.source_crs,
+        working_crs=projection_service.working_crs,
+        # L'empreinte vient du contexte lui-même, définie une seule fois :
+        # la recalculer ici ferait diverger le manifeste, le run et
+        # l'application au premier changement de format.
+        spatial_context_digest=projection_service.reference.context_digest(),
         policy_digest=policy_digest,
         overpass_elements_digest=elements_digest,
     )
@@ -102,9 +120,10 @@ def resolve(
             cache_snapshot.snapshot_id, target,
             "empreinte confirmée du manifeste spatial",
             ["bâtiment confirmé par l'opérateur au manifeste spatial"],
+            projection_service=projection_service,
         )
     )
-    target_projected = cg.project(target)
+    target_projected = cg.project(target, projection_service)
 
     # --- stationnement -------------------------------------------------------
     parking = _element_by_ref(elements, parking_ref) if parking_ref else None
@@ -117,6 +136,7 @@ def resolve(
                     cache_snapshot.snapshot_id, shape,
                     "élément Overpass amenity=parking cité par le manifeste de site",
                     [f"tags OSM : {json.dumps(parking.get('tags', {}), ensure_ascii=False)}"],
+                    projection_service=projection_service,
                 )
             )
         else:
@@ -143,6 +163,7 @@ def resolve(
         access_geometry = _resolve_access_road(
             access_road_ref, access_element, access_error,
             access_snapshot.snapshot_id if access_snapshot else None,
+            projection_service,
         )
         geometries.append(access_geometry)
 
@@ -154,7 +175,7 @@ def resolve(
             if access_element:
                 tags = {k: str(v) for k, v in (access_element[0].get("tags") or {}).items()}
             status, access_why = cg.access_status_of(tags)
-            target_projected_for_access = cg.project(target)
+            target_projected_for_access = cg.project(target, projection_service)
             projected_access = shapely_wkt.loads(access_geometry.projected_wkt)
             corridors.append(
                 RoadCorridor(
@@ -194,14 +215,17 @@ def resolve(
         )
         new_geometries, new_corridors = _resolve_roads(
             roads or [], target_projected, parking_shape, access_road_ref,
-            roads_snapshot.snapshot_id, adjacency_max_m,
+            roads_snapshot.snapshot_id, projection_service, adjacency_max_m,
         )
         geometries.extend(new_geometries)
         corridors.extend(new_corridors)
 
     # --- obstacles -----------------------------------------------------------
     geometries.extend(
-        _resolve_obstacles(elements, target, target_ref, cache_snapshot.snapshot_id, report)
+        _resolve_obstacles(
+            elements, target, target_ref, cache_snapshot.snapshot_id, report,
+            projection_service,
+        )
     )
 
     manifest.geometries = geometries
@@ -221,7 +245,7 @@ def resolve(
             )
     report.corridors = manifest.corridors_by_class()
     report.corridor_details = [json.loads(c.model_dump_json()) for c in corridors]
-    report.crs_problems = cg.verify(manifest)
+    report.crs_problems = cg.verify(manifest, projection_service)
     report.road_geometry_digest = cg.digest_of(
         [g for g in geometries if g.role in (GeometryRole.ACCESS_ROAD, GeometryRole.ROAD_CANDIDATE)]
     )
@@ -261,7 +285,8 @@ def _element_by_ref(elements: list[dict], ref: str | None) -> dict | None:
 
 
 def _resolve_access_road(
-    ref: str, element: list[dict] | None, error: str | None, snapshot_id: str | None
+    ref: str, element: list[dict] | None, error: str | None,
+    snapshot_id: str | None, projection_service,
 ) -> ResolvedGeometry:
     """Résout la voie d'accès nommée par le manifeste de site.
 
@@ -316,13 +341,15 @@ def _resolve_access_road(
         "ACCESS_ROAD_MAIN", GeometryRole.ACCESS_ROAD, ref, snapshot_id, shape,
         "résolution explicite de la voie citée par le manifeste de site",
         [f"tags OSM : {json.dumps(tags, ensure_ascii=False)}"],
+        projection_service=projection_service,
         caveats=caveats,
     )
 
 
 def _resolve_roads(
     roads: list[dict], target_projected, parking_projected, access_ref: str | None,
-    snapshot_id: str, adjacency_max_m: float = cg.DEFAULT_ADJACENCY_M,
+    snapshot_id: str, projection_service,
+    adjacency_max_m: float = cg.DEFAULT_ADJACENCY_M,
 ) -> tuple[list[ResolvedGeometry], list[RoadCorridor]]:
     geometries: list[ResolvedGeometry] = []
     corridors: list[RoadCorridor] = []
@@ -336,7 +363,7 @@ def _resolve_roads(
         if shape is None or shape.geom_type not in ("LineString", "MultiLineString"):
             continue
 
-        projected = cg.project(shape)
+        projected = cg.project(shape, projection_service)
         distance = projected.distance(target_projected)
         parking_distance = (
             projected.distance(parking_projected) if parking_projected is not None else None
@@ -353,6 +380,7 @@ def _resolve_roads(
                 feature_id, GeometryRole.ROAD_CANDIDATE, ref, snapshot_id, shape,
                 "voie du réseau routier interrogé dans le périmètre",
                 [f"tags OSM : {json.dumps(tags, ensure_ascii=False)}"],
+                projection_service=projection_service,
             )
         )
         corridors.append(
@@ -378,7 +406,7 @@ def _resolve_roads(
 
 def _resolve_obstacles(
     elements: list[dict], target, target_ref: str | None, snapshot_id: str,
-    report: cg.ResolutionReport,
+    report: cg.ResolutionReport, projection_service,
 ) -> list[ResolvedGeometry]:
     """Bâtiments voisins susceptibles de masquer la cible.
 
@@ -436,6 +464,7 @@ def _resolve_obstacles(
                 snapshot_id, shape,
                 "bâtiment voisin du cache d'éléments",
                 [f"tags OSM : {json.dumps(tags, ensure_ascii=False)}"],
+                projection_service=projection_service,
                 height_known=height is not None,
                 height_m=height,
                 height_source=source,

@@ -250,15 +250,14 @@ class ResolvedGeometry(BaseModel):
                 raise ValueError(
                     f"géométrie {self.feature_id!r} résolue sans preuve"
                 )
-            if self.projected_crs != PROJECTED_CRS:
-                raise ValueError(
-                    f"géométrie {self.feature_id!r} : référentiel projeté "
-                    f"{self.projected_crs!r} ; les calculs se font en {PROJECTED_CRS}"
-                )
             if self.horizontal_crs != GEOGRAPHIC_CRS:
                 raise ValueError(
                     f"géométrie {self.feature_id!r} : référentiel géographique "
                     f"{self.horizontal_crs!r} attendu {GEOGRAPHIC_CRS}"
+                )
+            if not self.projected_crs:
+                raise ValueError(
+                    f"géométrie {self.feature_id!r} : référentiel projeté absent"
                 )
             allowed = GEOMETRY_TYPES[self.role]
             if self.geometry_type not in allowed:
@@ -330,12 +329,24 @@ class CaptureGeometryManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: Version du schéma. **Sans défaut** : un manifeste qui ne la porte pas
+    #: n'est pas un manifeste de cette version, c'est un fichier antérieur, et
+    #: le laisser recevoir « 1.0.0 » en silence lui prêterait des garanties
+    #: qu'il n'a jamais eues. Le chargeur `load_capture_geometry` fait le tri.
+    schema_version: str = Field(min_length=1)
     hotel_id: str
     built_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     snapshots: list[GeometrySourceSnapshot] = Field(default_factory=list)
     geometries: list[ResolvedGeometry] = Field(default_factory=list)
     corridors: list[RoadCorridor] = Field(default_factory=list)
+
+    #: Référentiels du calcul. Obligatoires : un manifeste qui ne dit pas dans
+    #: quel référentiel ses formes projetées vivent n'est pas exploitable, et
+    #: rien ne permettrait de refuser de les confronter à un autre.
+    source_crs: str = GEOGRAPHIC_CRS
+    working_crs: str = Field(min_length=1)
+    spatial_context_digest: str = Field(min_length=1)
 
     site_manifest_digest: str | None = None
     spatial_manifest_digest: str | None = None
@@ -392,6 +403,17 @@ class CaptureGeometryManifest(BaseModel):
         if overlap:
             raise ValueError(
                 f"le bâtiment cible figure parmi les obstacles : {overlap}"
+            )
+
+        mismatched = [
+            geometry.feature_id
+            for geometry in self.geometries
+            if geometry.resolution_status is GeometryResolutionStatus.RESOLVED
+            and geometry.projected_crs != self.working_crs
+        ]
+        if mismatched:
+            raise ValueError(
+                f"géométries hors du CRS de travail {self.working_crs!r} : {mismatched}"
             )
 
         corridor_ids = [c.corridor_id for c in self.corridors]

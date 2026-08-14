@@ -52,9 +52,46 @@ def elements_from_corpus() -> list[dict]:
     return json.loads(Path("work-cache-unused.json").read_text()) if False else []
 
 
+#: Service du pilote, construit une fois pour toute la suite. Explicite : le
+#: référentiel de travail ne se suppose plus nulle part.
+SERVICE = None  # renseigné à l'import, après définition du constructeur
+
+
+def manifest_with(**overrides):
+    """Manifeste déclarant ses référentiels, comme tout manifeste produit."""
+    from hotel_pipeline.geo.geometry_loader import CURRENT_SCHEMA_VERSION
+
+    reference = boucherville_service().reference
+    fields = dict(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        hotel_id="h",
+        snapshots=[snapshot()],
+        working_crs=reference.working_crs,
+        spatial_context_digest=reference.context_digest(),
+    )
+    fields.update(overrides)
+    return CaptureGeometryManifest(**fields)
+
+
+def boucherville_service():
+    """Service de projection réel du pilote, construit explicitement.
+
+    Aucune fixture ne rétablit un défaut EPSG:2950 : le référentiel se résout
+    depuis la position du site, comme en production. Le rétablir « pour sauver
+    les tests » réintroduirait précisément le défaut qu'ils doivent surveiller.
+    """
+    from hotel_pipeline.geo import territory
+    from hotel_pipeline.geo.projection import ProjectionService
+
+    return ProjectionService(
+        territory.resolve("welcominns-boucherville", 45.574128, -73.443289)
+    )
+
+
 def run(**overrides):
     """Résolution complète sur les réponses figées."""
     fields = dict(
+        projection_service=boucherville_service(),
         hotel_id="welcominns-boucherville",
         building_wkt=BUILDING_WKT,
         access_road_ref="way/938806358",
@@ -70,6 +107,9 @@ def run(**overrides):
     )
     fields.update(overrides)
     return resolve(**fields)
+
+
+SERVICE = boucherville_service()
 
 
 # --- la voie d'accès existe réellement ---------------------------------------
@@ -275,14 +315,14 @@ def test_adjacency_is_measured_on_the_shape_not_on_the_box() -> None:
     l'adjacence des voies qui n'y sont pas — et l'écart croît avec l'obliquité.
     """
     target = shapely_wkt.loads(BUILDING_WKT)
-    projected = cg.project(target)
+    projected = cg.project(target, SERVICE)
     minx, miny, _, _ = target.bounds
 
     corner = LineString([(minx, miny), (minx + 0.00002, miny + 0.00001)])
     assert corner.within(target.envelope)
 
-    to_box = cg.project(corner).distance(cg.project(target.envelope))
-    to_shape = cg.project(corner).distance(projected)
+    to_box = cg.project(corner, SERVICE).distance(cg.project(target.envelope, SERVICE))
+    to_shape = cg.project(corner, SERVICE).distance(projected)
 
     assert to_box == 0.0
     assert to_shape > 20.0
@@ -378,13 +418,24 @@ def test_levels_are_never_converted_into_metres() -> None:
 def test_the_two_crs_are_verified_by_recomputation() -> None:
     manifest, report = run()
     assert report.crs_problems == []
-    assert cg.verify(manifest) == []
+    assert cg.verify(manifest, SERVICE) == []
 
 
 def test_swapped_axes_are_caught() -> None:
     """`always_xy=False` échangerait latitude et longitude sans rien dire."""
     swapped = Polygon([(45.57, -73.44), (45.58, -73.44), (45.58, -73.43), (45.57, -73.43)])
-    problems = cg.check_crs_pair(swapped.wkt, cg.project(swapped).wkt)
+    # La forme projetée est fabriquée hors du service : c'est l'entrée fautive
+    # que le contrôle doit reconnaître, et le service refuserait de la produire.
+    from pyproj import Transformer
+    from shapely.ops import transform as shapely_transform
+
+    forward = Transformer.from_crs("EPSG:4326", "EPSG:2950", always_xy=True)
+    bad = shapely_transform(
+        lambda xs, ys, zs=None: forward.transform(xs, ys), swapped
+    )
+
+    problems = cg.check_crs_pair(swapped.wkt, bad.wkt, SERVICE)
+
     assert any("inversées" in p for p in problems)
 
 
@@ -392,8 +443,8 @@ def test_a_shifted_projection_is_caught() -> None:
     target = shapely_wkt.loads(BUILDING_WKT)
     from shapely.affinity import translate
 
-    drifted = translate(cg.project(target), xoff=3.0)
-    problems = cg.check_crs_pair(target.wkt, drifted.wkt)
+    drifted = translate(cg.project(target, SERVICE), xoff=3.0)
+    problems = cg.check_crs_pair(target.wkt, drifted.wkt, SERVICE)
 
     assert any("divergent" in p for p in problems)
 
@@ -402,7 +453,7 @@ def test_an_incompatible_type_is_caught() -> None:
     target = shapely_wkt.loads(BUILDING_WKT)
     line = LineString(list(target.exterior.coords))
     assert any("types incompatibles" in p
-               for p in cg.check_crs_pair(target.wkt, cg.project(line).wkt))
+               for p in cg.check_crs_pair(target.wkt, cg.project(line, SERVICE).wkt, SERVICE))
 
 
 def test_a_round_trip_returns_to_the_source() -> None:
@@ -411,7 +462,7 @@ def test_a_round_trip_returns_to_the_source() -> None:
 
     target = shapely_wkt.loads(BUILDING_WKT)
     back = Transformer.from_crs("EPSG:2950", "EPSG:4326", always_xy=True)
-    returned = transform(lambda xs, ys, zs=None: back.transform(xs, ys), cg.project(target))
+    returned = transform(lambda xs, ys, zs=None: back.transform(xs, ys), cg.project(target, SERVICE))
 
     assert returned.hausdorff_distance(target) < 1e-7
 
@@ -483,7 +534,7 @@ def test_a_changed_source_makes_the_geometry_stale() -> None:
 def resolved(feature_id: str, role: GeometryRole, geometry, **extra) -> ResolvedGeometry:
     return cg.resolved_from(
         feature_id, role, f"way/{feature_id}", "snap", geometry,
-        "essai", ["preuve"], **extra
+        "essai", ["preuve"], SERVICE, **extra
     )
 
 
@@ -540,24 +591,20 @@ def test_always_xy_must_be_explicit() -> None:
 def test_a_corridor_geometry_must_cite_its_roads() -> None:
     corridor = resolved("CORRIDOR", GeometryRole.CONTEXT_CORRIDOR, square())
     with pytest.raises(ValueError, match="sans filiation"):
-        CaptureGeometryManifest(
-            hotel_id="h", snapshots=[snapshot()], geometries=[corridor]
-        )
+        manifest_with(geometries=[corridor])
 
 
 def test_a_relation_to_an_absent_geometry_is_refused() -> None:
     corridor = resolved("CORRIDOR", GeometryRole.CONTEXT_CORRIDOR, square(),
                         derived_from=["ROAD_1"])
     with pytest.raises(ValueError, match="dérive de formes absentes"):
-        CaptureGeometryManifest(
-            hotel_id="h", snapshots=[snapshot()], geometries=[corridor]
-        )
+        manifest_with(geometries=[corridor])
 
 
 def test_a_corridor_pointing_at_an_absent_feature_is_refused() -> None:
     with pytest.raises(ValueError, match="absente du manifeste"):
-        CaptureGeometryManifest(
-            hotel_id="h", snapshots=[snapshot()],
+        manifest_with(
+            snapshots=[snapshot()],
             corridors=[RoadCorridor(corridor_id="c", feature_id="fantome",
                                     corridor_class=CorridorClass.EXCLUDED,
                                     rationale="essai")],
@@ -567,8 +614,8 @@ def test_a_corridor_pointing_at_an_absent_feature_is_refused() -> None:
 def test_the_target_cannot_also_be_an_obstacle() -> None:
     shape = square()
     with pytest.raises(ValueError, match="figure parmi les obstacles"):
-        CaptureGeometryManifest(
-            hotel_id="h", snapshots=[snapshot()],
+        manifest_with(
+            snapshots=[snapshot()],
             geometries=[
                 resolved("T", GeometryRole.TARGET_BUILDING, shape),
                 resolved("T", GeometryRole.OBSTACLE_BUILDING, shape).model_copy(
@@ -580,8 +627,8 @@ def test_the_target_cannot_also_be_an_obstacle() -> None:
 
 def test_duplicate_feature_ids_are_refused() -> None:
     with pytest.raises(ValueError, match="dupliqués"):
-        CaptureGeometryManifest(
-            hotel_id="h", snapshots=[snapshot()],
+        manifest_with(
+            snapshots=[snapshot()],
             geometries=[
                 resolved("F", GeometryRole.TARGET_BUILDING, square()),
                 resolved("F", GeometryRole.OBSTACLE_BUILDING, square(-73.45)),
@@ -591,8 +638,11 @@ def test_duplicate_feature_ids_are_refused() -> None:
 
 def test_an_unknown_snapshot_is_refused() -> None:
     with pytest.raises(ValueError, match="instantané 'snap' absent"):
-        CaptureGeometryManifest(
-            hotel_id="h", geometries=[resolved("F", GeometryRole.TARGET_BUILDING, square())]
+        # Sans instantané déclaré : une géométrie ne peut pas citer une réponse
+        # source que le manifeste ne contient pas.
+        manifest_with(
+            snapshots=[],
+            geometries=[resolved("F", GeometryRole.TARGET_BUILDING, square())],
         )
 
 

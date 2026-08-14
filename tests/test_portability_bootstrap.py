@@ -153,6 +153,32 @@ def test_every_capability_declares_its_requirements() -> None:
     assert set(capabilities.REQUIREMENTS) == set(Capability)
 
 
+def test_every_command_declares_the_capability_it_needs() -> None:
+    """Un oubli ne doit pas devenir une permission tacite.
+
+    Le contexte traitait une commande non déclarée comme une inspection —
+    permissive. La matrice redevenait alors facultative pour qui l'oubliait.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("src/hotel_pipeline/cli.py").read_text("utf-8")
+    # `= _context(...)` ne capture que les **appels** : la définition de
+    # `_context`, qui mentionne aussi `hotel_id`, n'en est pas un.
+    invocations = re.findall(r"=\s*_context\(([^)]*)\)", source)
+
+    assert len(invocations) >= 18, f"seulement {len(invocations)} appels trouvés"
+    undeclared = [call for call in invocations if "Capability." not in call]
+    assert undeclared == []
+
+
+def test_an_undeclared_capability_stops_the_command() -> None:
+    from hotel_pipeline.cli import _context
+
+    with pytest.raises(RuntimeError, match="sans capacité déclarée"):
+        _context("hotel-test", None)
+
+
 def test_identity_classification_refuses_to_run_without_a_profile() -> None:
     with pytest.raises(CapabilityUnavailable) as raised:
         require(Context(policy=PipelinePolicy()), Capability.IDENTITY_CLASSIFICATION)

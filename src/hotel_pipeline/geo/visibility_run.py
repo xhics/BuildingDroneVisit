@@ -191,14 +191,20 @@ def run_assessment(
 ) -> tuple[VisibilityRun, RunReport]:
     """Mesure la visibilité de chaque asset situé et de chaque corridor.
 
-    `spatial_reference` fournit le référentiel de travail. Sans lui, ce module
-    projetait en `EPSG:2950` littéral, sans contrôle d'emprise : une position
-    lyonnaise se plaçait à 5 637 km à l'est, et distances, azimuts et
-    occlusions se calculaient là-dessus sans qu'une seule erreur ne soit levée.
+    `spatial_reference` est obligatoire, et toute exécution sans contexte est
+    refusée avant le premier calcul. Le repli historique `EPSG:2950` n'est pas
+    autorisé : un calcul portant sur le mauvais pays devrait rester inactif.
     """
     from shapely.geometry import Point
     from shapely.ops import transform as shapely_transform
     from shapely import wkt as shapely_wkt
+
+    if spatial_reference is None:
+        raise ValueError("spatial_reference requis : aucun contexte spatial, aucun calcul")
+
+    disagreements = check_spatial_agreement(manifest, spatial_reference)
+    if disagreements:
+        raise ValueError("; ".join(disagreements))
 
     settings = policy.visibility
     unsupported = engine.check_supported(settings)
@@ -239,6 +245,8 @@ def run_assessment(
         target_digest=target_geometry.geometry_digest,
         obstacles_digest=digests["obstacles"],
         road_geometry_digest=digests["roads"],
+        spatial_context_digest=manifest.spatial_context_digest,
+        crs=manifest.working_crs,
         elevation_sources=list(elevation_sources or []),
     )
 
@@ -260,6 +268,7 @@ def run_assessment(
             f"vis-{asset.id}", asset.id, "BUILDING_MAIN", origin, target_shape,
             obstacles, settings, camera=camera, target_vertical=target_vertical,
             vertical=getattr(spatial_reference, "vertical", None),
+            crs=manifest.working_crs,
         )
         visibility.assessments.append(assessment)
         _tally(report, asset, assessment)
@@ -295,16 +304,55 @@ def run_assessment(
     return visibility, report
 
 
-def _projection_for(spatial_reference):  # noqa: ANN001, ANN201
-    """Service de projection du site, ou `None` si aucun contexte n'est fourni.
+def check_spatial_agreement(manifest, spatial_reference) -> list[str]:  # noqa: ANN001
+    """Le manifeste et le contexte courant décrivent-ils le même espace ?
 
-    `None` conserve le comportement antérieur — projection directe en
-    EPSG:2950 — pour les runs déjà produits et rejouables. Un site hors du
-    Québec n'y a pas droit : sans contexte, `run_assessment` refuserait tout
-    aussi bien, puisque la géométrie de capture, elle, contrôle son emprise.
+    Trois égalités, et non une seule. Sans elles, les caméras pouvaient être
+    projetées dans le référentiel du contexte pendant que la cible et les
+    obstacles restaient stockés dans celui du manifeste : des distances en
+    mètres, finies, et fausses de milliers de kilomètres.
+
+    ```text
+    contexte courant  = empreinte citée par le manifeste
+                      = CRS du manifeste
+                      = CRS de chaque géométrie résolue
+    ```
     """
+    problems: list[str] = []
+    current = spatial_reference.context_digest()
+
+    if manifest.spatial_context_digest != current:
+        problems.append(
+            f"le manifeste géométrique cite le contexte spatial "
+            f"{manifest.spatial_context_digest!r}, le contexte courant est "
+            f"{current!r} : le référentiel ou le territoire a changé depuis, "
+            "relancez « geo resolve »"
+        )
+
+    if manifest.working_crs != spatial_reference.working_crs:
+        problems.append(
+            f"le manifeste est en {manifest.working_crs!r}, le contexte courant "
+            f"en {spatial_reference.working_crs!r}"
+        )
+
+    mismatched = sorted(
+        geometry.feature_id
+        for geometry in manifest.geometries
+        if geometry.resolution_status is GeometryResolutionStatus.RESOLVED
+        and geometry.projected_crs != spatial_reference.working_crs
+    )
+    if mismatched:
+        problems.append(
+            f"{len(mismatched)} géométrie(s) hors du référentiel courant "
+            f"{spatial_reference.working_crs!r} : {mismatched[:5]}"
+        )
+    return problems
+
+
+def _projection_for(spatial_reference):  # noqa: ANN001, ANN201
+    """Service de projection du site."""
     if spatial_reference is None:
-        return None
+        raise ValueError("spatial_reference requis : aucun contexte spatial, aucun calcul")
 
     from .projection import ProjectionService
 
@@ -312,14 +360,7 @@ def _projection_for(spatial_reference):  # noqa: ANN001, ANN201
 
 
 def _project(projection, lat: float, lon: float) -> tuple[float, float]:  # noqa: ANN001
-    if projection is not None:
-        return projection.point(lat, lon)
-
-    from pyproj import Transformer
-    from ..schemas.geometry import GEOGRAPHIC_CRS, PROJECTED_CRS
-
-    forward = Transformer.from_crs(GEOGRAPHIC_CRS, PROJECTED_CRS, always_xy=True)
-    return forward.transform(lon, lat)
+    return projection.point(lat, lon)
 
 
 def _sector_reader(target_shape, front_azimuth_deg: float | None):  # noqa: ANN001

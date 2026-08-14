@@ -58,10 +58,22 @@ def asset(asset_id: str = "mapillary-1", **overrides) -> Asset:
 
 
 def assessment_for(subject: str, obstacles=(), **kwargs):
+    kwargs.setdefault("crs", SPATIAL.working_crs)
     return engine.assess(
         f"vis-{subject}", subject, "BUILDING_MAIN", ORIGIN, TARGET,
         list(obstacles), POLICY.visibility, **kwargs
     )
+
+
+def _boucherville_reference():
+    from hotel_pipeline.geo import territory
+
+    return territory.resolve("h", 45.574128, -73.443289)
+
+
+#: Contexte spatial du pilote, résolu explicitement. Les contrôles de
+#: `visibility apply` le confrontent à celui de l'exécution.
+SPATIAL = _boucherville_reference()
 
 
 def elevation() -> ElevationSource:
@@ -81,6 +93,10 @@ def run_for(manifest: AssetManifest, assessments, digests=None) -> VisibilityRun
         capture_geometry_digest="g", policy_digest="p", site_manifest_digest="s",
         asset_files_digest="f", asset_manifest_digest=base_manifest_digest(manifest),
         target_digest="t", obstacles_digest="o", road_geometry_digest="r",
+        # Le run porte son contexte spatial et son référentiel : sans eux, des
+        # mesures d'un fuseau se projetteraient sur des assets d'un autre.
+        spatial_context_digest=SPATIAL.context_digest(),
+        crs=SPATIAL.working_crs,
         elevation_sources=[elevation()],
         assessments=list(assessments),
         framings=[

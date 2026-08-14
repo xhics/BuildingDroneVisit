@@ -84,29 +84,29 @@ def response_digest(payload) -> str:  # noqa: ANN001
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def transformer():  # noqa: ANN201
-    """Transformateur WGS84 → EPSG:2950, axes explicitement en x/y.
+def project(geometry, projection_service):  # noqa: ANN001, ANN201
+    """Projette une forme WGS84 dans le référentiel de travail du site.
 
-    `always_xy=False` échangerait latitude et longitude sans rien signaler, et
-    la forme partirait à des milliers de kilomètres.
+    Le service est **obligatoire**. Un repli vers EPSG:2950 était le défaut
+    d'origine sous un autre nom : il rendait des mètres finis et faux pour tout
+    site hors du fuseau MTM 8, sans qu'une erreur soit levée.
     """
-    from pyproj import Transformer
-
-    return Transformer.from_crs(GEOGRAPHIC_CRS, PROJECTED_CRS, always_xy=True)
-
-
-def project(geometry):  # noqa: ANN001, ANN201
-    from shapely.ops import transform
-
-    forward = transformer()
-    return transform(lambda xs, ys, zs=None: forward.transform(xs, ys), geometry)
+    if projection_service is None:
+        raise ValueError(
+            "aucun service de projection : le référentiel de travail se résout "
+            "depuis la position du site (« geo reference »), il ne se suppose pas"
+        )
+    return projection_service.geometry(geometry, label="géométrie")
 
 
-def check_crs_pair(wgs84_wkt: str, projected_wkt: str) -> list[str]:
+def check_crs_pair(wgs84_wkt: str, projected_wkt: str, projection_service) -> list[str]:
     """Reprojette la forme géographique et la confronte à la forme projetée.
 
     Conserver deux WKT indépendants n'établit rien : ils peuvent décrire deux
-    endroits. La seule vérification utile est de refaire le calcul.
+    endroits. La seule vérification utile est de refaire le calcul — avec le
+    **même** service que celui qui a produit la forme projetée. Contrôler
+    l'emprise d'un référentiel puis recalculer avec un autre déclarait
+    divergente toute géométrie parfaitement valide hors du Québec.
     """
     from shapely import wkt as shapely_wkt
 
@@ -129,23 +129,32 @@ def check_crs_pair(wgs84_wkt: str, projected_wkt: str) -> list[str]:
 
     minx, miny, maxx, maxy = geographic.bounds
     if not (-180 <= minx <= 180 and -90 <= miny <= 90 and -180 <= maxx <= 180):
-        problems.append(
-            "coordonnées géographiques hors domaine"
-        )
+        problems.append("coordonnées géographiques hors domaine")
         return problems
 
     # Le domaine mondial ne suffit pas : une inversion latitude/longitude
-    # produit ici (45,57 ; -73,44), deux valeurs parfaitement valides prises
-    # séparément. Seule l'emprise du référentiel projeté la révèle — EPSG:2950
-    # ne couvre que le Québec entre 75° et 72° ouest.
-    if not _within_projected_area(minx, miny, maxx, maxy):
+    # produit deux valeurs parfaitement valides prises séparément. Seule
+    # l'emprise du référentiel de travail la révèle.
+    target_crs = projection_service.working_crs
+    if not _within_projected_area(minx, miny, maxx, maxy, target_crs):
         problems.append(
-            f"coordonnées hors de l'emprise de {PROJECTED_CRS} — latitude et "
+            f"coordonnées hors de l'emprise de {target_crs} — latitude et "
             "longitude probablement inversées"
         )
         return problems
 
-    recomputed = project(geographic)
+    # Le service refuse ce qui sort de son emprise. C'est ici un **résultat**
+    # de contrôle, pas une panne : le rapporter comme problème permet à
+    # `verify()` de lister toutes les géométries fautives d'un coup, au lieu
+    # de s'arrêter à la première.
+    from .projection import ProjectionRefused
+
+    try:
+        recomputed = project(geographic, projection_service)
+    except ProjectionRefused as exc:
+        problems.append(str(exc))
+        return problems
+
     deviation = recomputed.hausdorff_distance(projected)
     if deviation > CRS_TOLERANCE_M:
         problems.append(
@@ -155,10 +164,10 @@ def check_crs_pair(wgs84_wkt: str, projected_wkt: str) -> list[str]:
     return problems
 
 
-def _within_projected_area(minx: float, miny: float, maxx: float, maxy: float) -> bool:
+def _within_projected_area(minx: float, miny: float, maxx: float, maxy: float, working_crs: str) -> bool:
     from pyproj import CRS
 
-    area = CRS.from_user_input(PROJECTED_CRS).area_of_use
+    area = CRS.from_user_input(working_crs).area_of_use
     if area is None:  # pragma: no cover — tous les CRS utilisés en ont une
         return True
     west, south, east, north = area.bounds
@@ -173,12 +182,13 @@ def resolved_from(
     geometry,  # noqa: ANN001 — shapely en WGS84
     derivation_method: str,
     evidence: list[str],
+    projection_service,
     **extra,
 ) -> ResolvedGeometry:
     """Construit une géométrie résolue, ses deux référentiels compris."""
     import pyproj
 
-    projected = project(geometry)
+    projected = project(geometry, projection_service)
     return ResolvedGeometry(
         feature_id=feature_id,
         role=role,
@@ -189,8 +199,10 @@ def resolved_from(
         projected_wkt=projected.wkt,
         geometry_type=geometry.geom_type,
         horizontal_crs=GEOGRAPHIC_CRS,
-        projected_crs=PROJECTED_CRS,
-        transform_method=f"pyproj.Transformer.from_crs({GEOGRAPHIC_CRS}→{PROJECTED_CRS})",
+        projected_crs=projection_service.working_crs,
+        transform_method=(
+            f"pyproj.Transformer.from_crs({GEOGRAPHIC_CRS}→{projection_service.working_crs}, always_xy=True)"
+        ),
         always_xy=True,
         pyproj_version=pyproj.__version__,
         geometry_digest=canonical_digest(geometry),
@@ -394,13 +406,20 @@ def snapshot(
     )
 
 
-def verify(manifest: CaptureGeometryManifest) -> list[str]:
-    """Recalcule ce que le manifeste affirme : référentiels et empreintes."""
+def verify(manifest: CaptureGeometryManifest, projection_service) -> list[str]:
+    """Recalcule ce que le manifeste affirme : référentiels et empreintes.
+
+    Le service est celui du site aujourd'hui. Vérifier un manifeste avec un
+    autre référentiel que le sien déclarerait divergente chaque géométrie ;
+    c'est pourquoi l'appelant confronte d'abord les deux référentiels.
+    """
     problems: list[str] = []
     for geometry in manifest.geometries:
         if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
             continue
-        for problem in check_crs_pair(geometry.wgs84_wkt, geometry.projected_wkt):
+        for problem in check_crs_pair(
+            geometry.wgs84_wkt, geometry.projected_wkt, projection_service
+        ):
             problems.append(f"{geometry.feature_id} : {problem}")
 
         from shapely import wkt as shapely_wkt

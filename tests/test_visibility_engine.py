@@ -41,7 +41,13 @@ ORIGIN = (0.0, 0.0)
 TARGET = Polygon([(-10, 50), (10, 50), (10, 70), (-10, 70)])
 
 
+#: Référentiel des coordonnées de ces cas. Il est passé explicitement : le
+#: moteur n'en suppose plus aucun.
+CRS = "EPSG:2950"
+
+
 def run(obstacles=(), **kwargs) -> VisibilityAssessment:
+    kwargs.setdefault("crs", CRS)
     return assess(
         "a", "camera", "BUILDING_MAIN", ORIGIN, kwargs.pop("target", TARGET),
         list(obstacles), POLICY, **kwargs
@@ -449,7 +455,7 @@ def test_geometric_usefulness_never_grants_access() -> None:
 def test_the_partition_must_sum_to_one() -> None:
     with pytest.raises(ValueError, match="totalisent"):
         VisibilityAssessment(
-            assessment_id="a", subject_ref="s", target_ref="t",
+            assessment_id="a", subject_ref="s", target_ref="t", crs=CRS,
             proven_clear_fraction=0.5, risk_unknown_height_fraction=0.2,
             rays=[RayAssessment(bearing_deg=0.0, angular_width_deg=1.0,
                                 partition=RayPartition.CLEAR_2D)],
@@ -597,6 +603,8 @@ def visibility_run(**overrides):
         capture_geometry_digest="a", policy_digest="b", site_manifest_digest="c",
         asset_files_digest="d1", asset_manifest_digest="d2", target_digest="e",
         obstacles_digest="f", road_geometry_digest="g",
+        # Un run est lié à un contexte spatial, ou n'est pas constructible.
+        spatial_context_digest="ctx0", crs=CRS,
     )
     fields.update(overrides)
     return VisibilityRun(**fields)
@@ -635,7 +643,7 @@ def test_duplicate_framings_or_corridors_are_refused() -> None:
     )
 
     assessment = VisibilityAssessment(
-        assessment_id="vis-1", subject_ref="asset-1", target_ref="t"
+        assessment_id="vis-1", subject_ref="asset-1", target_ref="t", crs=CRS
     )
     framing = FramingAssessment(
         assessment_id="vis-1", subject_ref="asset-1",
@@ -653,8 +661,12 @@ def test_duplicate_framings_or_corridors_are_refused() -> None:
 
 def test_two_assessments_of_one_asset_are_refused() -> None:
     """La correspondance évaluation ↔ asset doit rester univoque."""
-    first = VisibilityAssessment(assessment_id="a", subject_ref="asset-1", target_ref="t")
-    second = VisibilityAssessment(assessment_id="b", subject_ref="asset-1", target_ref="t")
+    first = VisibilityAssessment(
+        assessment_id="a", subject_ref="asset-1", target_ref="t", crs=CRS
+    )
+    second = VisibilityAssessment(
+        assessment_id="b", subject_ref="asset-1", target_ref="t", crs=CRS
+    )
 
     with pytest.raises(ValueError, match="même sujet"):
         visibility_run(assessments=[first, second])

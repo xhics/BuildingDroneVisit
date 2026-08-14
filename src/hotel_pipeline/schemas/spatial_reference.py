@@ -226,10 +226,36 @@ class SpatialReferenceContext(BaseModel):
         if self.territory_state is TerritoryState.UNKNOWN:
             raise ValueError(
                 "référentiel de travail choisi sur un territoire inconnu : "
-                "c'est exactement le défaut corrigé — EPSG:2950 s'appliquait "
-                "partout parce que le territoire valait QC par défaut"
+                "c'est exactement le défaut corrigé — le fuseau du pilote "
+                "s'appliquait partout, parce que le territoire avait une "
+                "valeur de repli"
             )
         return self
+
+    def context_digest(self) -> str:
+        """Empreinte de ce qui décide d'un calcul, et de rien d'autre.
+
+        Trois champs seulement : les référentiels et le territoire. Ni la date
+        de résolution, ni les preuves textuelles, ni les empreintes de
+        dépendances n'y entrent — un contexte relu ou re-résolu à l'identique
+        doit rendre la même empreinte, sans quoi tout manifeste deviendrait
+        périmé au premier `geo reference --force`.
+
+        C'est aussi ce qui distingue cette empreinte de la provenance générale :
+        elle ne couvre que les entrées dont dépend réellement la géométrie.
+        """
+        import hashlib
+        import json
+
+        payload = json.dumps(
+            {
+                "source_crs": self.source_crs,
+                "working_crs": self.working_crs,
+                "jurisdictions": self.jurisdictions,
+            },
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def contains(self, lat: float, lon: float) -> bool:
         """Ce point est-il dans l'emprise du référentiel de travail ?"""
