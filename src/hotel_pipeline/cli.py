@@ -746,16 +746,27 @@ def assets_plan(
     demands = CaptureDemandManifest.model_validate(demands_payload)
 
     digests = _plan_digests(workspace, context, candidates_payload, demands_payload)
+    geometries, geometry_report = _candidate_geometries(
+        workspace, context, candidates.candidates, demands.demands
+    )
 
     try:
         plan, evaluations, report = build(
             hotel_id, candidates.candidates, demands.demands, digests,
+            geometries=geometries,
         )
     except PlanRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
     typer.echo(f"  candidats   {report.candidates}")
+    if geometry_report is not None:
+        typer.echo(
+            f"  mesurés     {geometry_report.measured} "
+            f"({geometry_report.with_framing} avec cadrage)"
+        )
+        for reason, count in sorted(geometry_report.without_framing.items()):
+            typer.echo(f"    sans cadrage · {reason:<40} {count:>4}")
     typer.echo(f"  évaluations {report.evaluations}")
     typer.echo(f"  retenues    {report.selected}")
     if report.preview_required:
@@ -812,6 +823,56 @@ def assets_plan(
             f"    pour l'exécuter : assets plan {hotel_id} "
             f"--consent-bytes {plan.known_bytes}"
         )
+
+
+def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN001, ANN201
+    """Mesure ce que la géométrie permet, ou dit pourquoi elle ne le permet pas.
+
+    Sans contexte spatial ni empreinte cible, aucune mesure : le plan classera
+    en `preview_required`, ce qui est une réponse honnête. Projeter dans un
+    référentiel supposé donnerait des espérances finies et fausses.
+    """
+    from .candidate_geometry import measure_all
+    from .geo.geometry_loader import LegacyManifestRefused, load_capture_geometry
+    from .geo.projection import ProjectionRefused, ProjectionService
+
+    reference = context.spatial_reference
+    geometry_path = workspace.path("06_geo", "capture_geometry.json")
+    if reference is None or not geometry_path.is_file():
+        typer.secho(
+            "  · aucune mesure de cadrage : contexte spatial ou géométrie de "
+            "capture absents — les candidats resteront à vérifier",
+            fg=typer.colors.YELLOW,
+        )
+        return {}, None
+
+    try:
+        manifest, _ = load_capture_geometry(geometry_path, reference)
+        target, _ = _target_shape(manifest)
+        if target is None:
+            raise LegacyManifestRefused("aucune empreinte cible résolue")
+        measured, report = measure_all(
+            candidates, target, ProjectionService(reference),
+            context.policy.visibility, demands,
+            obstacles=_obstacle_shapes(manifest),
+        )
+    except (LegacyManifestRefused, ProjectionRefused, ValueError) as exc:
+        typer.secho(f"  · mesure impossible : {exc}", fg=typer.colors.YELLOW)
+        return {}, None
+
+    return measured, report
+
+
+def _target_shape(manifest):  # noqa: ANN001, ANN201
+    from .geo.visibility_run import _target
+
+    return _target(manifest)
+
+
+def _obstacle_shapes(manifest) -> list:  # noqa: ANN001
+    from .geo.visibility_run import _obstacles
+
+    return _obstacles(manifest, {})
 
 
 def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
