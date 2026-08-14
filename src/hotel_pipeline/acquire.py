@@ -62,6 +62,7 @@ class AcquireReport:
 #: pas : inventer une URL reviendrait à deviner le protocole d'un fournisseur.
 RESOLVERS: dict[str, str] = {
     "mapillary": "thumb_2048_url rendu par l'API Graph, à la demande",
+    "street_view": "endpoint image, reconstruit depuis le cadrage demandé",
 }
 
 
@@ -72,11 +73,19 @@ def resolve_url(source: str, request_spec: dict[str, str]) -> str:
     Graph, qui en rend une valable quelques minutes. C'est précisément pourquoi
     le manifeste n'en conserve aucune.
     """
-    if source != "mapillary":
+    if source not in RESOLVERS:
         raise AcquisitionRefused(
             f"source {source!r} sans résolveur d'adresse : le protocole de "
             f"téléchargement n'est pas déclaré. Connus : {sorted(RESOLVERS)}"
         )
+
+    if source == "street_view":
+        from .collectors.streetview_v2 import resolve_url as street_view_url
+
+        try:
+            return street_view_url(request_spec)
+        except ValueError as exc:
+            raise AcquisitionRefused(str(exc)) from exc
 
     provider_id = request_spec.get("provider_id")
     if not provider_id:
