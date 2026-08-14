@@ -959,6 +959,115 @@ def _new_run_id() -> str:
     return new_run_id()
 
 
+@assets_app.command("ocr")
+def assets_ocr(
+    hotel_id: str = typer.Argument(...),
+    run_id: str | None = typer.Option(
+        None, "--run", help="N'lire que les fichiers d'une exécution d'acquisition."
+    ),
+) -> None:
+    """Lit les enseignes des fichiers **acquis**, et trace chaque lecture.
+
+    L'OCR vient après l'acquisition : à la découverte, aucune image n'existe.
+    Les langues viennent du profil ; les supposer reviendrait à lire
+    l'établissement comme s'il était ailleurs.
+    """
+    from .ocr import OcrRefused, run as run_ocr
+    from .triage.sign_ocr import get_reader
+
+    context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
+    workspace = Workspace(hotel_id)
+
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    languages = context.ocr_languages()
+    if not languages:
+        typer.secho(
+            f"{KO} aucune langue d'OCR déclarée au profil de {hotel_id} — "
+            f"elles ne se déduisent ni du pays ni du fuseau",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    targets = [
+        asset for asset in manifest.assets
+        if asset.local_path
+        and (run_id is None or (asset.acquisition and asset.acquisition.run_id == run_id))
+    ]
+    if not targets:
+        typer.secho(
+            f"{KO} aucun fichier acquis à lire — lancez : assets acquire",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"  fichiers    {len(targets)}")
+    typer.echo(f"  langues     {', '.join(languages)}")
+
+    try:
+        reader = get_reader()
+    except (ImportError, RuntimeError) as exc:
+        typer.secho(f"{KO} aucun moteur d'OCR disponible : {exc}",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    engine, version = _ocr_engine(reader)
+    typer.echo(f"  moteur      {engine} {version}")
+
+    try:
+        updated, readings, report = run_ocr(
+            targets, reader, languages,
+            expected=context.identity_terms(), excluded=context.excluded_terms(),
+            engine=engine, engine_version=version, workspace_root=workspace.root,
+        )
+    except OcrRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    by_id = {asset.id: asset for asset in updated}
+    manifest.assets = [by_id.get(asset.id, asset) for asset in manifest.assets]
+    workspace.write_assets(manifest)
+
+    workspace.write_json(
+        f"01_sources/ocr_readings_{report.run_id}.json",
+        {"run_id": report.run_id, "readings": [r.as_dict() for r in readings]},
+    )
+    workspace.write_report(f"01_sources/ocr_report_{report.run_id}.json", report, context)
+
+    typer.echo("")
+    for status, count in sorted(report.by_status.items()):
+        typer.echo(f"    {status:<12} {count:>5}")
+    for term, count in sorted(report.matched_terms.items()):
+        typer.echo(f"    terme lu · {term[:40]:<40} {count:>4}")
+    for asset_id, reason in sorted(report.skipped.items())[:5]:
+        typer.secho(f"    ignoré · {asset_id} — {reason[:52]}", fg=typer.colors.YELLOW)
+
+    typer.echo("")
+    typer.echo(f"{OK} {report.read} lecture(s), {len(report.skipped)} ignorée(s)")
+    typer.echo("    une enseigne établit une appartenance, jamais une visibilité")
+
+
+def _ocr_engine(reader) -> tuple[str, str]:  # noqa: ANN001
+    """Nom et version du moteur réellement employé.
+
+    Inscrits à chaque lecture : deux versions d'EasyOCR ne lisent pas la même
+    chose, et une lecture qu'on ne peut pas rattacher à son moteur ne se rejoue
+    pas.
+    """
+    name = type(reader).__name__
+    if name == "LocalReader":
+        try:
+            import easyocr
+
+            return "easyocr", getattr(easyocr, "__version__", "inconnue")
+        except ImportError:  # pragma: no cover — le lecteur existe donc easyocr aussi
+            return "easyocr", "inconnue"
+    return name.lower(), "inconnue"
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""
