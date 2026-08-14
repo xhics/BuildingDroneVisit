@@ -29,6 +29,19 @@ def profile_digest(profile: PropertyProfile) -> str:
     return _digest(profile.model_dump_json())
 
 
+def digest_of(payload: object) -> str:
+    """Empreinte d'un document déjà lu, stable à l'ordre des clés près.
+
+    Deux écritures d'un même contenu doivent rendre la même empreinte : sans
+    tri, un manifeste relu puis réécrit paraîtrait avoir changé.
+    """
+    import json
+
+    return _digest(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    )
+
+
 def provenance(
     policy: PipelinePolicy, profile: PropertyProfile | None = None
 ) -> dict[str, str]:

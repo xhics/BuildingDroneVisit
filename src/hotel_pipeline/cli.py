@@ -612,6 +612,96 @@ def assets_migrate_review_status(
     typer.echo(f"    décisions et historiques inchangés : {report.untouched_decisions}")
 
 
+@assets_app.command("discover")
+def assets_discover(
+    hotel_id: str = typer.Argument(...),
+    radius_m: int | None = typer.Option(
+        None, "--radius", help="Rayon d'interrogation ; défaut : politique de collecte."
+    ),
+) -> None:
+    """Interroge les index des sources. **Aucune image n'est téléchargée.**
+
+    Le besoin juge la collecte : sans `CaptureDemand` déclarées, la découverte
+    serait un ramassage sans objectif, et le corpus définirait après coup ce
+    qu'on cherchait. Le choix vient au plan, le téléchargement à l'acquisition,
+    et l'OCR après elle — à ce stade, aucune image n'existe encore.
+    """
+    from .discover import DiscoveryRefused, discover
+    from .provenance import digest_of
+    from .schemas.acquisition import CaptureDemandManifest
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+
+    payload = workspace.read_json("01_sources/capture_demands.json")
+    if not payload:
+        typer.secho(
+            f"{KO} aucun besoin déclaré : écrivez "
+            f"01_sources/capture_demands.json avant de découvrir",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    demands = CaptureDemandManifest.model_validate(payload)
+    profile = context.profile
+    radius = radius_m or context.policy.collection.radius_m
+
+    typer.echo(f"  besoins     {len(demands.demands)}")
+    typer.echo(f"  position    {profile.lat:.6f}, {profile.lon:.6f}")
+    typer.echo(f"  rayon       {radius} m")
+
+    queries = _query_sources(profile, radius)
+
+    try:
+        manifest, report = discover(
+            hotel_id, demands, queries,
+            demand_digest=digest_of(payload),
+            policy_digest=context.provenance["policy_digest"],
+        )
+    except DiscoveryRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    workspace.write_json(
+        f"01_sources/candidates_{report.run_id}.json",
+        json.loads(manifest.model_dump_json()),
+    )
+    workspace.write_report(f"01_sources/discovery_{report.run_id}.json", report, context)
+
+    for source in report.sources_queried:
+        typer.echo(f"    {source:<14} {report.candidates_by_source[source]:>5} candidat(s)")
+    for source, reason in sorted(report.sources_skipped.items()):
+        typer.secho(f"    {source:<14} non interrogée — {reason}", fg=typer.colors.YELLOW)
+
+    typer.echo("")
+    typer.echo(f"{OK} {len(manifest.candidates)} candidat(s), 0 octet téléchargé")
+    typer.echo(f"    doublons écartés : {report.duplicates_dropped}")
+    typer.echo("    prochaine étape : assets plan")
+
+
+def _query_sources(profile, radius_m: int) -> dict:  # noqa: ANN001
+    """Interroge les index disponibles, et dit pourquoi les autres ne le sont pas.
+
+    Une source non configurée n'est pas une source vide : le motif remonte au
+    manifeste, et le plan saura qu'il ne juge pas un corpus complet.
+    """
+    from .collectors import mapillary
+    from .discover import candidates_from
+    from .providers.cache import OfflineError
+
+    queries: dict = {}
+    try:
+        images = mapillary.collect(profile.lat, profile.lon, radius_m=radius_m)
+    except OfflineError as exc:
+        queries["mapillary"] = f"hors ligne : {exc}"
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        queries["mapillary"] = f"interrogation impossible : {exc}"
+    else:
+        queries["mapillary"] = candidates_from("mapillary", images)
+
+    return queries
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""
