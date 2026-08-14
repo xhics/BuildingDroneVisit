@@ -48,10 +48,10 @@ SECTOR_BEARINGS: dict[str, float] = {
     ViewSector.FRONT_LEFT_CORNER.value: 315.0,
 }
 
-#: Demi-ouverture admise autour de l'azimut d'un secteur. Un quart de tour
-#: entier ferait de « avant » et « côté » la même chose ; un secteur trop
-#: étroit rejetterait des vues obliques parfaitement utiles.
-SECTOR_HALF_WIDTH_DEG = 67.5
+#: Valeur de repli, employée seulement si aucune politique n'est fournie. Le
+#: seuil réel vient de `policy.geometry.sector_observer_half_width_deg` : le
+#: tenir en double ici garantissait qu'un jour les deux divergent.
+DEFAULT_SECTOR_HALF_WIDTH_DEG = 67.5
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ class DemandTarget:
     #: `None` quand le besoin n'impose aucun côté — un corridor se documente
     #: d'où l'on veut.
     required_bearing_deg: float | None = None
-    half_width_deg: float = SECTOR_HALF_WIDTH_DEG
+    half_width_deg: float = DEFAULT_SECTOR_HALF_WIDTH_DEG
     description: str = ""
 
     def observer_is_admissible(self, observer_bearing_deg: float) -> bool:
@@ -87,6 +87,7 @@ def resolve(
     manifest,  # noqa: ANN001 — CaptureGeometryManifest
     front_azimuth_deg: float | None = None,
     site=None,  # noqa: ANN001 — SiteManifest
+    half_width_deg: float = DEFAULT_SECTOR_HALF_WIDTH_DEG,
 ) -> DemandTarget:
     """Résout ce que ce besoin vise, sans jamais retomber sur le bâtiment.
 
@@ -158,7 +159,27 @@ def resolve(
             demand_id=demand.demand_id,
             shape=shapely_wkt.loads(building.projected_wkt),
             required_bearing_deg=(front_azimuth_deg + offset) % 360.0,
+            half_width_deg=half_width_deg,
             description=f"secteur {demand.target_ref}",
+        )
+
+    if demand.target_kind is TargetKind.TRANSITION:
+        # Une transition relie deux objets — route à entrée, entrée à
+        # stationnement — et n'a pas d'empreinte propre. Tant qu'aucune
+        # géométrie ne la porte, elle est **explicitement** non résolue : lui
+        # prêter l'empreinte du bâtiment ferait juger la transition sur la
+        # façade.
+        geometry = resolved.get(demand.target_ref)
+        if geometry is None:
+            raise TargetUnresolved(
+                f"{demand.demand_id} : transition {demand.target_ref!r} sans "
+                "géométrie propre — elle relie deux objets et ne se mesure pas "
+                "sur l'empreinte de l'un d'eux"
+            )
+        return DemandTarget(
+            demand_id=demand.demand_id,
+            shape=shapely_wkt.loads(geometry.projected_wkt),
+            description=f"transition {demand.target_ref}",
         )
 
     raise TargetUnresolved(

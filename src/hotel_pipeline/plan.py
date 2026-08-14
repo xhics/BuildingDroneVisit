@@ -133,6 +133,20 @@ def evaluate(
             ),
         )
 
+    # Une zone interdite aux plans rapprochés n'est pas un avertissement : la
+    # vue prise depuis là ne sert pas ce besoin, et le schéma la validait sans
+    # que rien ne l'écarte.
+    if measured.forbidden_zones_entered:
+        return CandidateEvaluation(
+            candidate_id=candidate.candidate_id, demand_id=demand.demand_id,
+            intent=demand.intent, eligibility=Eligibility.REJECTED,
+            geometry=measured,
+            rejection_reason=(
+                "caméra située dans une zone interdite au besoin : "
+                + ", ".join(measured.forbidden_zones_entered)
+            ),
+        )
+
     width = measured.unclipped_width_fraction
     if width is not None and width < demand.min_projected_width_fraction:
         return CandidateEvaluation(
@@ -208,32 +222,66 @@ def _unknown_required_metrics(measured, demand) -> list[str]:  # noqa: ANN001
     return missing
 
 
-def viewpoint_of(candidate, tolerance_m: float = 10.0) -> str:  # noqa: ANN001
-    """Point de vue d'un candidat : sa **position**, non son cadrage.
+def group_viewpoints(candidates: list, separation_m: float) -> dict[str, str]:
+    """Attribue un point de vue à chaque candidat, par distance **réelle**.
 
     Deux cadrages d'un même panorama sont deux acquisitions et **un seul**
     point de vue : les compter deux fois ferait croire un besoin servi par
     deux observations indépendantes alors qu'il n'y en a qu'une, et un SfM
     n'en tirerait aucune parallaxe.
-    """
-    if candidate.camera_lat is None or candidate.camera_lon is None:
-        return f"sans-position:{candidate.candidate_id}"
-    if candidate.panorama_id:
-        return f"pano:{candidate.panorama_id}"
 
-    # Grille au pas de la tolérance : deux positions plus proches que cela ne
-    # produisent pas d'observation indépendante.
-    degrees = tolerance_m / 111_320.0
-    return (
-        f"pos:{round(candidate.camera_lat / degrees):d}"
-        f":{round(candidate.camera_lon / degrees):d}"
-    )
+    Le regroupement se faisait par grille de latitude/longitude, ce qui
+    séparait deux caméras distantes de six mètres tombant de part et d'autre
+    d'une frontière de cellule — et en réunissait deux distantes de quatorze au
+    sein d'une même cellule. On compare donc des distances, pas des cases.
+    """
+    assigned: dict[str, str] = {}
+    anchors: list[tuple[str, float, float]] = []
+
+    # Ordre stable : le regroupement ne doit pas dépendre de l'ordre d'arrivée.
+    for candidate in sorted(candidates, key=lambda c: c.candidate_id):
+        if candidate.panorama_id:
+            assigned[candidate.candidate_id] = f"pano:{candidate.panorama_id}"
+            continue
+        if candidate.camera_lat is None or candidate.camera_lon is None:
+            assigned[candidate.candidate_id] = f"sans-position:{candidate.candidate_id}"
+            continue
+
+        near = next(
+            (
+                name for name, lat, lon in anchors
+                if _distance_m(candidate.camera_lat, candidate.camera_lon, lat, lon)
+                <= separation_m
+            ),
+            None,
+        )
+        if near is None:
+            near = f"pos:{candidate.candidate_id}"
+            anchors.append((near, candidate.camera_lat, candidate.camera_lon))
+        assigned[candidate.candidate_id] = near
+
+    return assigned
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance approchée en mètres, suffisante à cette échelle.
+
+    Un calcul géodésique complet n'apporterait rien sur quelques dizaines de
+    mètres, et exigerait le contexte spatial que ce module n'a pas.
+    """
+    import math
+
+    mean_lat = math.radians((lat1 + lat2) / 2.0)
+    dx = (lon2 - lon1) * 111_320.0 * math.cos(mean_lat)
+    dy = (lat2 - lat1) * 110_540.0
+    return math.hypot(dx, dy)
 
 
 def select(
     evaluations: list[CandidateEvaluation], demands: list[CaptureDemand],
     sizes: dict[str, int] | None = None,
     candidates: dict | None = None,
+    separation_m: float = 10.0,
 ) -> list[PlannedAcquisition]:
     """Retient ce qui sert un besoin, en respectant le nombre attendu.
 
@@ -244,6 +292,7 @@ def select(
     """
     announced = sizes or {}
     known = candidates or {}
+    viewpoints = group_viewpoints(list(known.values()), separation_m)
     by_demand: dict[str, list[CandidateEvaluation]] = {}
     for evaluation in evaluations:
         if evaluation.eligibility is Eligibility.REJECTED:
@@ -264,10 +313,8 @@ def select(
 
         retained, seen_viewpoints = [], set()
         for evaluation in ordered:
-            subject = known.get(evaluation.candidate_id)
-            viewpoint = (
-                viewpoint_of(subject) if subject is not None
-                else f"candidat:{evaluation.candidate_id}"
+            viewpoint = viewpoints.get(
+                evaluation.candidate_id, f"candidat:{evaluation.candidate_id}"
             )
             if viewpoint in seen_viewpoints:
                 continue
@@ -311,6 +358,7 @@ def build(
     geometries: dict[tuple[str, str], object] | None = None,
     sizes: dict[str, int] | None = None,
     plan_id: str | None = None,
+    separation_m: float = 10.0,
 ) -> tuple[AcquisitionPlan, list[CandidateEvaluation], PlanReport]:
     """Évalue chaque candidat pour chaque besoin, puis arrête un plan.
 
@@ -342,6 +390,7 @@ def build(
     planned = select(
         evaluations, demands, sizes,
         candidates={c.candidate_id: c for c in candidates},
+        separation_m=separation_m,
     )
     plan = AcquisitionPlan(
         plan_id=plan_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),

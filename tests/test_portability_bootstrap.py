@@ -51,24 +51,51 @@ def profile(**overrides) -> PropertyProfile:
 # --- la politique du pilote ne bouge pas ------------------------------------
 
 
-def test_the_pilot_policy_keeps_its_digest() -> None:
-    """La contrainte la plus dure du lot.
+#: Empreinte de la politique du pilote, par version. Elle bouge quand la
+#: politique gagne un seuil décisionnel — c'est le rôle d'une empreinte — mais
+#: jamais quand une refactorisation ne change aucune valeur. Les rapports
+#: publiés conservent celle de leur époque : ils n'ont pas été produits avec la
+#: politique d'aujourd'hui, et le prétendre serait faux.
+PILOT_POLICY_DIGESTS = {
+    "a4564b71ddeec56e": "avant les seuils de secteur et de séparation",
+    "9275a7e32eeb0431": "avec sector_observer_half_width_deg et viewpoint_separation_m",
+}
 
-    Rendre les défauts génériques ne doit pas déplacer d'un octet la politique
-    déjà écrite : une vingtaine de rapports publiés citent son empreinte.
+
+def test_the_pilot_policy_digest_moves_only_on_a_real_change() -> None:
+    """Une empreinte change quand une valeur change, jamais autrement.
+
     Le socle `Calibrated` n'est donc pas un modèle — en hériter aurait placé
-    les deux champs en tête du dump et changé l'empreinte sans qu'aucune
-    valeur ne bouge.
+    les deux champs de calibration en tête du dump et changé l'empreinte sans
+    qu'aucune valeur ne bouge. Ajouter deux seuils décisionnels, au contraire,
+    la déplace à juste titre.
     """
     path = Path("work/welcominns-boucherville/00_manifest/pipeline_policy.json")
     if not path.is_file():  # pragma: no cover — dépend du corpus local
         pytest.skip("corpus du pilote absent")
 
     loaded = PipelinePolicy.model_validate_json(path.read_text("utf-8"))
+    digest = policy_digest(loaded)
 
-    assert policy_digest(loaded) == "a4564b71ddeec56e"
+    assert digest in PILOT_POLICY_DIGESTS, (
+        f"empreinte {digest!r} non répertoriée : si la politique a gagné une "
+        "valeur, inscrivez-la ; sinon, une refactorisation a déplacé un champ"
+    )
+    # Les valeurs du pilote, elles, ne bougent pas.
     assert loaded.model.calibration_id == "welcominns-2026-08-36-images"
     assert loaded.model.calibrated_on_sites == 1
+
+
+def test_a_refactoring_never_moves_the_digest_on_its_own() -> None:
+    """Le contrôle qui compte : deux politiques de mêmes valeurs, une empreinte.
+
+    C'est ce qui distingue un vrai changement d'un déplacement de champ.
+    """
+    from hotel_pipeline.schemas import DEFAULT_POLICY
+
+    twin = PipelinePolicy.model_validate_json(DEFAULT_POLICY.model_dump_json())
+
+    assert policy_digest(twin) == policy_digest(DEFAULT_POLICY)
 
 
 def test_the_calibration_fields_are_never_moved_to_the_front() -> None:

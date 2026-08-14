@@ -209,14 +209,50 @@ def test_distinct_positions_do_count_separately() -> None:
 
 def test_two_framings_of_one_panorama_are_one_viewpoint() -> None:
     """Le cas d'acceptation de Street View, avant même son résolveur."""
-    from hotel_pipeline.plan import viewpoint_of
+    from hotel_pipeline.plan import group_viewpoints
 
     first = candidate("sv-1", panorama_id="pano-A", requested_heading_deg=0.0)
     second = candidate("sv-2", panorama_id="pano-A", requested_heading_deg=180.0)
     elsewhere = candidate("sv-3", panorama_id="pano-B")
 
-    assert viewpoint_of(first) == viewpoint_of(second)
-    assert viewpoint_of(first) != viewpoint_of(elsewhere)
+    grouped = group_viewpoints([first, second, elsewhere], separation_m=10.0)
+
+    assert grouped["sv-1"] == grouped["sv-2"]
+    assert grouped["sv-1"] != grouped["sv-3"]
+
+
+def test_viewpoints_group_by_real_distance_not_by_grid_cell() -> None:
+    """Le défaut de la grille : deux caméras proches, deux cellules.
+
+    Six mètres de part et d'autre d'une frontière comptaient pour deux points
+    de vue ; quatorze mètres au sein d'une même cellule n'en comptaient qu'un.
+    """
+    from hotel_pipeline.plan import group_viewpoints
+
+    # Deux positions distantes d'environ 6 m, choisies pour tomber de part et
+    # d'autre d'une frontière de grille au pas de 10 m.
+    close_pair = [
+        candidate("a", camera_lat=45.573_000, camera_lon=-73.443_000),
+        candidate("b", camera_lat=45.573_054, camera_lon=-73.443_000),
+    ]
+    far = candidate("c", camera_lat=45.573_400, camera_lon=-73.443_000)
+
+    grouped = group_viewpoints([*close_pair, far], separation_m=10.0)
+
+    assert grouped["a"] == grouped["b"]
+    assert grouped["a"] != grouped["c"]
+
+
+def test_the_grouping_does_not_depend_on_arrival_order() -> None:
+    forward = [candidate(n, camera_lat=45.573 + i * 0.0002, camera_lon=-73.443)
+               for i, n in enumerate(("a", "b", "c"))]
+
+    from hotel_pipeline.plan import group_viewpoints
+
+    first = group_viewpoints(forward, separation_m=10.0)
+    second = group_viewpoints(list(reversed(forward)), separation_m=10.0)
+
+    assert first == second
 
 
 # --- rien ne s'acquiert sans consentement ni empreintes -----------------------
@@ -379,3 +415,191 @@ def test_a_draft_names_the_exact_command_that_would_execute_it(project) -> None:
     result = runner.invoke(app, ["assets", "plan", "hotel-test"])
 
     assert "--consent-bytes" in result.output
+
+
+# --- le raccord CLI : la nouvelle logique s'exécute réellement ----------------
+
+
+@pytest.fixture
+def sited_project(tmp_path, monkeypatch):
+    """Un projet complet : contexte spatial, géométrie de capture, façade orientée.
+
+    Les tests unitaires passaient alors que `assets plan` appelait encore la
+    mesure avec l'ancienne empreinte. Ce montage exerce la commande.
+    """
+    import json
+
+    from shapely.geometry import Polygon
+    from typer.testing import CliRunner
+
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.geo import capture_geometry as cg
+    from hotel_pipeline.geo import territory
+    from hotel_pipeline.geo.geometry_loader import CURRENT_SCHEMA_VERSION
+    from hotel_pipeline.geo.projection import ProjectionService
+    from hotel_pipeline.schemas.acquisition import CandidateManifest, CaptureDemandManifest
+    from hotel_pipeline.schemas.geometry import (
+        CaptureGeometryManifest, GeometryRole, GeometrySourceSnapshot,
+        SourceQueryStatus,
+    )
+    from hotel_pipeline.workspace import Workspace
+
+    monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path / "work"))
+    monkeypatch.setenv("HOTEL_PIPELINE_PROFILES", str(tmp_path / "profiles"))
+    monkeypatch.setenv("HOTEL_PIPELINE_OFFLINE", "1")
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    runner.invoke(app, [
+        "init", "hotel-test", "--address", "1 rue Test", "--name", "Hôtel Test",
+        "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr",
+        "--lat", "45.574128", "--lon", "-73.443289",
+    ])
+    runner.invoke(app, ["geo", "reference", "hotel-test"])
+
+    workspace = Workspace("hotel-test")
+    reference = territory.resolve("hotel-test", 45.574128, -73.443289)
+    service = ProjectionService(reference)
+
+    building = Polygon([
+        (-73.44355, 45.57395), (-73.44300, 45.57395),
+        (-73.44300, 45.57430), (-73.44355, 45.57430),
+    ])
+    resolved = cg.resolved_from(
+        "BUILDING_MAIN", GeometryRole.TARGET_BUILDING, "way/1", "snap",
+        building, "essai", ["preuve"], service,
+    )
+    geometry = CaptureGeometryManifest(
+        schema_version=CURRENT_SCHEMA_VERSION, hotel_id="hotel-test",
+        snapshots=[GeometrySourceSnapshot(
+            snapshot_id="snap", source="essai", endpoint="essai", query="essai",
+            status=SourceQueryStatus.SUCCESS, element_count=1, response_digest="d",
+        )],
+        geometries=[resolved],
+        working_crs=reference.working_crs,
+        spatial_context_digest=reference.context_digest(),
+    )
+    workspace.write_json(
+        "06_geo/capture_geometry.json", json.loads(geometry.model_dump_json())
+    )
+
+    # Façade orientée au sud : une caméra au sud observe l'avant. `init`
+    # n'écrit pas de manifeste spatial — il naît de la résolution d'adresse —
+    # donc le montage le pose explicitement.
+    from hotel_pipeline.schemas.spatial import GeocodeResult, SpatialManifest
+
+    workspace.write_spatial(
+        SpatialManifest(
+            hotel_id="hotel-test", address="1 rue Test",
+            geocode=GeocodeResult(lat=45.574128, lon=-73.443289, provider="essai"),
+            front_azimuth_deg=180.0,
+        )
+    )
+
+    workspace.write_json(
+        "01_sources/capture_demands.json",
+        json.loads(
+            CaptureDemandManifest(
+                hotel_id="hotel-test",
+                demands=[demand("avant", target_ref="front"),
+                         demand("arriere", target_ref="rear")],
+            ).model_dump_json()
+        ),
+    )
+    workspace.write_json(
+        "01_sources/candidates_20260814T000000000000Z.json",
+        json.loads(
+            CandidateManifest(
+                hotel_id="hotel-test",
+                candidates=[candidate("c1", camera_lat=45.57340, camera_lon=-73.44330)],
+            ).model_dump_json()
+        ),
+    )
+    return runner, workspace
+
+
+def test_the_cli_measures_each_demand_against_its_own_target(sited_project) -> None:
+    """Le défaut : la CLI passait encore l'ancienne empreinte unique.
+
+    Une caméra placée devant le bâtiment doit être acceptée pour « avant » et
+    rejetée pour « arrière » — ce que la copie d'une géométrie unique rendait
+    impossible.
+    """
+    import json
+
+    from hotel_pipeline.cli import app
+
+    runner, workspace = sited_project
+
+    result = runner.invoke(app, ["assets", "plan", "hotel-test"])
+
+    assert result.exit_code == 0, result.output
+    assert "mesurés" in result.output
+    assert "hors secteur" in result.output
+
+    written = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
+    plan = json.loads(written[-1].read_text("utf-8"))
+    served = {
+        demand_id
+        for acquisition in plan["acquisitions"]
+        for demand_id in acquisition["serves_demands"]
+    }
+
+    assert "avant" in served
+    assert "arriere" not in served
+
+
+def test_the_cli_reports_the_effective_sector_threshold(sited_project) -> None:
+    import json
+
+    from hotel_pipeline.cli import app
+
+    runner, workspace = sited_project
+    runner.invoke(app, ["assets", "plan", "hotel-test"])
+
+    written = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
+    plan = json.loads(written[-1].read_text("utf-8"))
+
+    assert plan["acquisitions"], "aucune acquisition planifiée"
+
+
+# --- continuité : planifiable, jamais satisfaite sans mesure ------------------
+
+
+def test_a_demand_requiring_continuity_is_never_met_without_measurement() -> None:
+    """Une continuité planifiée dit qu'on l'a cherchée, non qu'on l'a obtenue."""
+    from hotel_pipeline.schemas.acquisition import DemandAssessment
+
+    wanted = demand(viewpoints_required=2, continuity_required=0.6)
+
+    unmeasured = DemandAssessment(
+        demand_id="d1", corpus_digest="c0", viewpoints_found=3,
+    )
+    planned_only = DemandAssessment(
+        demand_id="d1", corpus_digest="c0", viewpoints_found=3,
+        continuity_achieved=0.8, continuity_level="planned",
+    )
+    observed = DemandAssessment(
+        demand_id="d1", corpus_digest="c0", viewpoints_found=3,
+        continuity_achieved=0.8, continuity_level="observed",
+    )
+    too_low = DemandAssessment(
+        demand_id="d1", corpus_digest="c0", viewpoints_found=3,
+        continuity_achieved=0.2, continuity_level="observed",
+    )
+
+    assert unmeasured.meets(wanted) is False
+    assert planned_only.meets(wanted) is False
+    assert too_low.meets(wanted) is False
+    assert observed.meets(wanted) is True
+
+
+def test_a_demand_without_continuity_needs_only_its_viewpoints() -> None:
+    from hotel_pipeline.schemas.acquisition import DemandAssessment
+
+    simple = demand(viewpoints_required=2)
+    enough = DemandAssessment(demand_id="d1", corpus_digest="c0", viewpoints_found=2)
+    short = DemandAssessment(demand_id="d1", corpus_digest="c0", viewpoints_found=1)
+
+    assert enough.meets(simple) is True
+    assert short.meets(simple) is False

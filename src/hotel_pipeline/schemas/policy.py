@@ -107,6 +107,20 @@ class GeometryPolicy(BaseModel):
     adjacency_strong_m: float = Field(default=8.0, gt=0)
     adjacency_max_m: float = Field(default=30.0, gt=0)
 
+    #: Demi-ouverture admise autour de l'azimut d'un secteur, pour juger d'où
+    #: un observateur regarde. **Valeur initiale provisoire**, et son usage est
+    #: borné : elle sert à écarter un observateur clairement situé du mauvais
+    #: côté, jamais à déclarer une façade couverte. Une vue oblique contribue
+    #: légitimement à deux secteurs voisins — c'est pourquoi la demi-ouverture
+    #: dépasse le huitième de tour, et pourquoi deux secteurs se recouvrent.
+    sector_observer_half_width_deg: float = Field(default=67.5, gt=0, le=180)
+
+    #: Distance en deçà de laquelle deux caméras ne produisent pas deux
+    #: observations indépendantes. Mesurée en mètres projetés, jamais en
+    #: cellules de grille : deux positions distantes de six mètres tombant de
+    #: part et d'autre d'une frontière comptaient pour deux points de vue.
+    viewpoint_separation_m: float = Field(default=10.0, gt=0)
+
 
 class VisibilityPolicy(BaseModel):
     """Réglages numériques du moteur de visibilité.

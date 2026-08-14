@@ -46,6 +46,12 @@ class GeometryReport:
     #: Couples mesurés depuis un côté que le besoin n'accepte pas.
     wrong_sector: int = 0
 
+    #: Couples dont la caméra se trouve dans une zone interdite au besoin.
+    forbidden_zone_entries: int = 0
+
+    #: Seuil effectivement appliqué, inscrit au rapport comme à la mesure.
+    sector_half_width_deg: float | None = None
+
     def as_dict(self) -> dict:
         return {
             "measured": self.measured,
@@ -56,6 +62,8 @@ class GeometryReport:
             },
             "unresolved_targets": self.unresolved_targets,
             "wrong_sector": self.wrong_sector,
+            "forbidden_zone_entries": self.forbidden_zone_entries,
+            "sector_half_width_deg": self.sector_half_width_deg,
             "note": (
                 "espérances calculées sur métadonnées : aucune image n'a été "
                 "acquise, et aucune de ces valeurs n'est une mesure sur pixels"
@@ -203,6 +211,22 @@ def _occlusion(origin, target_shape, obstacles: list, policy) -> tuple[bool, set
     return bool(found), found
 
 
+def _forbidden_entered(candidate, demand, zones: dict, projection) -> set:  # noqa: ANN001
+    """Zones interdites où se trouve la caméra, parmi celles que le besoin nomme.
+
+    Le schéma validait ces références sans que rien ne les fasse agir : une
+    vue prise depuis une zone interdite était planifiée comme une autre.
+    """
+    from shapely.geometry import Point
+
+    refs = getattr(demand, "forbidden_zone_refs", None) or []
+    if not refs:
+        return set()
+
+    origin = Point(projection.point(candidate.camera_lat, candidate.camera_lon))
+    return {ref for ref in refs if ref in zones and zones[ref].contains(origin)}
+
+
 def measure_all(
     candidates: list,
     manifest,  # noqa: ANN001 — CaptureGeometryManifest
@@ -212,6 +236,8 @@ def measure_all(
     obstacles: list | None = None,
     front_azimuth_deg: float | None = None,
     site=None,  # noqa: ANN001
+    half_width_deg: float | None = None,
+    forbidden_zones: dict | None = None,
 ) -> tuple[dict, GeometryReport]:
     """Mesure chaque candidat **contre la cible de chaque besoin**.
 
@@ -221,16 +247,23 @@ def measure_all(
     chaque besoin résout sa propre cible, et un besoin dont la cible n'est pas
     résolue n'est pas mesuré du tout — il n'est pas rabattu sur le bâtiment.
     """
-    from .demand_targets import TargetUnresolved, observer_bearing, resolve
+    from .demand_targets import (
+        DEFAULT_SECTOR_HALF_WIDTH_DEG, TargetUnresolved, observer_bearing, resolve,
+    )
 
-    report = GeometryReport()
+    half_width = (
+        half_width_deg if half_width_deg is not None
+        else DEFAULT_SECTOR_HALF_WIDTH_DEG
+    )
+    zones = forbidden_zones or {}
+    report = GeometryReport(sector_half_width_deg=half_width)
     measured: dict[tuple[str, str], CandidateGeometry] = {}
 
     targets = {}
     for demand in demands:
         try:
             targets[demand.demand_id] = resolve(
-                demand, manifest, front_azimuth_deg, site
+                demand, manifest, front_azimuth_deg, site, half_width
             )
         except TargetUnresolved as exc:
             report.unresolved_targets[demand.demand_id] = str(exc).split(" : ", 1)[-1]
@@ -262,6 +295,20 @@ def measure_all(
                     update={"view_sector": None, "wrong_sector": True}
                 )
                 report.wrong_sector += 1
+
+            # Le seuil effectif voyage avec la mesure : le modifier doit
+            # périmer ce qu'il a produit, et une mesure qui ne le porte pas ne
+            # peut pas être confrontée.
+            geometry = geometry.model_copy(
+                update={"sector_half_width_deg": half_width}
+            )
+
+            entered = _forbidden_entered(candidate, demand, zones, projection)
+            if entered:
+                geometry = geometry.model_copy(
+                    update={"forbidden_zones_entered": sorted(entered)}
+                )
+                report.forbidden_zone_entries += 1
 
             measured[(candidate.candidate_id, demand.demand_id)] = geometry
             report.measured += 1

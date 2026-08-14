@@ -468,3 +468,118 @@ def test_the_in_frame_fraction_is_not_the_apparent_width(service, target) -> Non
 
     assert result.eligibility is Eligibility.REJECTED
     assert "part dans le cadre" in result.rejection_reason
+
+
+# --- le seuil de secteur vient de la politique --------------------------------
+
+
+def test_the_sector_threshold_comes_from_the_policy(service, manifest) -> None:
+    """Valeur initiale provisoire, pas constante de code."""
+    from hotel_pipeline.schemas import DEFAULT_POLICY
+
+    assert DEFAULT_POLICY.geometry.sector_observer_half_width_deg == 67.5
+
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [demand("avant")],
+        front_azimuth_deg=180.0, half_width_deg=42.0,
+    )
+
+    # Le seuil effectif voyage avec la mesure : sans lui, on ne pourrait pas
+    # confronter un plan au seuil qui l'a produit.
+    assert measured[("c1", "avant")].sector_half_width_deg == 42.0
+    assert report.as_dict()["sector_half_width_deg"] == 42.0
+
+
+def test_a_narrower_threshold_rejects_a_more_oblique_view(service, manifest) -> None:
+    """Le seuil élimine un observateur du mauvais côté, rien de plus."""
+    oblique = candidate(camera_lat=45.57400, camera_lon=-73.44380)
+
+    lenient, _ = measure_all(
+        [oblique], manifest, service, POLICY, [demand("avant")],
+        front_azimuth_deg=180.0, half_width_deg=120.0,
+    )
+    strict, _ = measure_all(
+        [oblique], manifest, service, POLICY, [demand("avant")],
+        front_azimuth_deg=180.0, half_width_deg=5.0,
+    )
+
+    assert lenient[("c1", "avant")].wrong_sector is False
+    assert strict[("c1", "avant")].wrong_sector is True
+
+
+def test_an_oblique_view_may_serve_two_neighbouring_sectors(service, manifest) -> None:
+    """Une vue de coin contribue légitimement aux deux secteurs voisins."""
+    corner = candidate(camera_lat=45.57360, camera_lon=-73.44380)
+
+    measured, _ = measure_all(
+        [corner], manifest, service, POLICY,
+        [demand("avant", target_ref="front"), demand("gauche", target_ref="left")],
+        front_azimuth_deg=180.0, half_width_deg=67.5,
+    )
+
+    accepted = [
+        key for key, geometry in measured.items() if not geometry.wrong_sector
+    ]
+    assert len(accepted) >= 1
+
+
+# --- zones interdites : elles agissent, elles ne sont plus décoratives ---------
+
+
+def test_a_camera_inside_a_forbidden_zone_is_rejected(service, manifest) -> None:
+    """Le schéma validait ces références sans que rien ne les fasse agir."""
+    from hotel_pipeline.plan import evaluate
+
+    zone = service.geometry(
+        Polygon([
+            (-73.44340, 45.57330), (-73.44320, 45.57330),
+            (-73.44320, 45.57350), (-73.44340, 45.57350),
+        ]),
+        label="zone",
+    )
+    restricted = demand("avant", forbidden_zone_refs=["ZONE_TOIT"])
+
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [restricted],
+        front_azimuth_deg=180.0, forbidden_zones={"ZONE_TOIT": zone},
+    )
+    geometry = measured[("c1", "avant")]
+
+    assert geometry.forbidden_zones_entered == ["ZONE_TOIT"]
+    assert report.forbidden_zone_entries == 1
+
+    result = evaluate(candidate(), restricted, geometry)
+    assert result.eligibility is Eligibility.REJECTED
+    assert "zone interdite" in result.rejection_reason
+
+
+def test_a_demand_naming_no_zone_forbids_nothing(service, manifest) -> None:
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [demand("avant")],
+        front_azimuth_deg=180.0, forbidden_zones={"ZONE_TOIT": None},
+    )
+
+    assert measured[("c1", "avant")].forbidden_zones_entered == []
+    assert report.forbidden_zone_entries == 0
+
+
+# --- une transition se résout ou se déclare non résolue ------------------------
+
+
+def test_a_transition_without_its_own_geometry_is_unresolved(
+    service, manifest
+) -> None:
+    """Lui prêter l'empreinte du bâtiment ferait juger la transition sur la façade."""
+    transition = demand(
+        "acces-entree", target_kind=TargetKind.TRANSITION,
+        target_ref="ROAD_TO_ENTRANCE",
+    )
+
+    measured, report = measure_all(
+        [candidate()], manifest, service, POLICY, [transition],
+        front_azimuth_deg=180.0,
+    )
+
+    assert measured == {}
+    assert "acces-entree" in report.unresolved_targets
+    assert "ne se mesure pas" in report.unresolved_targets["acces-entree"]

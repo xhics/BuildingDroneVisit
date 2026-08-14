@@ -754,6 +754,7 @@ def assets_plan(
         plan, evaluations, report = build(
             hotel_id, candidates.candidates, demands.demands, digests,
             geometries=geometries,
+            separation_m=context.policy.geometry.viewpoint_separation_m,
         )
     except PlanRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -767,6 +768,13 @@ def assets_plan(
         )
         for reason, count in sorted(geometry_report.without_framing.items()):
             typer.echo(f"    sans cadrage · {reason:<40} {count:>4}")
+        if geometry_report.wrong_sector:
+            typer.echo(f"    hors secteur  {geometry_report.wrong_sector}")
+        for demand_id, reason in sorted(geometry_report.unresolved_targets.items()):
+            typer.secho(
+                f"    cible non résolue · {demand_id} — {reason[:48]}",
+                fg=typer.colors.YELLOW,
+            )
     typer.echo(f"  évaluations {report.evaluations}")
     typer.echo(f"  retenues    {report.selected}")
     if report.preview_required:
@@ -835,9 +843,11 @@ def assets_plan(
 def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN001, ANN201
     """Mesure ce que la géométrie permet, ou dit pourquoi elle ne le permet pas.
 
-    Sans contexte spatial ni empreinte cible, aucune mesure : le plan classera
-    en `preview_required`, ce qui est une réponse honnête. Projeter dans un
-    référentiel supposé donnerait des espérances finies et fausses.
+    Transmet **tout** ce dont la mesure a besoin : le manifeste géométrique —
+    et non une empreinte unique, qui ferait mesurer chaque besoin contre le
+    bâtiment — l'orientation de façade sans laquelle un secteur ne veut rien
+    dire, le manifeste de site pour les références indirectes, les obstacles,
+    et le seuil de secteur de la politique matérialisée.
     """
     from .candidate_geometry import measure_all
     from .geo.geometry_loader import LegacyManifestRefused, load_capture_geometry
@@ -853,15 +863,25 @@ def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN
         )
         return {}, None
 
+    spatial = _safe_read(workspace.read_spatial)
+    front = getattr(spatial, "front_azimuth_deg", None) if spatial else None
+    if front is None:
+        typer.secho(
+            "  · orientation de façade inconnue : les besoins de secteur ne "
+            "seront pas mesurés — « avant » et « arrière » ne se distinguent pas",
+            fg=typer.colors.YELLOW,
+        )
+
     try:
         manifest, _ = load_capture_geometry(geometry_path, reference)
-        target, _ = _target_shape(manifest)
-        if target is None:
-            raise LegacyManifestRefused("aucune empreinte cible résolue")
         measured, report = measure_all(
-            candidates, target, ProjectionService(reference),
+            candidates, manifest, ProjectionService(reference),
             context.policy.visibility, demands,
             obstacles=_obstacle_shapes(manifest),
+            front_azimuth_deg=front,
+            site=_safe_read(workspace.read_site),
+            half_width_deg=context.policy.geometry.sector_observer_half_width_deg,
+            forbidden_zones=_forbidden_zones(manifest),
         )
     except (LegacyManifestRefused, ProjectionRefused, ValueError) as exc:
         typer.secho(f"  · mesure impossible : {exc}", fg=typer.colors.YELLOW)
@@ -870,10 +890,17 @@ def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN
     return measured, report
 
 
-def _target_shape(manifest):  # noqa: ANN001, ANN201
-    from .geo.visibility_run import _target
+def _forbidden_zones(manifest) -> dict:  # noqa: ANN001
+    """Zones interdites nommées par le manifeste géométrique, par référence."""
+    from shapely import wkt as shapely_wkt
 
-    return _target(manifest)
+    from .schemas.geometry import GeometryResolutionStatus
+
+    return {
+        geometry.feature_id: shapely_wkt.loads(geometry.projected_wkt)
+        for geometry in manifest.geometries
+        if geometry.resolution_status is GeometryResolutionStatus.RESOLVED
+    }
 
 
 def _obstacle_shapes(manifest) -> list:  # noqa: ANN001

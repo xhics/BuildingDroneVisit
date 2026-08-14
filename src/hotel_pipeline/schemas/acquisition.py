@@ -179,6 +179,19 @@ class DemandAssessment(BaseModel):
     #: renoncer sans motif interdit d'y revenir.
     rationale: str | None = None
 
+    #: Niveau atteint par la continuité, quand elle est exigée. Trois états,
+    #: parce qu'ils ne s'établissent pas au même moment :
+    #:
+    #: ```text
+    #: planned    positions, séquence, caps et champs de vision
+    #: observed   recouvrement mesuré après acquisition
+    #: verified   enregistrement géométrique, au Lot 2
+    #: ```
+    #:
+    #: `planned` suffit à planifier une acquisition ; il ne suffira jamais à
+    #: déclarer un besoin satisfait.
+    continuity_level: str | None = None
+
     @model_validator(mode="after")
     def _unreachable_needs_a_reason(self) -> "DemandAssessment":
         if self.status is DemandStatus.UNREACHABLE and not (self.rationale or "").strip():
@@ -186,6 +199,25 @@ class DemandAssessment(BaseModel):
                 f"besoin {self.demand_id!r} déclaré inatteignable sans motif"
             )
         return self
+
+    def meets(self, demand: "CaptureDemand") -> bool:
+        """Ce corpus satisfait-il **ce** besoin ?
+
+        Le nombre de points de vue ne suffit pas : un besoin exigeant de la
+        continuité n'est satisfait que si elle a été **mesurée** et atteint le
+        seuil. Une continuité planifiée dit qu'on l'a cherchée, non qu'on l'a
+        obtenue — et un SfM ne se contente pas d'une intention.
+        """
+        if self.viewpoints_found < demand.viewpoints_required:
+            return False
+        if demand.continuity_required > 0:
+            if self.continuity_achieved is None:
+                return False
+            if self.continuity_achieved < demand.continuity_required:
+                return False
+            if self.continuity_level == "planned":
+                return False
+        return True
 
 
 class CaptureDemandManifest(BaseModel):
@@ -582,6 +614,17 @@ class CandidateGeometry(BaseModel):
 
     #: Secteur du vocabulaire officiel, jamais une chaîne libre.
     view_sector: ViewSector | None = None
+
+    #: Demi-ouverture effectivement appliquée pour juger le secteur. Inscrite
+    #: à la mesure : un seuil qui ne figure pas dans ce qu'il a produit ne peut
+    #: pas être confronté, et le modifier périmerait silencieusement candidats,
+    #: évaluations et plans — sans toucher aux artefacts LiDAR, qui ne le lisent
+    #: pas.
+    sector_half_width_deg: float | None = Field(default=None, gt=0, le=180)
+
+    #: Zones interdites aux plans rapprochés que ce candidat traverse. Le
+    #: schéma les validait sans que rien ne les fasse agir.
+    forbidden_zones_entered: list[str] = Field(default_factory=list)
 
     #: La caméra regarde-t-elle depuis un côté que le besoin n'accepte pas ?
     #: Une vue excellente prise de l'arrière ne montre pas la façade avant, et
