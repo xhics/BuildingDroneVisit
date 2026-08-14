@@ -157,7 +157,6 @@ def test_an_acquired_file_is_measured_not_believed(tmp_path) -> None:
     acquired, report = run(
         plan(), {"c1": candidate(advertised_width=9999, advertised_height=9999)},
         tmp_path, DIGESTS, plan_digest="pd", fetcher=fetcher,
-        rights=Rights.OPEN_DATA,
     )
 
     asset = acquired[0]
@@ -171,7 +170,7 @@ def test_an_acquired_file_is_measured_not_believed(tmp_path) -> None:
 def test_the_asset_identity_comes_from_the_provider_never_the_url(tmp_path) -> None:
     acquired, _ = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd", fetcher=fake_fetcher(),
     )
 
     asset = acquired[0]
@@ -182,7 +181,7 @@ def test_the_asset_identity_comes_from_the_provider_never_the_url(tmp_path) -> N
 def test_no_url_is_written_into_the_asset(tmp_path) -> None:
     acquired, _ = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd", fetcher=fake_fetcher(),
     )
 
     assert "://" not in acquired[0].model_dump_json()
@@ -191,7 +190,7 @@ def test_no_url_is_written_into_the_asset(tmp_path) -> None:
 def test_the_provenance_binds_the_file_to_the_plan_that_chose_it(tmp_path) -> None:
     acquired, report = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd0", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd0", fetcher=fake_fetcher(),
     )
 
     provenance = acquired[0].acquisition
@@ -202,13 +201,49 @@ def test_the_provenance_binds_the_file_to_the_plan_that_chose_it(tmp_path) -> No
     assert provenance.intents == [CaptureIntent.BUILDING_CAPTURE]
 
 
+def test_acquisition_establishes_no_right(tmp_path) -> None:
+    """`--rights owned` permettait d'écrire un statut juridique sans preuve.
+
+    L'acquisition constate d'où vient un fichier ; elle ne tranche rien.
+    """
+    acquired, _ = run(
+        plan(), {"c1": candidate()}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fake_fetcher(),
+    )
+
+    asset = acquired[0]
+    assert asset.rights is Rights.PUBLIC_UNCLEARED
+    assert asset.rights_encumbered is False
+    assert asset.rights_history == []
+    # Et donc : rien n'est éligible production à la sortie de l'acquisition.
+    assert asset.usable_in_production is False
+
+
+def test_a_source_licence_is_kept_as_a_claim_not_an_authorisation(tmp_path) -> None:
+    """Afficher « CC BY » ne prouve pas qu'on détenait les droits de l'accorder."""
+    claiming = candidate()
+    claiming = claiming.model_copy(
+        update={"request_spec": {**claiming.request_spec, "licence_claim": "CC BY-SA 4.0"}}
+    )
+
+    acquired, _ = run(
+        plan(), {"c1": claiming}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fake_fetcher(),
+    )
+
+    asset = acquired[0]
+    assert asset.rights is Rights.PUBLIC_UNCLEARED
+    assert "revendiquée par la source" in asset.rights_note
+    assert "CC BY-SA 4.0" in asset.rights_note
+
+
 def test_exterior_is_never_presumed(tmp_path) -> None:
     """Une vue d'intérieur déclarée extérieure fausserait la couverture."""
     from hotel_pipeline.schemas import ExteriorInterior
 
     acquired, _ = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd", fetcher=fake_fetcher(),
     )
 
     assert acquired[0].exterior_or_interior is ExteriorInterior.UNKNOWN
@@ -220,7 +255,7 @@ def test_exterior_is_never_presumed(tmp_path) -> None:
 def test_the_report_compares_downloaded_against_consented(tmp_path) -> None:
     _, report = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd", fetcher=fake_fetcher(),
     )
 
     volume = report.as_dict()["volume"]
@@ -233,7 +268,7 @@ def test_a_download_larger_than_announced_is_visible_in_the_report(tmp_path) -> 
     """Un dépassement doit se lire, pas se découvrir sur le disque."""
     _, report = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS, plan_digest="pd",
-        fetcher=fake_fetcher(JPEG + b"\x00" * 5000), rights=Rights.OPEN_DATA,
+        fetcher=fake_fetcher(JPEG + b"\x00" * 5000),
     )
 
     volume = report.as_dict()["volume"]
@@ -249,7 +284,7 @@ def test_a_tampered_file_is_caught_by_verification(tmp_path) -> None:
 
     acquired, _ = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS,
-        plan_digest="pd", fetcher=fake_fetcher(), rights=Rights.OPEN_DATA,
+        plan_digest="pd", fetcher=fake_fetcher(),
     )
     assert verify_acquired(acquired) == []
 

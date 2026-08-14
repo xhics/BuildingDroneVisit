@@ -113,7 +113,6 @@ def run(
     plan_digest: str,
     fetcher=None,  # noqa: ANN001 — injecté pour éprouver sans réseau
     run_id: str | None = None,
-    rights=None,  # noqa: ANN001
 ) -> tuple[list, AcquireReport]:
     """Télécharge ce que le plan porte, et rien d'autre.
 
@@ -123,6 +122,7 @@ def run(
     la résolution appeler le réseau derrière un téléchargeur pourtant injecté.
     """
     from .acquisition import as_asset, new_run_id
+    from .rights import acquisition_rights
     from .schemas import Rights
 
     if plan.status is not PlanStatus.EXECUTABLE:
@@ -188,7 +188,13 @@ def run(
             run_id=report.run_id,
         )
 
-        asset = as_asset(candidate, provenance, written, rights or Rights.UNKNOWN)
+        # L'acquisition constate un fait ; elle ne tranche aucun droit. Une
+        # source tierce téléchargée est `public_uncleared`, et la licence
+        # revendiquée par le fournisseur reste une **revendication**.
+        asset = as_asset(candidate, provenance, written, Rights.PUBLIC_UNCLEARED)
+        asset = asset.model_copy(
+            update=acquisition_rights(candidate.request_spec.get("licence_claim"))
+        )
         acquired.append(asset)
         report.acquired += 1
         report.bytes_downloaded += asset.file_size_bytes or 0

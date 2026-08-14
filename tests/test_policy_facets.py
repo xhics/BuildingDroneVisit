@@ -337,3 +337,22 @@ def test_a_written_report_carries_both_levels(tmp_path, monkeypatch) -> None:
     dependencies = report["policy_dependency_digests"]
     assert set(dependencies) == {"candidate_geometry", "visibility"}
     assert "terrain_derivation" not in dependencies
+
+
+def test_every_declared_production_is_actually_published() -> None:
+    """Déclarer une dépendance sans jamais l'écrire ne périme rien.
+
+    Six productions avaient leurs facettes déclarées et testées, sans que
+    leurs commandes les publient : le contrat était exact et inopérant.
+    """
+    import re
+    from pathlib import Path
+
+    source = Path("src/hotel_pipeline/cli.py").read_text("utf-8")
+    published = set(re.findall(r'production="([A-Za-z]+)"', source))
+
+    # `AcquiredImage` est écrit par le rapport d'acquisition d'images ;
+    # les autres se retrouvent dans leurs commandes respectives.
+    missing = sorted(set(CONSUMERS) - published)
+
+    assert missing == [], f"productions déclarées mais jamais publiées : {missing}"

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from datetime import datetime, timezone
 
 from .acquisition import AcquisitionProvenance
+from .rights import RightsDecision
 from .enums import (
     AssetCategory,
     Blinding,
@@ -319,6 +320,12 @@ class Asset(BaseModel):
     #: et propagé jusqu'au rapport final : l'option est tracée, pas dissoute.
     rights_encumbered: bool = False
     rights_note: str | None = None
+
+    #: Décisions de droits, append-only. L'acquisition n'en produit aucune :
+    #: elle constate un fait — ce fichier vient de là — et ne tranche rien.
+    #: Une autorisation est une décision humaine, avec auteur, date, portée et
+    #: preuves, et elle se corrige en ajoutant, jamais en réécrivant.
+    rights_history: list["RightsDecision"] = Field(default_factory=list)
 
     #: Métadonnées de prise de vue, utiles au preflight et à la couverture.
     attribution: str | None = None

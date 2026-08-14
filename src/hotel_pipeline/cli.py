@@ -826,7 +826,24 @@ def assets_plan(
         f"01_sources/acquisition_plan_{plan.plan_id}.json",
         json.loads(plan.model_dump_json()),
     )
-    workspace.write_report(f"01_sources/plan_report_{plan.plan_id}.json", report, context, production="AcquisitionPlan")
+    workspace.write_report(
+        f"01_sources/plan_report_{plan.plan_id}.json", report, context,
+        production="AcquisitionPlan",
+    )
+
+    # Les évaluations étaient calculées puis jetées : « pourquoi ce candidat
+    # a-t-il été écarté » n'était lisible nulle part, et la recherche suivante
+    # ne pouvait rien en apprendre.
+    workspace.write_report(
+        f"01_sources/candidate_evaluations_{plan.plan_id}.json",
+        {
+            "plan_id": plan.plan_id,
+            "evaluations": [
+                json.loads(evaluation.model_dump_json()) for evaluation in evaluations
+            ],
+        },
+        context, production="CandidateEvaluation",
+    )
 
     typer.echo("")
     if plan.status is PlanStatus.EXECUTABLE:
@@ -958,19 +975,21 @@ def assets_acquire(
     plan_file: Path | None = typer.Option(
         None, "--plan", help="Plan à exécuter ; défaut : le plus récent."
     ),
-    rights: str = typer.Option(
-        ..., "--rights", help="Droits d'usage établis pour ces fichiers."
-    ),
 ) -> None:
     """Exécute un plan **exécutable**. Seul point du pipeline qui télécharge.
 
     Un brouillon est refusé, un plan périmé aussi : dans les deux cas, les
     images auraient été choisies pour un état que le consentement n'a pas vu.
+
+    Les fichiers acquis sont `public_uncleared` : l'acquisition constate d'où
+    ils viennent, elle ne tranche pas leurs droits. L'autorisation est une
+    décision distincte — `assets rights clear` — et l'acceptation du risque en
+    est une autre, qui ne les améliore pas.
     """
     from .acquire import AcquisitionRefused, run
     from .acquisition import merge, run_directory, verify_acquired
     from .provenance import digest_of
-    from .schemas import AssetManifest, Rights
+    from .schemas import AssetManifest
     from .schemas.acquisition import AcquisitionPlan, CandidateManifest
 
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
@@ -1009,7 +1028,6 @@ def assets_acquire(
         acquired, report = run(
             plan, candidates, destination, digests,
             plan_digest=digest_of(plan_payload), run_id=run_id,
-            rights=Rights(rights),
         )
     except AcquisitionRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -1040,7 +1058,8 @@ def assets_acquire(
     typer.echo(f"    {report.bytes_downloaded} octets téléchargés "
                f"sur {report.bytes_consented} consentis")
     typer.echo(f"    répertoire : {destination}")
-    typer.echo("    prochaine étape : OCR sur les fichiers acquis")
+    typer.echo("    droits     : public_uncleared — aucun droit n'est établi ici")
+    typer.echo("    prochaine étape : OCR, puis assets rights clear ou assume-risk")
 
 
 def _latest_plan(workspace) -> Path | None:  # noqa: ANN001
@@ -1163,6 +1182,119 @@ def _ocr_engine(reader) -> tuple[str, str]:  # noqa: ANN001
     return name.lower(), "inconnue"
 
 
+rights_app = typer.Typer(
+    no_args_is_help=True,
+    help="Décisions de droits — distinctes de l'acquisition, qui n'en prend aucune.",
+)
+assets_app.add_typer(rights_app, name="rights")
+
+
+@rights_app.command("clear")
+def rights_clear(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    granted: str = typer.Option(..., "--granted", help="licensed, open_data ou owned."),
+    scope: str = typer.Option(..., "--scope", help="Ce que l'autorisation couvre."),
+    by: str = typer.Option(..., "--by", help="Qui décide."),
+    rationale: str = typer.Option(..., "--rationale", help="Sur quoi elle repose."),
+    evidence: list[str] = typer.Option(
+        [], "--evidence", help="Preuve de l'autorisation ; répétable, obligatoire."
+    ),
+) -> None:
+    """Enregistre une autorisation **prouvée**.
+
+    Une autorisation sans preuve est une affirmation : `--evidence` est
+    obligatoire. La portée aussi — « usage interne » et « diffusion publique »
+    ne sont pas la même permission.
+    """
+    from .schemas.rights import RightsAction, RightsDecision
+
+    _record_rights_decision(
+        hotel_id, asset_id,
+        action=RightsAction.CLEAR, granted=granted, scope=scope, by=by,
+        rationale=rationale, evidence=list(evidence),
+    )
+
+
+@rights_app.command("assume-risk")
+def rights_assume_risk(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Argument(...),
+    scope: str = typer.Option(..., "--scope", help="Ce que l'usage envisagé couvre."),
+    by: str = typer.Option(..., "--by", help="Qui accepte le risque."),
+    rationale: str = typer.Option(..., "--rationale", help="Pourquoi on avance."),
+    evidence: list[str] = typer.Option(
+        [], "--evidence", help="Ce qui a été examiné avant d'accepter ; répétable."
+    ),
+) -> None:
+    """Accepte le risque **sans** améliorer les droits.
+
+    L'état juridique reste `public_uncleared` : accepter un risque n'accorde
+    rien. Falsifier l'état pour se donner le droit de continuer rendrait le
+    manifeste inutilisable comme preuve de diligence.
+    """
+    from .schemas.rights import RightsAction
+
+    _record_rights_decision(
+        hotel_id, asset_id,
+        action=RightsAction.ASSUME_RISK, granted=None, scope=scope, by=by,
+        rationale=rationale, evidence=list(evidence),
+    )
+
+
+def _record_rights_decision(  # noqa: ANN001
+    hotel_id, asset_id, *, action, granted, scope, by, rationale, evidence
+) -> None:
+    """Contrôles, puis inscription append-only. Rien n'est écrasé."""
+    from .rights import apply
+    from .schemas import Rights
+    from .schemas.rights import RightsAction, RightsDecision
+
+    context = _context(hotel_id, Capability.INSPECTION)
+    workspace = Workspace(hotel_id)
+
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    index = next(
+        (i for i, asset in enumerate(manifest.assets) if asset.id == asset_id), None
+    )
+    if index is None:
+        typer.secho(f"{KO} asset {asset_id!r} inconnu", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    asset = manifest.assets[index]
+    try:
+        decision = RightsDecision(
+            action=action,
+            granted_rights=Rights(granted) if granted else None,
+            decided_by=by, rationale=rationale, scope=scope,
+            evidence=evidence, reviewed_checksum=asset.checksum,
+            supersedes_index=len(asset.rights_history) - 1
+            if asset.rights_history else None,
+        )
+        manifest.assets[index] = apply(asset, decision)
+    except ValueError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    workspace.write_assets(manifest)
+    updated = manifest.assets[index]
+
+    typer.echo(f"{OK} {asset_id} — {action.value}")
+    typer.echo(f"    droits     {updated.rights.value}")
+    typer.echo(f"    grevés     {updated.rights_encumbered}")
+    typer.echo(f"    portée     {scope}")
+    typer.echo(f"    décisions  {len(updated.rights_history)} au total")
+    if action is RightsAction.ASSUME_RISK:
+        typer.secho(
+            "    l'état juridique est inchangé : accepter un risque n'accorde rien",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""
@@ -1190,7 +1322,7 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
 
     roles = assign(manifest.assets, context.policy)
     workspace.write_assets(manifest)
-    workspace.write_report("01_sources/duplicate_report.json", report, context)
+    workspace.write_report("01_sources/duplicate_report.json", report, context, production="DuplicateReport")
     workspace.write_report("01_sources/roles_report.json", roles, context)
 
     typer.echo(f"  fichiers                  {report.files}")
@@ -1259,7 +1391,7 @@ def assets_classify(
         policy=context.policy,
     )
     workspace.write_assets(manifest)
-    workspace.write_report("01_sources/classification_report.json", report, context)
+    workspace.write_report("01_sources/classification_report.json", report, context, production="ClassificationReport")
 
     typer.echo("")
     typer.echo(f"  {report.total} asset(s), {report.needs_review} en revue")
@@ -2106,7 +2238,7 @@ def geo_acquire(
             provenance_from(r, t).model_dump(mode="json") for r, t in results
         ]
 
-    workspace.write_report("06_geo/acquisition_report.json", payload, context)
+    workspace.write_report("06_geo/acquisition_report.json", payload, context, production="AcquiredLaz")
 
     for result, tile in results:
         if result.succeeded:
@@ -2310,7 +2442,7 @@ def geo_derive(hotel_id: str = typer.Argument(...)) -> None:
         )
         typer.echo(f"  · politique effective écrite dans {workspace.policy_path.name}")
 
-    workspace.write_report(f"06_geo/derivation_report_{run_id}.json", result, context)
+    workspace.write_report(f"06_geo/derivation_report_{run_id}.json", result, context, production="DerivedRaster")
 
     metrics = result.metrics
     typer.echo("")
@@ -2425,7 +2557,7 @@ def geo_resolve(
     workspace.write_json(
         "06_geo/capture_geometry.json", json.loads(manifest.model_dump_json())
     )
-    workspace.write_report("06_geo/geometry_resolution_report.json", report, context)
+    workspace.write_report("06_geo/geometry_resolution_report.json", report, context, production="CaptureGeometryManifest")
 
     typer.echo("")
     for snap in manifest.snapshots:
@@ -2544,7 +2676,10 @@ def geo_qualify(hotel_id: str = typer.Argument(...)) -> None:
 
     # Le rapport est publié avant d'être cité : un objet doit pouvoir renvoyer
     # à l'empreinte d'un fichier qui existe.
-    published = workspace.write_report(f"06_geo/{report.name}", report, context)
+    published = workspace.write_report(
+        f"06_geo/{report.name}", report, context,
+        production="QualificationReport",
+    )
     qualified = qualification.apply(
         site, report, mapping, report_digest=sha256_file(published)[:16]
     )
@@ -2861,7 +2996,7 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     workspace.write_json(
         f"06_geo/visibility_run_{run_id}.json", json.loads(run.model_dump_json())
     )
-    workspace.write_report(f"06_geo/visibility_report_{run_id}.json", report, context)
+    workspace.write_report(f"06_geo/visibility_report_{run_id}.json", report, context, production="VisibilityRun")
 
     typer.echo("")
     typer.echo(f"  exécution {run_id} · moteur {run.engine_version}")
@@ -3183,7 +3318,7 @@ def temporal_assess(hotel_id: str = typer.Argument(...)) -> None:
     context = _context(hotel_id, Capability.IDENTITY_CLASSIFICATION)
     report = assess(manifest.assets, context.profile, context.policy)
     workspace.write_assets(manifest)
-    workspace.write_report("01_sources/temporal_report.json", report, context)
+    workspace.write_report("01_sources/temporal_report.json", report, context, production="TemporalReport")
 
     for scope, counts in sorted(report.by_scope.items()):
         typer.echo(f"  {scope:<12} {counts}")
