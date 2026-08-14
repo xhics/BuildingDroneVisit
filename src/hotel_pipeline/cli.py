@@ -586,6 +586,10 @@ def review_queue(
     pending_only: bool = typer.Option(
         False, "--pending-only", help="N'inclure que les vues non encore examinées."
     ),
+    reference_id: str = typer.Option(
+        None, "--reference",
+        help="Asset servant de référence visuelle sur la planche aveugle.",
+    ),
 ) -> None:
     """Produit une file versionnée et une planche HTML à examiner.
 
@@ -631,15 +635,34 @@ def review_queue(
     if pending_only:
         built.items = [i for i in built.items if not i.reviews]
 
+    protocol = None
     if mode == "blind":
         from . import cohort as cohort_module
 
         by_id = {a.id: a for a in manifest.assets}
         selected = [by_id[i.asset_id] for i in built.items if i.asset_id in by_id]
-        order = [
-            a.id for a in cohort_module.blind_order(selected, built.manifest_digest)
-        ]
+
+        # L'ordre dérive de l'empreinte de **cohorte**, celle que la planche
+        # annonce — non de celle du manifeste, qui change à chaque décision.
+        cohort_members = cohort_module.members(manifest.assets)
+        cohort_key = cohort_module.cohort_digest(cohort_members)
+        order = [a.id for a in cohort_module.blind_order(selected, cohort_key)]
         built.items.sort(key=lambda item: order.index(item.asset_id))
+        built.manifest_digest = cohort_key
+
+        reference = _blind_reference(manifest, reference_id)
+        protocol = cohort_module.build_protocol(
+            selected, hotel_id, cohort_key=cohort_key, reference=reference,
+            predictions_digest=_digest_of(
+                workspace.path("01_sources", f"cohort_predictions_{cohort_key}.json")
+            ),
+            sequence_register_digest=_digest_of(
+                workspace.path("01_sources", f"sequence_register_{cohort_key}.json")
+            ),
+        )
+        workspace.write_json(
+            f"01_sources/review_protocol_{protocol.protocol_id}.json", protocol.as_dict()
+        )
 
     # Le nom porte la date **et** l'empreinte du manifeste : une file décrit
     # un état, et deux exécutions dans la même seconde ne doivent pas s'écraser.
@@ -651,21 +674,9 @@ def review_queue(
     board = workspace.path("01_sources", f"review_board_{mode}_{built.slug}.html")
 
     if mode == "blind":
-        # La référence est une vue déjà confirmée et arbitrée : elle donne au
-        # réviseur de quoi reconnaître le bâtiment sans rien lui dire des vues
-        # à étiqueter.
-        reference = None
-        for asset in manifest.assets:
-            if asset.review_history and asset.target_visibility_decision.value == "confirmed":
-                reference = {
-                    "asset_id": asset.id,
-                    "local_path": asset.local_path,
-                    "checksum": asset.checksum,
-                    "rationale": asset.review_rationale or "",
-                }
-                break
         board.write_text(
-            review_module.to_blind_html(built, reference), encoding="utf-8"
+            review_module.to_blind_html(built, protocol.reference, protocol.protocol_id),
+            encoding="utf-8",
         )
     else:
         board.write_text(review_module.to_html(built), encoding="utf-8")
@@ -700,6 +711,9 @@ def review_set(
         "unblinded", "--blinding",
         help="blind si la décision a été prise sans voir la sortie du système.",
     ),
+    protocol_id: str = typer.Option(
+        None, "--protocol", help="Protocole d'étiquetage aveugle suivi."
+    ),
 ) -> None:
     """Inscrit **une** décision humaine. Aucune acceptation en masse."""
     from . import review as review_module
@@ -727,9 +741,11 @@ def review_set(
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
 
     try:
+        protocol, protocol_digest = _load_protocol(workspace, protocol_id)
         before, after = review_module.decide(
             manifest.assets, asset_id, verdict, by, rationale, list(evidence),
             workspace_root=workspace.root, blinding=blinding,
+            protocol=protocol, protocol_digest=protocol_digest,
         )
     except review_module.ReviewRefused as exc:
         # Rien n'a été écrit : le manifeste sur disque est intact.
@@ -793,6 +809,13 @@ def review_geometry(
     measure: list[str] = typer.Option(
         [], "--measure", help="Mesure à l'appui, forme clé=valeur. Répétable."
     ),
+    blinding: str = typer.Option(
+        "unblinded", "--blinding",
+        help="blind si l'appréciation a été rendue sans voir la sortie du système.",
+    ),
+    protocol_id: str = typer.Option(
+        None, "--protocol", help="Protocole d'étiquetage aveugle suivi."
+    ),
 ) -> None:
     """Apprécie ce que l'image apporte à la **structure**, non son identité."""
     from . import review as review_module
@@ -837,9 +860,11 @@ def review_geometry(
     before_viewpoints = review_module.viewpoints_by_suitability(manifest.assets)
 
     try:
+        protocol, protocol_digest = _load_protocol(workspace, protocol_id)
         before, after = review_module.assess(
             manifest.assets, asset_id, verdict, by, rationale, list(evidence),
-            measurements, workspace_root=workspace.root,
+            measurements, workspace_root=workspace.root, blinding=blinding,
+            protocol=protocol, protocol_digest=protocol_digest,
         )
     except review_module.ReviewRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -888,6 +913,65 @@ def review_geometry(
     typer.echo("  points de vue indépendants, par aptitude :")
     for name, total in review_module.viewpoints_by_suitability(manifest.assets).items():
         typer.echo(f"    {name:<14} {total:>4}")
+
+
+def _load_protocol(workspace, protocol_id: str | None):  # noqa: ANN001
+    """Charge un protocole d'étiquetage et son empreinte réelle."""
+    from . import cohort as cohort_module
+
+    if not protocol_id:
+        return None, None
+    path = workspace.path("01_sources", f"review_protocol_{protocol_id}.json")
+    if not path.is_file():
+        raise typer.BadParameter(f"protocole introuvable : {path.name}")
+
+    payload = json.loads(path.read_text("utf-8"))
+    protocol = cohort_module.ReviewProtocol(
+        protocol_id=payload["protocol_id"], hotel_id=payload["hotel_id"],
+        cohort_digest=payload["cohort_digest"], blinding=payload["blinding"],
+        created_at=payload.get("created_at", ""), members=payload.get("members", []),
+        reference=payload.get("reference"),
+        predictions_digest=payload.get("predictions_digest"),
+        sequence_register_digest=payload.get("sequence_register_digest"),
+        order=payload.get("presentation_order", []),
+    )
+    return protocol, _digest_of(path)
+
+
+def _digest_of(path: Path) -> str | None:
+    from .intake import sha256_file
+
+    return sha256_file(path)[:16] if path.is_file() else None
+
+
+def _blind_reference(manifest, reference_id: str | None) -> dict | None:  # noqa: ANN001
+    """Référence visuelle de la planche aveugle, choisie **explicitement**.
+
+    Prendre « le premier asset confirmé » laissait l'ordre du manifeste
+    désigner une image, qui se trouvait appartenir à l'une des séquences
+    évaluées. Le choix est donc demandé, et son appartenance à la cohorte
+    inscrite : une aide intra-séquence doit se déclarer.
+    """
+    from . import cohort as cohort_module
+
+    if not reference_id:
+        return None
+    asset = next((a for a in manifest.assets if a.id == reference_id), None)
+    if asset is None:
+        raise typer.BadParameter(f"référence inconnue : {reference_id}")
+    if asset.target_visibility_decision.value != "confirmed":
+        raise typer.BadParameter(
+            f"{reference_id} n'est pas une vue confirmée : une référence non "
+            "établie induirait le réviseur en erreur"
+        )
+    cohort_ids = {a.id for a in cohort_module.members(manifest.assets)}
+    return {
+        "asset_id": asset.id,
+        "local_path": asset.local_path,
+        "checksum": asset.checksum,
+        "rationale": asset.review_rationale or "",
+        "in_cohort": asset.id in cohort_ids,
+    }
 
 
 @review_app.command("cohort")

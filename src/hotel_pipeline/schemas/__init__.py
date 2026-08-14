@@ -56,6 +56,7 @@ from .geometry import (
 )
 from .enums import (
     AssetCategory,
+    Blinding,
     CaptureType,
     ClusterRole,
     EntranceVersion,
@@ -94,6 +95,7 @@ __all__ = [
     "AcquisitionProvenance",
     "AccessStatus",
     "Asset",
+    "Blinding",
     "CaptureGeometryManifest",
     "CorridorClass",
     "GeometryResolutionStatus",

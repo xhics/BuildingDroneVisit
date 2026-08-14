@@ -1126,15 +1126,126 @@ def test_the_blind_order_is_deterministic_and_not_the_manifest_order(tmp_path) -
     assert first != [a.id for a in assets]
 
 
-def test_a_decision_records_whether_it_was_blind(tmp_path) -> None:
-    assets = [asset(tmp_path)]
-    decide(assets, blinding="blind")
+def protocol_for(assets, hotel_id="hotel-test"):
+    from hotel_pipeline import cohort
 
+    return cohort.build_protocol(assets, hotel_id)
+
+
+def test_a_blind_decision_must_be_bound_to_a_protocol(tmp_path) -> None:
+    """`blind` est une déclaration ; le protocole en est la preuve."""
+    from hotel_pipeline.schemas import Blinding
+
+    assets = [asset(tmp_path)]
+
+    with pytest.raises(review.ReviewRefused, match="sans protocole"):
+        decide(assets, blinding="blind")
+    with pytest.raises(review.ReviewRefused, match="aveuglement inconnu"):
+        decide(assets, blinding="semi-aveugle")
+
+    decide(assets, blinding="blind", protocol=protocol_for(assets), protocol_digest="p1")
     entry = assets[0].review_history[0]
-    assert entry.blinding == "blind"
+
+    assert entry.blinding is Blinding.BLIND
+    assert entry.review_protocol_id.startswith("blind-")
+    assert entry.blind_queue_digest == "p1"
     # Le défaut reste `unblinded` : les sept décisions déjà prises l'ont été en
     # voyant le diagnostic.
-    assert review.ReviewEntry.model_fields["blinding"].default == "unblinded"
+    assert review.ReviewEntry.model_fields["blinding"].default is Blinding.UNBLINDED
+
+
+def test_a_protocol_that_does_not_cover_the_asset_is_refused(tmp_path) -> None:
+    other = [asset(tmp_path, name="autre.jpg", id="mapillary-999")]
+    assets = [asset(tmp_path)]
+
+    with pytest.raises(review.ReviewRefused, match="ne figure pas au protocole"):
+        decide(assets, blinding="blind", protocol=protocol_for(other),
+               protocol_digest="p1")
+
+
+def test_a_protocol_with_another_checksum_is_refused(tmp_path) -> None:
+    """L'image a changé depuis la constitution de la file."""
+    assets = [asset(tmp_path)]
+    stale = protocol_for(assets)
+    stale.members[0]["checksum"] = "f" * 64
+
+    with pytest.raises(review.ReviewRefused, match="l'image a changé"):
+        decide(assets, blinding="blind", protocol=stale, protocol_digest="p1")
+
+
+def test_a_non_blind_protocol_cannot_carry_a_blind_decision(tmp_path) -> None:
+    assets = [asset(tmp_path)]
+    analysis = protocol_for(assets)
+    analysis.blinding = "unblinded"
+
+    with pytest.raises(review.ReviewRefused, match="n'est pas aveugle"):
+        decide(assets, blinding="blind", protocol=analysis, protocol_digest="p1")
+
+
+def test_the_geometry_decision_records_the_same_protocol(tmp_path) -> None:
+    """L'aptitude s'étiquette avec les mêmes précautions que l'identité."""
+    from hotel_pipeline.schemas import Blinding, GeometrySuitability
+
+    assets = [asset(tmp_path, suitability=None)]
+    protocol = protocol_for(assets)
+    decide(assets, blinding="blind", protocol=protocol, protocol_digest="p1")
+
+    review.assess(
+        assets, "mapillary-1", GeometrySuitability.AUXILIARY, "Claude (Opus 5)",
+        "cible reconnaissable, façade reculée", ["mesures de cadrage"],
+        blinding="blind", protocol=protocol, protocol_digest="p1",
+    )
+    entry = assets[0].geometry_history[-1]
+
+    assert entry.blinding is Blinding.BLIND
+    assert entry.review_protocol_id == protocol.protocol_id
+
+    with pytest.raises(review.ReviewRefused, match="sans protocole"):
+        review.assess(
+            assets, "mapillary-1", GeometrySuitability.PRIMARY, "Claude (Opus 5)",
+            "correction", ["mesures"], blinding="blind",
+        )
+
+
+def test_a_protocol_survives_an_unrelated_manifest_change(tmp_path) -> None:
+    """Chaque décision modifie le manifeste : s'y rattacher le périmerait aussitôt."""
+    subject = asset(tmp_path)
+    neighbour = asset(tmp_path, name="voisine.jpg", id="mapillary-2")
+    assets = [subject, neighbour]
+    protocol = protocol_for(assets)
+
+    # Une première décision change le manifeste…
+    decide(assets, asset_id="mapillary-2", blinding="blind",
+           protocol=protocol, protocol_digest="p1")
+
+    # …et la seconde reste couverte par le même protocole.
+    decide(assets, asset_id="mapillary-1", blinding="blind",
+           protocol=protocol, protocol_digest="p1")
+
+    assert assets[0].review_history[0].review_protocol_id == protocol.protocol_id
+
+
+def test_the_protocol_binds_the_cohort_and_its_evidence(tmp_path) -> None:
+    from hotel_pipeline import cohort
+
+    assets = [asset(tmp_path), asset(tmp_path, name="b.jpg", id="mapillary-2")]
+    protocol = cohort.build_protocol(
+        assets, "hotel-test",
+        reference={"asset_id": "mapillary-9", "checksum": "c" * 64,
+                   "local_path": "r.jpg", "rationale": "pylône lisible",
+                   "in_cohort": False},
+        predictions_digest="pred123", sequence_register_digest="seq456",
+    )
+    payload = protocol.as_dict()
+
+    assert payload["cohort_digest"] == cohort.cohort_digest(assets)
+    assert payload["predictions_digest"] == "pred123"
+    assert payload["sequence_register_digest"] == "seq456"
+    assert payload["reference"]["in_cohort"] is False
+    # L'ordre de présentation est celui de l'empreinte de cohorte.
+    assert payload["presentation_order"] == [
+        a.id for a in cohort.blind_order(assets, payload["cohort_digest"])
+    ]
 
 
 def test_the_cohort_states_what_it_cannot_measure(tmp_path) -> None:
@@ -1207,3 +1318,88 @@ def test_a_complete_lookup_is_known(tmp_path) -> None:
     assert register.correlation == "known"
     assert register.by_sequence() == {"SEQ-A": ["mapillary-111", "mapillary-222"]}
     assert register.response_digest
+
+
+def test_a_command_copied_from_the_blind_board_records_the_protocol(
+    tmp_path, monkeypatch
+) -> None:
+    """La commande imprimée doit produire une décision réellement aveugle.
+
+    Elle omettait `--blinding blind`, tandis que la CLI vaut `unblinded` par
+    défaut : les 18 décisions auraient été mal qualifiées.
+    """
+    import re
+    import shlex
+
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.schemas import Blinding
+
+    runner, workspace, subject = cli_workspace(tmp_path, monkeypatch)
+    manifest = workspace.read_assets()
+    manifest.assets[0] = manifest.assets[0].model_copy(
+        update={"contains_building": True}
+    )
+    workspace.write_assets(manifest)
+
+    assert runner.invoke(app, [
+        "assets", "review", "queue", "hotel-test",
+        "--queue", "mapillary-candidates", "--mode", "blind",
+    ]).exit_code == 0
+
+    board = next(workspace.path("01_sources").glob("review_board_blind_*.html"))
+    html = board.read_text("utf-8")
+    printed = re.search(r"<pre>(.*?)</pre>", html, re.S).group(1)
+    printed = printed.replace("&lt;", "<").replace("&gt;", ">").replace("\\\n", " ")
+
+    # La commande est exécutée telle qu'elle est imprimée, aux valeurs près.
+    arguments = shlex.split(printed)[1:]
+    arguments = [
+        "hotel-test" if part == "<hôtel>" else part for part in arguments
+    ]
+    arguments = [
+        "confirmed" if part == "confirmed|rejected|unresolved" else part
+        for part in arguments
+    ]
+    arguments = ["Claude (Opus 5)" if part == "<vous>" else part for part in arguments]
+    arguments = ["façade reconnue" if part == "…" else part for part in arguments]
+
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 0, result.output
+    entry = workspace.read_assets().assets[0].review_history[0]
+    assert entry.blinding is Blinding.BLIND
+    assert entry.review_protocol_id.startswith("blind-")
+    assert entry.blind_queue_digest
+
+
+def test_the_blind_order_uses_the_cohort_digest(tmp_path, monkeypatch) -> None:
+    """La planche annonce l'empreinte de cohorte : elle doit l'employer."""
+    import json as json_module
+
+    from hotel_pipeline import cohort
+    from hotel_pipeline.cli import app
+
+    runner, workspace, _ = cli_workspace(tmp_path, monkeypatch)
+    manifest = workspace.read_assets()
+    manifest.assets = [
+        manifest.assets[0].model_copy(update={"contains_building": True}),
+        manifest.assets[0].model_copy(
+            update={"id": "mapillary-2", "checksum": "b" * 64,
+                    "contains_building": True}
+        ),
+    ]
+    workspace.write_assets(manifest)
+
+    runner.invoke(app, ["assets", "review", "queue", "hotel-test",
+                        "--queue", "mapillary-candidates", "--mode", "blind"])
+
+    protocol = json_module.loads(
+        next(workspace.path("01_sources").glob("review_protocol_*.json")).read_text("utf-8")
+    )
+    expected = cohort.cohort_digest(cohort.members(manifest.assets))
+
+    assert protocol["cohort_digest"] == expected
+    assert protocol["protocol_id"] == f"blind-{expected}"
+    assert protocol["presentation_order"] == [
+        a.id for a in cohort.blind_order(cohort.members(manifest.assets), expected)
+    ]

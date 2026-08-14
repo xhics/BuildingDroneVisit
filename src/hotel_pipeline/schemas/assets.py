@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from .acquisition import AcquisitionProvenance
 from .enums import (
     AssetCategory,
+    Blinding,
     CaptureType,
     ClusterRole,
     EntranceVersion,
@@ -127,6 +128,27 @@ class DecisionEntry(BaseModel):
     #: première n'en a pas.
     supersedes_index: int | None = Field(default=None, ge=0)
 
+    #: Conditions dans lesquelles la décision a été prise. Portées ici plutôt
+    #: que sur la seule visibilité : l'aptitude géométrique s'étiquette avec
+    #: les mêmes précautions, et devait être traçable de la même façon.
+    blinding: Blinding = Blinding.UNBLINDED
+
+    #: Protocole d'étiquetage suivi, et empreinte du fichier qui le fixe. Une
+    #: décision `blind` sans eux serait une déclaration invérifiable.
+    review_protocol_id: str | None = None
+    blind_queue_digest: str | None = None
+
+    @model_validator(mode="after")
+    def _blind_needs_a_protocol(self) -> "DecisionEntry":
+        if self.blinding is Blinding.BLIND and not (
+            self.review_protocol_id and self.blind_queue_digest
+        ):
+            raise ValueError(
+                "décision déclarée aveugle sans protocole ni empreinte de file — "
+                "l'aveuglement se prouve, il ne s'affirme pas"
+            )
+        return self
+
     @model_validator(mode="after")
     def _no_blank_text(self) -> "DecisionEntry":
         if not self.decided_by.strip():
@@ -147,11 +169,6 @@ class ReviewEntry(DecisionEntry):
     """Arbitrage d'identité : est-ce bien le bâtiment cible ?"""
 
     decision: ReviewDecision
-
-    #: La décision a-t-elle été prise **sans voir** la réponse du système ?
-    #: Une étiquette produite en connaissant le verdict automatique ne peut pas
-    #: servir à juger ce verdict : elle en hérite.
-    blinding: str = "unblinded"
 
 
 class GeometryEntry(DecisionEntry):

@@ -384,7 +384,9 @@ def _fractions(item: QueueItem) -> str:
     )
 
 
-def to_blind_html(queue: ReviewQueue, reference: dict | None = None) -> str:
+def to_blind_html(
+    queue: ReviewQueue, reference: dict | None = None, protocol_id: str | None = None
+) -> str:
     """Planche d'étiquetage : l'image, et rien de ce que le système en pense.
 
     Tout ce qui figure sur la planche d'analyse — rôle, motif, statut, scores,
@@ -412,7 +414,8 @@ def to_blind_html(queue: ReviewQueue, reference: dict | None = None) -> str:
         </dl>
         <pre>hotel-pipeline assets review set &lt;hôtel&gt; {escape(item.asset_id)} \
   --decision confirmed|rejected|unresolved \
-  --by "&lt;vous&gt;" --rationale "…" --evidence "…"</pre>
+  --by "&lt;vous&gt;" --rationale "…" --evidence "…" \
+  --blinding blind --protocol {escape(protocol_id or "&lt;protocole&gt;")}</pre>
       </div>
     </article>"""
         )
@@ -426,6 +429,7 @@ def to_blind_html(queue: ReviewQueue, reference: dict | None = None) -> str:
   <p><small><code>{escape(reference['asset_id'])}</code> ·
      empreinte <code>{escape(reference['checksum'][:16])}…</code> ·
      {escape(reference['rationale'])}</small></p>
+  <p><small>{'Appartient à la cohorte évaluée : aide intra-séquence, à déclarer au rapport.' if reference.get('in_cohort') else 'Hors cohorte évaluée.'}</small></p>
  </section>"""
 
     return f"""<!doctype html>
@@ -604,6 +608,50 @@ def _prepare(
     return before, path, actual
 
 
+def _protocol_fields(
+    asset: Asset, blinding: str, protocol, digest: str | None  # noqa: ANN001
+) -> dict:
+    """Champs de protocole, après vérification qu'ils disent vrai.
+
+    Déclarer `blind` ne suffit pas : le protocole doit exister, être aveugle,
+    contenir l'asset et porter la même empreinte d'image. Sans ces contrôles,
+    l'aveuglement serait une affirmation invérifiable — et c'est précisément
+    lui qui rend les étiquettes opposables au système.
+    """
+    from .schemas import Blinding
+
+    try:
+        mode = Blinding(blinding)
+    except ValueError as exc:
+        raise ReviewRefused(
+            f"aveuglement inconnu : {blinding!r} ; attendu "
+            f"{[b.value for b in Blinding]}"
+        ) from exc
+
+    if mode is Blinding.UNBLINDED:
+        return {"blinding": mode}
+
+    if protocol is None or not digest:
+        raise ReviewRefused(
+            "décision aveugle sans protocole : l'aveuglement se prouve par la "
+            "file qui l'a produit, il ne s'affirme pas"
+        )
+    if protocol.blinding != Blinding.BLIND.value:
+        raise ReviewRefused(
+            f"le protocole {protocol.protocol_id} n'est pas aveugle "
+            f"({protocol.blinding})"
+        )
+    problems = protocol.covers(asset.id, asset.checksum)
+    if problems:
+        raise ReviewRefused("; ".join(problems))
+
+    return {
+        "blinding": mode,
+        "review_protocol_id": protocol.protocol_id,
+        "blind_queue_digest": digest,
+    }
+
+
 def _revalidate(candidate: Asset, asset_id: str) -> Asset:
     """`model_copy(update=...)` ne revalide rien.
 
@@ -627,6 +675,8 @@ def decide(
     evidence: list[str],
     workspace_root: Path | None = None,
     blinding: str = "unblinded",
+    protocol: object = None,
+    protocol_digest: str | None = None,
 ) -> tuple[Asset, Asset]:
     """Inscrit une décision, après avoir vérifié qu'elle porte sur la bonne image.
 
@@ -644,7 +694,7 @@ def decide(
 
     entry = ReviewEntry(
         decision=decision,
-        blinding=blinding,
+        **_protocol_fields(before, blinding, protocol, protocol_digest),
         decided_by=by.strip(),
         rationale=rationale.strip(),
         evidence=kept,
@@ -684,6 +734,7 @@ def assessment_fields(
     checksum: str,
     measurements: dict[str, float] | None = None,
     previous: list | None = None,  # noqa: ANN001
+    **protocol,
 ) -> dict:
     """Champs d'une appréciation géométrique, historique compris.
 
@@ -694,6 +745,7 @@ def assessment_fields(
     previous = list(previous or [])
     entry = GeometryEntry(
         suitability=suitability,
+        **protocol,
         decided_by=by.strip(),
         rationale=rationale.strip(),
         evidence=[e.strip() for e in evidence if e.strip()],
@@ -716,6 +768,9 @@ def assess(
     evidence: list[str],
     measurements: dict[str, float] | None = None,
     workspace_root: Path | None = None,
+    blinding: str = "unblinded",
+    protocol: object = None,
+    protocol_digest: str | None = None,
 ) -> tuple[Asset, Asset]:
     """Inscrit une appréciation d'aptitude géométrique.
 
@@ -731,6 +786,7 @@ def assess(
             suitability, by, rationale,
             [e.strip() for e in evidence if e.strip()],
             digest, measurements, previous=before.geometry_history,
+            **_protocol_fields(before, blinding, protocol, protocol_digest),
         )
     )
     after = _revalidate(candidate, asset_id)

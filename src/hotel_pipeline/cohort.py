@@ -147,6 +147,85 @@ def build_register(assets: list[Asset], hotel_id: str, fetch) -> SequenceRegiste
     return register
 
 
+# --- protocole d'étiquetage -----------------------------------------------------
+
+
+@dataclass
+class ReviewProtocol:
+    """Ce qui rend un aveuglement vérifiable plutôt que déclaré.
+
+    Lié à la **cohorte immuable** — identifiants et empreintes d'images —, non
+    au manifeste : chaque décision modifie ce dernier, et s'y rattacher
+    périmerait le protocole à la première étiquette.
+    """
+
+    protocol_id: str
+    hotel_id: str
+    cohort_digest: str
+    blinding: str = "blind"
+    created_at: str = ""
+    members: list[dict] = field(default_factory=list)
+    reference: dict | None = None
+    predictions_digest: str | None = None
+    sequence_register_digest: str | None = None
+    order: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "protocol_id": self.protocol_id,
+            "hotel_id": self.hotel_id,
+            "cohort_digest": self.cohort_digest,
+            "blinding": self.blinding,
+            "created_at": self.created_at,
+            "members": self.members,
+            "reference": self.reference,
+            "predictions_digest": self.predictions_digest,
+            "sequence_register_digest": self.sequence_register_digest,
+            "presentation_order": self.order,
+        }
+
+    def covers(self, asset_id: str, checksum: str) -> list[str]:
+        """L'asset fait-il partie du protocole, et est-ce bien la même image ?"""
+        entry = next((m for m in self.members if m["asset_id"] == asset_id), None)
+        if entry is None:
+            return [f"{asset_id} ne figure pas au protocole {self.protocol_id}"]
+        if entry["checksum"] != checksum:
+            return [
+                f"{asset_id} : empreinte {checksum[:12]}… au manifeste, "
+                f"{entry['checksum'][:12]}… au protocole — l'image a changé"
+            ]
+        return []
+
+
+def build_protocol(
+    assets: list[Asset],
+    hotel_id: str,
+    reference: dict | None = None,
+    predictions_digest: str | None = None,
+    sequence_register_digest: str | None = None,
+    cohort_key: str | None = None,
+) -> ReviewProtocol:
+    """Protocole d'une session d'étiquetage.
+
+    `cohort_key` est l'empreinte de la **cohorte entière**, y compris les vues
+    déjà examinées : c'est elle que la planche annonce et qui fixe l'ordre. Les
+    membres, eux, sont les seules vues présentées.
+    """
+    digest_value = cohort_key or cohort_digest(assets)
+    ordered = blind_order(assets, digest_value)
+    return ReviewProtocol(
+        protocol_id=f"blind-{digest_value}",
+        hotel_id=hotel_id,
+        cohort_digest=digest_value,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        members=[{"asset_id": a.id, "checksum": a.checksum} for a in sorted(assets, key=lambda x: x.id)],
+        reference=reference,
+        predictions_digest=predictions_digest,
+        sequence_register_digest=sequence_register_digest,
+        order=[a.id for a in ordered],
+    )
+
+
 # --- instantané des prédictions ------------------------------------------------
 
 

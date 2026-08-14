@@ -206,6 +206,18 @@ class GeometrySuitability(StrEnum):
     INSUFFICIENT = "insufficient"
 
 
+class Blinding(StrEnum):
+    """La décision a-t-elle été prise sans voir la réponse du système ?
+
+    Une étiquette produite en connaissant le verdict automatique ne peut pas
+    servir à juger ce verdict : elle en hérite. Les deux qualités de preuve ne
+    se mélangent donc pas, et une chaîne libre les aurait laissées se confondre.
+    """
+
+    BLIND = "blind"
+    UNBLINDED = "unblinded"
+
+
 class ReviewStatus(StrEnum):
     """Statut de revue d'une qualification (Lot 1B §4, §6)."""
 
