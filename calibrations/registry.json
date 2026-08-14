@@ -1,0 +1,31 @@
+{
+  "version": "1.0.0",
+  "entries": [
+    {
+      "calibration_id": "welcominns-2026-08-36-images",
+      "site_ids": [
+        "welcominns-boucherville"
+      ],
+      "corpus_digests": {
+        "welcominns-boucherville": "e7eddf1e59b26f4e"
+      },
+      "method": "seuils OpenCLIP ViT-B-32/laion2b_s34b_b79k choisis à la lecture de 36 vues du corpus, sans échantillon de réglage séparé",
+      "calibrated_on": "2026-08-12",
+      "version": "1.0.0",
+      "notes": "un seul site, un seul réviseur : ces seuils ne sont pas généralisables. L'empreinte porte sur les 329 assets du manifeste, dont les 36 vues lues sont un sous-ensemble non tracé séparément."
+    },
+    {
+      "calibration_id": "welcominns-pilot-qualification-v1",
+      "site_ids": [
+        "welcominns-boucherville"
+      ],
+      "corpus_digests": {
+        "welcominns-boucherville": "e7eddf1e59b26f4e"
+      },
+      "method": "seuils de qualification TERRAIN_MAIN et ROOFLINE_MAIN posés a priori, puis éprouvés sur une seule tuile LiDAR — aucun réglage n'a été ajusté au vu des résultats",
+      "calibrated_on": "2026-08-13",
+      "version": "1.0.0",
+      "notes": "statut provisional, usage visual_proxy_not_survey."
+    }
+  ]
+}
