@@ -857,6 +857,108 @@ def _safe_read(reader):  # noqa: ANN001, ANN201
         return None
 
 
+@assets_app.command("acquire")
+def assets_acquire(
+    hotel_id: str = typer.Argument(...),
+    plan_file: Path | None = typer.Option(
+        None, "--plan", help="Plan à exécuter ; défaut : le plus récent."
+    ),
+    rights: str = typer.Option(
+        ..., "--rights", help="Droits d'usage établis pour ces fichiers."
+    ),
+) -> None:
+    """Exécute un plan **exécutable**. Seul point du pipeline qui télécharge.
+
+    Un brouillon est refusé, un plan périmé aussi : dans les deux cas, les
+    images auraient été choisies pour un état que le consentement n'a pas vu.
+    """
+    from .acquire import AcquisitionRefused, run
+    from .acquisition import merge, run_directory, verify_acquired
+    from .provenance import digest_of
+    from .schemas import AssetManifest, Rights
+    from .schemas.acquisition import AcquisitionPlan, CandidateManifest
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+
+    path = plan_file or _latest_plan(workspace)
+    if path is None:
+        typer.secho(
+            f"{KO} aucun plan — lancez : assets plan", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+
+    plan_payload = json.loads(Path(path).read_text("utf-8"))
+    plan = AcquisitionPlan.model_validate(plan_payload)
+
+    candidates_path = _latest_candidates(workspace)
+    if candidates_path is None:
+        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    candidates_payload = json.loads(candidates_path.read_text("utf-8"))
+    candidates = {
+        c.candidate_id: c
+        for c in CandidateManifest.model_validate(candidates_payload).candidates
+    }
+
+    demands_payload = workspace.read_json("01_sources/capture_demands.json") or {}
+    digests = _plan_digests(workspace, context, candidates_payload, demands_payload)
+
+    typer.echo(f"  plan        {plan.plan_id} ({plan.status.value})")
+    typer.echo(f"  consenti    {plan.known_bytes} octets, {len(plan.acquisitions)} vue(s)")
+
+    run_id = _new_run_id()
+    destination = run_directory(workspace, run_id)
+
+    try:
+        acquired, report = run(
+            plan, candidates, destination, digests,
+            plan_digest=digest_of(plan_payload), run_id=run_id,
+            rights=Rights(rights),
+        )
+    except AcquisitionRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    problems = verify_acquired(acquired, workspace.root)
+    if problems:
+        for problem in problems:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  aucun asset n'est inscrit au manifeste : un fichier dont "
+            "l'empreinte ne correspond pas n'est pas celui qu'on a mesuré",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=3)
+
+    manifest = workspace.read_assets() or AssetManifest(hotel_id=hotel_id, assets=[])
+    merged = merge(manifest.assets, acquired)
+    manifest.assets = merged.assets
+    workspace.write_assets(manifest)
+    workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context)
+
+    for candidate_id, reason in sorted(report.failed.items()):
+        typer.secho(f"    échec · {candidate_id} — {reason[:60]}", fg=typer.colors.YELLOW)
+
+    typer.echo("")
+    typer.echo(f"{OK} {report.acquired}/{report.planned} fichier(s) acquis")
+    typer.echo(f"    {report.bytes_downloaded} octets téléchargés "
+               f"sur {report.bytes_consented} consentis")
+    typer.echo(f"    répertoire : {destination}")
+    typer.echo("    prochaine étape : OCR sur les fichiers acquis")
+
+
+def _latest_plan(workspace) -> Path | None:  # noqa: ANN001
+    found = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
+    return found[-1] if found else None
+
+
+def _new_run_id() -> str:
+    from .acquisition import new_run_id
+
+    return new_run_id()
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""

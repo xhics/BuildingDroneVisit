@@ -112,6 +112,47 @@ def collect(
     return images
 
 
+#: Résolutions que l'API Graph sait rendre. Une autre valeur ne se devine pas :
+#: `thumb_9999_url` ne renverrait rien, et le silence passerait pour une panne.
+THUMBNAIL_FIELDS: dict[str, str] = {
+    "thumb_256": "thumb_256_url",
+    "thumb_1024": "thumb_1024_url",
+    "thumb_2048": "thumb_2048_url",
+    "thumb_original": "thumb_original_url",
+}
+
+
+def thumbnail_url(image_id: str, resolution: str = "thumb_2048") -> str:
+    """Adresse d'une vignette, **redemandée au moment du téléchargement**.
+
+    Mapillary ne publie pas d'URL durable : celle-ci vaut quelques minutes.
+    C'est pourquoi aucun manifeste n'en conserve — seul de quoi la reconstruire
+    y figure, et cette fonction est le point où elle réapparaît.
+    """
+    field = THUMBNAIL_FIELDS.get(resolution)
+    if field is None:
+        raise ValueError(
+            f"résolution {resolution!r} inconnue de l'API Graph ; "
+            f"disponibles : {sorted(THUMBNAIL_FIELDS)}"
+        )
+
+    ensure_online("Mapillary Graph")
+    response = requests.get(
+        f"https://graph.mapillary.com/{image_id}",
+        params={"fields": field},
+        headers={"Authorization": f"OAuth {secret('MAPILLARY_TOKEN')}"},
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    url = response.json().get(field)
+    if not url:
+        raise ValueError(
+            f"image {image_id} : l'API ne rend pas de {resolution!r} — la vue "
+            "existe peut-être dans une autre résolution"
+        )
+    return url
+
+
 def image_metadata(image_ids: list[str]) -> dict[str, dict]:
     """Métadonnées d'images précises — séquence comprise.
 
