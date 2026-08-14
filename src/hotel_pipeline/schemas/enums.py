@@ -219,11 +219,28 @@ class Blinding(StrEnum):
 
 
 class ReviewStatus(StrEnum):
-    """Statut de revue d'une qualification (Lot 1B §4, §6)."""
+    """Statut de revue d'une qualification (Lot 1B §4, §6).
+
+    `NEEDS_REVIEW` et `HUMAN_UNRESOLVED` décrivent deux situations opposées que
+    la version précédente confondait :
+
+    ```text
+    needs_review      personne n'a jugé, ou une action précise reste attendue
+    human_unresolved  examiné, indécidable avec les preuves disponibles
+    ```
+
+    Les mêler faisait d'une revue terminée un travail éternellement en attente :
+    une image regardée puis déclarée indécidable revenait dans la file à chaque
+    exécution, et le décompte affirmait qu'il restait à faire ce que personne
+    ne pouvait faire. `HUMAN_UNRESOLVED` est **terminal** : on n'en sort que
+    par une preuve nouvelle ou une supersession humaine explicite, c'est-à-dire
+    par une entrée ajoutée à l'historique — jamais par un recalcul.
+    """
 
     AUTOMATIC_ACCEPTED = "automatic_accepted"
     HUMAN_ACCEPTED = "human_accepted"
     NEEDS_REVIEW = "needs_review"
+    HUMAN_UNRESOLVED = "human_unresolved"
     REJECTED = "rejected"
 
 

@@ -51,8 +51,25 @@ class ReviewRefused(RuntimeError):
 
 
 def pending(assets: list[Asset]) -> list[Asset]:
-    """Tout ce que la cascade n'a pas tranché."""
+    """Tout ce que la cascade n'a pas tranché et qu'une revue peut trancher.
+
+    Les vues déjà examinées sans conclusion n'y figurent pas : les y laisser
+    réclamait éternellement un travail déjà fait, et faisait passer une limite
+    des preuves pour un retard de revue. Elles se comptent à part, avec
+    `reviewed_unresolved()`.
+    """
     return [a for a in assets if a.review_status is ReviewStatus.NEEDS_REVIEW]
+
+
+def reviewed_unresolved(assets: list[Asset]) -> list[Asset]:
+    """Vues examinées, restées indécidables avec les preuves disponibles.
+
+    Population terminale et non vide de sens : elle mesure ce que le corpus ne
+    permet pas de conclure. Elle ne se rouvre que sur preuve nouvelle ou
+    supersession humaine explicite, c'est-à-dire par une entrée ajoutée à
+    l'historique.
+    """
+    return [a for a in assets if a.review_status is ReviewStatus.HUMAN_UNRESOLVED]
 
 
 def would_confirm(asset: Asset, policy) -> tuple[bool, str]:  # noqa: ANN001
@@ -96,6 +113,9 @@ def blocking(assets: list[Asset], policy) -> list[Asset]:  # noqa: ANN001
 
     Un asset déjà confirmé mais dont l'aptitude reste à apprécier est bloquant
     lui aussi : c'est bien une revue qui manque.
+
+    Une vue examinée sans conclusion n'est plus bloquante : la revue a eu lieu,
+    et la redemander ne produirait pas de preuve que le corpus ne contient pas.
     """
     def awaits_a_decision(asset: Asset) -> bool:
         # Soit la cascade n'a pas tranché l'identité, soit l'identité est
@@ -137,6 +157,10 @@ QUEUES: dict[str, tuple[str, object]] = {
         blocking,
     ),
     "pending": ("tout asset en attente de revue", lambda assets, policy: pending(assets)),
+    "reviewed-unresolved": (
+        "vues examinées et restées indécidables — revue close, indécision assumée",
+        lambda assets, policy: reviewed_unresolved(assets),
+    ),
     "mapillary-candidates": (
         "cohorte de validation Mapillary — caps observés, donc probants",
         lambda assets, policy: cohort(assets, "mapillary"),
@@ -146,11 +170,16 @@ QUEUES: dict[str, tuple[str, object]] = {
 
 @dataclass
 class QueueCounts:
-    """Les trois nombres, séparés et non additionnables."""
+    """Les nombres, séparés et non additionnables.
+
+    `reviewed_unresolved` dit ce qu'aucun des autres ne peut dire : la revue
+    est close, et cette image demeure indécise.
+    """
 
     pending: int = 0
     blocking: int = 0
     cohort: int = 0
+    reviewed_unresolved: int = 0
     pending_by_source: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -158,10 +187,12 @@ class QueueCounts:
             "pending": self.pending,
             "blocking": self.blocking,
             "cohort": self.cohort,
+            "reviewed_unresolved": self.reviewed_unresolved,
             "pending_by_source": self.pending_by_source,
             "note": (
-                "trois populations distinctes : un bloquant est en attente, "
-                "un membre de la cohorte peut ne pas l'être. Ne pas additionner."
+                "populations distinctes : un bloquant est en attente, un membre "
+                "de la cohorte peut ne pas l'être, et une vue examinée sans "
+                "conclusion n'est plus en attente. Ne pas additionner."
             ),
         }
 
@@ -175,6 +206,7 @@ def counts(assets: list[Asset], policy, cohort_source: str = "mapillary") -> Que
         pending=len(waiting),
         blocking=len(blocking(assets, policy)),
         cohort=len(cohort(assets, cohort_source)),
+        reviewed_unresolved=len(reviewed_unresolved(assets)),
         pending_by_source=dict(sorted(by_source.items())),
     )
 

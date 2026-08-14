@@ -127,13 +127,18 @@ def test_a_rejection_survives_reclassification(tmp_path) -> None:
 
 
 def test_a_reviewed_unresolved_is_not_promoted_automatically(tmp_path) -> None:
-    """Examiné sans conclure n'est pas la même chose que jamais examiné."""
+    """Examiné sans conclure n'est pas la même chose que jamais examiné.
+
+    Ni l'un ni l'autre n'autorise l'acceptation automatique, mais les deux se
+    distinguent : l'un attend une personne, l'autre attend une preuve.
+    """
     assets = [asset(tmp_path)]
     decide(assets, decision=ReviewDecision.UNRESOLVED, rationale="trop sombre pour trancher")
 
     classify(assets, classifier=None, policy=policy())
 
-    assert assets[0].review_status is ReviewStatus.NEEDS_REVIEW
+    assert assets[0].review_status is ReviewStatus.HUMAN_UNRESOLVED
+    assert assets[0].review_status is not ReviewStatus.AUTOMATIC_ACCEPTED
     assert assets[0].has_been_reviewed
 
 
@@ -464,7 +469,9 @@ def test_cli_queue_writes_both_the_json_and_the_board(tmp_path, monkeypatch) -> 
                                  "--queue", "pending"])
 
     assert result.exit_code == 0, result.output
-    assert "trois populations distinctes" in result.output
+    assert "populations distinctes" in result.output
+    # Les indécises closes se lisent séparément des vues encore en attente.
+    assert "indécises" in result.output
     # Le nom porte le mode : une planche d'analyse et une planche aveugle du
     # même état ne doivent pas se confondre.
     assert len(list(workspace.path("01_sources").glob("review_queue_analysis_*.json"))) == 1
@@ -907,7 +914,11 @@ def test_the_register_reproduces_the_welcominns_state() -> None:
     assert canonical == ["mapillary-7688979294475178"]
 
     numbers = review.counts(assets, policy())
-    assert (numbers.pending, numbers.blocking, numbers.cohort) == (33, 11, 25)
+    # La vue examinée sans conclusion a quitté « en attente » et « bloquant »
+    # sans quitter le corpus : elle se compte désormais pour ce qu'elle est.
+    assert (numbers.pending, numbers.blocking, numbers.cohort) == (32, 10, 25)
+    assert numbers.reviewed_unresolved == 1
+    assert numbers.pending + numbers.reviewed_unresolved == 33
 
 
 # --- atomicité du registre --------------------------------------------------

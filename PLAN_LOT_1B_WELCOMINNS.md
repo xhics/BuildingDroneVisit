@@ -139,7 +139,9 @@ Asset
 : `pre_2024`, `post_2024`, `current_confirmed`, `historical`, `unknown`.
 
 `review_status`
-: `automatic_accepted`, `human_accepted`, `needs_review`, `rejected`.
+: `automatic_accepted`, `human_accepted`, `needs_review`, `human_unresolved`, `rejected`.
+
+  `needs_review` et `human_unresolved` ne se confondent pas : le premier dit que personne n'a jugé ou qu'une action précise reste attendue, le second qu'une personne a regardé sans pouvoir trancher avec les preuves disponibles. `human_unresolved` est terminal — on n'en sort que par une preuve nouvelle ou une supersession humaine explicite, c'est-à-dire par une entrée ajoutée à l'historique.
 
 Une image peut montrer simultanément le bâtiment, le stationnement et l'enseigne. La catégorie unique actuelle reste disponible pour compatibilité, mais elle ne doit plus porter toute la décision.
 

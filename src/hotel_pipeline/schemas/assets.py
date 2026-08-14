@@ -39,8 +39,15 @@ PRODUCTION_RIGHTS = frozenset({Rights.OWNED, Rights.LICENSED, Rights.OPEN_DATA})
 DECISION_STATUS: dict[ReviewDecision, ReviewStatus] = {
     ReviewDecision.CONFIRMED: ReviewStatus.HUMAN_ACCEPTED,
     ReviewDecision.REJECTED: ReviewStatus.REJECTED,
-    ReviewDecision.UNRESOLVED: ReviewStatus.NEEDS_REVIEW,
+    # Examiné sans conclure : un état terminal, non une absence de revue. La
+    # réouverture passe par une entrée ajoutée — preuve nouvelle ou
+    # supersession — et jamais par un recalcul.
+    ReviewDecision.UNRESOLVED: ReviewStatus.HUMAN_UNRESOLVED,
 }
+
+#: Statut porté par les manifestes antérieurs pour une revue non conclusive.
+#: Conservé pour que la migration le reconnaisse, jamais écrit à nouveau.
+LEGACY_UNRESOLVED_STATUS = ReviewStatus.NEEDS_REVIEW
 
 VISIBILITY_OF: dict[ReviewDecision, bool | None] = {
     ReviewDecision.CONFIRMED: True,
@@ -65,7 +72,13 @@ VISIBILITY_PROJECTED_FIELDS: frozenset[str] = frozenset(
 )
 
 #: Statuts qu'une personne seule peut poser.
-_HUMAN_STATUSES = frozenset({ReviewStatus.HUMAN_ACCEPTED, ReviewStatus.REJECTED})
+_HUMAN_STATUSES = frozenset(
+    {
+        ReviewStatus.HUMAN_ACCEPTED,
+        ReviewStatus.REJECTED,
+        ReviewStatus.HUMAN_UNRESOLVED,
+    }
+)
 
 #: Aptitudes autorisant un usage géométrique. `auxiliary` y figure : la vue
 #: sert au raccord et à l'enregistrement, mais le Router la comptera à part —
@@ -484,6 +497,8 @@ class Asset(BaseModel):
         if not history:
             # Aucune revue : les champs plats ne peuvent pas prétendre le
             # contraire. Sans cela, un statut humain se poserait sur du vide.
+            # `human_unresolved` en fait partie : constater qu'on ne peut pas
+            # trancher suppose d'avoir regardé.
             if self.review_status in _HUMAN_STATUSES:
                 raise ValueError(
                     f"asset {self.id!r} porte le statut {self.review_status.value!r} "
@@ -508,10 +523,25 @@ class Asset(BaseModel):
                 f"{last.decision.value!r}"
             )
         if self.review_status is not DECISION_STATUS[last.decision]:
+            # Le cas le plus probable est un manifeste écrit avant que
+            # « examiné sans conclure » cesse d'être « en attente de revue ».
+            # Le dire évite de faire chercher une incohérence de données là où
+            # il n'y a qu'une version antérieure.
+            legacy = (
+                last.decision is ReviewDecision.UNRESOLVED
+                and self.review_status is LEGACY_UNRESOLVED_STATUS
+            )
+            hint = (
+                " — manifeste antérieur au statut terminal ; "
+                "« hotel-pipeline assets migrate-review-status <hotel_id> » "
+                "le convertit sans toucher aux décisions"
+                if legacy
+                else ""
+            )
             raise ValueError(
                 f"asset {self.id!r} : statut {self.review_status.value!r} "
                 f"incompatible avec la décision {last.decision.value!r} ; "
-                f"attendu {DECISION_STATUS[last.decision].value!r}"
+                f"attendu {DECISION_STATUS[last.decision].value!r}{hint}"
             )
         # Une personne qui n'a pas conclu n'interdit pas au système de constater
         # qu'il ne voit rien : après un `unresolved`, la déduction automatique

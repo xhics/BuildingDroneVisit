@@ -46,8 +46,9 @@ _HUMAN_STATUS: dict[ReviewDecision, ReviewStatus] = {
     ReviewDecision.CONFIRMED: ReviewStatus.HUMAN_ACCEPTED,
     ReviewDecision.REJECTED: ReviewStatus.REJECTED,
     # Examiné sans conclure : c'est une information, pas une absence de revue.
-    # L'acceptation automatique ne peut pas la recouvrir.
-    ReviewDecision.UNRESOLVED: ReviewStatus.NEEDS_REVIEW,
+    # L'acceptation automatique ne peut pas la recouvrir, et la file d'attente
+    # ne doit pas la réclamer indéfiniment.
+    ReviewDecision.UNRESOLVED: ReviewStatus.HUMAN_UNRESOLVED,
 }
 
 

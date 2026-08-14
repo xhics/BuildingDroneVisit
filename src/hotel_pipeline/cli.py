@@ -470,6 +470,47 @@ def assets_migrate(hotel_id: str = typer.Argument(...)) -> None:
         )
 
 
+@assets_app.command("migrate-review-status")
+def assets_migrate_review_status(
+    hotel_id: str = typer.Argument(...),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Compter sans rien écrire."),
+) -> None:
+    """Convertit les revues non conclusives vers le statut terminal.
+
+    « Examiné sans conclure » cessait d'être « en attente de revue » : les
+    manifestes écrits avant ce changement réclamaient éternellement un travail
+    déjà fait. Rien d'autre n'est touché — ni décision, ni historique, ni
+    empreinte.
+    """
+    from .migrate_review_status import migrate_file
+
+    workspace = Workspace(hotel_id)
+    if not workspace.assets_path.is_file():
+        typer.secho("aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    migrated, report = migrate_file(workspace.assets_path)
+
+    if report.converted == 0:
+        typer.echo(f"{OK} rien à convertir — {report.already_terminal} déjà terminal(es)")
+        return
+
+    if dry_run:
+        typer.echo(f"    à convertir  {report.converted}")
+        for asset_id in report.converted_ids:
+            typer.echo(f"      {asset_id}")
+        typer.echo("    --dry-run : rien n'a été écrit")
+        return
+
+    workspace.write_assets(migrated)
+    workspace.write_json("00_manifest/review_status_migration.json", report.as_dict())
+
+    typer.echo(f"{OK} {report.converted} statut(s) converti(s) sur {report.total}")
+    for asset_id in report.converted_ids:
+        typer.echo(f"    {asset_id}  needs_review → human_unresolved")
+    typer.echo(f"    décisions et historiques inchangés : {report.untouched_decisions}")
+
+
 @assets_app.command("dedup")
 def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     """Déduplication à quatre niveaux (Lot 1B §5)."""
@@ -695,7 +736,12 @@ def review_queue(
     typer.secho(f"  en attente  {numbers.pending:>4}", fg=typer.colors.YELLOW)
     typer.secho(f"  bloquants   {numbers.blocking:>4}", fg=typer.colors.YELLOW)
     typer.secho(f"  cohorte     {numbers.cohort:>4}", fg=typer.colors.YELLOW)
-    typer.echo("  trois populations distinctes — ne pas additionner")
+    # Dire à la fois « la revue est close » et « cette image demeure indécise ».
+    typer.secho(
+        f"  indécises   {numbers.reviewed_unresolved:>4}  examinées, revue close",
+        fg=typer.colors.YELLOW,
+    )
+    typer.echo("  populations distinctes — ne pas additionner")
     typer.echo("")
     for source, total in numbers.pending_by_source.items():
         typer.echo(f"    en attente · {source:<14} {total:>4}")

@@ -80,6 +80,14 @@ def role_for(
         if asset.occluded_by:
             return ReconstructionRole.CONTEXT_LOCK, "ligne de visée masquée par un voisin"
         if asset.target_building_visible is not True:
+            # Le rôle est le même — verrou de contexte — mais le motif n'est
+            # pas le même : « pas encore jugé » et « jugé, indécidable » ne
+            # demandent pas la même suite.
+            if asset.review_status is ReviewStatus.HUMAN_UNRESOLVED:
+                return (
+                    ReconstructionRole.CONTEXT_LOCK,
+                    "revue close sans conclusion : preuves insuffisantes",
+                )
             return (
                 ReconstructionRole.CONTEXT_LOCK,
                 "bâtiment cible non établi" if contains else "environnement seulement",
