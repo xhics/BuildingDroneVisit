@@ -61,6 +61,9 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "collection.max_panorama_distance_m",
         "collection.image_fov_deg",
         "collection.wide_fov_deg",
+        "collection.sequence_enrichment_per_demand",
+        "collection.sequence_expansion_max_members",
+        "collection.sequence_expansion_max_distance_m",
     ),
     Facet.CANDIDATE_GEOMETRY: (
         "geometry.half_fov_deg",

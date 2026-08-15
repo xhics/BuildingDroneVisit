@@ -184,6 +184,20 @@ class CollectionPolicy(BaseModel):
     image_fov_deg: int = Field(default=80, gt=0, le=120)
     wide_fov_deg: int = Field(default=110, gt=0, le=120)
 
+    #: Candidats enrichis d'un `sequence_id` **par besoin**. L'API ne le rend
+    #: pas dans la recherche par zone : l'obtenir coûte un appel par image, et
+    #: enrichir des centaines de vues avant toute sélection dépenserait le
+    #: budget sur ce qu'on écartera.
+    sequence_enrichment_per_demand: int = Field(default=12, ge=0)
+
+    #: Membres d'une séquence explorés en expansion. Suivre une séquence
+    #: entière la mènerait hors de la zone utile — un véhicule roule.
+    sequence_expansion_max_members: int = Field(default=20, ge=0)
+
+    #: Distance au-delà de laquelle un membre de séquence n'est plus exploré,
+    #: quelle que soit la continuité qu'il promettrait.
+    sequence_expansion_max_distance_m: float = Field(default=250.0, gt=0)
+
 
 class CoveragePolicy(BaseModel):
     """Ce qu'une obligation exige, par intention.
