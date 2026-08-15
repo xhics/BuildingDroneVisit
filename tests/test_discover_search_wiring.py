@@ -23,6 +23,7 @@ from hotel_pipeline.schemas import DEFAULT_POLICY
 from hotel_pipeline.schemas.acquisition import CaptureDemandManifest, Eligibility
 
 from test_adaptive_search import TARGET, candidate, demand
+from test_adaptive_sector import FlatProjection, at_bearing, sector_context
 
 HOTEL = "pilote-test"
 
@@ -35,6 +36,9 @@ class FakeContext:
     skipped: dict = field(default_factory=dict)
     anchors: dict = field(default_factory=dict)
     target: tuple | None = TARGET
+    sector: object = None
+    viewpoint_separation_m: float | None = None
+    viewpoints: dict = field(default_factory=dict)
     policy: object = field(
         default_factory=lambda: DEFAULT_POLICY.adaptive_search
     )
@@ -161,9 +165,13 @@ def test_skipped_demands_keep_their_reason(rear_demand, three_candidates):
     assert report.search.demands_skipped["obligation:ENTRANCE_MAIN_CURRENT"] == reason
 
 
-def test_total_rejection_is_recorded_not_silent(rear_demand):
-    """Tout écarter est un résultat ; un zéro nu ne le dirait pas."""
-    # Un candidat à 8 km : hors de portée de n'importe quel seuil de distance.
+def test_distance_is_a_reprieve_not_a_verdict(rear_demand):
+    """Hors portée automatique n'est pas inutilisable.
+
+    Sans intrinsèques de caméra, la distance seule ne prouve pas qu'une cible
+    serait trop petite. Faute de candidat plus proche, le lointain redevient
+    donc examinable — plutôt que de laisser le besoin sans rien.
+    """
     remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
 
     manifest, report = discover(
@@ -171,9 +179,27 @@ def test_total_rejection_is_recorded_not_silent(rear_demand):
         search=FakeContext(outstanding=[rear_demand]),
     )
 
-    assert not manifest.recommended_for_plan
-    assert report.search.all_rejected.get("obligation:FACADE_REAR") == 1
-    assert manifest.candidates, "le candidat écarté reste au manifeste"
+    assert manifest.candidates, "le candidat lointain reste au manifeste"
+    measure = report.search.measures[0]
+    assert measure.outside_automatic_range
+    assert "non écarté" in measure.preview_only_reason
+    assert measure.rejection_reason is None, (
+        "la distance met à l'écart, elle ne condamne pas"
+    )
+
+
+def test_a_closer_candidate_wins_over_a_distant_one(rear_demand):
+    """Le repli ne doit pas mettre lointains et proches sur le même rang."""
+    near = candidate("mly-proche", *_south_of(TARGET, 40))
+    remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
+
+    manifest, _ = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": [near, remote]},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    assert "mly-loin" not in manifest.recommended_for_plan
+    assert "mly-proche" in manifest.recommended_for_plan
 
 
 def test_lineage_is_carried_into_the_report(rear_demand, three_candidates):
@@ -220,3 +246,95 @@ def test_report_publishes_the_search(rear_demand, three_candidates):
     assert published is not None
     assert published["run_id"] == report.run_id
     assert report.as_dict()["bytes_downloaded"] == 0
+
+
+def test_framings_panoramas_and_viewpoints_are_counted_separately(rear_demand):
+    """1442 cadrages pour 721 panoramas n'est pas un doublon.
+
+    Un seul chiffre les confondrait, et le rapport se lirait comme si la
+    déduplication avait échoué alors que ce sont deux acquisitions légitimes.
+    """
+    framings = [
+        candidate("pano-A-1", *_south_of(TARGET, 40), panorama_id="A"),
+        candidate("pano-A-2", *_south_of(TARGET, 40), panorama_id="A"),
+        candidate("pano-B-1", *_south_of(TARGET, 45, east=30), panorama_id="B"),
+    ]
+
+    manifest, report = discover(
+        HOTEL, _demands(rear_demand), {"street_view": framings},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    counts = report.viewpoint_counts
+    assert counts["framing_candidates"] == 3
+    assert counts["distinct_panoramas"] == 2
+    assert counts["viewpoints"] == 2
+    assert report.duplicates_dropped == 0, (
+        "deux cadrages ne sont pas des doublons d'identité"
+    )
+    assert len(manifest.candidates) == 3
+
+
+def test_a_fallback_recommendation_says_so(rear_demand):
+    """Retenu faute de mieux n'est pas retenu ordinairement."""
+    remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
+
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": [remote]},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    measure = report.search.measures[0]
+    assert measure.recommended_by_fallback, (
+        "sans cette marque, le plan prendrait un repli pour un choix"
+    )
+
+
+# --- la découverte transmet-elle ce qu'elle a reçu ? --------------------------
+#
+# Ces deux tests comblent un angle mort : neutraliser la transmission de
+# `sector` ou de `viewpoints` entre `discover` et la mesure ne faisait échouer
+# aucun test. Le contexte était construit, jamais vérifié comme transmis.
+
+
+def test_discover_passes_the_sector_context_through():
+    """Sans transmission, les besoins sectoriels cessent de se distinguer."""
+    need = demand("obligation:front", "front")
+    front = candidate("c-face", *at_bearing(5.0))
+    behind = candidate("c-dos", *at_bearing(180.0))
+
+    _, report = discover(
+        HOTEL, _demands(need), {"mapillary": [front, behind]},
+        search=FakeContext(
+            outstanding=[need], target=(0.0, 0.0),
+            sector=sector_context(need.demand_id, 0.0),
+        ),
+    )
+
+    fits = {m.candidate_id: m.sector_fit.value for m in report.search.measures}
+    assert fits["c-face"] == "exact"
+    assert fits["c-dos"] == "wrong_sector", (
+        "le contexte sectoriel n'a pas atteint la mesure"
+    )
+
+
+def test_discover_passes_the_viewpoint_grouping_through():
+    """Sans transmission, deux cadrages rempliraient un quota de deux vues."""
+    need = demand("obligation:front", "front", viewpoints_required=2)
+    framings = [
+        candidate("pano-A-1", *at_bearing(5.0), panorama_id="A"),
+        candidate("pano-A-2", *at_bearing(5.0), panorama_id="A"),
+    ]
+
+    manifest, _ = discover(
+        HOTEL, _demands(need), {"street_view": framings},
+        search=FakeContext(
+            outstanding=[need], target=(0.0, 0.0),
+            sector=sector_context(need.demand_id, 0.0),
+        ),
+    )
+
+    assert len(manifest.recommended_for_plan) == 1, (
+        "deux cadrages d'un même panorama ne remplissent pas un quota de deux "
+        "points de vue"
+    )

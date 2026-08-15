@@ -66,6 +66,15 @@ PILOT_POLICY_DIGESTS = {
         "avec max_distance_to_target_m — le classement seul ne bornait pas la "
         "distance : le premier candidat était retenu à n'importe quelle portée"
     ),
+    "e5d4fa407286fa72": (
+        "avec heading_tolerance_deg — position de l'observateur et orientation "
+        "de la caméra sont deux questions distinctes"
+    ),
+    "ea1d51576b06f645": (
+        "max_distance_to_target_m renommé automatic_candidate_max_distance_m — "
+        "hors de portée de recommandation n'est pas inutilisable : sans les "
+        "intrinsèques de la caméra, la distance seule ne prouve rien"
+    ),
 }
 
 

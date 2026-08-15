@@ -55,6 +55,11 @@ class DiscoveryReport:
     #: Rapport de recherche adaptative, quand elle a eu lieu.
     search: object = None
 
+    #: Cadrages, panoramas et points de vue comptés **séparément**. Un seul
+    #: chiffre les confondrait, et 1442 candidats pour 721 panoramas se lirait
+    #: comme un doublon alors que ce sont deux acquisitions légitimes.
+    viewpoint_counts: dict = field(default_factory=dict)
+
     def counts_by_source(self, unique: list, recommended: set) -> dict:
         """Effectifs par source : « zéro » cesse d'être ambigu."""
         from .schemas.acquisition import SourceCandidateCounts
@@ -83,6 +88,7 @@ class DiscoveryReport:
                 for source, counts in self.requests_by_source.items()
             },
             "adaptive_search": self.search.as_dict() if self.search else None,
+            "viewpoint_counts": self.viewpoint_counts,
             "bytes_downloaded": 0,
             "limits": self.limits or LIMITS,
         }
@@ -242,6 +248,17 @@ def discover(
         policy_digest=policy_digest,
     )
     report.search = search_report
+    panoramas = {c.panorama_id for c in unique if c.panorama_id}
+    report.viewpoint_counts = {
+        # Trois nombres distincts, parce que ce sont trois choses distinctes.
+        "framing_candidates": len(unique),
+        "distinct_panoramas": len(panoramas),
+        "viewpoints": len(set(_viewpoints_of(unique, search).values())),
+        "note": (
+            "deux cadrages d'un même panorama sont deux acquisitions et un "
+            "seul point de vue : les quotas se comptent en points de vue"
+        ),
+    }
     log.info(
         "découverte %s : %d candidat(s) de %d source(s), %d doublon(s) écarté(s), "
         "0 octet téléchargé",
@@ -282,6 +299,11 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     recommended: set[str] = set()
     by_id = {c.candidate_id: c for c in candidates}
 
+    # Les quotas se comptent en points de vue. Ceux du corpus existant sont
+    # déjà groupés ; les candidats le sont ici, par la même règle.
+    viewpoints = dict(getattr(search, "viewpoints", None) or {})
+    viewpoints.update(_viewpoints_of(candidates, search))
+
     for demand in search.outstanding:
         anchors = search.anchors.get(demand.demand_id, [])
         # Un besoin sans ancre compatible est le plus urgent : c'est un secteur
@@ -293,6 +315,7 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
                 candidate, demand, anchors, priority,
                 target_lat=target_lat, target_lon=target_lon,
                 policy=search.policy,
+                sector=getattr(search, "sector", None),
             )
             for candidate in candidates
         ]
@@ -301,6 +324,7 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
         retained = select_for_demand(
             measures, by_id, demand, target_lat, target_lon,
             wanted=demand.viewpoints_required, policy=search.policy,
+            viewpoints=viewpoints,
         )
         published.recommended[demand.demand_id] = list(retained)
         recommended.update(retained)
@@ -331,3 +355,26 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
         len(search.outstanding), len(recommended), len(candidates),
     )
     return evaluations, recommended, published
+
+
+def _viewpoints_of(candidates: list, search) -> dict:  # noqa: ANN001
+    """Point de vue de chaque candidat, par la règle du plan — non une seconde.
+
+    Deux cadrages d'un même panorama sont deux acquisitions et une seule
+    observation : `pano:<panorama_id>` les réunit, et un SfM ne tirerait aucune
+    parallaxe de leur paire.
+    """
+    from .plan import group_viewpoints
+
+    separation = getattr(search, "viewpoint_separation_m", None)
+    if separation is None:
+        # Sans seuil, on ne groupe **que** par panorama : deux positions
+        # distinctes restent deux points de vue plutôt que d'être réunies par
+        # une distance inventée ici.
+        return {
+            c.candidate_id: (
+                f"pano:{c.panorama_id}" if c.panorama_id else c.candidate_id
+            )
+            for c in candidates
+        }
+    return group_viewpoints(candidates, separation_m=separation)

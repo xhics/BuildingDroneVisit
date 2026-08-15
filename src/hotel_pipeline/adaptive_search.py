@@ -56,6 +56,32 @@ class SequenceStatus(StrEnum):
     QUERY_ERROR = "query_error"
 
 
+class SectorFit(StrEnum):
+    """Comment la **position** d'un candidat se situe face au secteur demandé.
+
+    Le demi-angle de tolérance rend volontairement les coins compatibles avec
+    deux faces. Compatible n'est pas équivalent : une vue de coin documente une
+    façade, elle ne la montre pas de face. Les confondre ferait créditer deux
+    besoins principaux avec une seule vue oblique.
+    """
+
+    #: Le secteur discret de l'observateur est celui que le besoin demande.
+    EXACT = "exact"
+
+    #: Hors du secteur discret, mais dans le cône de tolérance : coin adjacent.
+    ADJACENT = "adjacent"
+
+    #: Hors du cône. Un autre côté du bâtiment.
+    WRONG_SECTOR = "wrong_sector"
+
+    #: Le besoin n'impose aucun côté — un corridor se documente d'où l'on veut.
+    UNCONSTRAINED = "unconstrained"
+
+    #: Rien ne permet de le dire : cible non résolue, ou orientation du
+    #: bâtiment inconnue. L'ignorance reste de l'ignorance.
+    UNKNOWN = "unknown"
+
+
 class ContinuityLevel(StrEnum):
     """Jusqu'où va ce qu'on sait du recouvrement."""
 
@@ -81,6 +107,25 @@ class CandidateMeasure:
     coverage_gap_priority: int = 0
     sector_novelty: bool = False
 
+    #: --- position de l'observateur : de quel côté se tient la caméra --------
+    #: Azimut de la caméra **vu depuis la cible**. C'est ce qu'un secteur
+    #: nomme ; le relèvement inverse répond à une autre question.
+    observer_bearing_deg: float | None = None
+
+    #: Secteur discret produit par `sectors.sector_for`, sans tolérance.
+    observer_sector: str | None = None
+
+    #: Résultat du cône de tolérance, distinct du secteur discret.
+    sector_compatible: bool | None = None
+    sector_fit: SectorFit = SectorFit.UNKNOWN
+    sector_reason: str = ""
+
+    #: --- orientation de la caméra : regarde-t-elle vers la cible ? ----------
+    #: Question distincte de la précédente. Une caméra bien placée peut viser
+    #: ailleurs ; une caméra qui vise la cible peut être du mauvais côté.
+    heading_targets_object: bool | None = None
+    heading_offset_deg: float | None = None
+
     distance_to_target_m: float | None = None
     distance_to_nearest_anchor_m: float | None = None
     bearing_delta_from_anchor_deg: float | None = None
@@ -105,6 +150,19 @@ class CandidateMeasure:
     corridor_ref: str | None = None
 
     heading_is_measured: bool = False
+
+    #: Hors de la portée de **recommandation automatique**, ce qui n'est pas un
+    #: rejet : le candidat reste au manifeste et redevient examinable si rien
+    #: de plus proche n'existe.
+    outside_automatic_range: bool = False
+    preview_only_reason: str = ""
+
+    #: Retenu **faute de mieux** : aucun candidat dans la portée automatique.
+    #: Distinct d'une recommandation ordinaire.
+    recommended_by_fallback: bool = False
+
+    #: Rejet **définitif** pour ce besoin : mauvais côté du bâtiment, position
+    #: inconnue. Distinct de la mise à l'écart par distance.
     rejection_reason: str | None = None
 
     def as_dict(self) -> dict:
@@ -113,6 +171,24 @@ class CandidateMeasure:
             "demand_id": self.demand_id,
             "coverage_gap_priority": self.coverage_gap_priority,
             "sector_novelty": self.sector_novelty,
+            # Position et orientation restent **séparées** : les fondre en un
+            # « bon candidat » ferait disparaître laquelle des deux manque.
+            "observer_position": {
+                "bearing_deg": self.observer_bearing_deg,
+                "sector": self.observer_sector,
+                "compatible": self.sector_compatible,
+                "fit": self.sector_fit.value,
+                "reason": self.sector_reason,
+            },
+            "automatic_range": {
+                "outside": self.outside_automatic_range,
+                "reason": self.preview_only_reason,
+                "recommended_by_fallback": self.recommended_by_fallback,
+            },
+            "camera_orientation": {
+                "targets_object": self.heading_targets_object,
+                "offset_deg": self.heading_offset_deg,
+            },
             "distance_to_target_m": self.distance_to_target_m,
             "distance_to_nearest_anchor_m": self.distance_to_nearest_anchor_m,
             "bearing_delta_from_anchor_deg": self.bearing_delta_from_anchor_deg,
@@ -307,6 +383,7 @@ def measure_candidate(
     anchor_sequences: set[str] | None = None,
     sequence_status: SequenceStatus = SequenceStatus.NOT_QUERIED,
     policy=None,  # noqa: ANN001 — AdaptiveSearchPolicy
+    sector=None,  # noqa: ANN001 — SectorContext
 ) -> CandidateMeasure:
     """Mesure un candidat contre un besoin, qualité par qualité.
 
@@ -332,6 +409,8 @@ def measure_candidate(
             haversine_m(candidate.camera_lat, candidate.camera_lon,
                         target_lat, target_lon), 1
         )
+
+    _apply_sector(measure, candidate, demand, sector)
 
     # --- parallaxe : contre les ancres **de ce besoin**, ou rien -------------
     if not anchors:
@@ -498,6 +577,7 @@ def select_for_demand(
     target_lon: float | None,
     wanted: int,
     policy=None,  # noqa: ANN001 — AdaptiveSearchPolicy
+    viewpoints: dict | None = None,
 ) -> list[str]:
     """Retient les vues d'un besoin, la seconde par gain marginal.
 
@@ -506,20 +586,44 @@ def select_for_demand(
     """
     eligible = [m for m in measures if m.rejection_reason is None]
 
+    # Le crédit sectoriel doit être le **même** qu'à l'évaluation, qui exige
+    # l'égalité du secteur discret (`demands_assess._serves`). Recommander une
+    # vue de coin pour remplir un quota ferait acheter au plan une image que
+    # `demands assess` refuserait ensuite de compter — la boucle ne se
+    # fermerait jamais.
+    principal = [m for m in eligible if m.sector_fit is not SectorFit.ADJACENT]
+    if principal:
+        eligible = principal
+
     if policy is not None:
         # Le classement ne borne rien : sans ce filtre, le premier du tri est
         # retenu même s'il est à des kilomètres de la cible.
-        limit = policy.max_distance_to_target_m
+        #
+        # Écarter n'est pas condamner. Un candidat hors portée automatique
+        # reste au manifeste, réexaminable si rien de plus proche n'existe :
+        # la distance seule ne prouve pas qu'une cible serait trop petite.
+        limit = policy.automatic_candidate_max_distance_m
         for measure in eligible:
             if (
                 measure.distance_to_target_m is not None
                 and measure.distance_to_target_m > limit
             ):
-                measure.rejection_reason = (
+                measure.outside_automatic_range = True
+                measure.preview_only_reason = (
                     f"à {measure.distance_to_target_m:.0f} m de la cible, "
-                    f"au-delà de la portée retenue ({limit:.0f} m)"
+                    f"au-delà de la portée de recommandation automatique "
+                    f"({limit:.0f} m) — examinable, non écarté"
                 )
-        eligible = [m for m in eligible if m.rejection_reason is None]
+        near = [m for m in eligible if not m.outside_automatic_range]
+        if near:
+            eligible = near
+        else:
+            # Repli : faute de candidat proche, les lointains redeviennent
+            # examinables plutôt que de laisser un besoin sans rien. Le dire
+            # est indispensable — une recommandation par défaut ne vaut pas une
+            # recommandation ordinaire, et le plan doit pouvoir les distinguer.
+            for measure in eligible:
+                measure.recommended_by_fallback = True
 
     if not eligible:
         return []
@@ -535,7 +639,17 @@ def select_for_demand(
         ),
     )
 
+    # Le quota se compte en **points de vue**, pas en cadrages. Deux cadrages
+    # d'un même panorama sont deux acquisitions et une seule observation : les
+    # compter deux fois ferait croire un besoin servi par deux vues
+    # indépendantes, dont un SfM ne tirerait aucune parallaxe.
+    seen: dict = viewpoints or {}
+
+    def viewpoint_of(candidate_id: str) -> str:
+        return seen.get(candidate_id, candidate_id)
+
     retained = [ordered[0].candidate_id]
+    covered = {viewpoint_of(ordered[0].candidate_id)}
     if wanted <= 1 or target_lat is None or target_lon is None:
         return retained[:wanted]
 
@@ -545,6 +659,11 @@ def select_for_demand(
         best, best_gain = None, -1.0
         for measure in ordered:
             if measure.candidate_id in retained:
+                continue
+            if viewpoint_of(measure.candidate_id) in covered:
+                # Même panorama qu'une vue déjà retenue : un second cadrage ne
+                # fait pas un second point de vue. Il peut servir un autre
+                # besoin, jamais compléter le quota de celui-ci.
                 continue
             candidate = candidates.get(measure.candidate_id)
             if candidate is None or candidate.camera_lat is None:
@@ -572,8 +691,12 @@ def select_for_demand(
             ):
                 best, best_gain = measure.candidate_id, marginal
         if best is None:
+            # Aucun point de vue distinct disponible : le besoin restera
+            # partiellement couvert, ce qui est plus vrai que de le compléter
+            # avec un second cadrage de la même position.
             break
         retained.append(best)
+        covered.add(viewpoint_of(best))
 
     return retained
 
@@ -672,3 +795,132 @@ def expand_sequences(
             kept += 1
 
     return added, rejected, calls
+
+
+@dataclass
+class SectorContext:
+    """De quoi situer un candidat par rapport aux cibles, sans les recalculer.
+
+    Porte la projection et les cibles **déjà résolues** par `demand_targets` :
+    la recherche adaptative ne définit pas son propre secteur. Une troisième
+    définition sectorielle aurait divergé des deux existantes sans que rien ne
+    le signale, et le plan aurait acheté des vues que `demands assess` aurait
+    ensuite refusé de compter.
+    """
+
+    #: `demand_id` → `DemandTarget`, résolues par `demand_targets.resolve`.
+    targets: dict = field(default_factory=dict)
+
+    #: Projection commune. `observer_bearing` travaille en coordonnées
+    #: projetées : mesurer en géographique introduirait une distorsion qui
+    #: croît avec la latitude.
+    projection: object = None
+
+    #: Orientation du bâtiment. Sans elle, « avant » et « arrière » ne se
+    #: distinguent pas — et les inventer ferait passer n'importe quelle vue
+    #: pour une vue de façade.
+    front_azimuth_deg: float | None = None
+
+    #: Pourquoi une cible manque, quand elle manque.
+    unresolved: dict = field(default_factory=dict)
+
+    #: Écart toléré entre cap mesuré et direction de la cible. Vient de la
+    #: politique : le fixer ici en ferait une constante arbitraire de plus.
+    heading_tolerance_deg: float | None = None
+
+
+def _apply_sector(measure, candidate, demand, sector) -> None:  # noqa: ANN001
+    """Situe la caméra, puis vérifie où elle regarde. Deux questions.
+
+    `cible → caméra` dit de quel côté du bâtiment on se tient ; `caméra →
+    cible` dit si l'objectif y est effectivement tourné. Une vue n'est
+    automatiquement recommandable que si les deux passent.
+    """
+    from .demand_targets import observer_bearing
+    from .sectors import sector_for
+
+    if sector is None:
+        measure.sector_reason = "aucun contexte sectoriel fourni"
+        return
+
+    target = sector.targets.get(demand.demand_id)
+    if target is None:
+        measure.sector_reason = sector.unresolved.get(
+            demand.demand_id, "cible non résolue : le secteur reste inconnu"
+        )
+        return
+
+    if sector.projection is None:
+        measure.sector_reason = "aucune projection : le secteur ne se mesure pas"
+        return
+
+    origin = sector.projection.point(candidate.camera_lat, candidate.camera_lon)
+    bearing = observer_bearing(origin, target.shape)
+    measure.observer_bearing_deg = round(bearing, 1)
+
+    # --- position : de quel côté se tient la caméra -------------------------
+    if target.required_bearing_deg is None:
+        measure.sector_fit = SectorFit.UNCONSTRAINED
+        measure.sector_compatible = True
+        measure.sector_reason = "le besoin n'impose aucun côté"
+    else:
+        compatible = target.observer_is_admissible(bearing)
+        measure.sector_compatible = compatible
+
+        if sector.front_azimuth_deg is not None:
+            measure.observer_sector = sector_for(
+                bearing, sector.front_azimuth_deg
+            ).value
+
+        if not compatible:
+            measure.sector_fit = SectorFit.WRONG_SECTOR
+            measure.rejection_reason = (
+                f"observateur à {bearing:.0f}°, hors du secteur demandé "
+                f"({target.required_bearing_deg:.0f}° ± {target.half_width_deg:.0f}°)"
+            )
+            measure.sector_reason = measure.rejection_reason
+            return
+
+        # Compatible : reste à savoir si c'est de face ou de coin. Le secteur
+        # discret tranche — sans lui, une vue oblique créditerait une façade
+        # principale au même titre qu'une vue frontale.
+        wanted = getattr(demand, "target_ref", None)
+        if measure.observer_sector is None:
+            measure.sector_fit = SectorFit.UNKNOWN
+            measure.sector_reason = (
+                "dans le cône de tolérance, mais l'orientation du bâtiment est "
+                "inconnue : « de face » ou « de coin » ne se départagent pas"
+            )
+        elif measure.observer_sector == wanted:
+            measure.sector_fit = SectorFit.EXACT
+            measure.sector_reason = f"secteur {measure.observer_sector} demandé"
+        else:
+            measure.sector_fit = SectorFit.ADJACENT
+            measure.sector_reason = (
+                f"vue de coin : observateur en secteur {measure.observer_sector}, "
+                f"compatible avec {wanted} par tolérance — auxiliaire, non "
+                "créditable comme vue principale"
+            )
+
+    # --- orientation : la caméra regarde-t-elle vers la cible ? -------------
+    heading = (
+        candidate.requested_heading_deg
+        if candidate.requested_heading_deg is not None
+        else candidate.computed_heading_deg or candidate.original_heading_deg
+    )
+    if heading is None:
+        # `None`, jamais `False` : un cap absent n'est pas un cap qui vise
+        # ailleurs. Le rejeter écarterait des panoramas sans cadrage déclaré.
+        measure.heading_targets_object = None
+        return
+
+    # Le relèvement inverse : depuis la caméra, vers la cible.
+    towards = (measure.observer_bearing_deg + 180.0) % 360.0
+    offset = abs((towards - heading + 180.0) % 360.0 - 180.0)
+    measure.heading_offset_deg = round(offset, 1)
+    if sector.heading_tolerance_deg is None:
+        # La mesure est publiée, le verdict ne l'est pas : sans seuil, dire
+        # « oui » ou « non » inventerait une politique.
+        measure.heading_targets_object = None
+        return
+    measure.heading_targets_object = offset <= sector.heading_tolerance_deg

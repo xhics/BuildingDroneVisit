@@ -89,7 +89,8 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
     # Modifier une préférence périme la recherche et ses rapports, jamais les
     # besoins eux-mêmes — l'objectif n'a pas bougé.
     Facet.SEARCH_PREFERENCE: (
-        "adaptive_search.max_distance_to_target_m",
+        "adaptive_search.automatic_candidate_max_distance_m",
+        "adaptive_search.heading_tolerance_deg",
         "adaptive_search.parallax_preferred_min_deg",
         "adaptive_search.parallax_preferred_max_deg",
         "adaptive_search.parallax_excess_penalty",
@@ -170,9 +171,11 @@ UNSCOPED_FIELDS: frozenset[str] = frozenset(
 CONSUMERS: dict[str, tuple[Facet, ...]] = {
     "CaptureDemandManifest": (Facet.COVERAGE_TARGETS,),
     "DemandAssessmentManifest": (Facet.COVERAGE_TARGETS, Facet.CANDIDATE_GEOMETRY),
-    # `SearchReport` rejoindra cette table au câblage : la déclarer avant
-    # qu'une commande la publie ferait échouer le contrôle qui exige que toute
-    # production déclarée soit écrite — et ce contrôle a raison.
+    # `SearchReport` n'entre pas dans cette table, et c'est délibéré : il n'est
+    # pas un artefact autonome. Il est publié **dans** le rapport de découverte,
+    # et son empreinte est portée par `CandidateManifest`, qui consomme déjà
+    # `SEARCH_PREFERENCE`. Le déclarer ici lui prêterait une péremption propre,
+    # alors que rien ne le relit séparément.
     "CandidateManifest": (Facet.COLLECTION_DISCOVERY, Facet.SEARCH_PREFERENCE),
     "CandidateEvaluation": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
     "AcquisitionPlan": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),

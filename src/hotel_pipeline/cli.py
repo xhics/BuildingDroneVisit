@@ -702,6 +702,30 @@ def assets_discover(
     for source, reason in sorted(report.sources_skipped.items()):
         typer.secho(f"    {source:<14} non interrogée — {reason}", fg=typer.colors.YELLOW)
 
+    counts = report.viewpoint_counts
+    if counts:
+        typer.echo("")
+        typer.echo(f"    cadrages candidats  {counts['framing_candidates']:>6}")
+        typer.echo(f"    panoramas distincts {counts['distinct_panoramas']:>6}")
+        typer.echo(f"    points de vue       {counts['viewpoints']:>6}")
+
+    if report.search is not None:
+        typer.echo("")
+        typer.echo("  recommandations par besoin — le plan décide seul :")
+        for demand_id in sorted(report.search.recommended):
+            retained = report.search.recommended[demand_id]
+            considered = sum(
+                1 for m in report.search.measures
+                if m.demand_id == demand_id and m.rejection_reason is None
+            )
+            typer.echo(
+                f"    {demand_id:<36} {len(retained)} retenue(s) "
+                f"sur {considered} éligible(s)"
+            )
+        for demand_id, reason in sorted(report.search.demands_skipped.items()):
+            typer.secho(f"    {demand_id:<36} ignoré — {reason}",
+                        fg=typer.colors.YELLOW)
+
     typer.echo("")
     typer.echo(f"{OK} {len(manifest.candidates)} candidat(s), 0 octet téléchargé")
     typer.echo(f"    doublons écartés : {report.duplicates_dropped}")
@@ -750,6 +774,18 @@ class AdaptiveContext:
     skipped: dict = field(default_factory=dict)
     anchors: dict = field(default_factory=dict)
     target: tuple | None = None
+
+    #: De quel côté du bâtiment se tient chaque candidat. Sans lui, les besoins
+    #: sectoriels ne se distinguent pas les uns des autres.
+    sector: object = None
+
+    #: `candidate_id` → point de vue, pour compter les quotas en observations
+    #: et non en cadrages.
+    viewpoints: dict = field(default_factory=dict)
+
+    #: Distance en deçà de laquelle deux caméras sont un seul point de vue.
+    viewpoint_separation_m: float | None = None
+
     policy: object = None
     collection: object = None
     lineage: dict = field(default_factory=dict)
@@ -805,12 +841,16 @@ def _adaptive_context(workspace, context, demands, demands_payload):  # noqa: AN
 
     geometry = _capture_geometry_if_any(workspace, context)
     target = _target_position(workspace)
+    sector = _sector_context(workspace, context, outstanding, geometry)
 
     return AdaptiveContext(
         outstanding=outstanding,
         skipped=skipped,
         anchors=anchors,
         target=target,
+        sector=sector,
+        viewpoints=viewpoints,
+        viewpoint_separation_m=context.policy.geometry.viewpoint_separation_m,
         policy=context.policy.adaptive_search,
         collection=context.policy.collection,
         lineage={
@@ -4022,3 +4062,62 @@ def smoke() -> None:
 
 if __name__ == "__main__":
     app()
+
+
+def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN201
+    """Cibles résolues et projection, par le **même** chemin que la géométrie.
+
+    Aucune définition sectorielle propre à la recherche : une troisième règle
+    aurait divergé des deux existantes sans que rien ne le signale, et le plan
+    aurait acheté des vues que `demands assess` aurait refusé de compter.
+    """
+    from .adaptive_search import SectorContext
+    from .demand_targets import TargetUnresolved, resolve
+    from .geo.projection import ProjectionRefused, ProjectionService
+
+    reference = context.spatial_reference
+    if reference is None or geometry is None:
+        typer.secho(
+            "  · aucun secteur mesurable : contexte spatial ou géométrie de "
+            "capture absents — les besoins de secteur ne se distingueront pas",
+            fg=typer.colors.YELLOW,
+        )
+        return None
+
+    spatial = _safe_read(workspace.read_spatial)
+    front = getattr(spatial, "front_azimuth_deg", None) if spatial else None
+    if front is None:
+        typer.secho(
+            "  · orientation de façade inconnue : « de face » et « de coin » ne "
+            "se départageront pas",
+            fg=typer.colors.YELLOW,
+        )
+
+    try:
+        projection = ProjectionService(reference)
+    except ProjectionRefused as exc:
+        typer.secho(f"  · projection refusée : {exc}", fg=typer.colors.YELLOW)
+        return None
+
+    site = _safe_read(workspace.read_site)
+    half_width = context.policy.geometry.sector_observer_half_width_deg
+
+    targets, unresolved = {}, {}
+    for demand in demands:
+        try:
+            targets[demand.demand_id] = resolve(
+                demand, geometry, front, site, half_width
+            )
+        except TargetUnresolved as exc:
+            # La cible manque : le secteur reste inconnu, et le dire vaut mieux
+            # que de replier sur le bâtiment — ce qui ferait chercher la façade
+            # en croyant chercher l'entrée.
+            unresolved[demand.demand_id] = str(exc).split(" : ", 1)[-1]
+
+    return SectorContext(
+        targets=targets,
+        projection=projection,
+        front_azimuth_deg=front,
+        unresolved=unresolved,
+        heading_tolerance_deg=context.policy.adaptive_search.heading_tolerance_deg,
+    )

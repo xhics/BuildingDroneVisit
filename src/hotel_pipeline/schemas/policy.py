@@ -259,12 +259,21 @@ class AdaptiveSearchPolicy(BaseModel, Calibrated):
 
     model_config = ConfigDict(extra="forbid")
 
-    #: Au-delà, un candidat ne montre plus la cible utilement, quel que soit
-    #: son rang. Le classement seul ne suffisait pas : le premier était retenu
-    #: même à plusieurs kilomètres, la borne n'étant garantie que par le rayon
-    #: d'interrogation du collecteur — une garantie qui disparaît dès qu'une
-    #: source rend un candidat hors rayon.
-    max_distance_to_target_m: float = Field(default=250.0, gt=0)
+    #: Au-delà, un candidat n'est plus recommandé **automatiquement**. Ce
+    #: n'est pas une preuve d'inutilité : sans les intrinsèques de la caméra,
+    #: la distance seule ne dit pas qu'une cible serait trop petite. Un
+    #: téléobjectif lointain peut valoir mieux qu'un grand-angle proche.
+    #:
+    #: Distinct du rayon d'interrogation de l'index : on interroge plus large
+    #: qu'on ne recommande, et les rendre égaux masquerait cette différence
+    #: sans rendre le seuil moins provisoire. Valeur **non calibrée**.
+    automatic_candidate_max_distance_m: float = Field(default=250.0, gt=0)
+
+    #: Écart toléré entre le cap mesuré et la direction de la cible. Répond à
+    #: « l'objectif est-il tourné vers elle ? », question distincte de « de
+    #: quel côté du bâtiment se tient la caméra ? ». Un cap **absent** ne vaut
+    #: pas un cap qui vise ailleurs : il reste `None`.
+    heading_tolerance_deg: float = Field(default=60.0, gt=0, le=180)
 
     #: En deçà, deux vues sont presque colinéaires : peu de profondeur.
     parallax_preferred_min_deg: float = Field(default=15.0, ge=0, le=180)
