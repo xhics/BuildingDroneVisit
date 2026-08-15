@@ -676,9 +676,15 @@ def assets_discover(
     # qui sera téléchargé.
     search = _adaptive_context(workspace, context, demands.demands, payload)
 
+    # Le décompte porte sur **cette** commande : un total cumulé entre deux
+    # exécutions ne dirait rien de l'une ni de l'autre.
+    from .providers.cache import call_counts, reset_call_counts
+
+    reset_call_counts()
     queries = _query_sources(
         profile, context, workspace, radius, search.outstanding or demands.demands
     )
+    search.requests_by_source = _requests_by_source(call_counts())
 
     try:
         manifest, report = discover(
@@ -700,7 +706,12 @@ def assets_discover(
     for source in report.sources_queried:
         returned = report.candidates_by_source[source]
         kept = sum(1 for c in manifest.candidates if c.source == source)
+        emitted = report.requests_by_source.get(source)
         detail = f"{returned:>5} rendu(s)"
+        if emitted is not None:
+            # Appels et résultats sont deux choses : une source prolixe n'est
+            # pas une source souvent interrogée.
+            detail += f" pour {emitted.total} appel(s)"
         if kept != returned:
             # Les deux chiffres, sinon « 2163 » à côté d'un total de 1636 se
             # lit comme une incohérence alors que c'est un regroupement.
@@ -822,6 +833,9 @@ class AdaptiveContext:
 
     #: Écart de cap en deçà duquel deux cadrages montrent la même chose.
     framing_merge_bearing_deg: float | None = None
+
+    #: Appels émis par source, mesurés — non estimés.
+    requests_by_source: dict = field(default_factory=dict)
 
     policy: object = None
     collection: object = None
@@ -4351,3 +4365,37 @@ def _readable_evaluations(evaluations, candidates, separation_m):  # noqa: ANN00
             }
         readable.append(row)
     return readable
+
+
+#: Préfixe de clé de cache → source du manifeste. Les noms diffèrent — le cache
+#: distingue `streetview-meta` de `streetview`, le manifeste ne connaît que
+#: `street_view` — et les confondre attribuerait des appels à la mauvaise source.
+_CACHE_SOURCES: dict[str, str] = {
+    "mapillary": "mapillary",
+    "streetview-meta": "street_view",
+    "streetview": "street_view",
+}
+
+
+def _requests_by_source(counts: dict) -> dict:
+    """Appels émis par source du manifeste, agrégés depuis les clés de cache.
+
+    Une source absente du tableau n'a émis aucun appel — ce qui est une
+    information, à distinguer d'un zéro par défaut : les sources non
+    interrogées portent déjà leur motif ailleurs.
+    """
+    from .schemas.acquisition import SourceRequestCounts
+
+    merged: dict[str, int] = {}
+    for prefix, values in counts.items():
+        source = _CACHE_SOURCES.get(prefix)
+        if source is None:
+            # Une clé qui n'appartient à aucune source d'images — géométrie,
+            # réseau routier. La compter fausserait le coût de la collecte.
+            continue
+        merged[source] = merged.get(source, 0) + values["requested"]
+
+    return {
+        source: SourceRequestCounts(coarse_search=total)
+        for source, total in sorted(merged.items())
+    }

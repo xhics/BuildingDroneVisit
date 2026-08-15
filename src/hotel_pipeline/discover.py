@@ -296,6 +296,11 @@ def discover(
 
     unique, dropped = deduplicate(collected)
     report.duplicates_dropped = dropped
+    # Appels mesurés au passage du cache, non estimés depuis les résultats :
+    # une source prolixe n'est pas une source souvent interrogée.
+    report.requests_by_source = dict(
+        getattr(search, "requests_by_source", None) or {}
+    )
 
     tolerance = getattr(search, "framing_merge_bearing_deg", None) if search else None
     if tolerance:
@@ -597,8 +602,8 @@ def _declare_stages(published, search, sequences: dict) -> None:  # noqa: ANN001
 
     if not getattr(search, "requests_by_source", None):
         published.stages_skipped["request_provenance"] = (
-            "les collecteurs ne rendent pas encore leur décompte d'appels : "
-            "le coût réel des requêtes n'est pas mesuré"
+            "aucun appel mesuré : soit aucune source n'a été interrogée, soit "
+            "le décompte n'a pas été remis à zéro avant la collecte"
         )
 
 

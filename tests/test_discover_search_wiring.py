@@ -39,6 +39,7 @@ class FakeContext:
     sector: object = None
     viewpoint_separation_m: float | None = None
     framing_merge_bearing_deg: float | None = None
+    requests_by_source: dict = field(default_factory=dict)
     viewpoints: dict = field(default_factory=dict)
     policy: object = field(
         default_factory=lambda: DEFAULT_POLICY.adaptive_search
@@ -584,3 +585,56 @@ def test_without_sequences_the_stage_is_still_declared_skipped(
     skipped = report.search.stages_skipped
     assert "aucune source n'a rendu de séquence" in skipped["metadata_enrichment"]
     assert "rien à prolonger" in skipped["sequence_expansion"]
+
+
+def test_measured_requests_are_published(rear_demand, three_candidates):
+    """Le rapport publiait un zéro faute de compteur.
+
+    Un zéro ne distinguait pas « rien demandé » de « pas mesuré », et la
+    provenance des requêtes figurait parmi les étapes sautées alors que les
+    appels étaient bel et bien émis.
+    """
+    from hotel_pipeline.schemas.acquisition import SourceRequestCounts
+
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": three_candidates},
+        search=FakeContext(
+            outstanding=[rear_demand],
+            requests_by_source={"mapillary": SourceRequestCounts(coarse_search=3)},
+        ),
+    )
+
+    assert "request_provenance" not in report.search.stages_skipped
+    assert report.requests_by_source["mapillary"].coarse_search == 3
+
+
+def test_cache_hits_are_not_counted_as_requests():
+    """« 25 requêtes » là où le cache a tout servi surestimerait le coût."""
+    from hotel_pipeline.providers.cache import (
+        call_counts,
+        cached_call,
+        reset_call_counts,
+    )
+
+    reset_call_counts()
+    cached_call("essai-compteur::a", lambda: {"valeur": 1})
+    cached_call("essai-compteur::a", lambda: {"valeur": 1})
+
+    counts = call_counts()["essai-compteur"]
+    assert counts["requested"] == 1, "le second appel vient du cache"
+    assert counts["served_by_cache"] == 1
+
+
+def test_non_image_sources_do_not_inflate_the_cost():
+    """Une clé de géométrie n'appartient à aucune source d'images."""
+    from hotel_pipeline.cli import _requests_by_source
+
+    merged = _requests_by_source({
+        "mapillary": {"requested": 2, "served_by_cache": 0},
+        "streetview-meta": {"requested": 40, "served_by_cache": 1200},
+        "overpass-roads": {"requested": 1, "served_by_cache": 0},
+    })
+
+    assert set(merged) == {"mapillary", "street_view"}
+    assert merged["street_view"].coarse_search == 40
+    assert "overpass-roads" not in merged
