@@ -7,6 +7,7 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
@@ -670,13 +671,21 @@ def assets_discover(
     typer.echo(f"  position    {profile.lat:.6f}, {profile.lon:.6f}")
     typer.echo(f"  rayon       {radius} m")
 
-    queries = _query_sources(profile, context, workspace, radius, demands.demands)
+    # La recherche adaptative n'interroge que les besoins encore ouverts, et
+    # ne **recommande** que ce qui les sert : le plan reste seul à décider ce
+    # qui sera téléchargé.
+    search = _adaptive_context(workspace, context, demands.demands, payload)
+
+    queries = _query_sources(
+        profile, context, workspace, radius, search.outstanding or demands.demands
+    )
 
     try:
         manifest, report = discover(
             hotel_id, demands, queries,
             demand_digest=digest_of(payload),
             policy_digest=context.provenance["policy_digest"],
+            search=search,
         )
     except DiscoveryRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -731,6 +740,109 @@ def _refuse_legacy_gather_on_a_new_project(workspace, allowed: bool) -> None:  #
         fg=typer.colors.RED, err=True,
     )
     raise typer.Exit(code=2)
+
+
+@dataclass
+class AdaptiveContext:
+    """Ce que la recherche sait avant d'interroger quoi que ce soit."""
+
+    outstanding: list = field(default_factory=list)
+    skipped: dict = field(default_factory=dict)
+    anchors: dict = field(default_factory=dict)
+    target: tuple | None = None
+    policy: object = None
+    collection: object = None
+    lineage: dict = field(default_factory=dict)
+
+
+def _adaptive_context(workspace, context, demands, demands_payload):  # noqa: ANN001, ANN201
+    """Besoins ouverts, ancres compatibles et filiation, avant toute requête.
+
+    Une cible non résolue figure dans les besoins ignorés **avec son motif** :
+    la remplacer en silence par le bâtiment ferait chercher la façade en
+    croyant chercher l'entrée.
+    """
+    from .adaptive_search import anchors_for, open_demands
+    from .plan import group_viewpoints
+    from .policy_facets import dependency_digests
+    from .provenance import digest_of
+    from .schemas.acquisition import DemandAssessmentManifest
+
+    assessment_payload = _latest_json(workspace, "demand_assessment_*.json")
+    assessment = (
+        DemandAssessmentManifest.model_validate(assessment_payload)
+        if assessment_payload else None
+    )
+    if assessment is None:
+        typer.secho(
+            "  · aucune évaluation des besoins : la recherche ne sait pas quels "
+            "secteurs sont déficitaires — lancez « assets demands assess »",
+            fg=typer.colors.YELLOW,
+        )
+        return AdaptiveContext(
+            policy=context.policy.adaptive_search,
+            collection=context.policy.collection,
+        )
+
+    assets = workspace.read_assets()
+    corpus = assets.assets if assets else []
+    viewpoints = group_viewpoints(
+        [_as_viewpoint_subject(asset) for asset in corpus],
+        separation_m=context.policy.geometry.viewpoint_separation_m,
+    )
+
+    outstanding = open_demands(assessment, demands)
+    skipped = {
+        demand.demand_id: "besoin déjà satisfait"
+        for demand in demands
+        if demand not in outstanding
+    }
+
+    anchors = {}
+    for demand in outstanding:
+        found = anchors_for(demand, corpus, viewpoints, {})
+        anchors[demand.demand_id] = found
+
+    geometry = _capture_geometry_if_any(workspace, context)
+    target = _target_position(workspace)
+
+    return AdaptiveContext(
+        outstanding=outstanding,
+        skipped=skipped,
+        anchors=anchors,
+        target=target,
+        policy=context.policy.adaptive_search,
+        collection=context.policy.collection,
+        lineage={
+            "demand_digest": digest_of(demands_payload),
+            "demand_assessment_digest": digest_of(assessment_payload),
+            "asset_manifest_digest": (
+                digest_of(json.loads(assets.model_dump_json())) if assets else None
+            ),
+            "capture_geometry_digest": (
+                digest_of(json.loads(geometry.model_dump_json())) if geometry else None
+            ),
+            "policy_dependency_digests": dependency_digests(
+                context.policy, "CandidateManifest"
+            ),
+        },
+    )
+
+
+def _latest_json(workspace, pattern: str):  # noqa: ANN001, ANN201
+    found = sorted(workspace.path("01_sources").glob(pattern))
+    usable = [path for path in found if "report" not in path.name]
+    if not usable:
+        return None
+    return json.loads(usable[-1].read_text("utf-8"))
+
+
+def _target_position(workspace):  # noqa: ANN001, ANN201
+    spatial = _safe_read(workspace.read_spatial)
+    if spatial is None or not spatial.confirmed_building_id:
+        return None
+    building = spatial.candidate(spatial.confirmed_building_id)
+    return (building.centroid_lat, building.centroid_lon)
 
 
 def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:  # noqa: ANN001

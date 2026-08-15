@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from .logging import get_logger
+from .provenance import digest_of
 from .schemas.acquisition import CandidateManifest, CaptureCandidate
 
 log = get_logger("discover")
@@ -46,6 +47,30 @@ class DiscoveryReport:
     #: lecteur ne prenne un candidat pour une image utilisable.
     limits: list[str] = field(default_factory=list)
 
+    #: Appels émis, par source et par étage de recherche — jamais des candidats
+    #: rendus. Confondre les deux ferait passer une source prolixe pour une
+    #: source souvent interrogée.
+    requests_by_source: dict = field(default_factory=dict)
+
+    #: Rapport de recherche adaptative, quand elle a eu lieu.
+    search: object = None
+
+    def counts_by_source(self, unique: list, recommended: set) -> dict:
+        """Effectifs par source : « zéro » cesse d'être ambigu."""
+        from .schemas.acquisition import SourceCandidateCounts
+
+        by_source: dict = {}
+        for source, returned in self.candidates_by_source.items():
+            kept = [c for c in unique if c.source == source]
+            advised = [c for c in kept if c.candidate_id in recommended]
+            by_source[source] = SourceCandidateCounts(
+                returned=returned,
+                unique=len(kept),
+                recommended=len(advised),
+                rejected=len(kept) - len(advised),
+            )
+        return by_source
+
     def as_dict(self) -> dict:
         return {
             "run_id": self.run_id,
@@ -53,6 +78,11 @@ class DiscoveryReport:
             "sources_skipped": self.sources_skipped,
             "candidates_by_source": self.candidates_by_source,
             "duplicates_dropped": self.duplicates_dropped,
+            "requests_by_source": {
+                source: counts.as_dict()
+                for source, counts in self.requests_by_source.items()
+            },
+            "adaptive_search": self.search.as_dict() if self.search else None,
             "bytes_downloaded": 0,
             "limits": self.limits or LIMITS,
         }
@@ -144,6 +174,7 @@ def discover(
     run_id: str | None = None,
     demand_digest: str | None = None,
     policy_digest: str | None = None,
+    search=None,  # noqa: ANN001 — AdaptiveContext
 ) -> tuple[CandidateManifest, DiscoveryReport]:
     """Construit le manifeste de candidats à partir de réponses déjà obtenues.
 
@@ -180,19 +211,123 @@ def discover(
     unique, dropped = deduplicate(collected)
     report.duplicates_dropped = dropped
 
+    evaluations, recommended, search_report = _adaptive_pass(
+        hotel_id, unique, search, report,
+    )
+
+    # Les deux objets sont construits — et validés — avant toute écriture. Une
+    # incohérence entre eux ne doit laisser ni manifeste neuf ni rapport
+    # orphelin : c'est le couple qui est publié, ou rien.
     manifest = CandidateManifest(
         hotel_id=hotel_id,
         # `queries` porte le nombre d'entités rendues **par source
         # interrogée** : sans lui, un zéro ne distingue pas une source vide
         # d'une source jamais appelée.
         queries=dict(report.candidates_by_source),
+        requests_by_source=report.requests_by_source,
+        candidates_by_source=report.counts_by_source(unique, recommended),
+        # Tous les candidats restent au manifeste, y compris les non
+        # recommandés. Les retirer effacerait la trace de ce qui a été vu puis
+        # écarté : « rien à l'arrière » ne se distinguerait plus de « rien
+        # cherché à l'arrière ». La recherche présélectionne pour enrichir ;
+        # seul le plan décide ce qui sera acquis.
+        candidates=sorted(unique, key=lambda c: c.candidate_id),
+        evaluations=evaluations,
+        recommended_for_plan=sorted(recommended),
+        adaptive_search_run_id=search_report.run_id if search_report else None,
+        adaptive_search_report_digest=(
+            digest_of(search_report.as_dict()) if search_report else None
+        ),
         demand_digest=demand_digest,
         policy_digest=policy_digest,
-        candidates=sorted(unique, key=lambda c: c.candidate_id),
     )
+    report.search = search_report
     log.info(
         "découverte %s : %d candidat(s) de %d source(s), %d doublon(s) écarté(s), "
         "0 octet téléchargé",
         report.run_id, len(unique), len(report.sources_queried), dropped,
     )
     return manifest, report
+
+
+def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: ANN001
+    """Mesure chaque candidat contre les besoins ouverts, et **recommande**.
+
+    Recommander n'est pas décider. `assets plan` reste seul à trancher ce qui
+    sera acquis ; ce qui est produit ici sert à choisir quoi enrichir, et à
+    expliquer pourquoi un candidat n'a pas été retenu. Un candidat écarté
+    conserve donc son évaluation.
+    """
+    from .adaptive_search import SearchReport, measure_candidate, select_for_demand
+    from .schemas.acquisition import CandidateEvaluation, Eligibility
+
+    if search is None or not getattr(search, "outstanding", None):
+        return [], set(), None
+
+    target_lat, target_lon = search.target or (None, None)
+    published = SearchReport(
+        run_id=report.run_id,
+        hotel_id=hotel_id,
+        demands_searched=[d.demand_id for d in search.outstanding],
+        demands_skipped=dict(search.skipped),
+        anchors_by_demand={
+            demand_id: [anchor.viewpoint_id for anchor in anchors]
+            for demand_id, anchors in search.anchors.items()
+        },
+        candidates_considered=[c.candidate_id for c in candidates],
+        **(search.lineage or {}),
+    )
+
+    evaluations: list[CandidateEvaluation] = []
+    recommended: set[str] = set()
+    by_id = {c.candidate_id: c for c in candidates}
+
+    for demand in search.outstanding:
+        anchors = search.anchors.get(demand.demand_id, [])
+        # Un besoin sans ancre compatible est le plus urgent : c'est un secteur
+        # que rien ne couvre encore.
+        priority = 3 if not anchors else 2
+
+        measures = [
+            measure_candidate(
+                candidate, demand, anchors, priority,
+                target_lat=target_lat, target_lon=target_lon,
+                policy=search.policy,
+            )
+            for candidate in candidates
+        ]
+        published.measures.extend(measures)
+
+        retained = select_for_demand(
+            measures, by_id, demand, target_lat, target_lon,
+            wanted=demand.viewpoints_required, policy=search.policy,
+        )
+        published.recommended[demand.demand_id] = list(retained)
+        recommended.update(retained)
+
+        if measures and not retained:
+            # Tout écarter est un résultat, pas un silence : sans cette trace,
+            # « aucun candidat proposé » et « aucun candidat mesuré » se
+            # confondraient au rapport.
+            published.all_rejected[demand.demand_id] = len(measures)
+
+        evaluations.extend(
+            CandidateEvaluation(
+                candidate_id=measure.candidate_id,
+                demand_id=demand.demand_id,
+                intent=demand.intent,
+                eligibility=(
+                    Eligibility.REJECTED if measure.rejection_reason
+                    else Eligibility.PREVIEW_REQUIRED
+                ),
+                rejection_reason=measure.rejection_reason,
+            )
+            for measure in measures
+        )
+
+    log.info(
+        "recherche adaptative : %d besoin(s) ouvert(s), %d candidat(s) "
+        "recommandé(s) sur %d mesuré(s) — le plan reste seul à décider",
+        len(search.outstanding), len(recommended), len(candidates),
+    )
+    return evaluations, recommended, published

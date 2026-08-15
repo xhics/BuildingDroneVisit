@@ -676,6 +676,49 @@ class CandidateEvaluation(BaseModel):
         return self
 
 
+class SourceRequestCounts(BaseModel):
+    """Appels réellement émis vers une source, par étage.
+
+    Distincts des candidats rendus : « 25 » pouvait signifier 25 appels ou 25
+    images, et les deux nombres n'ont ni le même coût ni le même sens.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    coarse_search: int = Field(default=0, ge=0)
+    metadata_enrichment: int = Field(default=0, ge=0)
+    sequence_expansion: int = Field(default=0, ge=0)
+
+    @property
+    def total(self) -> int:
+        return self.coarse_search + self.metadata_enrichment + self.sequence_expansion
+
+    def as_dict(self) -> dict:
+        return {
+            "coarse_search": self.coarse_search,
+            "metadata_enrichment": self.metadata_enrichment,
+            "sequence_expansion": self.sequence_expansion,
+            "total": self.total,
+        }
+
+
+class SourceCandidateCounts(BaseModel):
+    """Effectifs de candidats à chaque étage, pour une source.
+
+    Sans eux, « zéro candidat arrière » ne distingue pas une zone vide d'une
+    zone pleine de vues mal orientées.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    returned: int = Field(default=0, ge=0)
+    unique: int = Field(default=0, ge=0)
+    enriched: int = Field(default=0, ge=0)
+    expanded: int = Field(default=0, ge=0)
+    recommended: int = Field(default=0, ge=0)
+    rejected: int = Field(default=0, ge=0)
+
+
 class CandidateManifest(BaseModel):
     """Tout ce qui a été découvert, et ce qu'on en a pensé, besoin par besoin.
 
@@ -691,9 +734,29 @@ class CandidateManifest(BaseModel):
     candidates: list[CaptureCandidate] = Field(default_factory=list)
     evaluations: list[CandidateEvaluation] = Field(default_factory=list)
 
-    #: Requêtes réellement émises, par source : sans elles, un zéro ne dit pas
-    #: si la source a été interrogée.
+    #: Nombre d'entités rendues par source interrogée. Conservé pour les
+    #: manifestes déjà écrits ; les deux champs ci-dessous le remplacent, en
+    #: distinguant ce qu'il confondait.
     queries: dict[str, int] = Field(default_factory=dict)
+
+    #: Appels émis, par source et par étage. « 25 » ne peut plus vouloir dire
+    #: à la fois 25 requêtes et 25 images.
+    requests_by_source: dict[str, SourceRequestCounts] = Field(default_factory=dict)
+
+    #: Effectifs de candidats, par source et par étage.
+    candidates_by_source: dict[str, SourceCandidateCounts] = Field(
+        default_factory=dict
+    )
+
+    #: Candidats que la **recherche** recommande au plan. Une recommandation,
+    #: non une décision : `AcquisitionPlan` reste seul à trancher ce qui sera
+    #: téléchargé, et un candidat non recommandé demeure au manifeste — le
+    #: retirer effacerait la trace de ce qui a été vu puis écarté.
+    recommended_for_plan: list[str] = Field(default_factory=list)
+
+    #: Filiation avec le rapport de recherche qui l'a produit.
+    adaptive_search_run_id: str | None = None
+    adaptive_search_report_digest: str | None = None
 
     demand_digest: str | None = None
     policy_digest: str | None = None
@@ -703,6 +766,14 @@ class CandidateManifest(BaseModel):
         ids = [c.candidate_id for c in self.candidates]
         if len(set(ids)) != len(ids):
             raise ValueError("identifiants de candidat dupliqués")
+
+        # Recommander ce qui n'est pas au manifeste rendrait la recommandation
+        # invérifiable : le plan citerait une vue qu'aucun rapport ne décrit.
+        unknown = sorted(set(self.recommended_for_plan) - set(ids))
+        if unknown:
+            raise ValueError(
+                f"candidats recommandés absents du manifeste : {unknown}"
+            )
 
         known = set(ids)
         pairs = set()

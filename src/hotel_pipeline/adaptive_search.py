@@ -156,7 +156,26 @@ class GeometryAnchor:
 
 @dataclass
 class SearchReport:
-    """Ce qui a été cherché, pour quels besoins, et ce qui en est ressorti."""
+    """Ce qui a été cherché, pour quels besoins, et ce qui en est ressorti.
+
+    Structurellement lié au manifeste qu'il accompagne : un horodatage commun
+    ne prouve rien, et un rapport orphelin ne se rattache à aucun état.
+    """
+
+    run_id: str = ""
+    hotel_id: str = ""
+
+    #: Filiation : ce à quoi cette recherche se rapporte.
+    demand_digest: str | None = None
+    demand_assessment_digest: str | None = None
+    asset_manifest_digest: str | None = None
+    capture_geometry_digest: str | None = None
+    coarse_response_digest: str | None = None
+    policy_dependency_digests: dict[str, str] = field(default_factory=dict)
+
+    #: Tous les candidats considérés, recommandés ou non.
+    candidates_considered: list[str] = field(default_factory=list)
+    recommended: dict[str, list[str]] = field(default_factory=dict)
 
     demands_searched: list[str] = field(default_factory=list)
     demands_skipped: dict[str, str] = field(default_factory=dict)
@@ -173,6 +192,18 @@ class SearchReport:
 
     def as_dict(self) -> dict:
         return {
+            "run_id": self.run_id,
+            "hotel_id": self.hotel_id,
+            "lineage": {
+                "demand_digest": self.demand_digest,
+                "demand_assessment_digest": self.demand_assessment_digest,
+                "asset_manifest_digest": self.asset_manifest_digest,
+                "capture_geometry_digest": self.capture_geometry_digest,
+                "coarse_response_digest": self.coarse_response_digest,
+            },
+            "policy_dependency_digests": self.policy_dependency_digests,
+            "candidates_considered": sorted(self.candidates_considered),
+            "recommended": {k: sorted(v) for k, v in sorted(self.recommended.items())},
             "demands_searched": sorted(self.demands_searched),
             "demands_skipped": self.demands_skipped,
             "anchors_by_demand": self.anchors_by_demand,
@@ -474,6 +505,22 @@ def select_for_demand(
     par identifiant, sans quoi deux exécutions rendraient deux plans.
     """
     eligible = [m for m in measures if m.rejection_reason is None]
+
+    if policy is not None:
+        # Le classement ne borne rien : sans ce filtre, le premier du tri est
+        # retenu même s'il est à des kilomètres de la cible.
+        limit = policy.max_distance_to_target_m
+        for measure in eligible:
+            if (
+                measure.distance_to_target_m is not None
+                and measure.distance_to_target_m > limit
+            ):
+                measure.rejection_reason = (
+                    f"à {measure.distance_to_target_m:.0f} m de la cible, "
+                    f"au-delà de la portée retenue ({limit:.0f} m)"
+                )
+        eligible = [m for m in eligible if m.rejection_reason is None]
+
     if not eligible:
         return []
 
@@ -529,3 +576,99 @@ def select_for_demand(
         retained.append(best)
 
     return retained
+
+
+def shortlist_for_enrichment(
+    measures_by_demand: dict[str, list[CandidateMeasure]], per_demand: int
+) -> list[str]:
+    """Identifiants à enrichir d'une séquence, bornés et **dédoublonnés**.
+
+    L'enrichissement coûte un appel par image. Un candidat servant deux besoins
+    n'en vaut qu'un : l'appeler deux fois dépenserait le budget sur une
+    information qu'on possède déjà.
+
+    L'ordre est déterministe : la priorité de couverture d'abord, puis
+    l'identifiant. Deux exécutions rendent la même liste.
+    """
+    wanted: list[str] = []
+    seen: set[str] = set()
+
+    for demand_id in sorted(measures_by_demand):
+        eligible = [
+            measure for measure in measures_by_demand[demand_id]
+            if measure.rejection_reason is None
+        ]
+        ordered = sorted(
+            eligible,
+            key=lambda m: (
+                -m.coverage_gap_priority,
+                -(m.parallax_utility if m.parallax_utility is not None else 0.0),
+                m.distance_to_target_m if m.distance_to_target_m is not None else math.inf,
+                m.candidate_id,
+            ),
+        )
+        for measure in ordered[:per_demand]:
+            if measure.candidate_id in seen:
+                continue
+            seen.add(measure.candidate_id)
+            wanted.append(measure.candidate_id)
+
+    return wanted
+
+
+def expand_sequences(
+    seeds: dict[str, str],
+    members_of,  # noqa: ANN001 — callable(sequence_id) -> list de candidats
+    target_lat: float,
+    target_lon: float,
+    policy,  # noqa: ANN001 — CollectionPolicy
+    known_ids: set[str],
+) -> tuple[list, dict[str, str], int]:
+    """Prolonge les séquences prometteuses, **dans la zone utile seulement**.
+
+    Suivre une séquence entière la mènerait ailleurs : un véhicule roule, et
+    ses vues suivantes montrent une autre rue. Deux bornes s'appliquent — un
+    nombre de membres et une distance à la cible — et chaque rejet porte son
+    motif.
+    """
+    from .visibility import haversine_m
+
+    added: list = []
+    rejected: dict[str, str] = {}
+    calls = 0
+
+    for sequence_id in sorted(set(seeds.values())):
+        try:
+            members = members_of(sequence_id)
+            calls += 1
+        except (OSError, RuntimeError, ValueError) as exc:
+            rejected[sequence_id] = f"expansion impossible : {exc}"
+            continue
+
+        kept = 0
+        for member in members:
+            if member.candidate_id in known_ids:
+                continue
+            if kept >= policy.sequence_expansion_max_members:
+                rejected[member.candidate_id] = (
+                    f"au-delà de {policy.sequence_expansion_max_members} membres "
+                    "explorés pour cette séquence"
+                )
+                continue
+            if member.camera_lat is None or member.camera_lon is None:
+                rejected[member.candidate_id] = "position inconnue"
+                continue
+            distance = haversine_m(
+                member.camera_lat, member.camera_lon, target_lat, target_lon
+            )
+            if distance > policy.sequence_expansion_max_distance_m:
+                rejected[member.candidate_id] = (
+                    f"à {distance:.0f} m de la cible, au-delà de "
+                    f"{policy.sequence_expansion_max_distance_m:.0f} m — hors zone utile"
+                )
+                continue
+            added.append(member)
+            known_ids.add(member.candidate_id)
+            kept += 1
+
+    return added, rejected, calls

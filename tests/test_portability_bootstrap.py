@@ -62,6 +62,10 @@ PILOT_POLICY_DIGESTS = {
     "18422c85a67d09fe": "avec la section coverage — cibles de couverture",
     "27133809b5a4f3da": "avec les bornes d'enrichissement et d'expansion de séquence",
     "b2090cf303c3ee23": "avec adaptive_search — préférence de parallaxe non monotone",
+    "fbfb02571f608b79": (
+        "avec max_distance_to_target_m — le classement seul ne bornait pas la "
+        "distance : le premier candidat était retenu à n'importe quelle portée"
+    ),
 }
 
 

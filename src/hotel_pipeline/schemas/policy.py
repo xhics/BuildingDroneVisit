@@ -259,6 +259,13 @@ class AdaptiveSearchPolicy(BaseModel, Calibrated):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: Au-delà, un candidat ne montre plus la cible utilement, quel que soit
+    #: son rang. Le classement seul ne suffisait pas : le premier était retenu
+    #: même à plusieurs kilomètres, la borne n'étant garantie que par le rayon
+    #: d'interrogation du collecteur — une garantie qui disparaît dès qu'une
+    #: source rend un candidat hors rayon.
+    max_distance_to_target_m: float = Field(default=250.0, gt=0)
+
     #: En deçà, deux vues sont presque colinéaires : peu de profondeur.
     parallax_preferred_min_deg: float = Field(default=15.0, ge=0, le=180)
 

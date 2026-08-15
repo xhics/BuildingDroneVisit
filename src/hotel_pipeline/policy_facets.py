@@ -89,6 +89,7 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
     # Modifier une préférence périme la recherche et ses rapports, jamais les
     # besoins eux-mêmes — l'objectif n'a pas bougé.
     Facet.SEARCH_PREFERENCE: (
+        "adaptive_search.max_distance_to_target_m",
         "adaptive_search.parallax_preferred_min_deg",
         "adaptive_search.parallax_preferred_max_deg",
         "adaptive_search.parallax_excess_penalty",
