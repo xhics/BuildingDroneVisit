@@ -577,3 +577,41 @@ def test_a_candidate_manifest_without_a_digest_is_tolerated() -> None:
     """Un manifeste antérieur ne portait pas d'empreinte : l'absence n'est pas
     une divergence."""
     assert _pairing(declared_digest=None) == []
+
+
+def test_the_evaluation_report_shows_the_framing() -> None:
+    """Deux lignes d'un même panorama doivent se distinguer à la lecture.
+
+    Le cap et le point de vue vivaient dans un autre fichier : deux verdicts
+    opposés semblaient porter sur la même image, et il fallait joindre deux
+    documents à la main pour voir qu'il s'agissait de deux cadrages.
+    """
+    from hotel_pipeline.cli import _readable_evaluations
+
+    framings = [
+        _candidate("f-1", panorama_id="A", requested_heading_deg=131.8,
+                   requested_fov_deg=80.0),
+        _candidate("f-2", panorama_id="A", requested_heading_deg=199.7,
+                   requested_fov_deg=80.0),
+    ]
+    rows = _readable_evaluations(
+        [_evaluation("f-1"), _evaluation("f-2")], framings, 10.0
+    )
+
+    caps = {row["framing"]["requested_heading_deg"] for row in rows}
+    assert caps == {131.8, 199.7}, "les deux cadrages se distinguent"
+    assert {row["framing"]["panorama_id"] for row in rows} == {"A"}
+    assert all(row["framing"]["viewpoint_id"] == "pano:A" for row in rows), (
+        "deux cadrages, un seul point de vue"
+    )
+
+
+def test_an_evaluation_without_its_candidate_keeps_its_verdict() -> None:
+    """Le rapport n'invente pas un cadrage qu'il ne connaît pas."""
+    from hotel_pipeline.cli import _readable_evaluations
+
+    rows = _readable_evaluations([_evaluation("absent")], [], 10.0)
+
+    assert len(rows) == 1
+    assert "framing" not in rows[0]
+    assert rows[0]["candidate_id"] == "absent"

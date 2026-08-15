@@ -1213,9 +1213,15 @@ def assets_plan(
         f"01_sources/candidate_evaluations_{plan.plan_id}.json",
         {
             "plan_id": plan.plan_id,
-            "evaluations": [
-                json.loads(evaluation.model_dump_json()) for evaluation in evaluations
-            ],
+            "note": (
+                "deux lignes d'un même panorama ne sont pas un doublon : ce "
+                "sont deux cadrages, et le cadrage change le verdict. Le "
+                "couple (candidate_id, demand_id) reste unique."
+            ),
+            "evaluations": _readable_evaluations(
+                evaluations, candidates.candidates,
+                context.policy.geometry.viewpoint_separation_m,
+            ),
         },
         context, production="CandidateEvaluation",
     )
@@ -4278,3 +4284,32 @@ def _validate_manifest_pairing(hotel_id, candidates, demands, demands_payload): 
             "découverte — relancez « assets discover »"
         )
     return problems
+
+
+def _readable_evaluations(evaluations, candidates, separation_m):  # noqa: ANN001, ANN201
+    """Le cadrage à côté du verdict, pour que deux lignes se distinguent.
+
+    Deux évaluations d'un même panorama portaient des verdicts différents sans
+    que rien n'explique pourquoi : le cap et le point de vue vivaient dans un
+    autre fichier. Les rapprocher ne change aucun verdict — il rend lisible ce
+    qui l'était déjà, à condition de joindre deux documents à la main.
+    """
+    from .plan import group_viewpoints
+
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    viewpoints = group_viewpoints(list(by_id.values()), separation_m)
+
+    readable = []
+    for evaluation in evaluations:
+        row = json.loads(evaluation.model_dump_json())
+        candidate = by_id.get(evaluation.candidate_id)
+        if candidate is not None:
+            row["framing"] = {
+                "panorama_id": candidate.panorama_id,
+                "viewpoint_id": viewpoints.get(evaluation.candidate_id),
+                "requested_heading_deg": candidate.requested_heading_deg,
+                "requested_fov_deg": candidate.requested_fov_deg,
+                "requested_pitch_deg": candidate.requested_pitch_deg,
+            }
+        readable.append(row)
+    return readable
