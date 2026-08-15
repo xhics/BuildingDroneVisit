@@ -1077,12 +1077,15 @@ def assets_plan(
     candidates = CandidateManifest.model_validate(candidates_payload)
     demands = CaptureDemandManifest.model_validate(demands_payload)
 
-    # Liaison des deux manifestes : une recommandation visant un besoin
-    # inexistant est invérifiable, et le plan citerait une autorisation portant
-    # sur une exigence que personne n'a formulée.
+    # Liaison des deux manifestes. `--candidates` permet de désigner un fichier
+    # arbitraire : sans ces contrôles, un manifeste d'un autre établissement ou
+    # produit contre d'anciens besoins entrerait au plan sans un mot.
     from .schemas.acquisition import validate_recommendation_demands
 
-    mismatches = validate_recommendation_demands(candidates, demands)
+    mismatches = _validate_manifest_pairing(
+        hotel_id, candidates, demands, demands_payload
+    )
+    mismatches += validate_recommendation_demands(candidates, demands)
     if mismatches:
         for problem in mismatches:
             typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
@@ -4241,3 +4244,37 @@ def _recommendation_levels(candidates):  # noqa: ANN001, ANN201
         (entry.candidate_id, entry.demand_id): entry.level
         for entry in getattr(candidates, "recommendations", [])
     }
+
+
+def _validate_manifest_pairing(hotel_id, candidates, demands, demands_payload):  # noqa: ANN001, ANN201
+    """Les deux manifestes parlent-ils du même établissement, et des mêmes besoins ?
+
+    Le brouillon vérifié l'a été sur un couple concordant. Rien ne garantissait
+    qu'il le reste : `--candidates` désigne un fichier arbitraire, et un
+    manifeste produit contre d'anciens besoins aurait planifié des vues pour des
+    exigences qui ont changé depuis.
+    """
+    from .provenance import digest_of
+
+    problems: list[str] = []
+
+    for label, value in (
+        ("manifeste de candidats", candidates.hotel_id),
+        ("manifeste de besoins", demands.hotel_id),
+    ):
+        if value != hotel_id:
+            problems.append(
+                f"{label} : hotel_id {value!r} au lieu de {hotel_id!r}"
+            )
+
+    # L'empreinte que la découverte a inscrite doit être celle des besoins
+    # d'aujourd'hui. Sinon le plan répond à une question qu'on ne pose plus.
+    current = digest_of(demands_payload)
+    declared = getattr(candidates, "demand_digest", None)
+    if declared and declared != current:
+        problems.append(
+            f"empreinte des besoins {declared} au manifeste de candidats, "
+            f"{current} aujourd'hui : les besoins ont changé depuis la "
+            "découverte — relancez « assets discover »"
+        )
+    return problems

@@ -33,7 +33,13 @@ import hashlib
 from datetime import datetime, timezone
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .enums import ViewSector
 
@@ -758,8 +764,16 @@ class DemandRecommendation(BaseModel):
 
     #: Pourquoi ce niveau, et non un autre. **Obligatoire** : une autorisation
     #: sans motif ne se conteste pas, et c'est précisément ce qu'un relecteur
-    #: doit pouvoir faire.
+    #: doit pouvoir faire. `min_length` seul laissait passer une chaîne
+    #: d'espaces, qui a la forme d'une explication sans en être une.
     reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("motif vide : une autorisation muette ne se conteste pas")
+        return value
 
     #: Exigences du besoin qu'aucune mesure de découverte n'établit.
     unmeasured_requirements: list[str] = Field(default_factory=list)

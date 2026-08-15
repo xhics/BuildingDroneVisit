@@ -502,3 +502,78 @@ def test_a_recommendation_on_an_unknown_demand_is_reported() -> None:
     problems = validate_recommendation_demands(candidates, other)
     assert len(problems) == 1
     assert "besoin inconnu" in problems[0]
+
+
+def test_a_blank_reason_is_refused() -> None:
+    """`min_length=1` laisse passer une chaîne d'espaces.
+
+    Elle a la forme d'une explication sans en être une : un relecteur y lirait
+    un motif là où il n'y en a pas.
+    """
+    from hotel_pipeline.schemas.acquisition import DemandRecommendation
+
+    for blank in ("   ", "\t", "\n "):
+        with pytest.raises(ValueError, match="motif vide"):
+            DemandRecommendation(
+                candidate_id="c-1", demand_id="obligation:front",
+                level=PREVIEW, reason=blank,
+            )
+
+
+# --- concordance des deux manifestes -----------------------------------------
+
+
+def _pairing(hotel_id="pilote", candidates_hotel="pilote", demands_hotel="pilote",
+             declared_digest=None, payload=None):
+    from hotel_pipeline.cli import _validate_manifest_pairing
+    from hotel_pipeline.schemas.acquisition import (
+        CandidateManifest,
+        CaptureDemandManifest,
+    )
+
+    candidates = CandidateManifest(
+        hotel_id=candidates_hotel,
+        candidates=[_candidate("c-1")],
+        demand_digest=declared_digest,
+    )
+    demands = CaptureDemandManifest(hotel_id=demands_hotel, demands=[_demand()])
+    return _validate_manifest_pairing(
+        hotel_id, candidates, demands, payload if payload is not None else {"a": 1}
+    )
+
+
+def test_matching_manifests_raise_nothing() -> None:
+    from hotel_pipeline.provenance import digest_of
+
+    payload = {"demands": ["obligation:front"]}
+    assert _pairing(declared_digest=digest_of(payload), payload=payload) == []
+
+
+def test_a_candidate_manifest_from_another_hotel_is_refused() -> None:
+    """`--candidates` désigne un fichier arbitraire."""
+    problems = _pairing(candidates_hotel="autre-hotel")
+
+    assert len(problems) == 1
+    assert "manifeste de candidats" in problems[0]
+    assert "autre-hotel" in problems[0]
+
+
+def test_a_demand_manifest_from_another_hotel_is_refused() -> None:
+    problems = _pairing(demands_hotel="autre-hotel")
+
+    assert len(problems) == 1
+    assert "manifeste de besoins" in problems[0]
+
+
+def test_a_stale_demand_digest_is_refused() -> None:
+    """Les besoins ont changé : le plan répondrait à une question périmée."""
+    problems = _pairing(declared_digest="0" * 16, payload={"demands": []})
+
+    assert len(problems) == 1
+    assert "les besoins ont changé" in problems[0]
+
+
+def test_a_candidate_manifest_without_a_digest_is_tolerated() -> None:
+    """Un manifeste antérieur ne portait pas d'empreinte : l'absence n'est pas
+    une divergence."""
+    assert _pairing(declared_digest=None) == []
