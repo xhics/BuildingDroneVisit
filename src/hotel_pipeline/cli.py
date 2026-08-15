@@ -737,6 +737,22 @@ def assets_discover(
                 f"    {demand_id:<36} {len(retained)} retenue(s) "
                 f"sur {considered} éligible(s) — {full} acquérable(s)"
             )
+        stats = report.search.distance_distribution
+        if stats:
+            typer.echo("")
+            typer.echo(
+                "  distances à la cible — le seuil de recommandation "
+                "automatique n'est pas calibré :"
+            )
+            for demand_id in sorted(stats):
+                row = stats[demand_id]
+                typer.echo(
+                    f"    {demand_id:<34} min {row['min_m']:>6.0f} m  "
+                    f"méd {row['median_m']:>6.0f} m  "
+                    f"{row['within_automatic_range']:>4} sous {row['limit_m']:.0f} m "
+                    f"sur {row['measured']}"
+                )
+
         for stage, reason in sorted(report.search.stages_skipped.items()):
             typer.secho(f"    étape non exécutée : {stage} — {reason}",
                         fg=typer.colors.YELLOW)

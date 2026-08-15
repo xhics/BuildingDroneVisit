@@ -448,3 +448,40 @@ def test_the_collector_sequence_reaches_the_candidate():
     assert "thumb_256" in built.available_resolutions, (
         "un plan demandant un aperçu doit pouvoir l'obtenir"
     )
+
+
+def test_the_distance_distribution_is_published(rear_demand, three_candidates):
+    """Un seuil non calibré se juge sur ce qu'il écarte, non sur son énoncé.
+
+    Sur le pilote, la façade avant n'a que cinq candidats sous 250 m quand
+    l'arrière en a cent quarante-deux : sans cette distribution, « le seuil est
+    trop bas » et « le corpus est loin » se confondent.
+    """
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": three_candidates},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    stats = report.search.distance_distribution["obligation:FACADE_REAR"]
+    assert stats["measured"] == 3
+    assert stats["min_m"] <= stats["median_m"] <= stats["max_m"]
+    assert stats["within_automatic_range"] + stats["beyond_automatic_range"] == 3
+    assert stats["limit_m"] == 250.0
+
+
+def test_rejected_measures_stay_out_of_the_distribution(rear_demand):
+    """La distance d'un candidat du mauvais côté n'apprend rien sur la portée."""
+    from test_adaptive_sector import at_bearing, sector_context
+
+    need = demand("obligation:front", "front")
+    behind = candidate("c-dos", *at_bearing(180.0))
+
+    _, report = discover(
+        HOTEL, _demands(need), {"mapillary": [behind]},
+        search=FakeContext(
+            outstanding=[need], target=(0.0, 0.0),
+            sector=sector_context(need.demand_id, 0.0),
+        ),
+    )
+
+    assert report.search.distance_distribution == {}

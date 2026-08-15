@@ -296,6 +296,11 @@ class SearchReport:
     query_errors: dict[str, str] = field(default_factory=dict)
     all_rejected: dict[str, int] = field(default_factory=dict)
 
+    #: Distribution des distances par besoin. Un seuil non calibré ne se juge
+    #: pas sur son énoncé mais sur ce qu'il écarte : sans cette distribution,
+    #: « 250 m » et « le corpus est loin » se confondent.
+    distance_distribution: dict = field(default_factory=dict)
+
     enrichment_calls: int = 0
 
     #: Étages de recherche **non exécutés**, avec leur motif. Un zéro nu ne
@@ -328,6 +333,7 @@ class SearchReport:
                 "query_errors": self.query_errors,
                 "all_candidates_rejected": self.all_rejected,
             },
+            "distance_distribution": self.distance_distribution,
             "enrichment_calls": self.enrichment_calls,
             "stages_skipped": self.stages_skipped,
             "measures": [measure.as_dict() for measure in self.measures],
@@ -1123,3 +1129,42 @@ def _distance_to_own_target(candidate, demand, sector) -> float | None:  # noqa:
 
     origin = Point(sector.projection.point(candidate.camera_lat, candidate.camera_lon))
     return round(origin.distance(target.shape), 1)
+
+
+def distance_distribution(measures: list, limit: float) -> dict:
+    """Ce que le seuil de distance écarte, besoin par besoin.
+
+    Un seuil non calibré ne se juge pas sur son énoncé mais sur son effet. Sur
+    le pilote, la façade avant n'a que cinq candidats sous 250 m quand
+    l'arrière en a cent quarante-deux : ce n'est pas le seuil qui est en cause,
+    c'est la desserte. Sans cette distribution, les deux se confondent.
+
+    Les mesures écartées pour une **autre** raison n'y figurent pas : la
+    distance d'un candidat du mauvais côté du bâtiment n'apprend rien sur la
+    portée utile.
+    """
+    by_demand: dict[str, list[float]] = {}
+    for measure in measures:
+        if measure.rejection_reason is not None:
+            continue
+        if measure.distance_to_target_m is None:
+            continue
+        by_demand.setdefault(measure.demand_id, []).append(
+            measure.distance_to_target_m
+        )
+
+    published: dict[str, dict] = {}
+    for demand_id, distances in by_demand.items():
+        ordered = sorted(distances)
+        count = len(ordered)
+        within = sum(1 for value in ordered if value <= limit)
+        published[demand_id] = {
+            "measured": count,
+            "min_m": ordered[0],
+            "median_m": ordered[count // 2],
+            "max_m": ordered[-1],
+            "within_automatic_range": within,
+            "beyond_automatic_range": count - within,
+            "limit_m": limit,
+        }
+    return published

@@ -362,6 +362,7 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     from .adaptive_search import (
         SearchReport,
         SequenceStatus,
+        distance_distribution,
         measure_candidate,
         select_for_demand,
     )
@@ -461,6 +462,13 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
                 rejection_reason=measure.rejection_reason,
             )
             for measure in measures
+        )
+
+    # Ce que le seuil de distance écarte, besoin par besoin : il reste non
+    # calibré, et son effet doit être lisible avant qu'on le modifie.
+    if search.policy is not None:
+        published.distance_distribution = distance_distribution(
+            published.measures, search.policy.automatic_candidate_max_distance_m
         )
 
     log.info(
