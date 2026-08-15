@@ -114,6 +114,14 @@ class CollectedImage:
     #: véhicule tourne. `None` signifie « non rendu », jamais « aucune ».
     sequence_id: str | None = None
 
+    #: Ce que la caméra dit d'elle-même. Sans champ de vision ni largeur, aucun
+    #: cadrage n'est calculable : la vue reste utilisable, mais rien ne dit ce
+    #: qu'elle montre. `None` partout plutôt qu'un objectif supposé.
+    camera_type: str | None = None
+    fov_deg: float | None = None
+    width_px: int | None = None
+    height_px: int | None = None
+
     #: Le cap est-il observé (imagerie de roulage) ou choisi par nous
     #: (extraction d'un panorama sphérique) ? Voir `Asset.heading_is_measured`.
     heading_is_measured: bool = True

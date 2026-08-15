@@ -485,3 +485,62 @@ def test_rejected_measures_stay_out_of_the_distribution(rear_demand):
     )
 
     assert report.search.distance_distribution == {}
+
+
+# --- ce que la caméra dit d'elle-même ----------------------------------------
+
+
+def test_camera_parameters_reach_the_candidate():
+    """Sans champ de vision ni largeur, aucun cadrage n'est calculable.
+
+    Les 194 images Mapillary du pilote portaient `largeur=None` : elles
+    restaient bornées à l'aperçu quoi qu'elles montrent, et la continuité n'y
+    aurait rien changé.
+    """
+    from hotel_pipeline.collectors.base import CollectedImage
+    from hotel_pipeline.discover import candidates_from
+
+    image = CollectedImage(
+        source="mapillary", source_id="1", url="http://exemple",
+        lat=45.0, lon=-73.0, heading_deg=180.0,
+        camera_type="perspective", fov_deg=60.9, width_px=4000, height_px=3000,
+    )
+    built = candidates_from("mapillary", [image])[0]
+
+    assert built.requested_fov_deg == 60.9
+    assert built.advertised_width == 4000
+    assert built.camera_type == "perspective"
+
+
+def test_a_panoramic_field_of_view_is_not_a_framing():
+    """360° n'est pas un cadrage : c'est l'absence de choix.
+
+    Le déclarer ferait croire à une mesure là où il n'y a qu'une promesse — et
+    le schéma le refuserait, puisqu'il plafonne à 120°.
+    """
+    from hotel_pipeline.collectors.base import CollectedImage
+    from hotel_pipeline.discover import candidates_from
+
+    image = CollectedImage(
+        source="mapillary", source_id="1", url="http://exemple",
+        lat=45.0, lon=-73.0, fov_deg=360.0, width_px=5760, height_px=2880,
+    )
+    built = candidates_from("mapillary", [image])[0]
+
+    assert built.requested_fov_deg is None
+    assert built.advertised_width == 5760, "la largeur reste connue"
+
+
+def test_an_undeclared_camera_stays_unknown():
+    """Supposer un objectif produirait un tri fondé sur une caméra imaginaire."""
+    from hotel_pipeline.collectors.base import CollectedImage
+    from hotel_pipeline.discover import candidates_from
+
+    image = CollectedImage(
+        source="mapillary", source_id="1", url="http://exemple",
+        lat=45.0, lon=-73.0,
+    )
+    built = candidates_from("mapillary", [image])[0]
+
+    assert built.requested_fov_deg is None
+    assert built.advertised_width is None

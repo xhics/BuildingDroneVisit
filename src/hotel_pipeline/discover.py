@@ -144,6 +144,12 @@ def candidates_from(source: str, images: list) -> list[CaptureCandidate]:
                 # Sans lui, la continuité restait inconnue et tout besoin
                 # l'exigeant demeurait borné à l'aperçu.
                 sequence_id=getattr(image, "sequence_id", None),
+                # Ce que la caméra déclare. Le cadrage exige un cap, un champ
+                # de vision et une largeur : il en manquait deux sur trois.
+                camera_type=getattr(image, "camera_type", None),
+                requested_fov_deg=_declared_fov(image),
+                advertised_width=getattr(image, "width_px", None),
+                advertised_height=getattr(image, "height_px", None),
                 # Le nécessaire à la reconstruction de l'adresse, et rien qui
                 # ressemble à un secret ou à une URL.
                 request_spec={
@@ -580,3 +586,23 @@ def _declare_stages(published, search) -> None:  # noqa: ANN001
             "les collecteurs ne rendent pas encore leur décompte d'appels : "
             "le coût réel des requêtes n'est pas mesuré"
         )
+
+
+#: Plafond du champ de vision qu'un candidat peut déclarer. Une image
+#: sphérique voit à 360°, ce que le schéma refuse — et à juste titre : « cadrer »
+#: n'a pas de sens avant qu'un cap et une ouverture soient choisis. La vue
+#: reste au manifeste, son cadrage attend l'extraction.
+MAX_DECLARABLE_FOV_DEG = 120.0
+
+
+def _declared_fov(image) -> float | None:  # noqa: ANN001
+    """Champ de vision utilisable pour juger un cadrage, ou `None`.
+
+    Un panorama complet n'a pas de cadrage tant qu'on n'en a pas extrait une
+    vue : rendre 360° ferait croire à une mesure là où il n'y a qu'une
+    promesse.
+    """
+    fov = getattr(image, "fov_deg", None)
+    if fov is None or fov <= 0 or fov > MAX_DECLARABLE_FOV_DEG:
+        return None
+    return fov

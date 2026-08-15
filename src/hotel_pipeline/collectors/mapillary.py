@@ -24,7 +24,14 @@ TIMEOUT = 60
 #: `sequence` vient dans la **même** requête : l'enrichissement de séquence
 #: n'exige donc aucun appel supplémentaire. Sans lui, la continuité restait
 #: inconnue, et tout besoin l'exigeant demeurait borné à l'aperçu.
-FIELDS = "id,captured_at,compass_angle,geometry,thumb_2048_url,is_pano,sequence"
+#: `sequence`, `camera_*` et les dimensions viennent dans la **même** requête :
+#: aucun appel supplémentaire. Sans le champ de vision ni la largeur, aucun
+#: cadrage n'était calculable, et les 194 images du pilote restaient bornées à
+#: l'aperçu quoi qu'elles montrent.
+FIELDS = (
+    "id,captured_at,compass_angle,geometry,thumb_2048_url,is_pano,sequence,"
+    "camera_type,camera_parameters,width,height"
+)
 
 #: Taille de page demandée à l'API.
 PAGE_SIZE = 200
@@ -110,6 +117,10 @@ def collect(
                 sequence_id=(
                     str(entry["sequence"]) if entry.get("sequence") else None
                 ),
+                camera_type=entry.get("camera_type"),
+                fov_deg=_horizontal_fov(entry),
+                width_px=entry.get("width"),
+                height_px=entry.get("height"),
                 extra={"is_pano": str(entry.get("is_pano", False))},
             )
         )
@@ -203,3 +214,39 @@ def _normalise_heading(angle: float | None) -> float | None:
     if angle is None:
         return None
     return float(angle) % 360.0
+
+
+#: Champ horizontal d'une image sphérique : elle voit tout autour.
+PANORAMIC_FOV_DEG = 360.0
+
+
+def _horizontal_fov(entry: dict) -> float | None:
+    """Champ de vision horizontal, **dérivé** des paramètres publiés.
+
+    Mapillary ne publie pas d'angle : il publie un rapport focal, exprimé en
+    fraction de la plus grande dimension de l'image. L'angle s'en déduit, et
+    sans lui aucun cadrage n'est calculable — la vue reste utilisable, mais
+    rien ne dit ce qu'elle montre.
+
+    Rend `None` dès qu'un élément manque. Supposer un objectif produirait un
+    tri fondé sur une caméra imaginaire, ce qui est pire que l'ignorance.
+    """
+    import math
+
+    if entry.get("is_pano"):
+        return PANORAMIC_FOV_DEG
+
+    parameters = entry.get("camera_parameters") or []
+    width, height = entry.get("width"), entry.get("height")
+    if not parameters or not width or not height:
+        return None
+
+    focal_ratio = parameters[0]
+    if not isinstance(focal_ratio, (int, float)) or focal_ratio <= 0:
+        return None
+
+    # Le rapport est relatif à la plus grande dimension ; l'angle horizontal se
+    # mesure donc sur la largeur rapportée à cette même référence.
+    longest = max(width, height)
+    focal_px = focal_ratio * longest
+    return round(2.0 * math.degrees(math.atan((width / 2.0) / focal_px)), 2)

@@ -216,3 +216,33 @@ def test_candidates_are_ordered_so_two_runs_compare() -> None:
 
     identifiers = [c.candidate_id for c in manifest.candidates]
     assert identifiers == sorted(identifiers)
+
+
+def test_the_field_of_view_is_derived_not_invented() -> None:
+    """Mapillary publie un rapport focal, pas un angle.
+
+    Sans cette dérivation, le champ de vision manquait, aucun cadrage n'était
+    calculable, et chaque image restait bornée à l'aperçu.
+    """
+    from hotel_pipeline.collectors.mapillary import _horizontal_fov
+
+    # Rapport focal exprimé en fraction de la plus grande dimension.
+    assert _horizontal_fov(
+        {"camera_parameters": [0.85, 0.0, 0.0], "width": 4000, "height": 3000}
+    ) == pytest.approx(60.93, abs=0.05)
+
+    # Format portrait : la référence est la **hauteur**, non la largeur. Les
+    # confondre donnerait un angle faux sur toute image plus haute que large.
+    assert _horizontal_fov(
+        {"camera_parameters": [0.85, 0.0, 0.0], "width": 3000, "height": 4000}
+    ) == pytest.approx(47.61, abs=0.05)
+
+    # Une sphérique voit tout autour : c'est vrai, et inutilisable comme cadrage.
+    assert _horizontal_fov({"is_pano": True}) == 360.0
+
+    # Il manque un élément : l'ignorance vaut mieux qu'un objectif supposé.
+    assert _horizontal_fov({"width": 4000}) is None
+    assert _horizontal_fov({"camera_parameters": [], "width": 1, "height": 1}) is None
+    assert _horizontal_fov(
+        {"camera_parameters": [0.0], "width": 4000, "height": 3000}
+    ) is None
