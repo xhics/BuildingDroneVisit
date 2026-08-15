@@ -1077,6 +1077,17 @@ def assets_plan(
     candidates = CandidateManifest.model_validate(candidates_payload)
     demands = CaptureDemandManifest.model_validate(demands_payload)
 
+    # Liaison des deux manifestes : une recommandation visant un besoin
+    # inexistant est invérifiable, et le plan citerait une autorisation portant
+    # sur une exigence que personne n'a formulée.
+    from .schemas.acquisition import validate_recommendation_demands
+
+    mismatches = validate_recommendation_demands(candidates, demands)
+    if mismatches:
+        for problem in mismatches:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     coverage = _check_coverage(workspace, demands.demands)
 
     digests = _plan_digests(workspace, context, candidates_payload, demands_payload)

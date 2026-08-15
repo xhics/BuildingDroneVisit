@@ -719,6 +719,26 @@ class SourceCandidateCounts(BaseModel):
     rejected: int = Field(default=0, ge=0)
 
 
+class RecommendationLevel(StrEnum):
+    """Jusqu'où va ce qu'une recommandation autorise.
+
+    `recommended_for_plan` confondait trois choses. Une vue dont on ignore la
+    cible ou l'orientation pouvait entrer directement dans une acquisition
+    complète, alors qu'on ne savait même pas ce qu'elle montre.
+    """
+
+    #: Vaut un appel de métadonnées supplémentaire, rien de plus.
+    ENRICHMENT = "recommended_for_enrichment"
+
+    #: Vaut un aperçu : ce qu'elle montre demande vérification humaine ou
+    #: mesurée avant tout engagement.
+    PREVIEW = "recommended_for_preview"
+
+    #: Position **et** orientation établies, cible propre résolue : le plan
+    #: peut l'envisager pour une acquisition complète. Il reste seul à décider.
+    FULL_ACQUISITION = "eligible_for_full_acquisition"
+
+
 class DemandRecommendation(BaseModel):
     """Ce que la recherche autorise, pour **un** couple candidat/besoin.
 
@@ -731,10 +751,15 @@ class DemandRecommendation(BaseModel):
 
     candidate_id: str
     demand_id: str
-    level: str
 
-    #: Pourquoi ce niveau, et non un autre.
-    reason: str = ""
+    #: Enum fermé, non une chaîne libre : un niveau inconnu — `banana` — était
+    #: accepté, et rien en aval ne l'aurait reconnu comme une preview.
+    level: RecommendationLevel
+
+    #: Pourquoi ce niveau, et non un autre. **Obligatoire** : une autorisation
+    #: sans motif ne se conteste pas, et c'est précisément ce qu'un relecteur
+    #: doit pouvoir faire.
+    reason: str = Field(min_length=1)
 
     #: Exigences du besoin qu'aucune mesure de découverte n'établit.
     unmeasured_requirements: list[str] = Field(default_factory=list)
@@ -832,11 +857,25 @@ class CandidateManifest(BaseModel):
         # Les couples sont l'autorité ; les listes n'en sont qu'un résumé. Si
         # elles s'en écartent, un lecteur pressé lirait une autorisation que
         # personne n'a prononcée.
+        # Une seule recommandation par couple. Deux niveaux contradictoires
+        # pour un même couple laissaient l'**ordre du fichier** décider entre
+        # 256 et 2048 : `_recommendation_levels` construit un dictionnaire, et
+        # la dernière entrée l'emportait.
+        seen_pairs: set[tuple[str, str]] = set()
+        recommended_pairs: set[tuple[str, str]] = set()
         for entry in self.recommendations:
             if entry.candidate_id not in known:
                 raise ValueError(
                     f"recommandation d'un candidat absent : {entry.candidate_id!r}"
                 )
+            pair = (entry.candidate_id, entry.demand_id)
+            if pair in seen_pairs:
+                raise ValueError(
+                    f"deux recommandations pour le couple {pair} : le niveau "
+                    "dépendrait de l'ordre du fichier"
+                )
+            seen_pairs.add(pair)
+            recommended_pairs.add(pair)
         if self.recommendations:
             # Un même candidat peut être autorisé à deux niveaux, pour deux
             # besoins distincts : pleinement acquérable pour documenter un
@@ -870,6 +909,7 @@ class CandidateManifest(BaseModel):
                     )
 
         pairs = set()
+        rejected_pairs: set[tuple[str, str]] = set()
         for evaluation in self.evaluations:
             if evaluation.candidate_id not in known:
                 raise ValueError(
@@ -879,6 +919,26 @@ class CandidateManifest(BaseModel):
             if pair in pairs:
                 raise ValueError(f"deux évaluations pour le couple {pair}")
             pairs.add(pair)
+            if evaluation.eligibility is Eligibility.REJECTED:
+                rejected_pairs.add(pair)
+
+        # Recommander ce qu'on a rejeté est une contradiction : l'évaluation
+        # dit « cette vue ne sert pas ce besoin », la recommandation dit
+        # l'inverse, et le plan croirait la seconde.
+        contradicted = sorted(recommended_pairs & rejected_pairs)
+        if contradicted:
+            raise ValueError(
+                f"recommandation(s) portant sur une évaluation rejetée : "
+                f"{contradicted}"
+            )
+
+        # Une recommandation sans évaluation ne s'appuie sur rien : le plan
+        # citerait une autorisation qu'aucune mesure ne soutient.
+        unsupported = sorted(recommended_pairs - pairs)
+        if unsupported:
+            raise ValueError(
+                f"recommandation(s) sans évaluation correspondante : {unsupported}"
+            )
         return self
 
     def eligible_for(self, demand_id: str) -> list[CandidateEvaluation]:
@@ -1143,3 +1203,31 @@ def capture_identity(
     )
     digest = hashlib.sha256(f"{provider_id}|{spec}".encode("utf-8")).hexdigest()[:12]
     return f"{source}-{provider_id}-{digest}"
+
+
+def validate_recommendation_demands(
+    candidates: "CandidateManifest", demands: "CaptureDemandManifest",
+) -> list[str]:
+    """Confronte les recommandations aux besoins réellement déclarés.
+
+    Vérification **inter-manifestes** : le validateur du manifeste de candidats
+    ne connaît pas les besoins, et prétendre le contraire y ferait entrer une
+    dépendance qu'il n'a pas. Elle se fait donc à la liaison, là où les deux
+    documents se rencontrent.
+
+    Une recommandation visant un besoin inexistant est invérifiable : le plan
+    citerait une autorisation portant sur une exigence que personne n'a
+    formulée.
+    """
+    declared = {demand.demand_id for demand in demands.demands}
+    unknown = sorted(
+        {
+            entry.demand_id
+            for entry in candidates.recommendations
+            if entry.demand_id not in declared
+        }
+    )
+    return [
+        f"recommandation portant sur un besoin inconnu : {demand_id!r}"
+        for demand_id in unknown
+    ]

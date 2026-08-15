@@ -458,7 +458,13 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
             candidate_id=measure.candidate_id,
             demand_id=measure.demand_id,
             level=measure.recommendation_level.value,
-            reason=measure.recommendation_reason,
+            # Le schéma refuse un motif vide : une autorisation muette ne se
+            # conteste pas. Si `_grade` en oubliait un, mieux vaut le dire que
+            # publier une chaîne vide qui aurait l'air d'une explication.
+            reason=(
+                measure.recommendation_reason
+                or "motif non renseigné par la recherche"
+            ),
             unmeasured_requirements=list(measure.unmeasured_requirements),
         )
         for measure in published.measures

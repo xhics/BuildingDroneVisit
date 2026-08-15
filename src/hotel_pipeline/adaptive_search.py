@@ -35,6 +35,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from .logging import get_logger
+from .schemas import ViewSector
+
+# Réexporté : le niveau est un contrat de schéma, mais c'est ici qu'il se
+# prononce, et les lecteurs du moteur l'y cherchent.
+from .schemas.acquisition import RecommendationLevel
 
 log = get_logger("adaptive-search")
 
@@ -80,26 +85,6 @@ class SectorFit(StrEnum):
     #: Rien ne permet de le dire : cible non résolue, ou orientation du
     #: bâtiment inconnue. L'ignorance reste de l'ignorance.
     UNKNOWN = "unknown"
-
-
-class RecommendationLevel(StrEnum):
-    """Jusqu'où va ce qu'une recommandation autorise.
-
-    `recommended_for_plan` confondait trois choses. Une vue dont on ignore la
-    cible ou l'orientation pouvait entrer directement dans une acquisition
-    complète, alors qu'on ne savait même pas ce qu'elle montre.
-    """
-
-    #: Vaut un appel de métadonnées supplémentaire, rien de plus.
-    ENRICHMENT = "recommended_for_enrichment"
-
-    #: Vaut un aperçu : ce qu'elle montre demande vérification humaine ou
-    #: mesurée avant tout engagement.
-    PREVIEW = "recommended_for_preview"
-
-    #: Position **et** orientation établies, cible propre résolue : le plan
-    #: peut l'envisager pour une acquisition complète. Il reste seul à décider.
-    FULL_ACQUISITION = "eligible_for_full_acquisition"
 
 
 class ContinuityLevel(StrEnum):

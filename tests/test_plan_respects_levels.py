@@ -349,14 +349,18 @@ def test_the_summary_keeps_the_safest_level_of_a_candidate() -> None:
     manifest = CandidateManifest(
         hotel_id="pilote",
         candidates=[_candidate("c-double")],
+        evaluations=[
+            _evaluation("c-double", demand_id="obligation:PARKING_HOTEL"),
+            _evaluation("c-double", demand_id="obligation:front"),
+        ],
         recommendations=[
             DemandRecommendation(
                 candidate_id="c-double", demand_id="obligation:PARKING_HOTEL",
-                level=FULL,
+                level=FULL, reason="cible propre résolue",
             ),
             DemandRecommendation(
                 candidate_id="c-double", demand_id="obligation:front",
-                level=PREVIEW,
+                level=PREVIEW, reason="taille projetée non mesurée",
             ),
         ],
         recommended_for_preview=["c-double"],
@@ -377,11 +381,124 @@ def test_a_summary_that_contradicts_the_pairs_is_refused() -> None:
         CandidateManifest(
             hotel_id="pilote",
             candidates=[_candidate("c-1")],
+            evaluations=[_evaluation("c-1")],
             recommendations=[
                 DemandRecommendation(
                     candidate_id="c-1", demand_id="obligation:front",
-                    level=PREVIEW,
+                    level=PREVIEW, reason="taille projetée non mesurée",
                 ),
             ],
             eligible_for_full_acquisition=["c-1"],
         )
+
+
+# --- gardes du registre : ce qu'un manifeste ne doit pas pouvoir dire ---------
+
+
+def _manifest(**overrides):
+    from hotel_pipeline.schemas.acquisition import CandidateManifest
+
+    fields = dict(
+        hotel_id="pilote",
+        candidates=[_candidate("c-1")],
+        evaluations=[_evaluation("c-1")],
+    )
+    fields.update(overrides)
+    return CandidateManifest(**fields)
+
+
+def _recommendation(**overrides):
+    from hotel_pipeline.schemas.acquisition import DemandRecommendation
+
+    fields = dict(
+        candidate_id="c-1", demand_id="obligation:front", level=PREVIEW,
+        reason="taille projetée non mesurée",
+    )
+    fields.update(overrides)
+    return DemandRecommendation(**fields)
+
+
+def test_an_unknown_level_is_refused() -> None:
+    """`level` était une chaîne libre : « banana » passait."""
+    from hotel_pipeline.schemas.acquisition import DemandRecommendation
+
+    with pytest.raises(ValueError):
+        DemandRecommendation(
+            candidate_id="c-1", demand_id="obligation:front",
+            level="banana", reason="peu importe",
+        )
+
+
+def test_a_recommendation_without_a_reason_is_refused() -> None:
+    """Une autorisation sans motif ne se conteste pas."""
+    from hotel_pipeline.schemas.acquisition import DemandRecommendation
+
+    with pytest.raises(ValueError):
+        DemandRecommendation(
+            candidate_id="c-1", demand_id="obligation:front", level=PREVIEW,
+        )
+    with pytest.raises(ValueError):
+        DemandRecommendation(
+            candidate_id="c-1", demand_id="obligation:front", level=PREVIEW,
+            reason="",
+        )
+
+
+@pytest.mark.parametrize("order", [(PREVIEW, FULL), (FULL, PREVIEW)])
+def test_a_duplicated_pair_is_refused_in_either_order(order) -> None:
+    """Deux niveaux pour un couple laissaient l'ordre du fichier décider entre
+    256 et 2048 : `_recommendation_levels` bâtit un dictionnaire, la dernière
+    entrée l'emportait."""
+    first, second = order
+
+    with pytest.raises(ValueError, match="deux recommandations pour le couple"):
+        _manifest(
+            recommendations=[
+                _recommendation(level=first),
+                _recommendation(level=second),
+            ],
+            recommended_for_preview=["c-1"],
+        )
+
+
+def test_a_recommendation_on_a_rejected_evaluation_is_refused() -> None:
+    """L'évaluation dit « ne sert pas ce besoin », la recommandation l'inverse."""
+    with pytest.raises(ValueError, match="évaluation rejetée"):
+        _manifest(
+            evaluations=[_evaluation("c-1", eligibility=Eligibility.REJECTED)],
+            recommendations=[_recommendation()],
+            recommended_for_preview=["c-1"],
+        )
+
+
+def test_a_recommendation_without_an_evaluation_is_refused() -> None:
+    """Une autorisation qu'aucune mesure ne soutient."""
+    with pytest.raises(ValueError, match="sans évaluation correspondante"):
+        _manifest(
+            evaluations=[],
+            recommendations=[_recommendation()],
+            recommended_for_preview=["c-1"],
+        )
+
+
+def test_a_recommendation_on_an_unknown_demand_is_reported() -> None:
+    """Vérification inter-manifestes : le besoin doit exister."""
+    from hotel_pipeline.schemas.acquisition import (
+        CaptureDemandManifest,
+        validate_recommendation_demands,
+    )
+
+    candidates = _manifest(
+        recommendations=[_recommendation()],
+        recommended_for_preview=["c-1"],
+    )
+
+    declared = CaptureDemandManifest(hotel_id="pilote", demands=[_demand()])
+    assert validate_recommendation_demands(candidates, declared) == []
+
+    other = CaptureDemandManifest(
+        hotel_id="pilote", demands=[_demand("obligation:rear")]
+    )
+    problems = validate_recommendation_demands(candidates, other)
+    assert len(problems) == 1
+    assert "besoin inconnu" in problems[0]
