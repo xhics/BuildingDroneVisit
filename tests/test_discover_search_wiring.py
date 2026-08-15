@@ -544,3 +544,43 @@ def test_an_undeclared_camera_stays_unknown():
 
     assert built.requested_fov_deg is None
     assert built.advertised_width is None
+
+
+def test_known_sequences_are_not_reported_as_a_skipped_stage(rear_demand):
+    """Le message doit suivre les faits.
+
+    `sequence` vient désormais dans la requête d'index. Continuer d'annoncer un
+    enrichissement « non exécuté » alors que 13 088 mesures portent
+    `sequence_status=known` serait une affirmation fausse — le défaut même que
+    cette déclaration existe pour empêcher.
+    """
+    near, side = _south_of(TARGET, 40), _south_of(TARGET, 45, east=30)
+    pair = [
+        candidate("mly-1", *near, sequence_id="seq-A"),
+        candidate("mly-2", *side, sequence_id="seq-B"),
+    ]
+
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": pair},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    skipped = report.search.stages_skipped
+    assert "metadata_enrichment" not in skipped, (
+        "des séquences sont connues : l'étape n'a pas été sautée"
+    )
+    assert "2 séquence(s)" in skipped["sequence_expansion"]
+
+
+def test_without_sequences_the_stage_is_still_declared_skipped(
+    rear_demand, three_candidates
+):
+    """Aucune source n'en rend : la continuité reste inconnue, non nulle."""
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": three_candidates},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    skipped = report.search.stages_skipped
+    assert "aucune source n'a rendu de séquence" in skipped["metadata_enrichment"]
+    assert "rien à prolonger" in skipped["sequence_expansion"]

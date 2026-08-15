@@ -392,7 +392,6 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
         **(search.lineage or {}),
     )
 
-    _declare_stages(published, search)
 
     evaluations: list[CandidateEvaluation] = []
     recommended: set[str] = set()
@@ -414,6 +413,9 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     sequence_status = (
         SequenceStatus.KNOWN if sequences else SequenceStatus.NOT_RETURNED
     )
+
+    # Après la construction des séquences : le message doit suivre les faits.
+    _declare_stages(published, search, sequences)
 
     for demand in search.outstanding:
         anchors = search.anchors.get(demand.demand_id, [])
@@ -564,21 +566,33 @@ def _viewpoints_of(candidates: list, search) -> dict:  # noqa: ANN001
     return group_viewpoints(candidates, separation_m=separation)
 
 
-def _declare_stages(published, search) -> None:  # noqa: ANN001
+def _declare_stages(published, search, sequences: dict) -> None:  # noqa: ANN001
     """Dit ce qui n'a pas eu lieu — un zéro ne le dirait pas.
 
     Une étape non exécutée et une étape sans résultat produisent le même
     compteur à zéro. Sans cette déclaration, la seconde passe pouvait rester
     non câblée en présentant les mêmes chiffres qu'une recherche complète.
+
+    Le message doit suivre les faits : `sequence` venant désormais dans la
+    requête initiale, annoncer un enrichissement « non exécuté » alors que des
+    séquences sont connues serait une affirmation fausse — le défaut même que
+    cette déclaration existe pour empêcher.
     """
-    enrich = getattr(search, "enrich_sequences", None)
-    if enrich is None:
+    if not sequences:
         published.stages_skipped["metadata_enrichment"] = (
-            "aucun client d'enrichissement de séquence fourni : la continuité "
-            "reste inconnue, elle n'est pas nulle"
+            "aucune source n'a rendu de séquence : la continuité reste "
+            "inconnue, elle n'est pas nulle"
         )
         published.stages_skipped["sequence_expansion"] = (
-            "sans enrichissement préalable, aucune séquence à prolonger"
+            "sans séquence connue, rien à prolonger"
+        )
+    else:
+        # Les séquences viennent de la requête d'index, sans appel dédié : le
+        # dire évite qu'un lecteur cherche un coût qui n'existe pas.
+        published.stages_skipped["sequence_expansion"] = (
+            f"{len(set(sequences.values()))} séquence(s) connue(s) par la "
+            "requête d'index ; prolonger au-delà de la zone utile n'a pas été "
+            "demandé"
         )
 
     if not getattr(search, "requests_by_source", None):
