@@ -21,6 +21,7 @@ from hotel_pipeline.adaptive_search import (
     select_for_demand,
 )
 from hotel_pipeline.schemas import (
+    DEFAULT_POLICY,
     Asset,
     ClusterRole,
     GeometrySuitability,
@@ -39,6 +40,8 @@ from hotel_pipeline.schemas.acquisition import (
 
 #: Cible : le bâtiment du pilote.
 TARGET = (45.5741, -73.4433)
+
+SEARCH = DEFAULT_POLICY.adaptive_search
 
 
 def demand(demand_id: str = "obligation:FACADE_REAR", ref: str = "rear", **overrides):
@@ -165,10 +168,10 @@ def test_no_anchor_means_no_parallax_never_the_building() -> None:
     """Le bâtiment est une cible géométrique, pas une position caméra."""
     measure = measure_candidate(
         candidate("c1", 45.5748, -73.4433), demand(), anchors=[], priority=3,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
     )
 
-    assert measure.parallax_gain is None
+    assert measure.parallax_utility is None
     assert "aucune ancre géométrique" in measure.parallax_reason
     assert "jamais une position caméra" in measure.parallax_reason
     # La priorité vient alors du manque de couverture.
@@ -176,21 +179,120 @@ def test_no_anchor_means_no_parallax_never_the_building() -> None:
     assert measure.sector_novelty is True
 
 
-def test_an_anchor_yields_a_measured_parallax() -> None:
+def test_an_anchor_yields_raw_measures_and_a_policy_score() -> None:
+    """Les deux sont publiés, et ne se confondent pas."""
     anchor = GeometryAnchor("vp-1", "obligation:FACADE_RIGHT", 45.5735, -73.4425, "primary")
 
-    aligned = measure_candidate(
-        candidate("c1", 45.5734, -73.4426), demand(), [anchor], 2,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+    measure = measure_candidate(
+        candidate("c1", 45.5745, -73.4440), demand(), [anchor], 2,
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
     )
-    opposite = measure_candidate(
-        candidate("c2", 45.5748, -73.4441), demand(), [anchor], 2,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+    published = measure.as_dict()["parallax"]
+
+    # Mesures géométriques : elles survivent à tout changement de préférence.
+    assert published["bearing_delta_deg"] is not None
+    assert published["baseline_m"] is not None
+    # Préférence : étiquetée comme telle, jamais confondue avec une mesure.
+    assert published["utility_policy_score"] is not None
+
+
+def test_the_preference_is_not_monotonic() -> None:
+    """Le défaut corrigé : `delta / 90` préférait 100° à 25°.
+
+    À grand écart, deux vues montrent des surfaces très différentes et ne
+    partagent plus assez de recouvrement pour qu'un appariement fonctionne.
+    C'est de la diversité, pas de la parallaxe exploitable.
+    """
+    from hotel_pipeline.adaptive_search import parallax_utility
+
+    too_small = parallax_utility(4.0, 30.0, SEARCH)
+    preferred = parallax_utility(30.0, 30.0, SEARCH)
+    excessive = parallax_utility(110.0, 30.0, SEARCH)
+
+    assert preferred > too_small
+    assert preferred > excessive
+
+
+def test_a_small_angle_loses_against_the_preferred_range() -> None:
+    from hotel_pipeline.adaptive_search import parallax_utility
+
+    assert parallax_utility(5.0, 30.0, SEARCH) < parallax_utility(25.0, 30.0, SEARCH)
+
+
+def test_an_excessive_angle_does_not_win_automatically() -> None:
+    """Un candidat à 25° peut être préféré à un candidat à 100°."""
+    from hotel_pipeline.adaptive_search import parallax_utility
+
+    assert parallax_utility(25.0, 30.0, SEARCH) > parallax_utility(100.0, 30.0, SEARCH)
+
+
+def test_a_baseline_too_short_yields_no_utility() -> None:
+    """Un écart mesuré sur deux positions confondues n'est pas de la parallaxe."""
+    from hotel_pipeline.adaptive_search import parallax_utility
+
+    assert parallax_utility(30.0, 0.5, SEARCH) == 0.0
+    assert parallax_utility(30.0, 30.0, SEARCH) == 1.0
+
+
+def test_changing_the_policy_changes_the_preference() -> None:
+    from hotel_pipeline.adaptive_search import parallax_utility
+    from hotel_pipeline.schemas.policy import AdaptiveSearchPolicy
+
+    wide = AdaptiveSearchPolicy(
+        parallax_preferred_min_deg=60.0, parallax_preferred_max_deg=120.0
     )
 
-    assert aligned.parallax_gain is not None
-    assert opposite.parallax_gain > aligned.parallax_gain
-    assert aligned.distance_to_nearest_anchor_m is not None
+    assert parallax_utility(100.0, 30.0, SEARCH) < 1.0
+    assert parallax_utility(100.0, 30.0, wide) == 1.0
+
+
+def test_raw_measures_survive_a_change_of_preference() -> None:
+    """Un rapport doit rester lisible après un changement de politique."""
+    from hotel_pipeline.schemas.policy import AdaptiveSearchPolicy
+
+    anchor = GeometryAnchor("vp-1", "d", 45.5735, -73.4425, "primary")
+    subject = candidate("c1", 45.5745, -73.4440)
+    wide = AdaptiveSearchPolicy(
+        parallax_preferred_min_deg=60.0, parallax_preferred_max_deg=120.0
+    )
+
+    strict = measure_candidate(
+        subject, demand(), [anchor], 2, target_lat=TARGET[0],
+        target_lon=TARGET[1], policy=SEARCH,
+    )
+    lenient = measure_candidate(
+        subject, demand(), [anchor], 2, target_lat=TARGET[0],
+        target_lon=TARGET[1], policy=wide,
+    )
+
+    assert strict.bearing_delta_from_anchor_deg == lenient.bearing_delta_from_anchor_deg
+    assert strict.baseline_to_anchor_m == lenient.baseline_to_anchor_m
+    assert strict.parallax_utility != lenient.parallax_utility
+
+
+def test_no_angular_threshold_is_written_in_the_module() -> None:
+    """Une constante bien testée reste une constante arbitraire."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(
+        pathlib.Path("src/hotel_pipeline/adaptive_search.py").read_text("utf-8")
+    )
+    numbers = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    }
+
+    # Les rangs de priorité (0–4) et l'arithmétique d'azimut (180, 360) sont
+    # légitimes. Un **seuil angulaire** ne l'est pas : ni 90, ni 45, ni 15.
+    thresholds = {
+        value for value in numbers
+        if isinstance(value, (int, float)) and 5 <= value < 180
+    }
+
+    assert thresholds == set(), f"seuils angulaires codés en dur : {sorted(thresholds)}"
 
 
 # --- la séquence : inconnue tant qu'on n'a pas demandé ------------------------
@@ -200,7 +302,7 @@ def test_an_unqueried_sequence_gives_none_never_zero() -> None:
     """Zéro dirait « mesuré, et nul » — une affirmation qu'on n'a pas."""
     measure = measure_candidate(
         candidate("c1", 45.5748, -73.4433), demand(), [], 3,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
     )
 
     assert measure.continuity_gain is None
@@ -214,14 +316,14 @@ def test_a_failed_enrichment_does_not_disqualify_a_promising_view() -> None:
 
     measure = measure_candidate(
         candidate("c1", 45.5748, -73.4441), demand(), [anchor], 2,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
         sequence_status=SequenceStatus.QUERY_ERROR,
     )
 
     assert measure.continuity_gain is None
     assert "indisponible" in measure.continuity_reason
     # La géométrie, elle, reste mesurée.
-    assert measure.parallax_gain is not None
+    assert measure.parallax_utility is not None
     assert measure.rejection_reason is None
 
 
@@ -233,14 +335,14 @@ def test_a_sequence_neighbour_gains_continuity_without_parallax() -> None:
 
     measure = measure_candidate(
         candidate("c1", 45.57352, -73.44252), demand(), [anchor], 2,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
         sequence_of={"c1": "seq-A"}, anchor_sequences={"seq-A"},
         sequence_status=SequenceStatus.KNOWN,
     )
 
     assert measure.continuity_gain == 1.0
     assert measure.continuity_level is ContinuityLevel.POTENTIAL
-    assert measure.parallax_gain < 0.2
+    assert measure.parallax_utility < 0.2
     assert measure.rejection_reason is None
 
 
@@ -248,7 +350,7 @@ def test_belonging_to_a_sequence_is_never_proof_of_overlap() -> None:
     """Un véhicule tourne : la même séquence ne garantit aucun recouvrement."""
     measure = measure_candidate(
         candidate("c1", 45.5735, -73.4425), demand(), [], 3,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
         sequence_of={"c1": "seq-A"}, anchor_sequences={"seq-A"},
         sequence_status=SequenceStatus.KNOWN,
     )
@@ -298,11 +400,14 @@ def test_the_second_view_is_chosen_by_marginal_gain() -> None:
     }
     wanted = demand(viewpoints_required=2)
     measures = [
-        measure_candidate(c, wanted, [], 3, target_lat=TARGET[0], target_lon=TARGET[1])
+        measure_candidate(
+            c, wanted, [], 3, target_lat=TARGET[0], target_lon=TARGET[1],
+            policy=SEARCH,
+        )
         for c in candidates.values()
     ]
 
-    retained = select_for_demand(measures, candidates, wanted, *TARGET, wanted=2)
+    retained = select_for_demand(measures, candidates, wanted, *TARGET, wanted=2, policy=SEARCH)
 
     assert len(retained) == 2
     # La seconde retenue est celle qui apporte l'angle, non la voisine.
@@ -317,13 +422,17 @@ def test_selection_is_independent_of_api_order() -> None:
     }
     wanted = demand(viewpoints_required=2)
     measures = [
-        measure_candidate(c, wanted, [], 3, target_lat=TARGET[0], target_lon=TARGET[1])
+        measure_candidate(
+            c, wanted, [], 3, target_lat=TARGET[0], target_lon=TARGET[1],
+            policy=SEARCH,
+        )
         for c in candidates.values()
     ]
 
-    forward = select_for_demand(measures, candidates, wanted, *TARGET, wanted=2)
+    forward = select_for_demand(measures, candidates, wanted, *TARGET, wanted=2, policy=SEARCH)
     backward = select_for_demand(
-        list(reversed(measures)), candidates, wanted, *TARGET, wanted=2
+        list(reversed(measures)), candidates, wanted, *TARGET, wanted=2,
+        policy=SEARCH,
     )
 
     assert forward == backward
@@ -335,7 +444,7 @@ def test_selection_is_independent_of_api_order() -> None:
 def test_a_candidate_without_a_position_is_rejected() -> None:
     measure = measure_candidate(
         candidate("c1", None, None), demand(), [], 3,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
     )
 
     assert measure.rejection_reason == "position de caméra inconnue"
@@ -381,8 +490,47 @@ def test_the_report_states_what_a_potential_continuity_is_not() -> None:
 def test_searching_downloads_nothing() -> None:
     measure = measure_candidate(
         candidate("c1", 45.5748, -73.4433), demand(), [], 3,
-        target_lat=TARGET[0], target_lon=TARGET[1],
+        target_lat=TARGET[0], target_lon=TARGET[1], policy=SEARCH,
     )
     report = SearchReport(measures=[measure])
 
     assert report.as_dict()["bytes_downloaded"] == 0
+
+
+def test_the_selector_prefers_a_usable_angle_over_an_extreme_one() -> None:
+    """Le sélecteur utilisait l'angle brut : il retenait le plus grand.
+
+    Un candidat à 25° partage encore de la surface avec la première vue ; un
+    candidat à 100° n'en partage peut-être aucune. Maximiser l'écart
+    sélectionnait de la diversité en croyant sélectionner de la parallaxe.
+    """
+    from hotel_pipeline.adaptive_search import pairwise_parallax_potential
+
+    first = candidate("c1", 45.5748, -73.4433)
+    # Positions calculées, non devinées : 43,7° et 121,5° d'écart vers la cible.
+    moderate = candidate("c2", 45.57465, -73.44405)
+    extreme = candidate("c3", 45.5735, -73.4419)
+
+    moderate_pair = pairwise_parallax_potential(first, moderate, *TARGET)
+    extreme_pair = pairwise_parallax_potential(first, extreme, *TARGET)
+
+    # Le montage doit être franc : l'un est dans la plage, l'autre au-delà.
+    assert moderate_pair["bearing_delta_deg"] <= SEARCH.parallax_preferred_max_deg
+    assert extreme_pair["bearing_delta_deg"] > SEARCH.parallax_preferred_max_deg
+
+    candidates = {c.candidate_id: c for c in (first, moderate, extreme)}
+    wanted = demand(viewpoints_required=2)
+    measures = [
+        measure_candidate(
+            c, wanted, [], 3, target_lat=TARGET[0], target_lon=TARGET[1],
+            policy=SEARCH,
+        )
+        for c in candidates.values()
+    ]
+
+    retained = select_for_demand(
+        measures, candidates, wanted, *TARGET, wanted=2, policy=SEARCH
+    )
+
+    assert "c2" in retained
+    assert "c3" not in retained

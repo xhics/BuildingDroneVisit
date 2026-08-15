@@ -40,6 +40,7 @@ class Facet(StrEnum):
     COLLECTION_DISCOVERY = "collection_discovery"
     CANDIDATE_GEOMETRY = "candidate_geometry"
     COVERAGE_TARGETS = "coverage_targets"
+    SEARCH_PREFERENCE = "search_preference"
     VISIBILITY = "visibility"
     BUILDING_RESOLUTION = "building_resolution"
     DEDUPLICATION = "deduplication"
@@ -83,6 +84,16 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "coverage.context_min_projected_width",
         "coverage.building_min_visible_fraction",
         "coverage.context_min_visible_fraction",
+    ),
+    # Comment **choisir** un candidat, distinct de ce qu'il faut obtenir.
+    # Modifier une préférence périme la recherche et ses rapports, jamais les
+    # besoins eux-mêmes — l'objectif n'a pas bougé.
+    Facet.SEARCH_PREFERENCE: (
+        "adaptive_search.parallax_preferred_min_deg",
+        "adaptive_search.parallax_preferred_max_deg",
+        "adaptive_search.parallax_excess_penalty",
+        "adaptive_search.baseline_min_m",
+        "adaptive_search.status",
     ),
     Facet.VISIBILITY: (
         "visibility.max_angular_step_deg",
@@ -148,6 +159,7 @@ UNSCOPED_FIELDS: frozenset[str] = frozenset(
         "model.calibration_id", "model.calibrated_on_sites",
         "terrain.calibration_id", "terrain.calibrated_on_sites",
         "qualification.calibration_id", "qualification.calibrated_on_sites",
+        "adaptive_search.calibration_id", "adaptive_search.calibrated_on_sites",
     }
 )
 
@@ -157,7 +169,10 @@ UNSCOPED_FIELDS: frozenset[str] = frozenset(
 CONSUMERS: dict[str, tuple[Facet, ...]] = {
     "CaptureDemandManifest": (Facet.COVERAGE_TARGETS,),
     "DemandAssessmentManifest": (Facet.COVERAGE_TARGETS, Facet.CANDIDATE_GEOMETRY),
-    "CandidateManifest": (Facet.COLLECTION_DISCOVERY,),
+    # `SearchReport` rejoindra cette table au câblage : la déclarer avant
+    # qu'une commande la publie ferait échouer le contrôle qui exige que toute
+    # production déclarée soit écrite — et ce contrôle a raison.
+    "CandidateManifest": (Facet.COLLECTION_DISCOVERY, Facet.SEARCH_PREFERENCE),
     "CandidateEvaluation": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
     "AcquisitionPlan": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
     "CaptureGeometryManifest": (Facet.BUILDING_RESOLUTION,),

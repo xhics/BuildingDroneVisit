@@ -90,8 +90,14 @@ class CandidateMeasure:
     continuity_level: ContinuityLevel | None = None
     continuity_reason: str = ""
 
-    #: `None` quand aucune ancre géométrique ne sert ce besoin.
-    parallax_gain: float | None = None
+    #: Mesures **géométriques**, indépendantes de toute préférence. Elles
+    #: restent identiques si la fonction de choix change, et c'est ce qui rend
+    #: un rapport relisible après un changement de politique.
+    baseline_to_anchor_m: float | None = None
+
+    #: Préférence **issue de la politique**, à ne pas confondre avec une
+    #: mesure. `None` quand aucune ancre géométrique ne sert ce besoin.
+    parallax_utility: float | None = None
     parallax_reason: str = ""
 
     sequence_id: str | None = None
@@ -118,7 +124,12 @@ class CandidateMeasure:
                 "sequence_status": self.sequence_status.value,
             },
             "parallax": {
-                "gain_against_existing": self.parallax_gain,
+                # Mesures brutes d'abord : elles survivent au changement de
+                # préférence, et un rapport doit rester lisible après.
+                "bearing_delta_deg": self.bearing_delta_from_anchor_deg,
+                "baseline_m": self.baseline_to_anchor_m,
+                # Puis la préférence, étiquetée comme telle.
+                "utility_policy_score": self.parallax_utility,
                 "reason": self.parallax_reason,
             },
             "corridor_ref": self.corridor_ref,
@@ -264,6 +275,7 @@ def measure_candidate(
     sequence_of: dict[str, str] | None = None,
     anchor_sequences: set[str] | None = None,
     sequence_status: SequenceStatus = SequenceStatus.NOT_QUERIED,
+    policy=None,  # noqa: ANN001 — AdaptiveSearchPolicy
 ) -> CandidateMeasure:
     """Mesure un candidat contre un besoin, qualité par qualité.
 
@@ -292,7 +304,7 @@ def measure_candidate(
 
     # --- parallaxe : contre les ancres **de ce besoin**, ou rien -------------
     if not anchors:
-        measure.parallax_gain = None
+        measure.parallax_utility = None
         measure.parallax_reason = (
             "aucune ancre géométrique compatible avec ce besoin — le bâtiment "
             "est une cible, jamais une position caméra"
@@ -308,6 +320,7 @@ def measure_candidate(
             candidate.camera_lat, candidate.camera_lon, nearest.lat, nearest.lon
         )
         measure.distance_to_nearest_anchor_m = round(separation, 1)
+        measure.baseline_to_anchor_m = round(separation, 1)
 
         if target_lat is not None and target_lon is not None:
             from_candidate = bearing_deg(
@@ -316,12 +329,19 @@ def measure_candidate(
             from_anchor = bearing_deg(nearest.lat, nearest.lon, target_lat, target_lon)
             delta = abs((from_candidate - from_anchor + 180.0) % 360.0 - 180.0)
             measure.bearing_delta_from_anchor_deg = round(delta, 1)
-            # Le gain de parallaxe croît avec l'écart angulaire vers la cible :
-            # c'est lui qui donne de la profondeur, non la distance seule.
-            measure.parallax_gain = round(min(delta / 90.0, 1.0), 4)
-            measure.parallax_reason = (
-                f"écart de {delta:.1f}° vers la cible depuis {nearest.viewpoint_id}"
-            )
+
+            if policy is None:
+                measure.parallax_reason = (
+                    f"écart de {delta:.1f}° depuis {nearest.viewpoint_id} — "
+                    "aucune politique de recherche : la mesure est publiée, "
+                    "la préférence n'est pas calculée"
+                )
+            else:
+                measure.parallax_utility = parallax_utility(delta, separation, policy)
+                measure.parallax_reason = (
+                    f"écart de {delta:.1f}° et base de {separation:.1f} m depuis "
+                    f"{nearest.viewpoint_id} — {_utility_note(delta, policy)}"
+                )
         else:
             measure.parallax_reason = "position de la cible inconnue"
 
@@ -357,6 +377,55 @@ def measure_candidate(
         measure.continuity_reason = "séquence connue, distincte de celles retenues"
 
     return measure
+
+
+def parallax_utility(bearing_delta_deg: float, baseline_m: float, policy) -> float:  # noqa: ANN001
+    """Utilité d'un écart angulaire, **selon la politique**. Non monotone.
+
+    Un écart plus grand donne plus de profondeur jusqu'à un point, puis les
+    deux vues cessent de partager assez de surface pour qu'un appariement
+    fonctionne. Préférer systématiquement le plus grand angle — ce que faisait
+    `delta / 90` — sélectionnait de la diversité en croyant sélectionner de la
+    parallaxe : à 100°, deux vues peuvent ne montrer presque rien en commun.
+
+    Aucun seuil n'est écrit ici : les trois viennent de la politique, et
+    changer la préférence ne doit toucher aucune mesure brute.
+    """
+    if baseline_m < policy.baseline_min_m:
+        # Un écart angulaire mesuré sur deux positions confondues ne
+        # correspond à aucune parallaxe exploitable.
+        return 0.0
+
+    low = policy.parallax_preferred_min_deg
+    high = policy.parallax_preferred_max_deg
+
+    if bearing_delta_deg < low:
+        # Montée linéaire : peu de profondeur, mais du recouvrement.
+        return round(max(bearing_delta_deg / low, 0.0) * 0.8, 4) if low else 0.0
+    if bearing_delta_deg <= high:
+        return 1.0
+
+    penalised = 1.0 - (bearing_delta_deg - high) * policy.parallax_excess_penalty
+    return round(max(penalised, 0.0), 4)
+
+
+def _utility_note(bearing_delta_deg: float, policy) -> str:  # noqa: ANN001
+    if bearing_delta_deg < policy.parallax_preferred_min_deg:
+        return "sous la plage préférée : peu de profondeur"
+    if bearing_delta_deg <= policy.parallax_preferred_max_deg:
+        return "dans la plage préférée"
+    return "au-delà de la plage préférée : recouvrement probablement dégradé"
+
+
+def pairwise_parallax_utility(
+    bearing_delta_deg: float, baseline_m: float, policy  # noqa: ANN001
+) -> float:
+    """Même préférence, entre deux **nouveaux** candidats.
+
+    Un candidat à 25° peut être préféré à un candidat à 100° : le second
+    apporte de la diversité, non de la parallaxe exploitable.
+    """
+    return parallax_utility(bearing_delta_deg, baseline_m, policy)
 
 
 def pairwise_parallax_potential(first, second, target_lat: float, target_lon: float) -> dict:  # noqa: ANN001
@@ -397,6 +466,7 @@ def select_for_demand(
     target_lat: float | None,
     target_lon: float | None,
     wanted: int,
+    policy=None,  # noqa: ANN001 — AdaptiveSearchPolicy
 ) -> list[str]:
     """Retient les vues d'un besoin, la seconde par gain marginal.
 
@@ -411,7 +481,7 @@ def select_for_demand(
         eligible,
         key=lambda m: (
             -m.coverage_gap_priority,
-            -(m.parallax_gain if m.parallax_gain is not None else 0.0),
+            -(m.parallax_utility if m.parallax_utility is not None else 0.0),
             -(m.continuity_gain if m.continuity_gain is not None else 0.0),
             m.distance_to_target_m if m.distance_to_target_m is not None else math.inf,
             m.candidate_id,
@@ -432,13 +502,23 @@ def select_for_demand(
             candidate = candidates.get(measure.candidate_id)
             if candidate is None or candidate.camera_lat is None:
                 continue
-            gains = [
-                pairwise_parallax_potential(
-                    candidates[kept], candidate, target_lat, target_lon
-                )["bearing_delta_deg"]
-                for kept in retained
-                if candidates.get(kept) is not None
-            ]
+            # La préférence, non l'angle brut : maximiser l'écart retiendrait
+            # deux vues sans surface commune, en croyant maximiser la parallaxe.
+            gains = []
+            for kept in retained:
+                other = candidates.get(kept)
+                if other is None:
+                    continue
+                pair = pairwise_parallax_potential(
+                    other, candidate, target_lat, target_lon
+                )
+                gains.append(
+                    pairwise_parallax_utility(
+                        pair["bearing_delta_deg"], pair["baseline_m"], policy
+                    )
+                    if policy is not None
+                    else pair["bearing_delta_deg"]
+                )
             marginal = min(gains) if gains else 0.0
             if marginal > best_gain or (
                 marginal == best_gain and best and measure.candidate_id < best

@@ -239,6 +239,54 @@ class CoveragePolicy(BaseModel):
     context_min_visible_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class AdaptiveSearchPolicy(BaseModel, Calibrated):
+    """Comment **choisir** des candidats. Distinct de ce qu'il faut obtenir.
+
+    `CoveragePolicy` dit combien de vues un besoin exige ; celle-ci dit
+    lesquelles préférer parmi les candidats possibles. Les mêler ferait
+    dépendre un objectif de couverture d'une heuristique de recherche.
+
+    La préférence de parallaxe n'est **pas monotone**, et c'est tout l'objet
+    de cette section. Un écart angulaire plus grand donne plus de profondeur
+    jusqu'à un point, puis les deux vues cessent de partager assez de surface
+    pour qu'un appariement fonctionne. Préférer systématiquement le plus grand
+    angle — ce que faisait un simple `delta / 90` — sélectionnait de la
+    diversité en croyant sélectionner de la parallaxe.
+
+    Aucune de ces valeurs n'est mesurée : elles décrivent une intention de
+    méthode, sur zéro site.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: En deçà, deux vues sont presque colinéaires : peu de profondeur.
+    parallax_preferred_min_deg: float = Field(default=15.0, ge=0, le=180)
+
+    #: Au-delà, le recouvrement se dégrade : les surfaces vues divergent.
+    parallax_preferred_max_deg: float = Field(default=45.0, gt=0, le=180)
+
+    #: Combien pénaliser un degré au-delà de la plage préférée, rapporté à
+    #: l'utilité maximale. Zéro rendrait la préférence monotone à nouveau.
+    parallax_excess_penalty: float = Field(default=0.015, ge=0.0)
+
+    #: Base minimale entre deux positions : sous ce seuil, l'écart angulaire
+    #: mesuré ne correspond à aucune parallaxe exploitable.
+    baseline_min_m: float = Field(default=3.0, ge=0.0)
+
+    status: str = "provisional"
+    calibration_id: str = UNCALIBRATED
+    calibrated_on_sites: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _the_preferred_range_is_a_range(self) -> "AdaptiveSearchPolicy":
+        if self.parallax_preferred_max_deg <= self.parallax_preferred_min_deg:
+            raise ValueError(
+                "plage de parallaxe vide : le maximum préféré doit dépasser le "
+                "minimum, sans quoi aucun angle ne serait jamais bon"
+            )
+        return self
+
+
 class TerrainPolicy(BaseModel, Calibrated):
     """Seuils de la validation par pseudo-empreinte.
 
@@ -376,6 +424,9 @@ class PipelinePolicy(BaseModel):
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)
     collection: CollectionPolicy = Field(default_factory=CollectionPolicy)
     coverage: CoveragePolicy = Field(default_factory=CoveragePolicy)
+    adaptive_search: AdaptiveSearchPolicy = Field(
+        default_factory=AdaptiveSearchPolicy
+    )
     terrain: TerrainPolicy = Field(default_factory=TerrainPolicy)
     qualification: QualificationPolicy = Field(default_factory=QualificationPolicy)
     temporal: TemporalPolicy = Field(default_factory=TemporalPolicy)
