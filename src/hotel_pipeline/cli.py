@@ -698,7 +698,14 @@ def assets_discover(
     workspace.write_report(f"01_sources/discovery_{report.run_id}.json", report, context, production="CandidateManifest")
 
     for source in report.sources_queried:
-        typer.echo(f"    {source:<14} {report.candidates_by_source[source]:>5} candidat(s)")
+        returned = report.candidates_by_source[source]
+        kept = sum(1 for c in manifest.candidates if c.source == source)
+        detail = f"{returned:>5} rendu(s)"
+        if kept != returned:
+            # Les deux chiffres, sinon « 2163 » à côté d'un total de 1636 se
+            # lit comme une incohérence alors que c'est un regroupement.
+            detail += f" → {kept} retenu(s) après regroupement"
+        typer.echo(f"    {source:<14} {detail}")
     for source, reason in sorted(report.sources_skipped.items()):
         typer.secho(f"    {source:<14} non interrogée — {reason}", fg=typer.colors.YELLOW)
 
