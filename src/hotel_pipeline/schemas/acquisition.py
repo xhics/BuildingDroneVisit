@@ -838,14 +838,30 @@ class CandidateManifest(BaseModel):
                     f"recommandation d'un candidat absent : {entry.candidate_id!r}"
                 )
         if self.recommendations:
-            derived = {
-                "recommended_for_enrichment": set(),
-                "recommended_for_preview": set(),
-                "eligible_for_full_acquisition": set(),
+            # Un même candidat peut être autorisé à deux niveaux, pour deux
+            # besoins distincts : pleinement acquérable pour documenter un
+            # stationnement, borné à l'aperçu pour une façade non mesurée. Le
+            # résumé retient alors **le plus prudent** — promouvoir le fichier
+            # entier parce qu'un seul besoin s'en contentait perdrait la
+            # réserve de l'autre.
+            rank = {
+                "recommended_for_enrichment": 0,
+                "recommended_for_preview": 1,
+                "eligible_for_full_acquisition": 2,
             }
+            safest: dict[str, int] = {}
             for entry in self.recommendations:
-                if entry.level in derived:
-                    derived[entry.level].add(entry.candidate_id)
+                if entry.level not in rank:
+                    continue
+                safest[entry.candidate_id] = min(
+                    safest.get(entry.candidate_id, rank[entry.level]),
+                    rank[entry.level],
+                )
+            derived: dict[str, set] = {name: set() for name in rank}
+            reverse = {value: name for name, value in rank.items()}
+            for candidate_id, value in safest.items():
+                derived[reverse[value]].add(candidate_id)
+
             for name, expected in derived.items():
                 if set(getattr(self, name)) != expected:
                     raise ValueError(

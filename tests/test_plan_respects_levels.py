@@ -333,3 +333,55 @@ def test_identical_optics_and_close_bearings_still_merge() -> None:
 
     assert len(kept) == 1
     assert merged == {"f-2": "f-1"}
+
+
+def test_the_summary_keeps_the_safest_level_of_a_candidate() -> None:
+    """Un candidat autorisé à deux niveaux pour deux besoins distincts.
+
+    Le résumé retient le plus prudent : le classer « pleinement éligible »
+    parce qu'un seul besoin s'en contentait perdrait la réserve de l'autre.
+    """
+    from hotel_pipeline.schemas.acquisition import (
+        CandidateManifest,
+        DemandRecommendation,
+    )
+
+    manifest = CandidateManifest(
+        hotel_id="pilote",
+        candidates=[_candidate("c-double")],
+        recommendations=[
+            DemandRecommendation(
+                candidate_id="c-double", demand_id="obligation:PARKING_HOTEL",
+                level=FULL,
+            ),
+            DemandRecommendation(
+                candidate_id="c-double", demand_id="obligation:front",
+                level=PREVIEW,
+            ),
+        ],
+        recommended_for_preview=["c-double"],
+    )
+
+    assert manifest.eligible_for_full_acquisition == []
+    assert manifest.recommended_for_preview == ["c-double"]
+
+
+def test_a_summary_that_contradicts_the_pairs_is_refused() -> None:
+    """Les couples font autorité ; un résumé qui s'en écarte est refusé."""
+    from hotel_pipeline.schemas.acquisition import (
+        CandidateManifest,
+        DemandRecommendation,
+    )
+
+    with pytest.raises(ValueError, match="ne résume pas"):
+        CandidateManifest(
+            hotel_id="pilote",
+            candidates=[_candidate("c-1")],
+            recommendations=[
+                DemandRecommendation(
+                    candidate_id="c-1", demand_id="obligation:front",
+                    level=PREVIEW,
+                ),
+            ],
+            eligible_for_full_acquisition=["c-1"],
+        )
