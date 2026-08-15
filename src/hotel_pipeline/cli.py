@@ -4147,6 +4147,17 @@ def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN
     )
 
 
+#: Types de façade et secteur qu'ils désignent. Un proxy `FACADE_PRIMARY` dit
+#: « cherche du côté avant », non « cherche l'objet FACADE_PRIMARY » — qui n'a
+#: pas de géométrie propre au manifeste.
+FACADE_SECTORS: dict[str, str] = {
+    "FACADE_PRIMARY": "front",
+    "FACADE_LEFT": "left",
+    "FACADE_RIGHT": "right",
+    "FACADE_REAR": "rear",
+}
+
+
 def _declared_proxies(workspace) -> dict:  # noqa: ANN001
     """Proxies de recherche déclarés à la construction des besoins.
 
@@ -4163,13 +4174,20 @@ def _resolve_proxy(proxy_ref, demand, geometry, front, site, half_width):  # noq
     from .demand_targets import TargetUnresolved, resolve
     from .schemas.acquisition import TargetKind
 
+    from .demand_targets import SECTOR_BEARINGS
+
+    # Un proxy de façade nomme un **secteur** (`FACADE_PRIMARY` → `front`) ;
+    # le traiter comme un objet de site cherchait une géométrie qui n'existe
+    # pas sous ce nom, et le proxy restait silencieusement inactif.
+    sector_ref = FACADE_SECTORS.get(proxy_ref)
+    if sector_ref is None and proxy_ref in SECTOR_BEARINGS:
+        sector_ref = proxy_ref
+
     stand_in = demand.model_copy(
         update={
-            "target_ref": proxy_ref,
+            "target_ref": sector_ref or proxy_ref,
             "target_kind": (
-                TargetKind.VIEW_SECTOR
-                if proxy_ref in ("front", "left", "right", "rear")
-                else TargetKind.SITE_OBJECT
+                TargetKind.VIEW_SECTOR if sector_ref else TargetKind.SITE_OBJECT
             ),
         }
     )

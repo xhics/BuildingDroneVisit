@@ -581,3 +581,47 @@ def test_an_object_kind_reaches_its_geometry_through_the_declared_role() -> None
     assert target.shape.centroid.x == pytest.approx(105.0), (
         "la cible du besoin est le stationnement, non le bâtiment"
     )
+
+
+def test_a_facade_proxy_resolves_as_a_sector_not_an_object() -> None:
+    """`FACADE_PRIMARY` désigne un côté, pas un objet géoréférencé.
+
+    Le traiter comme un objet de site cherchait une géométrie inexistante sous
+    ce nom : `_resolve_proxy` rendait `None`, et le proxy restait silencieusement
+    inactif — le mécanisme était écrit, testé unitairement, et sans effet.
+    """
+    from hotel_pipeline.cli import FACADE_SECTORS, _resolve_proxy
+    from hotel_pipeline.demand_targets import OBJECT_KIND_ROLES
+    from hotel_pipeline.schemas.geometry import (
+        GeometryResolutionStatus,
+        GeometryRole,
+    )
+
+    assert FACADE_SECTORS["FACADE_PRIMARY"] == "front"
+    # Le bâtiment porte le rôle `target_building`, non `BUILDING_MAIN`.
+    assert OBJECT_KIND_ROLES["BUILDING_MAIN"] is GeometryRole.TARGET_BUILDING
+
+    class Geometry:
+        feature_id = "TARGET_BUILDING"
+        role = GeometryRole.TARGET_BUILDING
+        resolution_status = GeometryResolutionStatus.RESOLVED
+        projected_wkt = "POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))"
+
+    class Manifest:
+        geometries = [Geometry()]
+
+    need = demand("obligation:ENTRANCE_MAIN_CURRENT", "ENTRANCE_MAIN_CURRENT")
+    need = need.model_copy(
+        update={"target_kind": need.target_kind.__class__.SITE_OBJECT}
+    )
+
+    as_sector = _resolve_proxy(
+        "FACADE_PRIMARY", need, Manifest(), 137.7, None, 67.5
+    )
+    as_object = _resolve_proxy(
+        "BUILDING_MAIN", need, Manifest(), 137.7, None, 67.5
+    )
+
+    assert as_sector is not None, "un proxy de façade doit se résoudre"
+    assert as_sector.required_bearing_deg == pytest.approx(137.7, abs=0.1)
+    assert as_object is not None, "le bâtiment se rejoint par son rôle déclaré"

@@ -217,6 +217,7 @@ def _by_site_object(object_id: str, resolved: dict, site) -> object | None:  # n
 OBJECT_KIND_ROLES: dict[str, GeometryRole] = {
     "PARKING_HOTEL": GeometryRole.HOTEL_PARKING,
     "ACCESS_ROAD_MAIN": GeometryRole.ACCESS_ROAD,
+    "BUILDING_MAIN": GeometryRole.TARGET_BUILDING,
 }
 
 
