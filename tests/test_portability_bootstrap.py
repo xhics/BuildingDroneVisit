@@ -59,6 +59,7 @@ def profile(**overrides) -> PropertyProfile:
 PILOT_POLICY_DIGESTS = {
     "a4564b71ddeec56e": "avant les seuils de secteur et de séparation",
     "9275a7e32eeb0431": "avec sector_observer_half_width_deg et viewpoint_separation_m",
+    "18422c85a67d09fe": "avec la section coverage — cibles de couverture",
 }
 
 

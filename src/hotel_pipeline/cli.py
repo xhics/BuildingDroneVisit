@@ -1115,12 +1115,9 @@ def _check_coverage(workspace, demands):  # noqa: ANN001, ANN201
     jamais eu. Le plan reste possible — planifier ce qu'on a demandé est
     légitime — mais l'oubli est nommé.
     """
-    from .coverage_obligations import ObligationWaiver, assess, missing_demands
+    from .coverage_obligations import assess, missing_demands
 
-    payload = workspace.read_json("01_sources/coverage_waivers.json") or {}
-    waivers = [ObligationWaiver.model_validate(row) for row in payload.get("waivers", [])]
-
-    report = assess(demands, waivers)
+    report = assess(demands, _read_waivers(workspace))
     if report.complete:
         typer.echo(f"  obligations couvertes ({len(report.demands_by_object)})")
     else:
@@ -1537,6 +1534,233 @@ def _record_rights_decision(  # noqa: ANN001
             "    l'état juridique est inchangé : accepter un risque n'accorde rien",
             fg=typer.colors.YELLOW,
         )
+
+
+demands_app = typer.Typer(
+    no_args_is_help=True,
+    help="Besoins de capture — instanciés depuis les obligations du gabarit.",
+)
+assets_app.add_typer(demands_app, name="demands")
+
+
+@demands_app.command("build")
+def demands_build(
+    hotel_id: str = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", help="Réécrit la copie canonique."),
+) -> None:
+    """Instancie les besoins depuis les obligations. **Aucun appel réseau.**
+
+    Traduit ce que le gabarit exige en besoins que le reste du pipeline sait
+    juger. Les demandes écrites par l'opérateur sont préservées : le générateur
+    n'est pas propriétaire du manifeste, il y ajoute ce qui est dû.
+
+    Un objet non résolu produit un besoin **non ciblable**, jamais une
+    dispense : le déclarer sans objet ferait disparaître un manque.
+    """
+    from .demands_build import DemandsRefused, build, validate_targets
+    from .provenance import digest_of
+    from .schemas.acquisition import CaptureDemandManifest
+
+    context = _context(hotel_id, Capability.INSPECTION)
+    workspace = Workspace(hotel_id)
+
+    site = _safe_read(workspace.read_site)
+    if site is None:
+        typer.secho(
+            f"{KO} aucun manifeste de site — lancez : site build",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    spatial = _safe_read(workspace.read_spatial)
+    existing_payload = workspace.read_json("01_sources/capture_demands.json")
+    existing = (
+        CaptureDemandManifest.model_validate(existing_payload)
+        if existing_payload else None
+    )
+    waivers = _read_waivers(workspace)
+
+    site_payload = json.loads(site.model_dump_json())
+    digests = {
+        "site_manifest_digest": digest_of(site_payload),
+        "spatial_manifest_digest": (
+            digest_of(json.loads(spatial.model_dump_json())) if spatial else None
+        ),
+        "policy_digest": context.provenance["policy_digest"],
+    }
+
+    try:
+        manifest, report = build(
+            hotel_id, site, context.policy.coverage, existing, waivers, digests
+        )
+    except DemandsRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    geometry = _capture_geometry_if_any(workspace, context)
+    problems = validate_targets(manifest, site, geometry)
+    if problems:
+        for problem in problems:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  aucun besoin n'est écrit : une demande qui ne vise rien resterait "
+            "ouverte indéfiniment, et compterait comme un manque réel",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    payload = json.loads(manifest.model_dump_json())
+    digest = digest_of(payload)
+
+    workspace.write_json(f"01_sources/capture_demands_{digest}.json", payload)
+    workspace.write_report(
+        f"01_sources/capture_demands_build_{digest}.json", report, context,
+        production="CaptureDemandManifest",
+    )
+
+    canonical = workspace.path("01_sources", "capture_demands.json")
+    if canonical.is_file() and not force:
+        typer.secho(
+            f"  · copie canonique conservée — {canonical.name} existe déjà ; "
+            f"--force pour l'activer",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        workspace.write_json("01_sources/capture_demands.json", payload)
+
+    typer.echo(f"  générés     {len(report.generated_from_obligation)}")
+    typer.echo(f"  conservés   {len(report.operator_defined)} (opérateur)")
+    for object_id, reason in sorted(report.unresolved_target.items()):
+        typer.secho(f"    non ciblable · {object_id} — {reason[:52]}",
+                    fg=typer.colors.YELLOW)
+    for object_id in sorted({**report.waived, **report.not_applicable}):
+        typer.echo(f"    dispensé · {object_id}")
+
+    typer.echo("")
+    typer.echo(f"{OK} {len(manifest.demands)} besoin(s) — empreinte {digest}")
+    typer.echo("    prochaine étape : assets demands assess")
+
+
+@demands_app.command("assess")
+def demands_assess(hotel_id: str = typer.Argument(...)) -> None:
+    """Évalue les besoins sur le corpus **existant**. Aucune collecte.
+
+    Répond, besoin par besoin : combien de points de vue indépendants le
+    servent, lesquels, et ce qui manque. C'est ce rapport qui dira ensuite à la
+    recherche adaptative quels secteurs sont déficitaires — sans lui, le
+    collecteur devrait redéfinir les objectifs de couverture, et deux sources
+    d'autorité finiraient par diverger.
+    """
+    from .demands_assess import assess
+    from .plan import group_viewpoints
+    from .provenance import digest_of
+    from .schemas.acquisition import CaptureDemandManifest
+
+    context = _context(hotel_id, Capability.INSPECTION)
+    workspace = Workspace(hotel_id)
+
+    payload = workspace.read_json("01_sources/capture_demands.json")
+    if not payload:
+        typer.secho(
+            f"{KO} aucun besoin — lancez : assets demands build",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    demands = CaptureDemandManifest.model_validate(payload)
+    corpus = json.loads(manifest.model_dump_json())
+
+    # Les points de vue viennent des positions, jamais du nombre de fichiers :
+    # neuf fichiers à six positions font six observations, pas neuf.
+    viewpoints = group_viewpoints(
+        [_as_viewpoint_subject(asset) for asset in manifest.assets],
+        separation_m=context.policy.geometry.viewpoint_separation_m,
+    )
+
+    assessment, report = assess(
+        hotel_id, demands.demands, manifest.assets,
+        corpus_digest=digest_of(corpus),
+        viewpoints=viewpoints,
+        demand_digest=digest_of(payload),
+    )
+
+    workspace.write_json(
+        f"01_sources/demand_assessment_{report.corpus_digest}.json",
+        json.loads(assessment.model_dump_json()),
+    )
+    workspace.write_report(
+        f"01_sources/demand_assessment_report_{report.corpus_digest}.json",
+        report, context, production="DemandAssessmentManifest",
+    )
+
+    typer.echo(f"  assets      {report.assets_considered}")
+    for status, identifiers in sorted(report.by_status.items()):
+        typer.echo(f"    {status:<16} {len(identifiers):>3}")
+    for demand_id, viewpoint_ids in sorted(report.viewpoints_by_demand.items()):
+        if viewpoint_ids:
+            typer.echo(f"    {demand_id} · {len(viewpoint_ids)} point(s) de vue")
+
+    typer.echo("")
+    typer.echo(f"{OK} {len(assessment.assessments)} besoin(s) évalué(s)")
+    if report.open_demands:
+        typer.echo(f"    encore ouverts : {', '.join(report.open_demands)}")
+    typer.echo("    prochaine étape : assets discover (recherche ciblée)")
+
+
+def _as_viewpoint_subject(asset):  # noqa: ANN001, ANN201
+    """Adapte un asset au regroupement par point de vue.
+
+    `group_viewpoints` attend des candidats ; un asset porte les mêmes faits
+    sous d'autres noms. L'adapter ici évite de dupliquer la règle de
+    regroupement, qui doit rester unique.
+    """
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Subject:
+        candidate_id: str
+        camera_lat: float | None
+        camera_lon: float | None
+        panorama_id: str | None
+
+    return Subject(
+        candidate_id=asset.id,
+        camera_lat=asset.camera_lat,
+        camera_lon=asset.camera_lon,
+        panorama_id=(
+            asset.acquisition.panorama_id if asset.acquisition else None
+        ),
+    )
+
+
+def _capture_geometry_if_any(workspace, context):  # noqa: ANN001, ANN201
+    """Géométrie de capture, si elle est résolue. `None` sinon — jamais vide.
+
+    Un registre absent et un registre vide ne disent pas la même chose : le
+    premier qu'on ne peut pas valider, le second que toute référence est fausse.
+    """
+    from .geo.geometry_loader import LegacyManifestRefused, load_capture_geometry
+
+    path = workspace.path("06_geo", "capture_geometry.json")
+    if context.spatial_reference is None or not path.is_file():
+        return None
+    try:
+        manifest, _ = load_capture_geometry(path, context.spatial_reference)
+    except (LegacyManifestRefused, ValueError):
+        return None
+    return manifest
+
+
+def _read_waivers(workspace) -> list:  # noqa: ANN001
+    from .coverage_obligations import ObligationWaiver
+
+    payload = workspace.read_json("01_sources/coverage_waivers.json") or {}
+    return [ObligationWaiver.model_validate(row) for row in payload.get("waivers", [])]
 
 
 @assets_app.command("dedup")

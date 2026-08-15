@@ -185,6 +185,46 @@ class CollectionPolicy(BaseModel):
     wide_fov_deg: int = Field(default=110, gt=0, le=120)
 
 
+class CoveragePolicy(BaseModel):
+    """Ce qu'une obligation exige, par intention.
+
+    Ces seuils **ne sont pas** dans la commande qui construit les besoins :
+    codés là, ils auraient été deux fois — une fois dans le générateur, une
+    fois dans le manifeste produit — et le second aurait fini par mentir sur
+    le premier. Ils vivent ici, versionnés, et une modification périme les
+    besoins générés sans toucher aux artefacts LiDAR.
+
+    Provisoires, comme tous les seuils de ce dépôt : mesurés sur aucun site,
+    ils décrivent une intention de méthode, pas une validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Une façade ne se reconstruit pas depuis une seule position : deux vues
+    #: indépendantes sont le minimum pour qu'un SfM y trouve de la parallaxe.
+    building_viewpoints_required: int = Field(default=2, ge=1)
+
+    #: Une vue de contexte documente un accès ou une transition ; une seule
+    #: suffit à établir qu'on l'a regardé.
+    context_viewpoints_required: int = Field(default=1, ge=1)
+
+    #: Recouvrement attendu entre vues voisines d'un même besoin de bâtiment.
+    #: Zéro signifierait « vues indépendantes acceptées », ce qui priverait le
+    #: SfM de tout chaînage.
+    building_continuity_required: float = Field(default=0.3, ge=0.0, le=1.0)
+    context_continuity_required: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Taille projetée minimale de la cible. Le critère décisif n'est pas la
+    #: distance : un téléobjectif lointain vaut mieux qu'un grand-angle proche.
+    building_min_projected_width: float = Field(default=0.15, ge=0.0, le=1.0)
+    context_min_projected_width: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Part de silhouette utile non masquée, en deçà de laquelle la vue ne
+    #: répond pas au besoin.
+    building_min_visible_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+    context_min_visible_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
 class TerrainPolicy(BaseModel, Calibrated):
     """Seuils de la validation par pseudo-empreinte.
 
@@ -321,6 +361,7 @@ class PipelinePolicy(BaseModel):
     visibility: VisibilityPolicy = Field(default_factory=VisibilityPolicy)
     dedup: DedupPolicy = Field(default_factory=DedupPolicy)
     collection: CollectionPolicy = Field(default_factory=CollectionPolicy)
+    coverage: CoveragePolicy = Field(default_factory=CoveragePolicy)
     terrain: TerrainPolicy = Field(default_factory=TerrainPolicy)
     qualification: QualificationPolicy = Field(default_factory=QualificationPolicy)
     temporal: TemporalPolicy = Field(default_factory=TemporalPolicy)

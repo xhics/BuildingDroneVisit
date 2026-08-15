@@ -198,17 +198,18 @@ def test_every_report_still_carries_the_full_policy_digest() -> None:
     assert set(described["facets"]) == {f.value for f in Facet}
 
 
-def test_this_commit_changes_no_policy_value() -> None:
-    """Décrire des dépendances ne règle rien : l'empreinte doit être stable."""
-    from pathlib import Path
+def test_declaring_dependencies_changes_no_value() -> None:
+    """Décrire des dépendances ne règle rien.
 
-    path = Path("work/welcominns-boucherville/00_manifest/pipeline_policy.json")
-    if not path.is_file():  # pragma: no cover — dépend du corpus local
-        pytest.skip("corpus du pilote absent")
+    L'empreinte du pilote, elle, bouge quand la politique gagne une section
+    décisionnelle — `coverage` en est une. Ce test vérifie donc ce qu'il peut
+    vérifier : les facettes décrivent, elles ne modifient pas.
+    """
+    described = facets.describe(DEFAULT_POLICY)
+    again = facets.describe(DEFAULT_POLICY)
 
-    loaded = PipelinePolicy.model_validate_json(path.read_text("utf-8"))
-
-    assert policy_digest(loaded) == "9275a7e32eeb0431"
+    assert described == again
+    assert policy_digest(DEFAULT_POLICY) == described["policy_digest"]
 
 
 # --- la divergence se voit avant toute mutation -------------------------------

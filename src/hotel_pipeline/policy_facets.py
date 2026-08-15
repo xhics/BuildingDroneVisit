@@ -39,6 +39,7 @@ class Facet(StrEnum):
 
     COLLECTION_DISCOVERY = "collection_discovery"
     CANDIDATE_GEOMETRY = "candidate_geometry"
+    COVERAGE_TARGETS = "coverage_targets"
     VISIBILITY = "visibility"
     BUILDING_RESOLUTION = "building_resolution"
     DEDUPLICATION = "deduplication"
@@ -66,6 +67,19 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "geometry.max_distance_m",
         "geometry.sector_observer_half_width_deg",
         "geometry.viewpoint_separation_m",
+    ),
+    # Ce qu'une obligation exige. Séparée de `candidate_geometry` : l'une dit
+    # combien de vues il faut, l'autre comment on juge une vue. Modifier la
+    # première périme les besoins ; modifier la seconde périme les évaluations.
+    Facet.COVERAGE_TARGETS: (
+        "coverage.building_viewpoints_required",
+        "coverage.context_viewpoints_required",
+        "coverage.building_continuity_required",
+        "coverage.context_continuity_required",
+        "coverage.building_min_projected_width",
+        "coverage.context_min_projected_width",
+        "coverage.building_min_visible_fraction",
+        "coverage.context_min_visible_fraction",
     ),
     Facet.VISIBILITY: (
         "visibility.max_angular_step_deg",
@@ -138,6 +152,8 @@ UNSCOPED_FIELDS: frozenset[str] = frozenset(
 #: Ce que chaque production **lit** de la politique. Les dépendances
 #: transitives n'y figurent pas : elles passent par les empreintes d'entrée.
 CONSUMERS: dict[str, tuple[Facet, ...]] = {
+    "CaptureDemandManifest": (Facet.COVERAGE_TARGETS,),
+    "DemandAssessmentManifest": (Facet.COVERAGE_TARGETS, Facet.CANDIDATE_GEOMETRY),
     "CandidateManifest": (Facet.COLLECTION_DISCOVERY,),
     "CandidateEvaluation": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
     "AcquisitionPlan": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
