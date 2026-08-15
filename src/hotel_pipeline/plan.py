@@ -359,6 +359,7 @@ def build(
     sizes: dict[str, int] | None = None,
     plan_id: str | None = None,
     separation_m: float = 10.0,
+    policy=None,  # noqa: ANN001 — pour inscrire les facettes consommées
 ) -> tuple[AcquisitionPlan, list[CandidateEvaluation], PlanReport]:
     """Évalue chaque candidat pour chaque besoin, puis arrête un plan.
 
@@ -397,6 +398,10 @@ def build(
         hotel_id=hotel_id,
         status=PlanStatus.DRAFT,
         acquisitions=planned,
+        # Les facettes réellement lues : c'est par elles que le plan périme.
+        policy_dependency_digests=(
+            _facet_digests(policy) if policy is not None else {}
+        ),
         **{name: digests.get(name) for name in _PLAN_DIGEST_FIELDS},
     )
 
@@ -416,6 +421,12 @@ _PLAN_DIGEST_FIELDS = (
     "site_manifest_digest", "spatial_manifest_digest", "corpus_digest",
     "road_geometry_digest", "obstacle_geometry_digest",
 )
+
+
+def _facet_digests(policy) -> dict[str, str]:  # noqa: ANN001
+    from .policy_facets import dependency_digests
+
+    return dependency_digests(policy, "AcquisitionPlan")
 
 
 def _report(

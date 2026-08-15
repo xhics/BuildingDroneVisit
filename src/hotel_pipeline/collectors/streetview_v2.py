@@ -116,6 +116,82 @@ def candidates_from(panoramas: list, framings: list[Framing]) -> list[CaptureCan
     return produced
 
 
+def discover_panoramas(
+    corridors: list[dict],
+    spacing_m: float,
+    snap_radius_m: int,
+    probe=None,  # noqa: ANN001 — injecté pour éprouver sans clé ni réseau
+) -> tuple[list, dict[str, str]]:
+    """Cherche les panoramas le long des corridors, sans télécharger d'image.
+
+    L'endpoint de métadonnées est gratuit et dit s'il existe un panorama, où et
+    à quelle date : toute la sélection s'y fait. L'endpoint image, facturé,
+    n'intervient qu'à l'acquisition — et seulement pour ce qu'un plan consenti
+    porte.
+
+    Les panoramas sont dédupliqués par identifiant : deux points d'échantillon
+    voisins rendent le même, et l'empiler gonflerait le volume annoncé au plan.
+    """
+    from .streetview import panorama_at, sample_road_network
+
+    seen: dict[str, object] = {}
+    skipped: dict[str, str] = {}
+
+    points = sample_road_network(corridors, spacing_m=spacing_m)
+    if not points:
+        skipped["corridors"] = (
+            "aucun point d'échantillon : les corridors n'ont pas de géométrie"
+        )
+        return [], skipped
+
+    lookup = probe or _default_probe(snap_radius_m)
+
+    for lat, lon in points:
+        try:
+            panorama = lookup(lat, lon)
+        except (OSError, RuntimeError, ValueError) as exc:
+            skipped[f"{lat:.5f},{lon:.5f}"] = str(exc)[:100]
+            continue
+        if panorama is None or not panorama.pano_id:
+            continue
+        seen.setdefault(panorama.pano_id, panorama)
+
+    log.info(
+        "Street View : %d panorama(s) distinct(s) sur %d point(s) de corridor",
+        len(seen), len(points),
+    )
+    return list(seen.values()), skipped
+
+
+def _default_probe(snap_radius_m: int):  # noqa: ANN202
+    from ..config import secret
+    from .streetview import panorama_at
+
+    def probe(lat: float, lon: float):  # noqa: ANN202
+        return panorama_at(
+            lat, lon, secret("GOOGLE_MAPS_API_KEY"), radius_m=snap_radius_m
+        )
+
+    return probe
+
+
+def framings_for_targets(panorama, targets: list) -> list[Framing]:  # noqa: ANN001
+    """Un cadrage par cible visée depuis ce panorama.
+
+    Le cap n'est pas choisi au hasard ni tourné en huit : il est **dirigé** vers
+    ce qu'un besoin demande. Balayer l'horizon produirait des acquisitions que
+    rien ne réclame, et le consentement porterait sur elles.
+    """
+    from ..visibility import bearing_deg
+
+    framings: dict[float, Framing] = {}
+    for target in targets:
+        centroid = target.shape.centroid
+        heading = bearing_deg(panorama.lat, panorama.lon, centroid.y, centroid.x)
+        framings.setdefault(round(heading, 1), Framing(heading_deg=heading))
+    return list(framings.values())
+
+
 def framings_towards(bearing_deg: float, extra_offsets: tuple[float, ...] = ()) -> list[Framing]:
     """Un cadrage vers la cible, et ceux qu'on veut en plus.
 
@@ -129,11 +205,15 @@ def framings_towards(bearing_deg: float, extra_offsets: tuple[float, ...] = ()) 
     ]
 
 
-def resolve_url(request_spec: dict[str, str]) -> str:
-    """Reconstruit l'adresse d'un cadrage, au moment du téléchargement.
+def resolve_url(request_spec: dict[str, str], *, signed: bool = True) -> str:
+    """Reconstruit l'adresse d'un cadrage, au moment de la requête.
 
-    C'est le seul endroit où elle existe. La clé d'API y est jointe par
-    l'appelant, jamais conservée.
+    C'est le seul endroit où elle existe, et la clé y est jointe **ici** :
+    « l'appelant l'ajoutera » était une intention que ni la mesure de volume ni
+    le téléchargement n'honoraient, et Street View restait inutilisable en réel.
+
+    `signed=False` rend l'adresse sans clé, pour les journaux et les rapports :
+    une URL signée dans un fichier versionné y mettrait le secret.
     """
     from .streetview import IMAGE_URL
 
@@ -147,13 +227,19 @@ def resolve_url(request_spec: dict[str, str]) -> str:
             "qu'une fois entièrement cadrée"
         )
 
-    return (
+    url = (
         f"{IMAGE_URL}?size={request_spec['size']}"
         f"&pano={request_spec['pano_id']}"
         f"&heading={request_spec['heading_deg']}"
         f"&fov={request_spec['fov_deg']}"
         f"&pitch={request_spec['pitch_deg']}"
     )
+    if not signed:
+        return url
+
+    from ..config import secret
+
+    return f"{url}&key={secret('GOOGLE_MAPS_API_KEY')}"
 
 
 def _captured_at(date: str | None):  # noqa: ANN201

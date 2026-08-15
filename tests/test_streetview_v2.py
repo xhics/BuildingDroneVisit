@@ -167,14 +167,48 @@ def test_no_url_is_persisted(tmp_path) -> None:
 def test_the_address_is_rebuilt_from_the_framing_alone() -> None:
     candidate = candidate_from(Panorama("pano-A"), Framing(heading_deg=42.0))
 
-    url = resolve_url(candidate.request_spec)
+    url = resolve_url(candidate.request_spec, signed=False)
 
     assert "pano=pano-A" in url
     assert "heading=42.0" in url
     assert "fov=80.0" in url
     assert "size=640x640" in url
-    # La clé est jointe par l'appelant, jamais conservée.
     assert "key=" not in url
+
+
+def test_the_request_is_actually_signed(monkeypatch) -> None:
+    """« L'appelant ajoutera la clé » était une intention que personne
+    n'honorait : ni la mesure de volume, ni le téléchargement.
+
+    Street View était donc validé par tests unitaires et inutilisable en réel.
+    """
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "cle-d-essai")
+
+    candidate = candidate_from(Panorama("pano-A"), Framing(heading_deg=0.0))
+    signed = resolve_url(candidate.request_spec)
+
+    assert "key=cle-d-essai" in signed
+
+
+def test_the_unsigned_form_exists_for_reports(monkeypatch) -> None:
+    """Une URL signée dans un fichier versionné y mettrait le secret."""
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "cle-d-essai")
+
+    candidate = candidate_from(Panorama("pano-A"), Framing(heading_deg=0.0))
+
+    assert "key=" not in resolve_url(candidate.request_spec, signed=False)
+
+
+def test_the_acquisition_path_signs_its_request(monkeypatch) -> None:
+    """Le raccord qui manquait, éprouvé là où il compte."""
+    from hotel_pipeline.acquire import resolve_url as acquire_url
+
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "cle-d-essai")
+
+    candidate = candidate_from(Panorama("pano-A"), Framing(heading_deg=0.0))
+    url = acquire_url("street_view", candidate.request_spec)
+
+    assert "key=cle-d-essai" in url
 
 
 def test_an_incomplete_framing_cannot_be_resolved() -> None:

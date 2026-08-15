@@ -414,8 +414,23 @@ def assets_gather(
         True, "--classify/--no-classify", help="Classification OpenCLIP (couche vision)."
     ),
     force: bool = typer.Option(False, "--force", help="Réécrit le manifeste d'assets."),
+    allow_legacy: bool = typer.Option(
+        False, "--allow-legacy",
+        help="Autoriser la collecte historique sur un projet qui n'en a pas.",
+    ),
 ) -> None:
-    """Collecte multi-sources puis tri assisté (§9, §11)."""
+    """**Historique.** Collecte multi-sources puis tri assisté (§9, §11).
+
+    Cette commande télécharge d'abord et justifie ensuite : elle ignore les
+    besoins, ne demande aucun consentement sur le volume, et `--assume-rights`
+    y écrit un état de droits sans décision tracée. La chaîne V2 —
+    `discover → plan → acquire` — fait tout cela dans l'ordre inverse, qui est
+    le bon.
+
+    Elle reste disponible pour le pilote, dont le corpus en provient, et se
+    refuse aux projets neufs : un nouvel établissement contournerait sinon
+    toute l'architecture.
+    """
     from .gather import (
         build_manifest,
         collect_sources,
@@ -425,6 +440,11 @@ def assets_gather(
     )
 
     workspace = Workspace(hotel_id)
+    # Avant tout : ce projet a-t-il le droit d'employer la collecte
+    # historique ? Le contrôle vient en tête, faute de quoi un projet neuf
+    # échouerait sur un motif secondaire et croirait la commande utilisable.
+    _refuse_legacy_gather_on_a_new_project(workspace, allow_legacy)
+
     spatial = workspace.read_spatial()
     if spatial is None or not spatial.confirmed_building_id:
         typer.secho(
@@ -650,7 +670,7 @@ def assets_discover(
     typer.echo(f"  position    {profile.lat:.6f}, {profile.lon:.6f}")
     typer.echo(f"  rayon       {radius} m")
 
-    queries = _query_sources(profile, radius)
+    queries = _query_sources(profile, context, workspace, radius, demands.demands)
 
     try:
         manifest, report = discover(
@@ -679,17 +699,56 @@ def assets_discover(
     typer.echo("    prochaine étape : assets plan")
 
 
-def _query_sources(profile, radius_m: int) -> dict:  # noqa: ANN001
+def _refuse_legacy_gather_on_a_new_project(workspace, allowed: bool) -> None:  # noqa: ANN001
+    """Refuse la collecte historique là où aucun corpus n'en provient.
+
+    Un projet dont le manifeste d'assets est vide n'a rien à récupérer d'un
+    ramassage antérieur : lui en offrir un revient à contourner besoins,
+    consentement et décisions de droits.
+    """
+    if allowed:
+        typer.secho(
+            "  · collecte historique autorisée explicitement — elle télécharge "
+            "avant d'évaluer, et n'établit aucun droit",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    manifest = workspace.read_assets()
+    if manifest is not None and manifest.assets:
+        typer.secho(
+            "  · collecte historique sur un corpus existant — préférez "
+            "assets discover → plan → acquire",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    typer.secho(
+        f"{KO} collecte historique refusée sur un projet neuf : elle télécharge "
+        f"avant d'évaluer, ignore les besoins et ne demande aucun consentement "
+        f"sur le volume. Utilisez « assets discover » puis « plan » et "
+        f"« acquire ». Pour passer outre : --allow-legacy.",
+        fg=typer.colors.RED, err=True,
+    )
+    raise typer.Exit(code=2)
+
+
+def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:  # noqa: ANN001
     """Interroge les index disponibles, et dit pourquoi les autres ne le sont pas.
 
     Une source non configurée n'est pas une source vide : le motif remonte au
     manifeste, et le plan saura qu'il ne juge pas un corpus complet.
+
+    Aucune image n'est téléchargée ici, y compris pour Street View : son
+    endpoint de métadonnées est gratuit et suffit à savoir où existe un
+    panorama. L'endpoint image, facturé, n'intervient qu'à l'acquisition.
     """
     from .collectors import mapillary
     from .discover import candidates_from
     from .providers.cache import OfflineError
 
     queries: dict = {}
+
     try:
         images = mapillary.collect(profile.lat, profile.lon, radius_m=radius_m)
     except OfflineError as exc:
@@ -699,7 +758,100 @@ def _query_sources(profile, radius_m: int) -> dict:  # noqa: ANN001
     else:
         queries["mapillary"] = candidates_from("mapillary", images)
 
+    queries["street_view"] = _street_view_candidates(
+        context, workspace, radius_m, demands
+    )
     return queries
+
+
+def _street_view_candidates(context, workspace, radius_m: int, demands):  # noqa: ANN001, ANN201
+    """Panoramas des corridors proches, cadrés vers ce que les besoins demandent.
+
+    Le cap est **dirigé**, jamais balayé : tourner l'horizon produirait des
+    acquisitions que rien ne réclame, et le consentement porterait sur elles.
+    """
+    from .collectors.streetview_v2 import (
+        candidate_from, discover_panoramas, framings_for_targets,
+    )
+    from .demand_targets import TargetUnresolved, resolve
+    from .geo.geometry_loader import LegacyManifestRefused, load_capture_geometry
+    from .providers.cache import OfflineError
+
+    reference = context.spatial_reference
+    geometry_path = workspace.path("06_geo", "capture_geometry.json")
+    if reference is None or not geometry_path.is_file():
+        return (
+            "aucune géométrie de capture : les corridors où chercher des "
+            "panoramas ne sont pas résolus"
+        )
+
+    try:
+        manifest, _ = load_capture_geometry(geometry_path, reference)
+    except LegacyManifestRefused as exc:
+        return f"géométrie illisible : {exc}"
+
+    corridors = _corridor_elements(manifest)
+    if not corridors:
+        return "aucun corridor résolu autour du site"
+
+    spatial = _safe_read(workspace.read_spatial)
+    front = getattr(spatial, "front_azimuth_deg", None) if spatial else None
+    targets = []
+    for demand in demands:
+        try:
+            targets.append(
+                resolve(demand, manifest, front, _safe_read(workspace.read_site))
+            )
+        except TargetUnresolved:
+            continue
+    if not targets:
+        return "aucune cible de besoin résolue : rien vers quoi cadrer"
+
+    try:
+        panoramas, skipped = discover_panoramas(
+            corridors,
+            spacing_m=context.policy.collection.sample_spacing_m,
+            snap_radius_m=context.policy.collection.snap_radius_m,
+        )
+    except OfflineError as exc:
+        return f"hors ligne : {exc}"
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        return f"interrogation impossible : {exc}"
+
+    if skipped:
+        typer.secho(
+            f"    street_view · {len(skipped)} point(s) sans réponse",
+            fg=typer.colors.YELLOW,
+        )
+
+    return [
+        candidate_from(panorama, framing)
+        for panorama in panoramas
+        for framing in framings_for_targets(panorama, targets)
+    ]
+
+
+def _corridor_elements(manifest) -> list[dict]:  # noqa: ANN001
+    """Corridors résolus, au format qu'attend l'échantillonnage de voirie."""
+    from shapely import wkt as shapely_wkt
+
+    from .schemas.geometry import GeometryResolutionStatus, GeometryRole
+
+    elements = []
+    for geometry in manifest.geometries:
+        if geometry.role not in (GeometryRole.ROAD_CANDIDATE, GeometryRole.ACCESS_ROAD):
+            continue
+        if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
+            continue
+        shape = shapely_wkt.loads(geometry.wgs84_wkt)
+        coords = (
+            list(shape.coords) if shape.geom_type == "LineString"
+            else [point for part in shape.geoms for point in part.coords]
+        )
+        elements.append(
+            {"geometry": [{"lat": lat, "lon": lon} for lon, lat in coords]}
+        )
+    return elements
 
 
 @assets_app.command("plan")
@@ -763,6 +915,7 @@ def assets_plan(
             hotel_id, candidates.candidates, demands.demands, digests,
             geometries=geometries, sizes=sizes,
             separation_m=context.policy.geometry.viewpoint_separation_m,
+            policy=context.policy,
         )
     except PlanRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -817,6 +970,17 @@ def assets_plan(
     typer.echo(f"  statut          {report.volume_status}")
 
     if consent_bytes is not None:
+        # Un brouillon montre les obligations manquantes ; un plan exécutable
+        # ne peut pas les ignorer. Consentir à acquérir un corpus dont on sait
+        # qu'il laisse un objet sans couverture, c'est le figer incomplet.
+        if not coverage.complete:
+            typer.secho(
+                f"{KO} consentement refusé : {len(coverage.unmet)} obligation(s) "
+                f"sans demande ni dispense — {', '.join(coverage.unmet)}. "
+                f"Déclarez une demande, ou une dispense motivée.",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=2)
         if plan.volume_status is not VolumeStatus.EXACT:
             typer.secho(
                 f"{KO} consentement refusé : le volume est « "
@@ -1107,6 +1271,7 @@ def assets_acquire(
         acquired, report = run(
             plan, candidates, destination, digests,
             plan_digest=digest_of(plan_payload), run_id=run_id,
+            policy=context.policy,
         )
     except AcquisitionRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)

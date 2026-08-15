@@ -40,6 +40,10 @@ from .enums import ViewSector
 #: Champs d'empreinte qu'un plan exécutable doit **tous** porter. Une liste
 #: fermée, vérifiée par le plan lui-même : laisser l'appelant choisir ce qu'il
 #: transmet permettait de déclarer courant un plan sans lien avec le site.
+#: `policy_digest` y figure pour la **provenance** : un plan doit dire avec
+#: quels réglages il a été produit. Il n'y sert pas de dépendance — c'est
+#: `policy_dependency_digests` qui décide de sa péremption, sans quoi un seuil
+#: de terrain périmerait un plan photographique.
 REQUIRED_PLAN_DIGESTS: tuple[str, ...] = (
     "candidate_manifest_digest",
     "demand_digest",
@@ -803,6 +807,12 @@ class AcquisitionPlan(BaseModel):
     corpus_digest: str | None = None
     road_geometry_digest: str | None = None
     obstacle_geometry_digest: str | None = None
+
+    #: Empreintes des **facettes** de politique que ce plan lit réellement.
+    #: Distinctes de `policy_digest`, qui bouge dès qu'un seuil change où que
+    #: ce soit : un réglage de terrain n'a rien à voir avec une sélection
+    #: photographique, et le laisser périmer le plan obligerait à tout refaire.
+    policy_dependency_digests: dict[str, str] = Field(default_factory=dict)
 
     @property
     def known_bytes(self) -> int:

@@ -234,3 +234,65 @@ def test_the_acquisition_command_no_longer_takes_rights() -> None:
     from hotel_pipeline.cli import assets_acquire
 
     assert "rights" not in inspect.signature(assets_acquire).parameters
+
+
+# --- la collecte historique ne contourne plus l'architecture -------------------
+
+
+def test_legacy_gather_is_refused_on_a_new_project(tmp_path, monkeypatch) -> None:
+    """Un nouvel établissement contournerait sinon besoins, consentement et droits."""
+    from typer.testing import CliRunner
+
+    from hotel_pipeline.cli import app
+
+    monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path / "work"))
+    monkeypatch.setenv("HOTEL_PIPELINE_PROFILES", str(tmp_path / "profiles"))
+    monkeypatch.setenv("HOTEL_PIPELINE_OFFLINE", "1")
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    runner.invoke(app, [
+        "init", "neuf", "--address", "1 rue Test", "--name", "Hôtel Neuf",
+        "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr",
+        "--lat", "45.573", "--lon", "-73.443",
+    ])
+
+    result = runner.invoke(app, ["assets", "gather", "neuf"])
+
+    assert result.exit_code == 2
+    assert "collecte historique refusée" in result.output
+    assert "assets discover" in result.output
+    # Aucun fichier n'a été téléchargé.
+    images = tmp_path / "work" / "neuf" / "02_images"
+    assert not images.exists() or not any(images.rglob("*.jpg"))
+
+
+def test_legacy_gather_stays_available_where_a_corpus_came_from_it(
+    tmp_path, monkeypatch
+) -> None:
+    """Le pilote en provient : le lui interdire réécrirait son histoire."""
+    from typer.testing import CliRunner
+
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.schemas import AssetManifest
+    from hotel_pipeline.workspace import Workspace
+
+    monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path / "work"))
+    monkeypatch.setenv("HOTEL_PIPELINE_PROFILES", str(tmp_path / "profiles"))
+    monkeypatch.setenv("HOTEL_PIPELINE_OFFLINE", "1")
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    runner.invoke(app, [
+        "init", "ancien", "--address", "1 rue Test", "--name", "Hôtel Ancien",
+        "--country", "CA", "--timezone", "America/Toronto", "--ocr-language", "fr",
+        "--lat", "45.573", "--lon", "-73.443",
+    ])
+    workspace = Workspace("ancien")
+    workspace.write_assets(AssetManifest(hotel_id="ancien", assets=[asset()]))
+
+    result = runner.invoke(app, ["assets", "gather", "ancien"])
+
+    # Elle s'arrête plus loin, faute de bâtiment confirmé — mais elle n'est
+    # plus refusée d'emblée, et l'avertissement porte.
+    assert "collecte historique refusée" not in result.output

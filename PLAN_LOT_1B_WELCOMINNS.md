@@ -40,7 +40,6 @@ Le principe directeur est simple : **observer, mesurer ou masquer — jamais inv
 
 - hloc, LightGlue et pycolmap ;
 - entraînement ou rendu de Gaussian Splat ;
-- Router final des chemins A à D ;
 - environnement composite final dans Blender ;
 - conception d'un mouvement de caméra ou d'une vidéo ;
 - génération visuelle destinée à remplacer une zone inconnue.
@@ -66,25 +65,28 @@ Toutes les sources publiques ou accessibles sont considérées utilisables à la
 
 ### Corpus actuellement enregistré
 
+Les chiffres ci-dessous datent de la **collecte historique**, antérieure à la
+chaîne V2. Ils décrivent ce que `assets gather` a ramassé, non ce qu'un besoin
+a demandé — et c'est précisément ce que la V2 corrige.
+
 | Mesure | Valeur actuelle |
 |---|---:|
-| Images totales | 219 |
-| Mapillary | 189 |
-| Street View | 8 |
-| Google Places | 10 |
-| Site officiel | 12 |
-| Images avec position | 197 |
-| Images extérieures | 203 |
-| Images cadrant réellement le bâtiment | 20 |
-| Vues de façade principale | 17 |
-| Vues latérales éparses | 3 |
+| Fichiers au manifeste | 329 |
+| Points de vue indépendants | 206 |
+| Rôles `context_lock` | 298 |
+| Rôles `reference_only` | 16 |
+| Rôles `photo_geometry` | 9 |
+| Rôles `identity_evidence` | 5 |
+| Points de vue porteurs de géométrie | 6 |
+| Façades couvertes | 1 (avant, et un coin) |
 | Arrière | 0 |
 | Toiture exploitable au sol | 0 |
-| Images sans position | 22 |
-| OCR lisible parmi ces 22 | 6 |
-| OCR confirmant explicitement WelcomINNS | 1 |
 
-Le seuil quantitatif de 20 extérieurs est atteint, mais pas la diversité. Les 219 fichiers représentent principalement une seule façade vue depuis la rue Ampère.
+Le nombre n'est pas le problème : 329 fichiers pour 6 points de vue porteurs, tous
+du même côté. Les quatre façades, l'entrée actuelle et la parcelle restent non
+résolues au manifeste de site. C'est une couverture d'une seule face, pas un
+corpus de reconstruction — et aucun ramassage supplémentaire ne le corrigera,
+puisque le défaut est dans la stratégie de recherche, non dans le volume.
 
 ### Limites déjà mesurées et à ne pas réexaminer en boucle
 
@@ -513,7 +515,7 @@ La capture complémentaire ne devient obligatoire que si une demande future exig
 ### Étape 1 — Corriger la structure de vérité
 
 - étendre les schémas du manifeste ;
-- migrer sans perte les 219 assets existants ;
+- migrer sans perte les 219 assets existants (état du corpus à la date de la migration ; il en compte 329 aujourd'hui) ;
 - ajouter les enums et validations ;
 - préserver l'historique et la provenance.
 
@@ -584,7 +586,7 @@ Ordre : TripAdvisor voyageurs → Meta → PIIA/hôtel/intervenants → ICEPorta
 
 ### Schémas et migration
 
-- migration des 219 assets sans perte ;
+- migration des 219 assets sans perte — chiffre d'époque, conservé tel quel ;
 - enums invalides rejetés explicitement ;
 - provenance multiple préservée ;
 - droits assumés tracés mais non bloquants.

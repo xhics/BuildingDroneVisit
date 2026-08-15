@@ -170,13 +170,18 @@ def verify_acquired(assets: list[Asset], workspace_root: Path | None = None) -> 
     return problems
 
 
-def plan_is_current(plan, digests: dict[str, str | None]) -> list[str]:  # noqa: ANN001
+def plan_is_current(plan, digests: dict[str, str | None], policy=None) -> list[str]:  # noqa: ANN001
     """Confronte un plan à l'état courant, sur une **liste fermée** de champs.
 
     Ne vérifier que les clés transmises laissait l'appelant décider de ce qui
     serait contrôlé : un plan sans lien avec le site passait pour courant. Ici,
     une empreinte absente — du plan comme de l'état courant — est un refus, et
     non un silence.
+
+    `policy_digest` est comparé pour la **provenance** seulement quand aucune
+    facette n'est déclarée. Dès que le plan porte ses dépendances, ce sont
+    elles qui jugent : un seuil de terrain, ou une calibration renommée,
+    n'a aucune raison de périmer une sélection photographique.
     """
     from .schemas.acquisition import REQUIRED_PLAN_DIGESTS, PlanStatus
 
@@ -184,7 +189,17 @@ def plan_is_current(plan, digests: dict[str, str | None]) -> list[str]:  # noqa:
     if getattr(plan, "status", None) is PlanStatus.DRAFT:
         stale.append("plan à l'état de brouillon : un brouillon ne s'acquiert pas")
 
+    recorded_facets = getattr(plan, "policy_dependency_digests", None) or {}
+    if recorded_facets and policy is not None:
+        from .policy_facets import stale_facets
+
+        stale.extend(stale_facets(recorded_facets, policy, "AcquisitionPlan"))
+
     for name in REQUIRED_PLAN_DIGESTS:
+        # La politique est jugée par ses facettes dès qu'elles existent :
+        # comparer aussi l'empreinte complète rendrait la finesse inutile.
+        if name == "policy_digest" and recorded_facets and policy is not None:
+            continue
         recorded = getattr(plan, name, None)
         current = digests.get(name)
         if not recorded:

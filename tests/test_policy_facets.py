@@ -22,6 +22,7 @@ from hotel_pipeline.policy_facets import (
 )
 from hotel_pipeline.provenance import policy_digest
 from hotel_pipeline.schemas import DEFAULT_POLICY, PipelinePolicy
+from hotel_pipeline.schemas.acquisition import REQUIRED_PLAN_DIGESTS
 
 
 def altered(**changes) -> PipelinePolicy:
@@ -356,3 +357,79 @@ def test_every_declared_production_is_actually_published() -> None:
     missing = sorted(set(CONSUMERS) - published)
 
     assert missing == [], f"productions déclarées mais jamais publiées : {missing}"
+
+
+# --- le plan est jugé par ses facettes, non par l'empreinte complète ----------
+
+
+def test_a_terrain_threshold_no_longer_stales_an_executable_plan() -> None:
+    """Le blocage constaté : le plan dépendait encore de `policy_digest`.
+
+    Un réglage de terrain n'a rien à voir avec une sélection photographique ;
+    le laisser périmer le plan obligeait à tout refaire pour rien.
+    """
+    from hotel_pipeline.acquisition import plan_is_current
+    from hotel_pipeline.plan import build
+    from hotel_pipeline.schemas.acquisition import (
+        REQUIRED_PLAN_DIGESTS, CaptureCandidate, CaptureDemand, CaptureIntent,
+        TargetKind,
+    )
+
+    digests = {name: f"{name[:4]}0" for name in REQUIRED_PLAN_DIGESTS}
+    digests["policy_digest"] = policy_digest(DEFAULT_POLICY)
+
+    plan, _, _ = build(
+        "h",
+        [CaptureCandidate(
+            candidate_id="c1", source="mapillary", provider_id="1",
+            camera_lat=45.573, camera_lon=-73.443,
+        )],
+        [CaptureDemand(
+            demand_id="d1", intent=CaptureIntent.BUILDING_CAPTURE,
+            target_kind=TargetKind.VIEW_SECTOR, target_ref="front",
+        )],
+        digests, policy=DEFAULT_POLICY,
+    )
+    plan = plan.model_copy(update={"status": "executable"})
+
+    assert plan.policy_dependency_digests, "le plan doit porter ses facettes"
+
+    # Un seuil de terrain bouge : l'empreinte complète change, le plan non.
+    moved_terrain = altered(**{"terrain.ring_m": 35.0})
+    current = dict(digests)
+    current["policy_digest"] = policy_digest(moved_terrain)
+
+    assert plan_is_current(plan, current, moved_terrain) == []
+
+    # Un seuil de cadrage, en revanche, le périme bien.
+    moved_framing = altered(**{"geometry.sector_observer_half_width_deg": 30.0})
+    framing_current = dict(digests)
+    framing_current["policy_digest"] = policy_digest(moved_framing)
+
+    problems = plan_is_current(plan, framing_current, moved_framing)
+    assert any("candidate_geometry" in problem for problem in problems)
+
+
+def test_a_plan_without_facets_still_compares_the_full_digest() -> None:
+    """Les plans écrits avant les facettes restent jugés, sans passe-droit."""
+    from hotel_pipeline.acquisition import plan_is_current
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan, CaptureIntent, PlannedAcquisition, PlanStatus,
+    )
+
+    digests = {name: f"{name[:4]}0" for name in REQUIRED_PLAN_DIGESTS}
+    legacy = AcquisitionPlan(
+        plan_id="p", hotel_id="h", status=PlanStatus.EXECUTABLE,
+        acquisitions=[PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+        )],
+        **digests,
+    )
+
+    moved = dict(digests)
+    moved["policy_digest"] = "autre-chose"
+
+    problems = plan_is_current(legacy, moved, DEFAULT_POLICY)
+
+    assert any("policy_digest" in problem for problem in problems)

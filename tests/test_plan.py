@@ -394,10 +394,37 @@ def test_the_cli_plan_downloads_nothing_and_stays_a_draft(project) -> None:
 
 
 def test_consenting_to_an_unknown_volume_is_refused(project) -> None:
-    """Le cas dangereux : consentir à un total dont une part est invisible."""
-    from hotel_pipeline.cli import app
+    """Le cas dangereux : consentir à un total dont une part est invisible.
 
-    runner, _, _ = project
+    Le montage déclare toutes les obligations, sans quoi le refus porterait sur
+    la couverture — un autre motif, et le test ne prouverait plus rien du
+    volume.
+    """
+    import json
+
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.coverage_obligations import OBLIGATIONS
+    from hotel_pipeline.schemas.acquisition import CaptureDemandManifest
+
+    runner, workspace, _ = project
+    workspace.write_json(
+        "01_sources/capture_demands.json",
+        json.loads(
+            CaptureDemandManifest(
+                hotel_id="hotel-test",
+                demands=[
+                    CaptureDemand(
+                        demand_id=f"d-{obligation.object_id.lower()}",
+                        intent=obligation.intent,
+                        target_kind=obligation.target_kind,
+                        target_ref=obligation.expected_target_ref,
+                    )
+                    for obligation in OBLIGATIONS
+                    if obligation.mandatory
+                ],
+            ).model_dump_json()
+        ),
+    )
 
     result = runner.invoke(
         app, ["assets", "plan", "hotel-test", "--consent-bytes", "0"]

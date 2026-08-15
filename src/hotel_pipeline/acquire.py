@@ -98,11 +98,13 @@ def resolve_url(source: str, request_spec: dict[str, str]) -> str:
     return thumbnail_url(provider_id, request_spec.get("resolution", "thumb_2048"))
 
 
-def check_executable(plan: AcquisitionPlan, digests: dict[str, str | None]) -> list[str]:
+def check_executable(
+    plan: AcquisitionPlan, digests: dict[str, str | None], policy=None  # noqa: ANN001
+) -> list[str]:
     """Le plan peut-il être exécuté maintenant, et tel quel ?"""
     from .acquisition import plan_is_current
 
-    return plan_is_current(plan, digests)
+    return plan_is_current(plan, digests, policy)
 
 
 def run(
@@ -113,6 +115,7 @@ def run(
     plan_digest: str,
     fetcher=None,  # noqa: ANN001 — injecté pour éprouver sans réseau
     run_id: str | None = None,
+    policy=None,  # noqa: ANN001
 ) -> tuple[list, AcquireReport]:
     """Télécharge ce que le plan porte, et rien d'autre.
 
@@ -131,7 +134,7 @@ def run(
             "non consenti ne s'acquiert pas"
         )
 
-    stale = check_executable(plan, digests)
+    stale = check_executable(plan, digests, policy)
     if stale:
         raise AcquisitionRefused(
             "plan périmé — les images auraient été choisies pour un autre "

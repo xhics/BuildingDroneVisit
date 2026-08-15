@@ -304,3 +304,33 @@ def test_a_declared_waiver_silences_the_warning(project) -> None:
 
     assert result.exit_code == 0, result.output
     assert "obligations couvertes" in result.output
+
+
+def test_an_executable_plan_is_refused_while_an_obligation_is_unmet(project) -> None:
+    """Un brouillon montre le manque ; l'exécutable ne peut pas l'ignorer.
+
+    Consentir à acquérir un corpus dont on sait qu'il laisse un objet sans
+    couverture reviendrait à le figer incomplet.
+    """
+    from hotel_pipeline.cli import app
+
+    runner, _, write_demands = project
+    write_demands([
+        demand_for(o) for o in mandatory() if o.expected_target_ref != "rear"
+    ])
+
+    draft = runner.invoke(app, ["assets", "plan", "hotel-test"])
+    assert draft.exit_code == 0
+    assert "FACADE_REAR" in draft.output
+
+    consented = runner.invoke(
+        app, ["assets", "plan", "hotel-test", "--consent-bytes", "0"]
+    )
+
+    assert consented.exit_code == 2
+    # Le motif doit être **la couverture**, non le volume : les deux refus se
+    # ressemblent, et un test satisfait par le mauvais ne prouve rien. Sans ce
+    # contrôle, neutraliser le garde-fou des obligations ne cassait aucun test.
+    assert "obligation(s) sans demande ni dispense" in consented.output
+    assert "FACADE_REAR" in consented.output
+    assert "n'a pas été montré" not in consented.output
