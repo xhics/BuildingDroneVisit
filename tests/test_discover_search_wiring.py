@@ -38,6 +38,7 @@ class FakeContext:
     target: tuple | None = TARGET
     sector: object = None
     viewpoint_separation_m: float | None = None
+    framing_merge_bearing_deg: float | None = None
     viewpoints: dict = field(default_factory=dict)
     policy: object = field(
         default_factory=lambda: DEFAULT_POLICY.adaptive_search
@@ -364,4 +365,29 @@ def test_a_stage_that_did_not_run_says_so(rear_demand, three_candidates):
     assert report.search.enrichment_calls == 0
     assert all(reason for reason in skipped.values()), (
         "une étape sautée sans motif ne vaut pas mieux qu'un zéro"
+    )
+
+
+def test_discover_actually_merges_near_identical_framings(rear_demand):
+    """La fonction de regroupement doit être **appelée**, pas seulement juste.
+
+    Le pilote produisait trois cadrages par panorama, dont deux séparés de
+    1,5° : deux requêtes pour une même image.
+    """
+    lat, lon = _south_of(TARGET, 40)
+    framings = [
+        candidate("sv-1", lat, lon, panorama_id="A", requested_heading_deg=131.8),
+        candidate("sv-2", lat, lon, panorama_id="A", requested_heading_deg=133.3),
+        candidate("sv-3", lat, lon, panorama_id="A", requested_heading_deg=199.7),
+    ]
+
+    manifest, report = discover(
+        HOTEL, _demands(rear_demand), {"street_view": framings},
+        search=FakeContext(outstanding=[rear_demand], framing_merge_bearing_deg=15.0),
+    )
+
+    kept = {c.candidate_id for c in manifest.candidates}
+    assert len(kept) == 2, "les cadrages voisins n'ont pas été regroupés"
+    assert report.framings_merged == {"sv-2": "sv-1"}, (
+        "l'écarté doit rester nommé dans la trace d'audit"
     )

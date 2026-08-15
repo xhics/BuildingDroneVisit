@@ -175,6 +175,19 @@ class CollectionPolicy(BaseModel):
 
     radius_m: int = Field(default=500, ge=25, le=2000)
     road_radius_m: int = Field(default=350, ge=25, le=2000)
+
+    #: Résolution d'un **aperçu**. Une vue dont on ignore ce qu'elle montre se
+    #: vérifie en miniature : la télécharger en pleine résolution dépenserait
+    #: le volume avant de savoir s'il valait la peine.
+    #: En deçà de cet écart de cap, deux cadrages d'un même panorama montrent
+    #: la même chose. Deux requêtes pour une image : le pilote en produisait
+    #: trois par panorama dont deux à 1,5° l'une de l'autre.
+    framing_merge_bearing_deg: float = Field(default=15.0, gt=0, le=180)
+
+    preview_resolution: str = Field(default="256", min_length=1)
+
+    #: Résolution d'une acquisition complète, une fois le niveau établi.
+    full_resolution: str = Field(default="2048", min_length=1)
     sample_spacing_m: float = Field(default=15.0, gt=0)
     snap_radius_m: int = Field(default=25, gt=0)
     max_panorama_distance_m: float = Field(default=220.0, gt=0)

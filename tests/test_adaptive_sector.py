@@ -625,3 +625,59 @@ def test_a_facade_proxy_resolves_as_a_sector_not_an_object() -> None:
     assert as_sector is not None, "un proxy de façade doit se résoudre"
     assert as_sector.required_bearing_deg == pytest.approx(137.7, abs=0.1)
     assert as_object is not None, "le bâtiment se rejoint par son rôle déclaré"
+
+
+# --- « pleinement éligible » est une affirmation sur toutes les exigences -----
+
+
+def _aimed_measure(need, **context_overrides):
+    aimed = candidate("c-visee", *at_bearing(0.0), original_heading_deg=180.0)
+    context = sector_context(need.demand_id, 0.0, **context_overrides)
+    measure = measure_candidate(
+        aimed, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    _select([measure], {aimed.candidate_id: aimed}, need)
+    return measure
+
+
+def test_a_required_projected_width_keeps_the_candidate_in_preview() -> None:
+    """La taille projetée se calcule sur un cadrage, pas sur des métadonnées.
+
+    Sans cette réserve, une vue devenait pleinement acquérable alors que rien
+    n'établissait qu'elle montre la cible assez grande.
+    """
+    need = demand("obligation:front", "front", min_projected_width_fraction=0.25)
+    measure = _aimed_measure(need)
+
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert "taille projetée" in measure.unmeasured_requirements
+
+
+def test_a_required_visible_fraction_keeps_the_candidate_in_preview() -> None:
+    need = demand("obligation:front", "front", min_visible_fraction=0.5)
+    measure = _aimed_measure(need)
+
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert "fraction visible" in measure.unmeasured_requirements
+
+
+def test_required_continuity_without_enrichment_stays_preview() -> None:
+    """L'enrichissement de séquence n'a pas eu lieu : la continuité est
+    inconnue, et inconnu n'est pas satisfait."""
+    need = demand("obligation:front", "front", continuity_required=0.6)
+    measure = _aimed_measure(need)
+
+    assert measure.continuity_gain is None, "aucune séquence n'a été interrogée"
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert "continuité" in measure.unmeasured_requirements
+
+
+def test_a_demand_without_extra_requirements_can_be_fully_eligible() -> None:
+    """Sans quoi le niveau complet deviendrait inatteignable, ce qui n'est pas
+    le but : l'exigence doit être réelle, pas systématique."""
+    need = demand("obligation:front", "front")
+    measure = _aimed_measure(need)
+
+    assert measure.unmeasured_requirements == []
+    assert measure.recommendation_level is RecommendationLevel.FULL_ACQUISITION

@@ -55,6 +55,9 @@ class DiscoveryReport:
     #: Rapport de recherche adaptative, quand elle a eu lieu.
     search: object = None
 
+    #: Cadrages regroupés faute de différer : `écarté` → `retenu`.
+    framings_merged: dict = field(default_factory=dict)
+
     #: Cadrages, panoramas et points de vue comptés **séparément**. Un seul
     #: chiffre les confondrait, et 1442 candidats pour 721 panoramas se lirait
     #: comme un doublon alors que ce sont deux acquisitions légitimes.
@@ -89,6 +92,7 @@ class DiscoveryReport:
             },
             "adaptive_search": self.search.as_dict() if self.search else None,
             "viewpoint_counts": self.viewpoint_counts,
+            "framings_merged": self.framings_merged,
             "bytes_downloaded": 0,
             "limits": self.limits or LIMITS,
         }
@@ -157,6 +161,54 @@ def _captured_at(image):  # noqa: ANN001, ANN201
     return datetime(int(year), 1, 1, tzinfo=timezone.utc)
 
 
+def merge_near_identical_framings(
+    candidates: list[CaptureCandidate], bearing_tolerance_deg: float,
+) -> tuple[list[CaptureCandidate], dict[str, str]]:
+    """Réunit les cadrages d'un même panorama dont les caps se confondent.
+
+    Deux cadrages séparés de 1,5° montrent la même chose et coûtent deux
+    requêtes. Les fusionner n'est pas une déduplication d'identité — ce sont
+    bien deux acquisitions possibles — mais un choix : à contenu identique, une
+    seule suffit.
+
+    Les écartés sont **rendus**, avec le cadrage qui les remplace. Les perdre
+    ferait disparaître la trace de ce qui a été proposé puis regroupé.
+    """
+    if bearing_tolerance_deg <= 0:
+        return candidates, {}
+
+    kept: list[CaptureCandidate] = []
+    merged: dict[str, str] = {}
+    by_panorama: dict[str, list[CaptureCandidate]] = {}
+
+    for candidate in sorted(candidates, key=lambda c: c.candidate_id):
+        if not candidate.panorama_id:
+            kept.append(candidate)
+            continue
+        heading = candidate.requested_heading_deg
+        if heading is None:
+            kept.append(candidate)
+            continue
+
+        group = by_panorama.setdefault(candidate.panorama_id, [])
+        twin = next(
+            (
+                other for other in group
+                if abs(
+                    (other.requested_heading_deg - heading + 180.0) % 360.0 - 180.0
+                ) <= bearing_tolerance_deg
+            ),
+            None,
+        )
+        if twin is not None:
+            merged[candidate.candidate_id] = twin.candidate_id
+            continue
+        group.append(candidate)
+        kept.append(candidate)
+
+    return kept, merged
+
+
 def deduplicate(candidates: list[CaptureCandidate]) -> tuple[list[CaptureCandidate], int]:
     """Écarte les doublons d'identité, en conservant le premier vu.
 
@@ -216,6 +268,13 @@ def discover(
 
     unique, dropped = deduplicate(collected)
     report.duplicates_dropped = dropped
+
+    tolerance = getattr(search, "framing_merge_bearing_deg", None) if search else None
+    if tolerance:
+        unique, merged = merge_near_identical_framings(unique, tolerance)
+        # Trace d'audit : les regroupés sont nommés, avec leur remplaçant. Un
+        # simple compteur ne dirait pas **lequel** a été proposé puis écarté.
+        report.framings_merged = merged
 
     evaluations, recommended, search_report, by_level = _adaptive_pass(
         hotel_id, unique, search, report,

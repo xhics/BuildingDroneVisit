@@ -797,6 +797,9 @@ class AdaptiveContext:
     #: Distance en deçà de laquelle deux caméras sont un seul point de vue.
     viewpoint_separation_m: float | None = None
 
+    #: Écart de cap en deçà duquel deux cadrages montrent la même chose.
+    framing_merge_bearing_deg: float | None = None
+
     policy: object = None
     collection: object = None
     lineage: dict = field(default_factory=dict)
@@ -862,6 +865,9 @@ def _adaptive_context(workspace, context, demands, demands_payload):  # noqa: AN
         sector=sector,
         viewpoints=viewpoints,
         viewpoint_separation_m=context.policy.geometry.viewpoint_separation_m,
+        framing_merge_bearing_deg=(
+            context.policy.collection.framing_merge_bearing_deg
+        ),
         policy=context.policy.adaptive_search,
         collection=context.policy.collection,
         lineage={
@@ -1079,6 +1085,10 @@ def assets_plan(
             geometries=geometries, sizes=sizes,
             separation_m=context.policy.geometry.viewpoint_separation_m,
             policy=context.policy,
+            # Les niveaux prononcés par la recherche **contraignent** le plan :
+            # sans eux, les trois listes publiées restaient informatives et une
+            # preview entrait en pleine résolution.
+            levels=_recommendation_levels(candidates),
         )
     except PlanRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
@@ -4197,3 +4207,21 @@ def _resolve_proxy(proxy_ref, demand, geometry, front, site, half_width):  # noq
         # Le proxy lui-même n'est pas résolu : on ne cherche pas autour d'un
         # repère qu'on ne sait pas placer.
         return None
+
+
+def _recommendation_levels(candidates) -> dict[str, str]:  # noqa: ANN001
+    """Niveau prononcé par la recherche, par candidat.
+
+    Un candidat absent de ce tableau n'a été recommandé à rien : le plan ne le
+    repêche pas. Le tableau **vide** est distinct — il signifie qu'aucune
+    recherche n'a eu lieu, et le plan retrouve alors son comportement antérieur
+    plutôt que de tout refuser.
+    """
+    levels: dict[str, str] = {}
+    for candidate_id in getattr(candidates, "recommended_for_enrichment", []):
+        levels[candidate_id] = "recommended_for_enrichment"
+    for candidate_id in getattr(candidates, "recommended_for_preview", []):
+        levels[candidate_id] = "recommended_for_preview"
+    for candidate_id in getattr(candidates, "eligible_for_full_acquisition", []):
+        levels[candidate_id] = "eligible_for_full_acquisition"
+    return levels

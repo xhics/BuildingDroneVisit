@@ -75,6 +75,10 @@ PILOT_POLICY_DIGESTS = {
         "hors de portée de recommandation n'est pas inutilisable : sans les "
         "intrinsèques de la caméra, la distance seule ne prouve rien"
     ),
+    "4034de29c03892b8": (
+        "avec framing_merge_bearing_deg et les deux résolutions — une preview "
+        "se vérifie en miniature, jamais en pleine résolution"
+    ),
 }
 
 

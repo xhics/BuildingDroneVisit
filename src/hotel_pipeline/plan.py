@@ -282,6 +282,9 @@ def select(
     sizes: dict[str, int] | None = None,
     candidates: dict | None = None,
     separation_m: float = 10.0,
+    levels: dict[str, str] | None = None,
+    preview_resolution: str = "256",
+    full_resolution: str = "2048",
 ) -> list[PlannedAcquisition]:
     """Retient ce qui sert un besoin, en respectant le nombre attendu.
 
@@ -289,13 +292,28 @@ def select(
     deux cadrages d'un même panorama ne comptent que pour un. Sans le
     dictionnaire des candidats, la position est inconnue et chaque candidat
     compte pour lui-même — l'appelant qui veut le décompte juste le fournit.
+
+    `levels` porte le niveau que la **recherche** a prononcé. Le plan ne peut
+    pas le contredire : un candidat qu'aucun niveau n'autorise n'entre pas au
+    plan, et une preview y entre en miniature. Sans cette contrainte, les trois
+    listes publiées restaient informatives et le plan téléchargeait en pleine
+    résolution ce que la recherche bornait à l'aperçu.
     """
     announced = sizes or {}
     known = candidates or {}
     viewpoints = group_viewpoints(list(known.values()), separation_m)
+    # Ce que la recherche a prononcé. `None` signifie « aucun niveau » : le
+    # candidat n'a été recommandé à rien, et le plan ne le repêche pas de
+    # lui-même — sinon les trois listes ne contraindraient rien.
+    graded = levels or {}
+
     by_demand: dict[str, list[CandidateEvaluation]] = {}
+    unrecommended: set[str] = set()
     for evaluation in evaluations:
         if evaluation.eligibility is Eligibility.REJECTED:
+            continue
+        if graded and evaluation.candidate_id not in graded:
+            unrecommended.add(evaluation.candidate_id)
             continue
         by_demand.setdefault(evaluation.demand_id, []).append(evaluation)
 
@@ -334,6 +352,14 @@ def select(
     for candidate_id in sorted(wanted):
         served = sorted(wanted[candidate_id])
         chosen = sorted(intents[candidate_id], key=lambda i: i.value)
+
+        # Une preview se vérifie en miniature. La planifier en pleine
+        # résolution dépenserait le volume avant de savoir s'il le valait.
+        level = graded.get(candidate_id)
+        is_preview = level in (
+            "recommended_for_preview", "recommended_for_enrichment"
+        )
+        resolution = preview_resolution if is_preview else full_resolution
         planned.append(
             PlannedAcquisition(
                 candidate_id=candidate_id,
@@ -341,9 +367,14 @@ def select(
                 primary_intent=chosen[0],
                 serves_demands=served,
                 # `None` et non zéro : une taille absente est inconnue.
+                resolution=resolution,
                 expected_bytes=announced.get(candidate_id),
                 selection_rationale=(
                     "retenu pour " + ", ".join(sorted(reasons[candidate_id]))
+                    + (
+                        f" — {level}, planifié en {resolution}"
+                        if level else ""
+                    )
                 ),
             )
         )
@@ -360,6 +391,7 @@ def build(
     plan_id: str | None = None,
     separation_m: float = 10.0,
     policy=None,  # noqa: ANN001 — pour inscrire les facettes consommées
+    levels: dict[str, str] | None = None,
 ) -> tuple[AcquisitionPlan, list[CandidateEvaluation], PlanReport]:
     """Évalue chaque candidat pour chaque besoin, puis arrête un plan.
 
@@ -388,10 +420,14 @@ def build(
                 )
             )
 
+    collection = getattr(policy, "collection", None)
     planned = select(
         evaluations, demands, sizes,
         candidates={c.candidate_id: c for c in candidates},
         separation_m=separation_m,
+        levels=levels,
+        preview_resolution=getattr(collection, "preview_resolution", "256"),
+        full_resolution=getattr(collection, "full_resolution", "2048"),
     )
     plan = AcquisitionPlan(
         plan_id=plan_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"),

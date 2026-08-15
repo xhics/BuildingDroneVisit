@@ -223,7 +223,7 @@ def test_a_missing_dependency_is_reported_not_assumed_valid() -> None:
     """
     problems = stale_facets({}, DEFAULT_POLICY, "AcquisitionPlan")
 
-    assert len(problems) == 2
+    assert len(problems) == 3
     assert all("absente de la production" in problem for problem in problems)
 
 
@@ -337,7 +337,9 @@ def test_a_written_report_carries_both_levels(tmp_path, monkeypatch) -> None:
     assert report["provenance"]["policy_digest"]
     # Les facettes lues, pour la péremption — et **seulement** celles-là.
     dependencies = report["policy_dependency_digests"]
-    assert set(dependencies) == {"candidate_geometry", "visibility"}
+    assert set(dependencies) == {
+        "candidate_geometry", "visibility", "acquisition_sizing",
+    }
     assert "terrain_derivation" not in dependencies
 
 

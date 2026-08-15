@@ -195,6 +195,10 @@ class CandidateMeasure:
     recommendation_level: RecommendationLevel | None = None
     recommendation_reason: str = ""
 
+    #: Exigences du besoin qu'aucune mesure de découverte n'établit. Les taire
+    #: ferait passer « jamais mesuré » pour « satisfait ».
+    unmeasured_requirements: list[str] = field(default_factory=list)
+
     #: Rejet **définitif** pour ce besoin : mauvais côté du bâtiment, position
     #: inconnue. Distinct de la mise à l'écart par distance.
     rejection_reason: str | None = None
@@ -220,6 +224,7 @@ class CandidateMeasure:
                     if self.recommendation_level else None
                 ),
                 "reason": self.recommendation_reason,
+                "unmeasured_requirements": self.unmeasured_requirements,
             },
             "automatic_range": {
                 "outside": self.outside_automatic_range,
@@ -721,7 +726,7 @@ def select_for_demand(
     def viewpoint_of(candidate_id: str) -> str:
         return seen.get(candidate_id, candidate_id)
 
-    _grade(ordered[0])
+    _grade(ordered[0], demand)
     retained = [ordered[0].candidate_id]
     covered = {viewpoint_of(ordered[0].candidate_id)}
     if wanted <= 1 or target_lat is None or target_lon is None:
@@ -771,17 +776,22 @@ def select_for_demand(
             break
         retained.append(best)
         covered.add(viewpoint_of(best))
-        _grade(next(m for m in ordered if m.candidate_id == best))
+        _grade(next(m for m in ordered if m.candidate_id == best), demand)
 
     return retained
 
 
-def _grade(measure) -> None:  # noqa: ANN001
+def _grade(measure, demand=None) -> None:  # noqa: ANN001
     """Jusqu'où va cette recommandation — trois niveaux, jamais un seul.
 
-    Ce qu'on ignore borne ce qu'on autorise. Une cible non résolue ou un cap
-    inconnu n'interdit pas de regarder l'image ; ils interdisent de l'acquérir
-    sans l'avoir regardée.
+    Ce qu'on ignore borne ce qu'on autorise. Une cible non résolue, un cap
+    inconnu ou une métrique jamais mesurée n'interdisent pas de regarder
+    l'image ; ils interdisent de l'acquérir sans l'avoir regardée.
+
+    « Pleinement éligible » est une affirmation sur **toutes** les exigences du
+    besoin, pas seulement sur celles que la recherche sait mesurer. Ne juger
+    que le secteur, le cap et la distance revenait à déclarer satisfaites des
+    métriques jamais calculées.
     """
     # La cible d'abord : sans elle, l'orientation ne se calcule pas non plus,
     # et invoquer « orientation inconnue » masquerait la cause première.
@@ -815,10 +825,47 @@ def _grade(measure) -> None:  # noqa: ANN001
         measure.recommendation_reason = measure.preview_only_reason
         return
 
+    # Les exigences que la recherche **ne sait pas** évaluer : elles demandent
+    # un cadrage, donc les intrinsèques de la caméra, donc une acquisition ou
+    # une mesure de géométrie. Inconnu n'est pas satisfait.
+    unmeasured = _unmeasured_requirements(measure, demand)
+    if unmeasured:
+        measure.recommendation_level = RecommendationLevel.PREVIEW
+        measure.recommendation_reason = (
+            "exigence(s) du besoin non mesurable(s) à la découverte : "
+            + ", ".join(unmeasured)
+            + " — un aperçu les établira, la recherche ne le peut pas"
+        )
+        measure.unmeasured_requirements = unmeasured
+        return
+
     measure.recommendation_level = RecommendationLevel.FULL_ACQUISITION
     measure.recommendation_reason = (
-        "position et orientation établies sur la cible propre du besoin"
+        "position et orientation établies sur la cible propre du besoin ; "
+        "aucune exigence non mesurée"
     )
+
+
+def _unmeasured_requirements(measure, demand) -> list[str]:  # noqa: ANN001
+    """Exigences du besoin qu'aucune mesure de découverte n'établit.
+
+    Le cadrage — taille projetée, fraction cadrée, fraction visible — se
+    calcule sur l'image ou sur une géométrie de visibilité, jamais sur des
+    métadonnées de position. La continuité demande l'enrichissement de
+    séquence, qui n'a pas eu lieu.
+    """
+    if demand is None:
+        return []
+
+    missing: list[str] = []
+    if getattr(demand, "min_projected_width_fraction", 0.0) > 0:
+        missing.append("taille projetée")
+    if getattr(demand, "min_visible_fraction", 0.0) > 0:
+        missing.append("fraction visible")
+    if getattr(demand, "continuity_required", 0.0) > 0:
+        if measure.continuity_gain is None:
+            missing.append("continuité")
+    return missing
 
 
 def shortlist_for_enrichment(

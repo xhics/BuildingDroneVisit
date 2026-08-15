@@ -49,6 +49,9 @@ class Facet(StrEnum):
     TERRAIN_DERIVATION = "terrain_derivation"
     GEOSPATIAL_QUALIFICATION = "geospatial_qualification"
 
+    #: Ce qu'on télécharge d'une vue retenue, une fois son niveau établi.
+    ACQUISITION_SIZING = "acquisition_sizing"
+
 
 #: Champs de chaque facette, en chemins pointés. Une valeur qui n'y figure pas
 #: ne périme rien : c'est un choix, vérifié par un test qui refuse qu'un champ
@@ -65,6 +68,15 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "collection.sequence_enrichment_per_demand",
         "collection.sequence_expansion_max_members",
         "collection.sequence_expansion_max_distance_m",
+        # Regrouper deux cadrages qui se confondent change **ce qui est
+        # découvert**, non ce qui sera acquis : la facette est bien celle-ci.
+        "collection.framing_merge_bearing_deg",
+    ),
+    # Ce qu'on télécharge d'une vue retenue. Modifier une résolution périme le
+    # plan — le volume annoncé change — sans rien changer à la découverte.
+    Facet.ACQUISITION_SIZING: (
+        "collection.preview_resolution",
+        "collection.full_resolution",
     ),
     Facet.CANDIDATE_GEOMETRY: (
         "geometry.half_fov_deg",
@@ -178,7 +190,9 @@ CONSUMERS: dict[str, tuple[Facet, ...]] = {
     # alors que rien ne le relit séparément.
     "CandidateManifest": (Facet.COLLECTION_DISCOVERY, Facet.SEARCH_PREFERENCE),
     "CandidateEvaluation": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
-    "AcquisitionPlan": (Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY),
+    "AcquisitionPlan": (
+        Facet.CANDIDATE_GEOMETRY, Facet.VISIBILITY, Facet.ACQUISITION_SIZING,
+    ),
     "CaptureGeometryManifest": (Facet.BUILDING_RESOLUTION,),
     "VisibilityRun": (Facet.VISIBILITY,),
     "DuplicateReport": (Facet.DEDUPLICATION,),
