@@ -708,6 +708,10 @@ def assets_plan(
     candidates_file: Path | None = typer.Option(
         None, "--candidates", help="Manifeste de candidats ; défaut : le plus récent."
     ),
+    measure_volumes: bool = typer.Option(
+        False, "--measure-volumes",
+        help="Interroge les en-têtes pour connaître les tailles. Ne télécharge aucun corps.",
+    ),
     consent_bytes: int | None = typer.Option(
         None, "--consent-bytes",
         help="Volume exact accepté, en octets. Rend le plan exécutable.",
@@ -750,10 +754,12 @@ def assets_plan(
         workspace, context, candidates.candidates, demands.demands
     )
 
+    sizes, volume_report = _measure_volumes(candidates.candidates, measure_volumes)
+
     try:
         plan, evaluations, report = build(
             hotel_id, candidates.candidates, demands.demands, digests,
-            geometries=geometries,
+            geometries=geometries, sizes=sizes,
             separation_m=context.policy.geometry.viewpoint_separation_m,
         )
     except PlanRefused as exc:
@@ -795,6 +801,15 @@ def assets_plan(
         )
 
     typer.echo("")
+    if volume_report is not None:
+        typer.echo(
+            f"  tailles mesurées {len(volume_report.measured)} "
+            f"({len(volume_report.unmeasured)} inconnue(s))"
+        )
+        for candidate_id, reason in sorted(volume_report.unmeasured.items())[:3]:
+            typer.secho(f"    sans taille · {candidate_id} — {reason[:44]}",
+                        fg=typer.colors.YELLOW)
+
     typer.echo(f"  volume connu    {report.known_bytes:,} octets".replace(",", " "))
     typer.echo(f"  taille inconnue {report.unknown_size_items} acquisition(s)")
     typer.echo(f"  statut          {report.volume_status}")
@@ -924,6 +939,28 @@ def _obstacle_shapes(manifest) -> list:  # noqa: ANN001
     from .geo.visibility_run import _obstacles
 
     return _obstacles(manifest, {})
+
+
+def _measure_volumes(candidates, requested: bool):  # noqa: ANN001, ANN201
+    """Mesure les tailles, si l'opérateur le demande.
+
+    Ce n'est pas gratuit — une requête par candidat — et surtout ce n'est pas
+    anodin : interroger un service facturé à l'appel doit rester un geste
+    explicite. Sans mesure, le volume reste inconnu et le consentement sera
+    refusé, ce qui est la bonne réponse plutôt qu'un échec.
+    """
+    if not requested:
+        typer.secho(
+            "  · volumes non mesurés : le consentement exige un total exact, "
+            "relancez avec --measure-volumes",
+            fg=typer.colors.YELLOW,
+        )
+        return None, None
+
+    from .volumes import measure
+
+    report = measure(candidates)
+    return report.measured, report
 
 
 def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
