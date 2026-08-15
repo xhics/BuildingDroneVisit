@@ -748,11 +748,17 @@ class CandidateManifest(BaseModel):
         default_factory=dict
     )
 
-    #: Candidats que la **recherche** recommande au plan. Une recommandation,
-    #: non une décision : `AcquisitionPlan` reste seul à trancher ce qui sera
-    #: téléchargé, et un candidat non recommandé demeure au manifeste — le
+    #: Trois niveaux, jamais un seul. `recommended_for_plan` confondait « vaut
+    #: un appel de métadonnées », « vaut un aperçu » et « peut être acquise en
+    #: entier » : une vue dont on ignorait la cible ou l'orientation pouvait
+    #: entrer directement en acquisition complète.
+    #:
+    #: Recommander n'est jamais décider : `AcquisitionPlan` reste seul à
+    #: trancher, et un candidat non recommandé demeure au manifeste — le
     #: retirer effacerait la trace de ce qui a été vu puis écarté.
-    recommended_for_plan: list[str] = Field(default_factory=list)
+    recommended_for_enrichment: list[str] = Field(default_factory=list)
+    recommended_for_preview: list[str] = Field(default_factory=list)
+    eligible_for_full_acquisition: list[str] = Field(default_factory=list)
 
     #: Filiation avec le rapport de recherche qui l'a produit.
     adaptive_search_run_id: str | None = None
@@ -769,10 +775,28 @@ class CandidateManifest(BaseModel):
 
         # Recommander ce qui n'est pas au manifeste rendrait la recommandation
         # invérifiable : le plan citerait une vue qu'aucun rapport ne décrit.
-        unknown = sorted(set(self.recommended_for_plan) - set(ids))
+        recommended = (
+            set(self.recommended_for_enrichment)
+            | set(self.recommended_for_preview)
+            | set(self.eligible_for_full_acquisition)
+        )
+        unknown = sorted(recommended - set(ids))
         if unknown:
             raise ValueError(
                 f"candidats recommandés absents du manifeste : {unknown}"
+            )
+
+        # Les niveaux se **succèdent** : ce qui est éligible à l'acquisition
+        # complète ne peut pas être simultanément borné à l'aperçu. Les laisser
+        # se chevaucher rendrait le plan libre de choisir la lecture qui
+        # l'arrange.
+        both = sorted(
+            set(self.eligible_for_full_acquisition)
+            & set(self.recommended_for_preview)
+        )
+        if both:
+            raise ValueError(
+                f"candidats à la fois preview-only et pleinement éligibles : {both}"
             )
 
         known = set(ids)

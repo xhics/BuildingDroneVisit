@@ -217,7 +217,7 @@ def discover(
     unique, dropped = deduplicate(collected)
     report.duplicates_dropped = dropped
 
-    evaluations, recommended, search_report = _adaptive_pass(
+    evaluations, recommended, search_report, by_level = _adaptive_pass(
         hotel_id, unique, search, report,
     )
 
@@ -239,7 +239,9 @@ def discover(
         # seul le plan décide ce qui sera acquis.
         candidates=sorted(unique, key=lambda c: c.candidate_id),
         evaluations=evaluations,
-        recommended_for_plan=sorted(recommended),
+        recommended_for_enrichment=sorted(by_level["enrichment"]),
+        recommended_for_preview=sorted(by_level["preview"]),
+        eligible_for_full_acquisition=sorted(by_level["full"]),
         adaptive_search_run_id=search_report.run_id if search_report else None,
         adaptive_search_report_digest=(
             digest_of(search_report.as_dict()) if search_report else None
@@ -278,8 +280,9 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     from .adaptive_search import SearchReport, measure_candidate, select_for_demand
     from .schemas.acquisition import CandidateEvaluation, Eligibility
 
+    empty_levels = {"enrichment": set(), "preview": set(), "full": set()}
     if search is None or not getattr(search, "outstanding", None):
-        return [], set(), None
+        return [], set(), None, empty_levels
 
     target_lat, target_lon = search.target or (None, None)
     published = SearchReport(
@@ -294,6 +297,8 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
         candidates_considered=[c.candidate_id for c in candidates],
         **(search.lineage or {}),
     )
+
+    _declare_stages(published, search)
 
     evaluations: list[CandidateEvaluation] = []
     recommended: set[str] = set()
@@ -354,7 +359,25 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
         "recommandé(s) sur %d mesuré(s) — le plan reste seul à décider",
         len(search.outstanding), len(recommended), len(candidates),
     )
-    return evaluations, recommended, published
+    # Une mesure peut servir plusieurs besoins à des niveaux différents. Le
+    # **plus prudent** l'emporte : autoriser une acquisition complète parce
+    # qu'un autre besoin s'en contentait perdrait la réserve du premier.
+    by_level = {"enrichment": set(), "preview": set(), "full": set()}
+    graded = {}
+    for measure in published.measures:
+        level = measure.recommendation_level
+        if level is None or measure.candidate_id not in recommended:
+            continue
+        rank = {"recommended_for_enrichment": 0,
+                "recommended_for_preview": 1,
+                "eligible_for_full_acquisition": 2}[level.value]
+        graded[measure.candidate_id] = min(
+            graded.get(measure.candidate_id, rank), rank
+        )
+    for candidate_id, rank in graded.items():
+        by_level[("enrichment", "preview", "full")[rank]].add(candidate_id)
+
+    return evaluations, recommended, published, by_level
 
 
 def _viewpoints_of(candidates: list, search) -> dict:  # noqa: ANN001
@@ -378,3 +401,27 @@ def _viewpoints_of(candidates: list, search) -> dict:  # noqa: ANN001
             for c in candidates
         }
     return group_viewpoints(candidates, separation_m=separation)
+
+
+def _declare_stages(published, search) -> None:  # noqa: ANN001
+    """Dit ce qui n'a pas eu lieu — un zéro ne le dirait pas.
+
+    Une étape non exécutée et une étape sans résultat produisent le même
+    compteur à zéro. Sans cette déclaration, la seconde passe pouvait rester
+    non câblée en présentant les mêmes chiffres qu'une recherche complète.
+    """
+    enrich = getattr(search, "enrich_sequences", None)
+    if enrich is None:
+        published.stages_skipped["metadata_enrichment"] = (
+            "aucun client d'enrichissement de séquence fourni : la continuité "
+            "reste inconnue, elle n'est pas nulle"
+        )
+        published.stages_skipped["sequence_expansion"] = (
+            "sans enrichissement préalable, aucune séquence à prolonger"
+        )
+
+    if not getattr(search, "requests_by_source", None):
+        published.stages_skipped["request_provenance"] = (
+            "les collecteurs ne rendent pas encore leur décompte d'appels : "
+            "le coût réel des requêtes n'est pas mesuré"
+        )

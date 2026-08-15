@@ -45,6 +45,15 @@ class FakeContext:
     lineage: dict = field(default_factory=dict)
 
 
+def _recommended(manifest) -> set:
+    """Les trois niveaux réunis — utile quand seul l'ensemble importe."""
+    return (
+        set(manifest.recommended_for_enrichment)
+        | set(manifest.recommended_for_preview)
+        | set(manifest.eligible_for_full_acquisition)
+    )
+
+
 def _demands(*demands):
     return CaptureDemandManifest(hotel_id=HOTEL, demands=list(demands))
 
@@ -98,12 +107,11 @@ def test_every_candidate_stays_in_the_manifest(rear_demand, three_candidates):
     )
 
     assert len(manifest.candidates) == 3
-    assert len(manifest.recommended_for_plan) < 3, (
+    recommended = _recommended(manifest)
+    assert len(recommended) < 3, (
         "si tout est recommandé, ce test ne prouve plus la conservation"
     )
-    written_off = set(c.candidate_id for c in manifest.candidates) - set(
-        manifest.recommended_for_plan
-    )
+    written_off = set(c.candidate_id for c in manifest.candidates) - recommended
     evaluated = {e.candidate_id for e in manifest.evaluations}
     assert written_off <= evaluated, (
         "un candidat écarté sans évaluation ne s'explique pas"
@@ -131,10 +139,8 @@ def test_recommendations_must_exist_in_the_manifest(rear_demand, three_candidate
     )
 
     with pytest.raises(ValueError, match="recommandés absents"):
-        manifest.model_copy(
-            update={"recommended_for_plan": ["mly-fantome"]}
-        ).model_validate(manifest.model_dump() | {
-            "recommended_for_plan": ["mly-fantome"]
+        manifest.model_validate(manifest.model_dump() | {
+            "recommended_for_preview": ["mly-fantome"]
         })
 
 
@@ -198,8 +204,8 @@ def test_a_closer_candidate_wins_over_a_distant_one(rear_demand):
         search=FakeContext(outstanding=[rear_demand]),
     )
 
-    assert "mly-loin" not in manifest.recommended_for_plan
-    assert "mly-proche" in manifest.recommended_for_plan
+    assert "mly-loin" not in _recommended(manifest)
+    assert "mly-proche" in _recommended(manifest)
 
 
 def test_lineage_is_carried_into_the_report(rear_demand, three_candidates):
@@ -334,7 +340,28 @@ def test_discover_passes_the_viewpoint_grouping_through():
         ),
     )
 
-    assert len(manifest.recommended_for_plan) == 1, (
+    assert len(_recommended(manifest)) == 1, (
         "deux cadrages d'un même panorama ne remplissent pas un quota de deux "
         "points de vue"
+    )
+
+
+def test_a_stage_that_did_not_run_says_so(rear_demand, three_candidates):
+    """Zéro appel et zéro résultat produisent le même chiffre.
+
+    Sans déclaration explicite, la seconde passe Mapillary pouvait rester non
+    câblée en présentant les compteurs d'une recherche complète.
+    """
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": three_candidates},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    skipped = report.search.stages_skipped
+    assert "metadata_enrichment" in skipped
+    assert "sequence_expansion" in skipped
+    assert "request_provenance" in skipped
+    assert report.search.enrichment_calls == 0
+    assert all(reason for reason in skipped.values()), (
+        "une étape sautée sans motif ne vaut pas mieux qu'un zéro"
     )

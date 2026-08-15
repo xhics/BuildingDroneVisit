@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from .logging import get_logger
 from .schemas.acquisition import TargetKind
 from .schemas.enums import ViewSector
+from .schemas.geometry import GeometryRole
 
 log = get_logger("demand-targets")
 
@@ -97,7 +98,7 @@ def resolve(
     """
     from shapely import wkt as shapely_wkt
 
-    from .schemas.geometry import GeometryResolutionStatus, GeometryRole
+    from .schemas.geometry import GeometryResolutionStatus
 
     resolved = {
         geometry.feature_id: geometry
@@ -118,8 +119,10 @@ def resolve(
         )
 
     if demand.target_kind is TargetKind.SITE_OBJECT:
-        geometry = resolved.get(demand.target_ref) or _by_site_object(
-            demand.target_ref, resolved, site
+        geometry = (
+            resolved.get(demand.target_ref)
+            or _by_site_object(demand.target_ref, resolved, site)
+            or _by_declared_role(demand.target_ref, resolved)
         )
         if geometry is None:
             raise TargetUnresolved(
@@ -199,6 +202,33 @@ def _by_site_object(object_id: str, resolved: dict, site) -> object | None:  # n
             if ref in resolved:
                 return resolved[ref]
     return None
+
+
+#: Correspondance **déclarée** entre un type d'objet de site et le rôle de la
+#: géométrie qui le porte. Le stationnement de l'hôtel s'appelle
+#: `PARKING_HOTEL` au manifeste de site et `HOTEL_PARKING` au rôle de
+#: géométrie : deux vocabulaires pour une chose. Sans cette table, le besoin
+#: cherchait un identifiant inexistant, ne trouvait rien, et se rabattait
+#: implicitement sur la position du bâtiment — le repli que le contrat refuse.
+#:
+#: Une table, non une heuristique de nom : deviner par permutation de mots
+#: marcherait ici et échouerait au premier type dont les deux noms diffèrent
+#: vraiment.
+OBJECT_KIND_ROLES: dict[str, GeometryRole] = {
+    "PARKING_HOTEL": GeometryRole.HOTEL_PARKING,
+    "ACCESS_ROAD_MAIN": GeometryRole.ACCESS_ROAD,
+}
+
+
+def _by_declared_role(object_kind: str, resolved: dict) -> object | None:
+    """Géométrie portant le rôle déclaré pour ce type d'objet."""
+    role = OBJECT_KIND_ROLES.get(object_kind)
+    if role is None:
+        return None
+    return next(
+        (geometry for geometry in resolved.values() if geometry.role is role),
+        None,
+    )
 
 
 def observer_bearing(origin, target_shape) -> float:  # noqa: ANN001

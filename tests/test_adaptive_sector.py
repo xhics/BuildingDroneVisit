@@ -27,6 +27,7 @@ import pytest
 from shapely.geometry import Point
 
 from hotel_pipeline.adaptive_search import (
+    RecommendationLevel,
     SectorContext,
     SectorFit,
     measure_candidate,
@@ -374,3 +375,209 @@ def test_a_corner_view_does_not_fill_a_principal_quota() -> None:
         "pas un besoin de façade principale"
     )
     assert retained == ["c-face"]
+
+
+# --- Gate d'orientation : le secteur ne suffit pas ----------------------------
+
+
+def _select(measures, by_id, need, wanted=1):
+    return select_for_demand(
+        measures, by_id, need, 0.0, 0.0, wanted=wanted, policy=SEARCH,
+    )
+
+
+def test_a_camera_on_the_right_side_looking_elsewhere_is_rejected() -> None:
+    """Le test obligatoire : bien placée, mais elle ne regarde pas la cible.
+
+    Sur le pilote, six recommandations de façade sur huit regardaient ailleurs
+    — jusqu'à 155° d'écart. Le verdict était calculé, puis ignoré par le
+    sélecteur, qui ne filtrait que `rejection_reason`.
+    """
+    need = demand("obligation:front", "front")
+    aside = candidate("c-detourne", *at_bearing(0.0), original_heading_deg=0.0)
+    context = sector_context(need.demand_id, 0.0)
+
+    measure = measure_candidate(
+        aside, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    assert measure.sector_fit is SectorFit.EXACT, "la position est correcte"
+
+    retained = _select([measure], {aside.candidate_id: aside}, need)
+
+    assert retained == [], "une vue qui regarde ailleurs n'est pas recommandée"
+    assert measure.rejection_reason is not None
+    assert "camera_not_aimed_at_target" in measure.rejection_reason
+
+
+def test_an_aimed_camera_reaches_full_acquisition() -> None:
+    need = demand("obligation:front", "front")
+    aimed = candidate("c-visee", *at_bearing(0.0), original_heading_deg=180.0)
+    context = sector_context(need.demand_id, 0.0)
+
+    measure = measure_candidate(
+        aimed, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    retained = _select([measure], {aimed.candidate_id: aimed}, need)
+
+    assert retained == ["c-visee"]
+    assert measure.recommendation_level is RecommendationLevel.FULL_ACQUISITION
+
+
+def test_an_unknown_heading_is_preview_never_full_acquisition() -> None:
+    """Un cap absent n'interdit pas de regarder l'image ; il interdit de
+    l'acquérir sans l'avoir regardée."""
+    need = demand("obligation:front", "front")
+    blind = candidate("c-sans-cap", *at_bearing(0.0))
+    context = sector_context(need.demand_id, 0.0)
+
+    measure = measure_candidate(
+        blind, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    retained = _select([measure], {blind.candidate_id: blind}, need)
+
+    assert retained == ["c-sans-cap"], "il reste examinable"
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert measure.recommendation_level is not RecommendationLevel.FULL_ACQUISITION
+
+
+def test_an_unresolved_target_never_reaches_full_acquisition() -> None:
+    """Un proxy de recherche ne satisfait pas le besoin qu'il approche."""
+    need = demand("obligation:PROPERTY_SIGN", "PROPERTY_SIGN")
+    near = candidate("c-proxy", *at_bearing(0.0), original_heading_deg=180.0)
+
+    measure = measure_candidate(
+        near, need, [], 3, target_lat=0.0, target_lon=0.0, policy=SEARCH,
+        sector=SectorContext(
+            targets={}, projection=FlatProjection(),
+            unresolved={need.demand_id: "enseigne non géoréférencée"},
+            heading_tolerance_deg=SEARCH.heading_tolerance_deg,
+        ),
+    )
+    retained = _select([measure], {near.candidate_id: near}, need)
+
+    assert retained == ["c-proxy"], "examinable, faute de mieux"
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert "ne la remplace pas" in measure.recommendation_reason
+
+
+# --- une cible par besoin -----------------------------------------------------
+
+
+def test_distance_is_measured_on_the_demands_own_target() -> None:
+    """Le stationnement du pilote est à 137 m du bâtiment.
+
+    Mesurer sur le bâtiment classait les candidats du stationnement selon leur
+    distance à autre chose.
+    """
+    from shapely.geometry import Point as ShapelyPoint
+
+    need = demand("obligation:PARKING_HOTEL", "PARKING_HOTEL")
+    # Cible décalée de 100 m à l'est de l'origine.
+    apart = DemandTarget(
+        demand_id=need.demand_id, shape=ShapelyPoint(100.0, 0.0).buffer(5.0),
+    )
+    context = SectorContext(
+        targets={need.demand_id: apart}, projection=FlatProjection(),
+        heading_tolerance_deg=SEARCH.heading_tolerance_deg,
+    )
+    # Candidat à l'origine : collé au bâtiment, loin du stationnement.
+    at_building = candidate("c-1", 0.0, 0.0)
+
+    measure = measure_candidate(
+        at_building, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+
+    assert measure.distance_measured_on == "cible du besoin"
+    assert measure.distance_to_target_m == pytest.approx(95.0, abs=1.0), (
+        "mesuré sur le stationnement, non sur la position du site"
+    )
+
+
+def test_without_an_own_target_the_fallback_says_so() -> None:
+    """Se rabattre sur la position du site est licite ; le taire ne l'est pas."""
+    need = demand("obligation:X", "front")
+    somewhere = candidate("c-1", *at_bearing(0.0))
+
+    measure = measure_candidate(
+        somewhere, need, [], 3, target_lat=0.0, target_lon=0.0, policy=SEARCH,
+        sector=SectorContext(targets={}, projection=FlatProjection()),
+    )
+
+    assert measure.distance_measured_on == "position du site"
+
+
+def test_a_proxy_directs_the_search_without_satisfying_the_demand() -> None:
+    """Le proxy dit où regarder ; il ne devient jamais la cible.
+
+    L'enseigne du pilote est cherchée autour du bâtiment. Sans cette réserve,
+    une vue de façade satisferait un besoin d'enseigne — et rien ne dirait
+    qu'aucune enseigne n'a jamais été vue.
+    """
+    from shapely.geometry import Point as ShapelyPoint
+
+    need = demand("obligation:PROPERTY_SIGN", "PROPERTY_SIGN")
+    stand_in = DemandTarget(
+        demand_id=need.demand_id, shape=ShapelyPoint(0.0, 0.0).buffer(12.0),
+    )
+    context = SectorContext(
+        targets={},
+        projection=FlatProjection(),
+        unresolved={need.demand_id: "enseigne non géoréférencée"},
+        proxies={need.demand_id: "BUILDING_MAIN"},
+        proxy_targets={need.demand_id: stand_in},
+        heading_tolerance_deg=SEARCH.heading_tolerance_deg,
+    )
+    near = candidate("c-proxy", *at_bearing(0.0), original_heading_deg=180.0)
+
+    measure = measure_candidate(
+        near, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    retained = _select([measure], {near.candidate_id: near}, need)
+
+    assert retained == ["c-proxy"], "le proxy oriente bien la recherche"
+    assert measure.searched_via_proxy == "BUILDING_MAIN"
+    assert measure.distance_measured_on == "proxy BUILDING_MAIN"
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW, (
+        "une vue trouvée par proxy ne devient jamais directement acquérable"
+    )
+    assert "ne la remplace pas" in measure.recommendation_reason
+
+
+def test_an_object_kind_reaches_its_geometry_through_the_declared_role() -> None:
+    """Le stationnement s'appelle `PARKING_HOTEL` au site, `HOTEL_PARKING` au
+    rôle de géométrie.
+
+    Sans la table de correspondance, le besoin cherchait un identifiant
+    inexistant, ne trouvait rien, et se rabattait implicitement sur la position
+    du bâtiment — à 137 m de là sur le pilote.
+    """
+    from hotel_pipeline.demand_targets import OBJECT_KIND_ROLES, resolve
+    from hotel_pipeline.schemas.geometry import (
+        GeometryResolutionStatus,
+        GeometryRole,
+    )
+
+    assert OBJECT_KIND_ROLES["PARKING_HOTEL"] is GeometryRole.HOTEL_PARKING
+
+    class Geometry:
+        feature_id = "HOTEL_PARKING"
+        role = GeometryRole.HOTEL_PARKING
+        resolution_status = GeometryResolutionStatus.RESOLVED
+        projected_wkt = "POLYGON ((100 0, 110 0, 110 10, 100 10, 100 0))"
+
+    class Manifest:
+        geometries = [Geometry()]
+
+    need = demand("obligation:PARKING_HOTEL", "PARKING_HOTEL")
+    need = need.model_copy(update={"target_kind": need.target_kind.__class__.SITE_OBJECT})
+
+    target = resolve(need, Manifest(), front_azimuth_deg=0.0)
+
+    assert target.shape.centroid.x == pytest.approx(105.0), (
+        "la cible du besoin est le stationnement, non le bâtiment"
+    )

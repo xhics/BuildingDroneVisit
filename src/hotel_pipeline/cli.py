@@ -712,16 +712,27 @@ def assets_discover(
     if report.search is not None:
         typer.echo("")
         typer.echo("  recommandations par besoin — le plan décide seul :")
+        levels = {
+            m.candidate_id: m.recommendation_level
+            for m in report.search.measures if m.recommendation_level
+        }
         for demand_id in sorted(report.search.recommended):
             retained = report.search.recommended[demand_id]
             considered = sum(
                 1 for m in report.search.measures
                 if m.demand_id == demand_id and m.rejection_reason is None
             )
+            full = sum(
+                1 for c in retained
+                if levels.get(c) and levels[c].value == "eligible_for_full_acquisition"
+            )
             typer.echo(
                 f"    {demand_id:<36} {len(retained)} retenue(s) "
-                f"sur {considered} éligible(s)"
+                f"sur {considered} éligible(s) — {full} acquérable(s)"
             )
+        for stage, reason in sorted(report.search.stages_skipped.items()):
+            typer.secho(f"    étape non exécutée : {stage} — {reason}",
+                        fg=typer.colors.YELLOW)
         for demand_id, reason in sorted(report.search.demands_skipped.items()):
             typer.secho(f"    {demand_id:<36} ignoré — {reason}",
                         fg=typer.colors.YELLOW)
@@ -4102,7 +4113,8 @@ def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN
     site = _safe_read(workspace.read_site)
     half_width = context.policy.geometry.sector_observer_half_width_deg
 
-    targets, unresolved = {}, {}
+    proxies = _declared_proxies(workspace)
+    targets, unresolved, proxy_targets = {}, {}, {}
     for demand in demands:
         try:
             targets[demand.demand_id] = resolve(
@@ -4114,10 +4126,56 @@ def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN
             # en croyant chercher l'entrée.
             unresolved[demand.demand_id] = str(exc).split(" : ", 1)[-1]
 
+            # Un proxy déclaré dit **où chercher**, sans établir la cible. La
+            # vue trouvée ainsi restera preview-only jusqu'à vérification.
+            proxy_ref = proxies.get(demand.demand_id)
+            if proxy_ref:
+                resolved_proxy = _resolve_proxy(
+                    proxy_ref, demand, geometry, front, site, half_width
+                )
+                if resolved_proxy is not None:
+                    proxy_targets[demand.demand_id] = resolved_proxy
+
     return SectorContext(
         targets=targets,
         projection=projection,
         front_azimuth_deg=front,
         unresolved=unresolved,
+        proxies={k: v for k, v in proxies.items() if k in proxy_targets},
+        proxy_targets=proxy_targets,
         heading_tolerance_deg=context.policy.adaptive_search.heading_tolerance_deg,
     )
+
+
+def _declared_proxies(workspace) -> dict:  # noqa: ANN001
+    """Proxies de recherche déclarés à la construction des besoins.
+
+    Ils viennent des obligations, non de la recherche : où chercher tant qu'une
+    cible manque est une décision de gabarit, pas une improvisation du
+    collecteur.
+    """
+    payload = _latest_json(workspace, "capture_demands_build_*.json")
+    return dict((payload or {}).get("search_proxies") or {})
+
+
+def _resolve_proxy(proxy_ref, demand, geometry, front, site, half_width):  # noqa: ANN001, ANN201
+    """Résout le repère approchant, par le même chemin que les vraies cibles."""
+    from .demand_targets import TargetUnresolved, resolve
+    from .schemas.acquisition import TargetKind
+
+    stand_in = demand.model_copy(
+        update={
+            "target_ref": proxy_ref,
+            "target_kind": (
+                TargetKind.VIEW_SECTOR
+                if proxy_ref in ("front", "left", "right", "rear")
+                else TargetKind.SITE_OBJECT
+            ),
+        }
+    )
+    try:
+        return resolve(stand_in, geometry, front, site, half_width)
+    except TargetUnresolved:
+        # Le proxy lui-même n'est pas résolu : on ne cherche pas autour d'un
+        # repère qu'on ne sait pas placer.
+        return None

@@ -82,6 +82,26 @@ class SectorFit(StrEnum):
     UNKNOWN = "unknown"
 
 
+class RecommendationLevel(StrEnum):
+    """Jusqu'où va ce qu'une recommandation autorise.
+
+    `recommended_for_plan` confondait trois choses. Une vue dont on ignore la
+    cible ou l'orientation pouvait entrer directement dans une acquisition
+    complète, alors qu'on ne savait même pas ce qu'elle montre.
+    """
+
+    #: Vaut un appel de métadonnées supplémentaire, rien de plus.
+    ENRICHMENT = "recommended_for_enrichment"
+
+    #: Vaut un aperçu : ce qu'elle montre demande vérification humaine ou
+    #: mesurée avant tout engagement.
+    PREVIEW = "recommended_for_preview"
+
+    #: Position **et** orientation établies, cible propre résolue : le plan
+    #: peut l'envisager pour une acquisition complète. Il reste seul à décider.
+    FULL_ACQUISITION = "eligible_for_full_acquisition"
+
+
 class ContinuityLevel(StrEnum):
     """Jusqu'où va ce qu'on sait du recouvrement."""
 
@@ -127,6 +147,15 @@ class CandidateMeasure:
     heading_offset_deg: float | None = None
 
     distance_to_target_m: float | None = None
+
+    #: Sur quoi la distance a été mesurée. Sans cette mention, une distance au
+    #: bâtiment et une distance au stationnement se liraient pareil.
+    distance_measured_on: str | None = None
+
+    #: Repère approchant ayant servi à chercher, quand la cible manquait. Une
+    #: vue trouvée ainsi reste `preview` : elle ne peut pas satisfaire le
+    #: besoin qu'elle approche.
+    searched_via_proxy: str | None = None
     distance_to_nearest_anchor_m: float | None = None
     bearing_delta_from_anchor_deg: float | None = None
 
@@ -161,6 +190,11 @@ class CandidateMeasure:
     #: Distinct d'une recommandation ordinaire.
     recommended_by_fallback: bool = False
 
+    #: Jusqu'où va ce que cette mesure autorise. `None` tant qu'aucune
+    #: recommandation n'a été prononcée.
+    recommendation_level: RecommendationLevel | None = None
+    recommendation_reason: str = ""
+
     #: Rejet **définitif** pour ce besoin : mauvais côté du bâtiment, position
     #: inconnue. Distinct de la mise à l'écart par distance.
     rejection_reason: str | None = None
@@ -180,6 +214,13 @@ class CandidateMeasure:
                 "fit": self.sector_fit.value,
                 "reason": self.sector_reason,
             },
+            "recommendation": {
+                "level": (
+                    self.recommendation_level.value
+                    if self.recommendation_level else None
+                ),
+                "reason": self.recommendation_reason,
+            },
             "automatic_range": {
                 "outside": self.outside_automatic_range,
                 "reason": self.preview_only_reason,
@@ -190,6 +231,8 @@ class CandidateMeasure:
                 "offset_deg": self.heading_offset_deg,
             },
             "distance_to_target_m": self.distance_to_target_m,
+            "distance_measured_on": self.distance_measured_on,
+            "searched_via_proxy": self.searched_via_proxy,
             "distance_to_nearest_anchor_m": self.distance_to_nearest_anchor_m,
             "bearing_delta_from_anchor_deg": self.bearing_delta_from_anchor_deg,
             "continuity": {
@@ -264,6 +307,12 @@ class SearchReport:
     all_rejected: dict[str, int] = field(default_factory=dict)
 
     enrichment_calls: int = 0
+
+    #: Étages de recherche **non exécutés**, avec leur motif. Un zéro nu ne
+    #: distinguait pas « aucune séquence trouvée » de « séquences jamais
+    #: interrogées » : la seconde passe pouvait rester non câblée sans que rien
+    #: ne le dise.
+    stages_skipped: dict[str, str] = field(default_factory=dict)
     measures: list[CandidateMeasure] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -290,6 +339,7 @@ class SearchReport:
                 "all_candidates_rejected": self.all_rejected,
             },
             "enrichment_calls": self.enrichment_calls,
+            "stages_skipped": self.stages_skipped,
             "measures": [measure.as_dict() for measure in self.measures],
             "bytes_downloaded": 0,
             "note": (
@@ -404,11 +454,19 @@ def measure_candidate(
         measure.rejection_reason = "position de caméra inconnue"
         return measure
 
-    if target_lat is not None and target_lon is not None:
+    # Distance à **la cible de ce besoin**, non à une position globale. Le
+    # stationnement du pilote est à 137 m du bâtiment : mesurer sur le bâtiment
+    # classait les candidats du stationnement selon leur distance à autre chose.
+    projected = _distance_to_own_target(candidate, demand, sector)
+    if projected is not None:
+        measure.distance_to_target_m = projected
+        measure.distance_measured_on = "cible du besoin"
+    elif target_lat is not None and target_lon is not None:
         measure.distance_to_target_m = round(
             haversine_m(candidate.camera_lat, candidate.camera_lon,
                         target_lat, target_lon), 1
         )
+        measure.distance_measured_on = "position du site"
 
     _apply_sector(measure, candidate, demand, sector)
 
@@ -584,6 +642,21 @@ def select_for_demand(
     Déterministe et indépendant de l'ordre de l'API : les égalités se départagent
     par identifiant, sans quoi deux exécutions rendraient deux plans.
     """
+    # --- Gate d'orientation : où la caméra regarde, non seulement où elle est
+    #
+    # Le secteur prouve de quel côté se tient l'appareil. Il ne dit rien de ce
+    # qu'il cadre. Sur le pilote, six recommandations de façade sur huit
+    # regardaient ailleurs — jusqu'à 155° d'écart — parce que le verdict était
+    # calculé puis ignoré par le sélecteur.
+    for measure in measures:
+        if measure.rejection_reason is not None:
+            continue
+        if measure.heading_targets_object is False:
+            measure.rejection_reason = (
+                f"camera_not_aimed_at_target : cap à "
+                f"{measure.heading_offset_deg:.0f}° de la cible"
+            )
+
     eligible = [m for m in measures if m.rejection_reason is None]
 
     # Le crédit sectoriel doit être le **même** qu'à l'évaluation, qui exige
@@ -648,6 +721,7 @@ def select_for_demand(
     def viewpoint_of(candidate_id: str) -> str:
         return seen.get(candidate_id, candidate_id)
 
+    _grade(ordered[0])
     retained = [ordered[0].candidate_id]
     covered = {viewpoint_of(ordered[0].candidate_id)}
     if wanted <= 1 or target_lat is None or target_lon is None:
@@ -697,8 +771,54 @@ def select_for_demand(
             break
         retained.append(best)
         covered.add(viewpoint_of(best))
+        _grade(next(m for m in ordered if m.candidate_id == best))
 
     return retained
+
+
+def _grade(measure) -> None:  # noqa: ANN001
+    """Jusqu'où va cette recommandation — trois niveaux, jamais un seul.
+
+    Ce qu'on ignore borne ce qu'on autorise. Une cible non résolue ou un cap
+    inconnu n'interdit pas de regarder l'image ; ils interdisent de l'acquérir
+    sans l'avoir regardée.
+    """
+    # La cible d'abord : sans elle, l'orientation ne se calcule pas non plus,
+    # et invoquer « orientation inconnue » masquerait la cause première.
+    if measure.sector_fit is SectorFit.UNKNOWN:
+        measure.recommendation_level = RecommendationLevel.PREVIEW
+        measure.recommendation_reason = (
+            f"cible non résolue, cherchée via {measure.searched_via_proxy} : "
+            "ce repère ne la remplace pas"
+            if measure.searched_via_proxy
+            else "cible non résolue : la recherche s'est appuyée sur un repère "
+                 "approchant, qui ne la remplace pas"
+        )
+        return
+
+    if measure.sector_fit is SectorFit.ADJACENT:
+        measure.recommendation_level = RecommendationLevel.PREVIEW
+        measure.recommendation_reason = (
+            "vue de coin : auxiliaire, non créditable comme vue principale"
+        )
+        return
+
+    if measure.heading_targets_object is None:
+        measure.recommendation_level = RecommendationLevel.PREVIEW
+        measure.recommendation_reason = (
+            "orientation inconnue : ce que cette vue cadre demande vérification"
+        )
+        return
+
+    if measure.outside_automatic_range:
+        measure.recommendation_level = RecommendationLevel.PREVIEW
+        measure.recommendation_reason = measure.preview_only_reason
+        return
+
+    measure.recommendation_level = RecommendationLevel.FULL_ACQUISITION
+    measure.recommendation_reason = (
+        "position et orientation établies sur la cible propre du besoin"
+    )
 
 
 def shortlist_for_enrichment(
@@ -824,6 +944,14 @@ class SectorContext:
     #: Pourquoi une cible manque, quand elle manque.
     unresolved: dict = field(default_factory=dict)
 
+    #: `demand_id` → cible **approchante** déclarée à l'obligation. Elle dit où
+    #: chercher tant que la vraie cible manque ; elle ne la remplace jamais.
+    #: Une vue obtenue par ce détour reste `preview`, quoi qu'elle montre.
+    proxies: dict = field(default_factory=dict)
+
+    #: Cibles de proxy résolues, quand elles le sont.
+    proxy_targets: dict = field(default_factory=dict)
+
     #: Écart toléré entre cap mesuré et direction de la cible. Vient de la
     #: politique : le fixer ici en ferait une constante arbitraire de plus.
     heading_tolerance_deg: float | None = None
@@ -845,9 +973,29 @@ def _apply_sector(measure, candidate, demand, sector) -> None:  # noqa: ANN001
 
     target = sector.targets.get(demand.demand_id)
     if target is None:
-        measure.sector_reason = sector.unresolved.get(
-            demand.demand_id, "cible non résolue : le secteur reste inconnu"
+        proxy = sector.proxy_targets.get(demand.demand_id)
+        if proxy is None:
+            measure.sector_reason = sector.unresolved.get(
+                demand.demand_id, "cible non résolue : le secteur reste inconnu"
+            )
+            return
+
+        # Chercher **autour** d'un repère déclaré, en le disant. Le proxy
+        # oriente la recherche ; il n'établit pas la cible, et la mesure reste
+        # marquée `searched_via_proxy` jusqu'au bout.
+        measure.searched_via_proxy = sector.proxies.get(demand.demand_id)
+        measure.sector_reason = (
+            f"cible non résolue — recherche autour de "
+            f"{measure.searched_via_proxy} : ce repère indique où regarder, "
+            "il ne satisfait pas le besoin"
         )
+        from shapely.geometry import Point as _Point
+
+        origin = _Point(
+            sector.projection.point(candidate.camera_lat, candidate.camera_lon)
+        )
+        measure.distance_to_target_m = round(origin.distance(proxy.shape), 1)
+        measure.distance_measured_on = f"proxy {measure.searched_via_proxy}"
         return
 
     if sector.projection is None:
@@ -924,3 +1072,22 @@ def _apply_sector(measure, candidate, demand, sector) -> None:  # noqa: ANN001
         measure.heading_targets_object = None
         return
     measure.heading_targets_object = offset <= sector.heading_tolerance_deg
+
+
+def _distance_to_own_target(candidate, demand, sector) -> float | None:  # noqa: ANN001
+    """Distance à la géométrie propre du besoin, en coordonnées projetées.
+
+    Mesurer sur la forme plutôt que sur son centroïde : pour une voie d'accès,
+    la distance au centroïde d'une polyligne de deux cents mètres ne veut rien
+    dire, alors que la distance à la voie elle-même en veut une.
+    """
+    if sector is None or sector.projection is None:
+        return None
+    target = sector.targets.get(demand.demand_id)
+    if target is None or candidate.camera_lat is None:
+        return None
+
+    from shapely.geometry import Point
+
+    origin = Point(sector.projection.point(candidate.camera_lat, candidate.camera_lon))
+    return round(origin.distance(target.shape), 1)
