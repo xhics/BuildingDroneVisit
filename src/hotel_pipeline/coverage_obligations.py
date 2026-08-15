@@ -72,6 +72,12 @@ class ObligationStatus(StrEnum):
     #: Aucune demande, aucune dispense : l'oubli qu'on cherche à empêcher.
     UNMET = "unmet"
 
+    #: Conditionnelle, et l'existence de l'objet n'est pas établie. Ni due, ni
+    #: sans objet : on ne sait pas encore. Le manifeste de site instancie tous
+    #: les types du gabarit, donc un objet `unresolved` n'y prouve rien — ni sa
+    #: présence, ni son absence.
+    PENDING_APPLICABILITY = "pending_applicability"
+
 
 @dataclass(frozen=True)
 class CoverageObligation:

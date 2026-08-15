@@ -511,3 +511,101 @@ def test_the_pilot_manifest_carries_at_least_the_seven_mandatory_demands() -> No
 
     # Le stationnement existe au site : son obligation conditionnelle joue.
     assert demand_id_for("PARKING_HOTEL") in identifiers
+
+
+# --- l'existence s'établit, elle ne se présume pas -----------------------------
+
+
+def test_an_unresolved_conditional_object_is_pending_not_demanded() -> None:
+    """Le gabarit instancie **tous** les types : `unresolved` ne prouve rien.
+
+    Créer le besoin ferait consacrer des requêtes à une allée dont rien
+    n'établit l'existence ; le dispenser affirmerait son absence.
+    """
+    manifest, report = build(
+        "h",
+        site(
+            geometry={"PARKING_HOTEL"},
+            **{o.object_id: ObjectState.INFERRED for o in OBLIGATIONS
+               if o.object_id != "DRIVEWAY_MAIN"},
+            DRIVEWAY_MAIN=ObjectState.UNRESOLVED,
+        ),
+        COVERAGE,
+    )
+
+    assert demand_id_for("DRIVEWAY_MAIN") not in {d.demand_id for d in manifest.demands}
+    assert "DRIVEWAY_MAIN" in report.pending_applicability
+    assert "existence non établie" in report.pending_applicability["DRIVEWAY_MAIN"]
+    # Ni dispensée : affirmer l'absence serait une affirmation qu'on n'a pas.
+    assert "DRIVEWAY_MAIN" not in report.not_applicable
+    assert "DRIVEWAY_MAIN" not in report.waived
+
+
+def test_an_unresolved_mandatory_object_still_gets_its_demand() -> None:
+    """`always` ne dépend d'aucune existence : toute propriété a des façades."""
+    manifest, report = build(
+        "h",
+        site(**{o.object_id: ObjectState.UNRESOLVED for o in OBLIGATIONS}),
+        COVERAGE,
+    )
+    identifiers = {d.demand_id for d in manifest.demands}
+
+    assert demand_id_for("ENTRANCE_MAIN_CURRENT") in identifiers
+    assert demand_id_for("FACADE_REAR") in identifiers
+    # Le conditionnel, lui, attend.
+    assert demand_id_for("PARKING_HOTEL") not in identifiers
+    assert "PARKING_HOTEL" in report.pending_applicability
+
+
+def test_an_absent_conditional_object_is_not_applicable_not_pending() -> None:
+    """« Absent du gabarit » est une preuve d'absence ; `unresolved` ne l'est pas."""
+    manifest, report = build(
+        "h",
+        site(**{o.object_id: ObjectState.INFERRED for o in OBLIGATIONS
+                if o.object_id != "DRIVEWAY_MAIN"}),
+        COVERAGE,
+    )
+
+    assert "DRIVEWAY_MAIN" in report.not_applicable
+    assert "DRIVEWAY_MAIN" not in report.pending_applicability
+
+
+def test_an_inferred_conditional_object_is_demanded() -> None:
+    manifest, report = build("h", resolved_site(), COVERAGE)
+
+    assert demand_id_for("PARKING_HOTEL") in {d.demand_id for d in manifest.demands}
+    assert "PARKING_HOTEL" not in report.pending_applicability
+
+
+def test_existence_is_distinct_from_instantiation() -> None:
+    """Deux questions que le manifeste de site confond volontairement."""
+    from hotel_pipeline.site_resolution import resolve_site_object
+
+    instantiated = resolve_site_object(
+        site(DRIVEWAY_MAIN=ObjectState.UNRESOLVED), "DRIVEWAY_MAIN"
+    )
+    established = resolve_site_object(
+        site(DRIVEWAY_MAIN=ObjectState.INFERRED), "DRIVEWAY_MAIN"
+    )
+
+    assert instantiated.is_instantiated is True
+    assert instantiated.exists is False
+    assert established.exists is True
+
+
+def test_the_pilot_holds_eight_demands_and_one_pending() -> None:
+    """Non-régression sur le résultat réel."""
+    from pathlib import Path
+
+    demands_path = Path(
+        "work/welcominns-boucherville/01_sources/capture_demands.json"
+    )
+    if not demands_path.is_file():  # pragma: no cover — dépend du corpus local
+        pytest.skip("manifeste du pilote absent")
+
+    payload = json.loads(demands_path.read_text("utf-8"))
+    identifiers = {demand["demand_id"] for demand in payload["demands"]}
+
+    assert len(payload["demands"]) == 8
+    assert demand_id_for("PARKING_HOTEL") in identifiers
+    assert demand_id_for("DRIVEWAY_MAIN") not in identifiers

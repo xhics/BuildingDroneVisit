@@ -85,6 +85,18 @@ class SiteObjectResolution:
 
     @property
     def exists(self) -> bool:
+        """L'objet est-il **établi** sur ce site ?
+
+        `unresolved` ne l'établit pas : le manifeste de site instancie tous les
+        types du gabarit, et un objet non résolu n'y est qu'un emplacement
+        réservé. Le compter comme existant ferait consacrer des requêtes à une
+        allée dont rien ne dit qu'elle existe.
+        """
+        return self.resolution in (Resolution.NO_GEOMETRY, Resolution.TARGETABLE)
+
+    @property
+    def is_instantiated(self) -> bool:
+        """Un objet de ce type figure au manifeste, quel que soit son état."""
         return self.resolution is not Resolution.ABSENT
 
     @property

@@ -62,6 +62,10 @@ class BuildReport:
     #: détour demande vérification, elle n'établit pas la cible.
     search_proxies: dict[str, str] = field(default_factory=dict)
 
+    #: Obligations conditionnelles dont l'existence de l'objet n'est pas
+    #: établie. Ni dues, ni dispensées : la question reste ouverte.
+    pending_applicability: dict[str, str] = field(default_factory=dict)
+
     def as_dict(self) -> dict:
         return {
             "generated_from_obligation": sorted(self.generated_from_obligation),
@@ -70,6 +74,7 @@ class BuildReport:
             "not_applicable": self.not_applicable,
             "unresolved_target": self.unresolved_target,
             "resolved_instances": self.resolved_instances,
+            "pending_applicability": self.pending_applicability,
             "search_proxies": self.search_proxies,
             "bytes_downloaded": 0,
             "note": (
@@ -165,14 +170,21 @@ def build(
 
         if obligation.applicability is Applicability.OPERATOR_ONLY:
             continue
-        if (
-            obligation.applicability is Applicability.WHEN_OBJECT_EXISTS
-            and not resolved.exists
-        ):
-            # Son absence est établie : rien n'est dû, et le dire évite qu'on
-            # la croie oubliée.
-            report.not_applicable[object_id] = resolved.why()
-            continue
+        if obligation.applicability is Applicability.WHEN_OBJECT_EXISTS:
+            if resolved.resolution is Resolution.ABSENT:
+                # Absence **prouvée** : rien n'est dû, et le dire évite qu'on
+                # la croie oubliée.
+                report.not_applicable[object_id] = resolved.why()
+                continue
+            if not resolved.exists:
+                # Instancié mais non résolu : ni dû, ni sans objet. Créer le
+                # besoin ferait chercher un objet dont rien n'établit
+                # l'existence ; le dispenser affirmerait son absence.
+                report.pending_applicability[object_id] = (
+                    "existence non établie : objet instancié au gabarit, "
+                    "mais non résolu"
+                )
+                continue
 
         # Le besoin existe **même** si sa cible n'est pas encore résolue. Le
         # supprimer confondrait « la cible n'est pas résolue » avec « le besoin
