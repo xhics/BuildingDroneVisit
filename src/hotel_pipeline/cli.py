@@ -749,6 +749,8 @@ def assets_plan(
     candidates = CandidateManifest.model_validate(candidates_payload)
     demands = CaptureDemandManifest.model_validate(demands_payload)
 
+    coverage = _check_coverage(workspace, demands.demands)
+
     digests = _plan_digests(workspace, context, candidates_payload, demands_payload)
     geometries, geometry_report = _candidate_geometries(
         workspace, context, candidates.candidates, demands.demands
@@ -939,6 +941,46 @@ def _obstacle_shapes(manifest) -> list:  # noqa: ANN001
     from .geo.visibility_run import _obstacles
 
     return _obstacles(manifest, {})
+
+
+def _check_coverage(workspace, demands):  # noqa: ANN001, ANN201
+    """Confronte les besoins aux obligations du gabarit, avant tout plan.
+
+    Un manifeste peut omettre la façade arrière et paraître complet : ses
+    besoins seraient tous satisfaits, sans que rien ne dise qu'un objet n'en a
+    jamais eu. Le plan reste possible — planifier ce qu'on a demandé est
+    légitime — mais l'oubli est nommé.
+    """
+    from .coverage_obligations import ObligationWaiver, assess, missing_demands
+
+    payload = workspace.read_json("01_sources/coverage_waivers.json") or {}
+    waivers = [ObligationWaiver.model_validate(row) for row in payload.get("waivers", [])]
+
+    report = assess(demands, waivers)
+    if report.complete:
+        typer.echo(f"  obligations couvertes ({len(report.demands_by_object)})")
+    else:
+        typer.secho(
+            f"  · {len(report.unmet)} obligation(s) sans demande ni dispense :",
+            fg=typer.colors.YELLOW,
+        )
+        for obligation in missing_demands(report):
+            typer.echo(
+                f"      {obligation.object_id:<24} "
+                f"{obligation.target_kind.value}/{obligation.expected_target_ref}"
+            )
+        typer.secho(
+            "    le plan ne couvrira pas ces objets ; déclarez une demande, ou "
+            "une dispense motivée dans 01_sources/coverage_waivers.json",
+            fg=typer.colors.YELLOW,
+        )
+
+    for demand_id in report.orphan_demands:
+        typer.secho(
+            f"  · besoin hors gabarit : {demand_id} — vérifiez sa cible",
+            fg=typer.colors.YELLOW,
+        )
+    return report
 
 
 def _measure_volumes(candidates, requested: bool):  # noqa: ANN001, ANN201
