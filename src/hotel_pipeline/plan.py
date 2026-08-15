@@ -282,7 +282,7 @@ def select(
     sizes: dict[str, int] | None = None,
     candidates: dict | None = None,
     separation_m: float = 10.0,
-    levels: dict[str, str] | None = None,
+    levels: dict[tuple[str, str], str] | None = None,
     preview_resolution: str = "256",
     full_resolution: str = "2048",
 ) -> list[PlannedAcquisition]:
@@ -302,18 +302,22 @@ def select(
     announced = sizes or {}
     known = candidates or {}
     viewpoints = group_viewpoints(list(known.values()), separation_m)
-    # Ce que la recherche a prononcé. `None` signifie « aucun niveau » : le
-    # candidat n'a été recommandé à rien, et le plan ne le repêche pas de
-    # lui-même — sinon les trois listes ne contraindraient rien.
-    graded = levels or {}
+    # `None` et `{}` ne disent pas la même chose, et les confondre réactivait
+    # tout : un registre vide signifie « la recherche a eu lieu et n'a rien
+    # recommandé », non « aucune contrainte ».
+    legacy = levels is None
+    graded = dict(levels or {})
 
     by_demand: dict[str, list[CandidateEvaluation]] = {}
-    unrecommended: set[str] = set()
+    unrecommended: set[tuple[str, str]] = set()
     for evaluation in evaluations:
         if evaluation.eligibility is Eligibility.REJECTED:
             continue
-        if graded and evaluation.candidate_id not in graded:
-            unrecommended.add(evaluation.candidate_id)
+        # L'autorisation vaut pour **ce besoin**, non pour le candidat en
+        # général : une vue pleinement acquérable pour le stationnement n'est
+        # pas autorisée à servir une façade qui ne l'a jamais recommandée.
+        if not legacy and (evaluation.candidate_id, evaluation.demand_id) not in graded:
+            unrecommended.add((evaluation.candidate_id, evaluation.demand_id))
             continue
         by_demand.setdefault(evaluation.demand_id, []).append(evaluation)
 
@@ -355,9 +359,21 @@ def select(
 
         # Une preview se vérifie en miniature. La planifier en pleine
         # résolution dépenserait le volume avant de savoir s'il le valait.
-        level = graded.get(candidate_id)
-        is_preview = level in (
-            "recommended_for_preview", "recommended_for_enrichment"
+        # Le niveau **le plus prudent** parmi les besoins servis : autoriser
+        # la pleine résolution parce qu'un seul besoin s'en contentait perdrait
+        # la réserve des autres.
+        served_levels = [
+            graded[(candidate_id, demand_id)]
+            for demand_id in served
+            if (candidate_id, demand_id) in graded
+        ]
+        is_preview = any(
+            value in ("recommended_for_preview", "recommended_for_enrichment")
+            for value in served_levels
+        )
+        level = (
+            "recommended_for_preview" if is_preview
+            else (served_levels[0] if served_levels else None)
         )
         resolution = preview_resolution if is_preview else full_resolution
         planned.append(
@@ -391,7 +407,7 @@ def build(
     plan_id: str | None = None,
     separation_m: float = 10.0,
     policy=None,  # noqa: ANN001 — pour inscrire les facettes consommées
-    levels: dict[str, str] | None = None,
+    levels: dict[tuple[str, str], str] | None = None,
 ) -> tuple[AcquisitionPlan, list[CandidateEvaluation], PlanReport]:
     """Évalue chaque candidat pour chaque besoin, puis arrête un plan.
 

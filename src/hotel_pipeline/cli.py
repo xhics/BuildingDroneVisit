@@ -4216,19 +4216,17 @@ def _resolve_proxy(proxy_ref, demand, geometry, front, site, half_width):  # noq
         return None
 
 
-def _recommendation_levels(candidates) -> dict[str, str]:  # noqa: ANN001
-    """Niveau prononcé par la recherche, par candidat.
+def _recommendation_levels(candidates):  # noqa: ANN001, ANN201
+    """Niveau prononcé par la recherche, **par couple candidat/besoin**.
 
-    Un candidat absent de ce tableau n'a été recommandé à rien : le plan ne le
-    repêche pas. Le tableau **vide** est distinct — il signifie qu'aucune
-    recherche n'a eu lieu, et le plan retrouve alors son comportement antérieur
-    plutôt que de tout refuser.
+    Rend `None` quand aucune recherche adaptative n'a produit ce manifeste :
+    c'est la compatibilité avec les espaces de travail antérieurs, et elle se
+    reconnaît à l'absence de `adaptive_search_run_id` — non à un registre vide,
+    qui signifie au contraire « cherché, rien recommandé ».
     """
-    levels: dict[str, str] = {}
-    for candidate_id in getattr(candidates, "recommended_for_enrichment", []):
-        levels[candidate_id] = "recommended_for_enrichment"
-    for candidate_id in getattr(candidates, "recommended_for_preview", []):
-        levels[candidate_id] = "recommended_for_preview"
-    for candidate_id in getattr(candidates, "eligible_for_full_acquisition", []):
-        levels[candidate_id] = "eligible_for_full_acquisition"
-    return levels
+    if not getattr(candidates, "adaptive_search_run_id", None):
+        return None
+    return {
+        (entry.candidate_id, entry.demand_id): entry.level
+        for entry in getattr(candidates, "recommendations", [])
+    }

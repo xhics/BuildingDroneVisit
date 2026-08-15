@@ -719,6 +719,27 @@ class SourceCandidateCounts(BaseModel):
     rejected: int = Field(default=0, ge=0)
 
 
+class DemandRecommendation(BaseModel):
+    """Ce que la recherche autorise, pour **un** couple candidat/besoin.
+
+    Le niveau ne qualifie pas une image dans l'absolu : la même vue peut être
+    pleinement acquérable pour documenter un stationnement et bornée à l'aperçu
+    pour une façade dont la taille projetée n'est pas mesurée.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_id: str
+    demand_id: str
+    level: str
+
+    #: Pourquoi ce niveau, et non un autre.
+    reason: str = ""
+
+    #: Exigences du besoin qu'aucune mesure de découverte n'établit.
+    unmeasured_requirements: list[str] = Field(default_factory=list)
+
+
 class CandidateManifest(BaseModel):
     """Tout ce qui a été découvert, et ce qu'on en a pensé, besoin par besoin.
 
@@ -756,6 +777,13 @@ class CandidateManifest(BaseModel):
     #: Recommander n'est jamais décider : `AcquisitionPlan` reste seul à
     #: trancher, et un candidat non recommandé demeure au manifeste — le
     #: retirer effacerait la trace de ce qui a été vu puis écarté.
+    #: **L'autorité** : ce que la recherche autorise, couple par couple. Une
+    #: vue recommandée pour le stationnement ne l'est pas pour la façade — et
+    #: un niveau porté par le seul `candidate_id` laissait une autorisation
+    #: obtenue pour un besoin en couvrir un autre qui ne l'avait jamais
+    #: recommandée.
+    recommendations: list["DemandRecommendation"] = Field(default_factory=list)
+
     recommended_for_enrichment: list[str] = Field(default_factory=list)
     recommended_for_preview: list[str] = Field(default_factory=list)
     eligible_for_full_acquisition: list[str] = Field(default_factory=list)
@@ -800,6 +828,31 @@ class CandidateManifest(BaseModel):
             )
 
         known = set(ids)
+
+        # Les couples sont l'autorité ; les listes n'en sont qu'un résumé. Si
+        # elles s'en écartent, un lecteur pressé lirait une autorisation que
+        # personne n'a prononcée.
+        for entry in self.recommendations:
+            if entry.candidate_id not in known:
+                raise ValueError(
+                    f"recommandation d'un candidat absent : {entry.candidate_id!r}"
+                )
+        if self.recommendations:
+            derived = {
+                "recommended_for_enrichment": set(),
+                "recommended_for_preview": set(),
+                "eligible_for_full_acquisition": set(),
+            }
+            for entry in self.recommendations:
+                if entry.level in derived:
+                    derived[entry.level].add(entry.candidate_id)
+            for name, expected in derived.items():
+                if set(getattr(self, name)) != expected:
+                    raise ValueError(
+                        f"{name} ne résume pas les recommandations par besoin : "
+                        f"{sorted(set(getattr(self, name)) ^ expected)}"
+                    )
+
         pairs = set()
         for evaluation in self.evaluations:
             if evaluation.candidate_id not in known:

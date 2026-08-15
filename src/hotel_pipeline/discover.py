@@ -24,7 +24,11 @@ from datetime import datetime, timezone
 
 from .logging import get_logger
 from .provenance import digest_of
-from .schemas.acquisition import CandidateManifest, CaptureCandidate
+from .schemas.acquisition import (
+    CandidateManifest,
+    CaptureCandidate,
+    DemandRecommendation,
+)
 
 log = get_logger("discover")
 
@@ -179,7 +183,7 @@ def merge_near_identical_framings(
 
     kept: list[CaptureCandidate] = []
     merged: dict[str, str] = {}
-    by_panorama: dict[str, list[CaptureCandidate]] = {}
+    by_panorama: dict[tuple, list[CaptureCandidate]] = {}
 
     for candidate in sorted(candidates, key=lambda c: c.candidate_id):
         if not candidate.panorama_id:
@@ -190,7 +194,17 @@ def merge_near_identical_framings(
             kept.append(candidate)
             continue
 
-        group = by_panorama.setdefault(candidate.panorama_id, [])
+        # Deux cadrages ne se confondent que si **tout** le reste coïncide.
+        # Comparer les seuls caps réunirait un gros plan et un grand angle pris
+        # dans la même direction : ils ne montrent pas la même chose.
+        signature = (
+            candidate.panorama_id,
+            candidate.requested_fov_deg,
+            candidate.requested_pitch_deg,
+            candidate.advertised_width,
+            candidate.advertised_height,
+        )
+        group = by_panorama.setdefault(signature, [])
         twin = next(
             (
                 other for other in group
@@ -276,8 +290,8 @@ def discover(
         # simple compteur ne dirait pas **lequel** a été proposé puis écarté.
         report.framings_merged = merged
 
-    evaluations, recommended, search_report, by_level = _adaptive_pass(
-        hotel_id, unique, search, report,
+    evaluations, recommended, search_report, by_level, recommendations = (
+        _adaptive_pass(hotel_id, unique, search, report)
     )
 
     # Les deux objets sont construits — et validés — avant toute écriture. Une
@@ -298,6 +312,7 @@ def discover(
         # seul le plan décide ce qui sera acquis.
         candidates=sorted(unique, key=lambda c: c.candidate_id),
         evaluations=evaluations,
+        recommendations=recommendations,
         recommended_for_enrichment=sorted(by_level["enrichment"]),
         recommended_for_preview=sorted(by_level["preview"]),
         eligible_for_full_acquisition=sorted(by_level["full"]),
@@ -341,7 +356,7 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
 
     empty_levels = {"enrichment": set(), "preview": set(), "full": set()}
     if search is None or not getattr(search, "outstanding", None):
-        return [], set(), None, empty_levels
+        return [], set(), None, empty_levels, []
 
     target_lat, target_lon = search.target or (None, None)
     published = SearchReport(
@@ -436,7 +451,39 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     for candidate_id, rank in graded.items():
         by_level[("enrichment", "preview", "full")[rank]].add(candidate_id)
 
-    return evaluations, recommended, published, by_level
+    # L'autorité : couple par couple. Un niveau porté par le seul candidat
+    # laissait une autorisation obtenue pour un besoin en couvrir un autre.
+    recommendations = [
+        DemandRecommendation(
+            candidate_id=measure.candidate_id,
+            demand_id=measure.demand_id,
+            level=measure.recommendation_level.value,
+            reason=measure.recommendation_reason,
+            unmeasured_requirements=list(measure.unmeasured_requirements),
+        )
+        for measure in published.measures
+        if measure.recommendation_level is not None
+        and measure.candidate_id in published.recommended.get(measure.demand_id, [])
+    ]
+
+    # Le résumé doit **dériver** des couples, sinon les deux divergent et le
+    # schéma refuse le manifeste — ce qui est le comportement voulu.
+    by_level = {"enrichment": set(), "preview": set(), "full": set()}
+    short = {
+        "recommended_for_enrichment": "enrichment",
+        "recommended_for_preview": "preview",
+        "eligible_for_full_acquisition": "full",
+    }
+    ranked = {"enrichment": 0, "preview": 1, "full": 2}
+    best: dict[str, str] = {}
+    for entry in recommendations:
+        key = short[entry.level]
+        if entry.candidate_id not in best or ranked[key] < ranked[best[entry.candidate_id]]:
+            best[entry.candidate_id] = key
+    for candidate_id, key in best.items():
+        by_level[key].add(candidate_id)
+
+    return evaluations, recommended, published, by_level, recommendations
 
 
 def _viewpoints_of(candidates: list, search) -> dict:  # noqa: ANN001
