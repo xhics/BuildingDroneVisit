@@ -33,23 +33,36 @@ from hotel_pipeline.schemas.site import SiteManifest, SiteObject
 COVERAGE = DEFAULT_POLICY.coverage
 
 
-def site(**states) -> SiteManifest:
-    """Un manifeste de site où chaque objet porte l'état demandé."""
+def site(geometry: set[str] | None = None, **states) -> SiteManifest:
+    """Un manifeste de site aux identifiants **préfixés**, comme le réel.
+
+    `welcominns-boucherville:PARKING_HOTEL` — c'est cette forme qui a révélé
+    la jointure fausse : indexer par identifiant puis chercher par type ne
+    pouvait jamais aboutir.
+    """
+    with_geometry = geometry or set()
     objects = []
-    for object_id, state in states.items():
+    for kind, state in states.items():
         objects.append(
             SiteObject(
-                object_id=object_id, kind=object_id, state=state,
+                object_id=f"h:{kind}", kind=kind, state=state,
                 evidence=["essai"] if state is ObjectState.CONFIRMED else [],
+                geometry_wkt=(
+                    "POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))"
+                    if kind in with_geometry else None
+                ),
             )
         )
     return SiteManifest(hotel_id="h", objects=objects)
 
 
 def resolved_site() -> SiteManifest:
-    return site(**{
-        obligation.object_id: ObjectState.INFERRED for obligation in OBLIGATIONS
-    })
+    """Tous les objets présents, inférés, et géoréférencés."""
+    kinds = {obligation.object_id for obligation in OBLIGATIONS}
+    return site(
+        geometry=kinds,
+        **{kind: ObjectState.INFERRED for kind in kinds},
+    )
 
 
 def waiver(object_id: str, **overrides) -> ObligationWaiver:
@@ -152,23 +165,30 @@ def test_building_and_context_do_not_share_their_thresholds() -> None:
 # --- un objet non résolu ne devient jamais une dispense ------------------------
 
 
-def test_an_unresolved_object_yields_an_unresolved_target_not_a_waiver() -> None:
-    """Le convertir ferait disparaître un manque en le déclarant sans objet."""
+def test_an_unresolved_object_keeps_its_demand() -> None:
+    """« La cible n'est pas résolue » n'est pas « le besoin n'existe pas ».
+
+    Supprimer le besoin donnait un système sûr et bloqué : la découverte ne
+    cherchait jamais cette cible, et rien ne pouvait la débloquer.
+    """
     partial = resolved_site()
     partial.objects = [
-        obj.model_copy(update={"state": ObjectState.UNRESOLVED, "evidence": []})
-        if obj.object_id == "ENTRANCE_MAIN_CURRENT" else obj
+        obj.model_copy(
+            update={"state": ObjectState.UNRESOLVED, "evidence": [],
+                    "geometry_wkt": None}
+        )
+        if obj.kind == "ENTRANCE_MAIN_CURRENT" else obj
         for obj in partial.objects
     ]
 
     manifest, report = build("h", partial, COVERAGE)
 
+    assert demand_id_for("ENTRANCE_MAIN_CURRENT") in {
+        d.demand_id for d in manifest.demands
+    }
     assert "ENTRANCE_MAIN_CURRENT" in report.unresolved_target
     assert "ENTRANCE_MAIN_CURRENT" not in report.waived
     assert "ENTRANCE_MAIN_CURRENT" not in report.not_applicable
-    assert demand_id_for("ENTRANCE_MAIN_CURRENT") not in {
-        d.demand_id for d in manifest.demands
-    }
 
 
 def test_a_declared_waiver_is_honoured() -> None:
@@ -332,3 +352,162 @@ def test_the_report_names_the_open_demands_for_the_search() -> None:
 
     assert "obligation:FACADE_REAR" in report.open_demands
     assert "obligation:FACADE_LEFT" in report.open_demands
+
+
+# --- la jointure par type, et ce que sa fausseté coûtait -----------------------
+
+
+def test_objects_resolve_by_kind_not_by_instance_identifier() -> None:
+    """Le défaut trouvé à l'exécution réelle.
+
+    Les identifiants sont préfixés du site ; les indexer puis chercher par
+    type ne pouvait jamais aboutir. Trois objets présents — dont un
+    géoréférencé — étaient déclarés absents, et deux besoins obligatoires
+    disparaissaient du manifeste.
+    """
+    from hotel_pipeline.site_resolution import Resolution, resolve_site_object
+
+    manifest = site(
+        geometry={"PARKING_HOTEL"},
+        PARKING_HOTEL=ObjectState.INFERRED,
+        PROPERTY_SIGN=ObjectState.INFERRED,
+        ENTRANCE_MAIN_CURRENT=ObjectState.UNRESOLVED,
+    )
+
+    parking = resolve_site_object(manifest, "PARKING_HOTEL")
+    sign = resolve_site_object(manifest, "PROPERTY_SIGN")
+    entrance = resolve_site_object(manifest, "ENTRANCE_MAIN_CURRENT")
+
+    assert parking.resolution is Resolution.TARGETABLE
+    assert sign.resolution is Resolution.NO_GEOMETRY
+    assert entrance.resolution is Resolution.UNRESOLVED
+    # L'identifiant d'instance complet est conservé : le type ne désigne rien.
+    assert parking.object_id == "h:PARKING_HOTEL"
+
+
+def test_an_absent_kind_is_distinguished_from_an_unresolved_one() -> None:
+    """« Aucun objet de ce type » et « présent, non résolu » diffèrent."""
+    from hotel_pipeline.site_resolution import Resolution, resolve_site_object
+
+    manifest = site(PROPERTY_SIGN=ObjectState.UNRESOLVED)
+
+    assert resolve_site_object(manifest, "PROPERTY_SIGN").resolution is (
+        Resolution.UNRESOLVED
+    )
+    assert resolve_site_object(manifest, "PARKING_HOTEL").resolution is (
+        Resolution.ABSENT
+    )
+
+
+def test_two_instances_of_a_singleton_are_refused_not_silently_chosen() -> None:
+    """Deux entrées principales ne sont pas un choix, c'est une contradiction."""
+    from hotel_pipeline.schemas.site import SiteObject
+    from hotel_pipeline.site_resolution import AmbiguousSiteObject, resolve_site_object
+
+    manifest = site(ENTRANCE_MAIN_CURRENT=ObjectState.INFERRED)
+    manifest.objects.append(
+        SiteObject(
+            object_id="h:ENTRANCE_MAIN_CURRENT-bis",
+            kind="ENTRANCE_MAIN_CURRENT", state=ObjectState.INFERRED,
+        )
+    )
+
+    with pytest.raises(AmbiguousSiteObject, match="2 instances"):
+        resolve_site_object(manifest, "ENTRANCE_MAIN_CURRENT")
+
+
+def test_an_inferred_object_without_geometry_is_not_targetable() -> None:
+    from hotel_pipeline.site_resolution import Resolution, resolve_site_object
+
+    manifest = site(PROPERTY_SIGN=ObjectState.INFERRED)
+
+    resolved = resolve_site_object(manifest, "PROPERTY_SIGN")
+    assert resolved.resolution is Resolution.NO_GEOMETRY
+    assert resolved.exists is True
+    assert resolved.is_targetable is False
+
+
+# --- applicabilité : obligatoire quand l'objet existe -------------------------
+
+
+def test_a_parking_that_exists_produces_its_obligation() -> None:
+    """« Facultatif » laissait un stationnement géoréférencé n'exiger rien."""
+    manifest, report = build("h", resolved_site(), COVERAGE)
+
+    assert demand_id_for("PARKING_HOTEL") in {d.demand_id for d in manifest.demands}
+    assert "PARKING_HOTEL" not in report.not_applicable
+
+
+def test_a_parking_whose_absence_is_established_is_not_applicable() -> None:
+    without = site(**{
+        obligation.object_id: ObjectState.INFERRED
+        for obligation in OBLIGATIONS
+        if obligation.object_id != "PARKING_HOTEL"
+    })
+
+    manifest, report = build("h", without, COVERAGE)
+
+    assert demand_id_for("PARKING_HOTEL") not in {d.demand_id for d in manifest.demands}
+    assert "PARKING_HOTEL" in report.not_applicable
+
+
+def test_every_mandatory_obligation_survives_an_unresolved_target() -> None:
+    """Les sept obligations obligatoires doivent toutes apparaître."""
+    unresolved_everywhere = site(**{
+        obligation.object_id: ObjectState.UNRESOLVED for obligation in OBLIGATIONS
+    })
+
+    manifest, _ = build("h", unresolved_everywhere, COVERAGE)
+    identifiers = {d.demand_id for d in manifest.demands}
+
+    for obligation in OBLIGATIONS:
+        if obligation.applicability.value == "always":
+            assert demand_id_for(obligation.object_id) in identifiers
+
+
+# --- proxy de recherche : chercher sans conclure ------------------------------
+
+
+def test_an_unresolved_target_declares_where_to_search() -> None:
+    """Ne rien chercher parce que le point exact manque serait un blocage."""
+    partial = site(
+        geometry={"BUILDING_MAIN"},
+        **{o.object_id: ObjectState.INFERRED for o in OBLIGATIONS},
+        BUILDING_MAIN=ObjectState.CONFIRMED,
+    )
+
+    _, report = build("h", partial, COVERAGE)
+
+    assert report.search_proxies[demand_id_for("ENTRANCE_MAIN_CURRENT")] == (
+        "FACADE_PRIMARY"
+    )
+    assert report.search_proxies[demand_id_for("PROPERTY_SIGN")] == "BUILDING_MAIN"
+
+
+def test_a_targetable_object_needs_no_proxy() -> None:
+    _, report = build("h", resolved_site(), COVERAGE)
+
+    assert demand_id_for("PARKING_HOTEL") not in report.search_proxies
+
+
+def test_the_pilot_manifest_carries_at_least_the_seven_mandatory_demands() -> None:
+    """Non-régression sur le manifeste réel du pilote."""
+    from pathlib import Path
+
+    path = Path(
+        "work/welcominns-boucherville/01_sources/capture_demands.json"
+    )
+    if not path.is_file():  # pragma: no cover — dépend du corpus local
+        pytest.skip("manifeste du pilote absent")
+
+    payload = json.loads(path.read_text("utf-8"))
+    identifiers = {demand["demand_id"] for demand in payload["demands"]}
+
+    for object_id in (
+        "FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR",
+        "ENTRANCE_MAIN_CURRENT", "PROPERTY_SIGN", "ACCESS_ROAD_MAIN",
+    ):
+        assert demand_id_for(object_id) in identifiers, object_id
+
+    # Le stationnement existe au site : son obligation conditionnelle joue.
+    assert demand_id_for("PARKING_HOTEL") in identifiers

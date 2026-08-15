@@ -25,8 +25,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .logging import get_logger
-from .schemas.acquisition import CaptureDemand, CaptureDemandManifest, CaptureIntent
-from .schemas.enums import ObjectState
+from .schemas.acquisition import (
+    CaptureDemand,
+    CaptureDemandManifest,
+    CaptureIntent,
+    TargetKind,
+)
 
 log = get_logger("demands-build")
 
@@ -50,6 +54,14 @@ class BuildReport:
     not_applicable: dict[str, str] = field(default_factory=dict)
     unresolved_target: dict[str, str] = field(default_factory=dict)
 
+    #: Identifiant d'instance retenu, par type. Le type seul ne désigne rien :
+    #: c'est l'instance qui est référencée ailleurs.
+    resolved_instances: dict[str, str] = field(default_factory=dict)
+
+    #: Où chercher tant qu'une cible n'est pas résolue. Une vue obtenue par ce
+    #: détour demande vérification, elle n'établit pas la cible.
+    search_proxies: dict[str, str] = field(default_factory=dict)
+
     def as_dict(self) -> dict:
         return {
             "generated_from_obligation": sorted(self.generated_from_obligation),
@@ -57,6 +69,8 @@ class BuildReport:
             "waived": self.waived,
             "not_applicable": self.not_applicable,
             "unresolved_target": self.unresolved_target,
+            "resolved_instances": self.resolved_instances,
+            "search_proxies": self.search_proxies,
             "bytes_downloaded": 0,
             "note": (
                 "un objet non résolu produit un besoin non résolu, jamais une "
@@ -108,7 +122,8 @@ def build(
     possède pas le manifeste, il y ajoute ce que le gabarit exige. Écraser
     aurait fait disparaître à chaque exécution ce qu'une personne avait ajouté.
     """
-    from .coverage_obligations import OBLIGATIONS, ObligationStatus
+    from .coverage_obligations import OBLIGATIONS, Applicability, ObligationStatus
+    from .site_resolution import Resolution, resolve_site_object
 
     if site is None:
         raise DemandsRefused(
@@ -117,7 +132,6 @@ def build(
         )
 
     dispensed = {waiver.object_id: waiver for waiver in (waivers or [])}
-    states = {obj.object_id: obj.state for obj in getattr(site, "objects", [])}
 
     report = BuildReport()
     demands: dict[str, CaptureDemand] = {}
@@ -144,24 +158,29 @@ def build(
             bucket[object_id] = waiver.rationale
             continue
 
-        state = states.get(object_id)
-        if state is ObjectState.UNRESOLVED:
-            # Le besoin existe et n'est pas ciblable : ni satisfait, ni
-            # dispensé. Le convertir en dispense ferait disparaître le manque.
-            report.unresolved_target[object_id] = (
-                "objet non résolu au manifeste de site : le besoin est réel, "
-                "mais rien ne permet encore de le viser"
-            )
+        # Résolution **par type**, jamais par identifiant d'instance : les
+        # identifiants sont préfixés du site, et comparer les deux déclarait
+        # absents des objets bel et bien présents.
+        resolved = resolve_site_object(site, object_id)
+
+        if obligation.applicability is Applicability.OPERATOR_ONLY:
             continue
-        if state is None and obligation.target_kind.value == "site_object":
-            report.unresolved_target[object_id] = (
-                "objet absent du manifeste de site : la cible n'existe pas"
-            )
+        if (
+            obligation.applicability is Applicability.WHEN_OBJECT_EXISTS
+            and not resolved.exists
+        ):
+            # Son absence est établie : rien n'est dû, et le dire évite qu'on
+            # la croie oubliée.
+            report.not_applicable[object_id] = resolved.why()
             continue
 
-        if not obligation.mandatory and demand_id not in demands:
-            # Facultative et non demandée : rien n'est dû.
-            continue
+        # Le besoin existe **même** si sa cible n'est pas encore résolue. Le
+        # supprimer confondrait « la cible n'est pas résolue » avec « le besoin
+        # n'existe pas » : la découverte ne chercherait jamais cette cible, et
+        # le plan serait bloqué sans rien pour le débloquer.
+        targetable = resolved.is_targetable
+        if not targetable and obligation.target_kind is TargetKind.SITE_OBJECT:
+            report.unresolved_target[object_id] = resolved.why()
 
         demands[demand_id] = CaptureDemand(
             demand_id=demand_id,
@@ -172,6 +191,12 @@ def build(
             **_thresholds(obligation.intent, coverage),
         )
         report.generated_from_obligation.append(demand_id)
+        if resolved.object_id:
+            report.resolved_instances[object_id] = resolved.object_id
+        if not targetable and obligation.search_proxy_ref:
+            # Où chercher tant que la cible précise manque. Une vue obtenue par
+            # ce détour demandera vérification : elle ne vaut pas preuve.
+            report.search_proxies[demand_id] = obligation.search_proxy_ref
 
     manifest = CaptureDemandManifest(
         hotel_id=hotel_id,
@@ -203,12 +228,26 @@ def validate_targets(  # noqa: ANN001
     """
     from .schemas.acquisition import validate_targets as check
 
-    object_ids = {obj.object_id for obj in getattr(site, "objects", [])}
+    # Les besoins visent un **type** ; le manifeste porte des instances
+    # préfixées du site. Comparer les deux déclarait inconnus des objets
+    # présents — le même défaut de jointure, une couche plus bas.
+    object_ids = {
+        kind
+        for obj in getattr(site, "objects", []) or []
+        if (kind := getattr(obj, "kind", None))
+    }
     corridor_ids = None
     if geometry is not None:
         corridor_ids = {
             corridor.corridor_id for corridor in getattr(geometry, "corridors", [])
         } | {
             resolved.feature_id for resolved in getattr(geometry, "geometries", [])
+        } | {
+            # Une transition dont l'objet existe au site est une cible
+            # légitime, même sans géométrie propre : c'est `demand_targets`
+            # qui refusera de la mesurer, en le disant.
+            kind
+            for obj in getattr(site, "objects", []) or []
+            if (kind := getattr(obj, "kind", None))
         }
     return check(manifest, object_ids, corridor_ids)

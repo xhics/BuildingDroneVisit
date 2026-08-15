@@ -38,6 +38,25 @@ from .schemas.acquisition import CaptureIntent, TargetKind
 log = get_logger("coverage-obligations")
 
 
+class Applicability(StrEnum):
+    """Quand une obligation s'applique à un site.
+
+    Un booléen `mandatory` disait mal les choses : le stationnement n'est pas
+    « facultatif » — il est obligatoire **quand il existe**, et sans objet
+    quand son absence est établie. Les confondre laissait un stationnement
+    géoréférencé n'exiger aucune vue.
+    """
+
+    #: Toujours due : toute propriété a des façades.
+    ALWAYS = "always"
+
+    #: Due dès que l'objet existe sur ce site, sans objet sinon.
+    WHEN_OBJECT_EXISTS = "when_object_exists"
+
+    #: Jamais générée : l'opérateur la demande, ou personne.
+    OPERATOR_ONLY = "operator_only"
+
+
 class ObligationStatus(StrEnum):
     """Ce qu'il advient d'une obligation, pour un site donné."""
 
@@ -71,8 +90,18 @@ class CoverageObligation:
     #: un objet, l'identifiant de l'objet lui-même.
     expected_target_ref: str
 
-    mandatory: bool = True
+    applicability: Applicability = Applicability.ALWAYS
     rationale: str = ""
+
+    #: Où chercher tant que la cible précise n'est pas résolue. Une entrée sans
+    #: position ne se cherche pas nulle part : on cadre la façade, et la vue
+    #: obtenue demande vérification plutôt que de valoir preuve.
+    search_proxy_ref: str | None = None
+
+    @property
+    def mandatory(self) -> bool:
+        """Compatibilité de lecture : `always` reste le cas obligatoire pur."""
+        return self.applicability is Applicability.ALWAYS
 
 
 #: Obligations du gabarit. Génériques : aucun établissement n'y est nommé, et
@@ -103,11 +132,15 @@ OBLIGATIONS: tuple[CoverageObligation, ...] = (
         "ENTRANCE_MAIN_CURRENT", CaptureIntent.BUILDING_CAPTURE,
         TargetKind.SITE_OBJECT, "ENTRANCE_MAIN_CURRENT",
         rationale="l'entrée porte l'apparence la plus datée du bâtiment",
+        # Tant que l'entrée n'est pas située, on cadre la façade d'adresse :
+        # c'est là qu'elle se trouve. La vue obtenue ne vaut pas preuve.
+        search_proxy_ref="FACADE_PRIMARY",
     ),
     CoverageObligation(
         "PROPERTY_SIGN", CaptureIntent.BUILDING_CAPTURE, TargetKind.SITE_OBJECT,
         "PROPERTY_SIGN",
         rationale="l'enseigne établit l'appartenance là où la géométrie ne peut pas",
+        search_proxy_ref="BUILDING_MAIN",
     ),
     CoverageObligation(
         "ACCESS_ROAD_MAIN", CaptureIntent.CONTEXT_CAPTURE,
@@ -116,12 +149,15 @@ OBLIGATIONS: tuple[CoverageObligation, ...] = (
     ),
     CoverageObligation(
         "PARKING_HOTEL", CaptureIntent.CONTEXT_CAPTURE, TargetKind.SITE_OBJECT,
-        "PARKING_HOTEL", mandatory=False,
-        rationale="tous les établissements n'en ont pas",
+        "PARKING_HOTEL", applicability=Applicability.WHEN_OBJECT_EXISTS,
+        rationale=(
+            "tous les établissements n'en ont pas — mais quand il existe, il "
+            "documente l'arrivée et doit être couvert"
+        ),
     ),
     CoverageObligation(
         "DRIVEWAY_MAIN", CaptureIntent.CONTEXT_CAPTURE, TargetKind.TRANSITION,
-        "DRIVEWAY_MAIN", mandatory=False,
+        "DRIVEWAY_MAIN", applicability=Applicability.WHEN_OBJECT_EXISTS,
         rationale="la transition voie-entrée, quand elle existe",
     ),
 )
