@@ -630,3 +630,38 @@ def test_a_demand_without_continuity_needs_only_its_viewpoints() -> None:
 
     assert enough.meets(simple) is True
     assert short.meets(simple) is False
+
+
+def test_the_cli_refuses_to_write_an_unexecutable_draft(project) -> None:
+    """Un brouillon irréalisable est un brouillon faux.
+
+    `bind_plan` existait, était testé, et n'était appelé nulle part : la
+    contradiction entre ce que le plan demande et ce que le fournisseur propose
+    n'apparaissait qu'au moment de payer.
+    """
+    import json
+
+    from hotel_pipeline.cli import app
+    from hotel_pipeline.schemas.acquisition import CandidateManifest
+
+    runner, workspace, _ = project
+
+    # Un fournisseur qui ne sert qu'une résolution dont le plan ne veut pas.
+    impossible = candidate().model_copy(
+        update={"available_resolutions": ["une-taille-que-le-plan-ignore"]}
+    )
+    workspace.write_json(
+        "01_sources/candidates_20260814T000000000000Z.json",
+        json.loads(
+            CandidateManifest(hotel_id="hotel-test", candidates=[impossible])
+            .model_dump_json()
+        ),
+    )
+
+    result = runner.invoke(app, ["assets", "plan", "hotel-test"])
+
+    assert result.exit_code == 1, result.output
+    assert "indisponible" in result.output
+    assert "aucun plan écrit" in result.output
+    written = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
+    assert written == [], "rien ne doit être écrit quand le plan est irréalisable"

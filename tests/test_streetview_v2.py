@@ -256,5 +256,9 @@ def test_the_announced_size_is_not_a_measurement() -> None:
     )
 
     assert candidate.advertised_width == 2048
-    # Rien n'est encore mesuré : aucun fichier n'existe.
-    assert candidate.available_resolutions == ["2048x2048"]
+    # Rien n'est encore mesuré : aucun fichier n'existe. La taille du cadrage
+    # figure parmi les résolutions disponibles, aux côtés du vocabulaire que le
+    # plan manipule — Street View rend la taille demandée, dans la limite d'un
+    # plafond, et non une liste fermée.
+    assert "2048x2048" in candidate.available_resolutions
+    assert {"256", "2048"} <= set(candidate.available_resolutions)

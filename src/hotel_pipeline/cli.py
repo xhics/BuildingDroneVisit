@@ -1115,6 +1115,28 @@ def assets_plan(
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    # Un brouillon irréalisable est un brouillon faux. `bind_plan` existait,
+    # était testé, et n'était appelé nulle part : la contradiction entre ce que
+    # le plan demande et ce que le fournisseur propose n'apparaissait qu'au
+    # moment de payer.
+    from .schemas.acquisition import bind_plan
+
+    # Confronté aux évaluations **que le plan vient de produire** : celles du
+    # manifeste de découverte sont antérieures à la mesure de cadrage, et un
+    # candidat peut y être éligible avant d'être écarté par la géométrie.
+    # Juger sur elles comparerait le plan à un état périmé.
+    measured = candidates.model_copy(update={"evaluations": evaluations})
+    broken = bind_plan(plan, measured, demands)
+    if broken:
+        for problem in broken:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  aucun plan écrit : un brouillon qui ne peut pas s'exécuter "
+            "annoncerait une dépense impossible",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        raise typer.Exit(code=1)
+
     typer.echo(f"  candidats   {report.candidates}")
     if geometry_report is not None:
         typer.echo(

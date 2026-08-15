@@ -391,3 +391,60 @@ def test_discover_actually_merges_near_identical_framings(rear_demand):
     assert report.framings_merged == {"sv-2": "sv-1"}, (
         "l'écarté doit rester nommé dans la trace d'audit"
     )
+
+
+def test_sequences_reach_the_continuity_measure(rear_demand):
+    """La séquence traverse collecteur → candidat → mesure.
+
+    `sequence` vient dans la même requête Mapillary : l'enrichissement n'exige
+    aucun appel supplémentaire. Sans ce câblage, la continuité restait
+    `not_queried` et tout besoin l'exigeant demeurait borné à l'aperçu.
+    """
+    near, side = _south_of(TARGET, 40), _south_of(TARGET, 45, east=30)
+    pair = [
+        candidate("mly-1", *near, sequence_id="seq-A"),
+        candidate("mly-2", *side, sequence_id="seq-A"),
+    ]
+
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": pair},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    statuses = {m.sequence_status.value for m in report.search.measures}
+    assert statuses == {"known"}, "la séquence n'a pas atteint la mesure"
+    assert {m.sequence_id for m in report.search.measures} == {"seq-A"}
+
+
+def test_a_source_without_sequences_says_not_returned(rear_demand, three_candidates):
+    """« Le fournisseur n'en a pas rendu » n'est pas « nous n'avons pas
+    demandé »."""
+    _, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": three_candidates},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    statuses = {m.sequence_status.value for m in report.search.measures}
+    assert statuses == {"not_returned"}
+    assert all(m.sequence_id is None for m in report.search.measures)
+
+
+def test_the_collector_sequence_reaches_the_candidate():
+    """Le premier maillon : `CollectedImage` → `CaptureCandidate`.
+
+    Les tests suivants construisent des candidats directement ; sans celui-ci,
+    couper la recopie dans `candidates_from` ne faisait rien échouer.
+    """
+    from hotel_pipeline.collectors.base import CollectedImage
+    from hotel_pipeline.discover import candidates_from
+
+    image = CollectedImage(
+        source="mapillary", source_id="1", url="http://exemple",
+        lat=45.0, lon=-73.0, sequence_id="seq-A",
+    )
+    built = candidates_from("mapillary", [image])[0]
+
+    assert built.sequence_id == "seq-A"
+    assert "thumb_256" in built.available_resolutions, (
+        "un plan demandant un aperçu doit pouvoir l'obtenir"
+    )

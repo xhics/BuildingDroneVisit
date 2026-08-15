@@ -21,7 +21,10 @@ log = get_logger("mapillary")
 
 GRAPH_URL = "https://graph.mapillary.com/images"
 TIMEOUT = 60
-FIELDS = "id,captured_at,compass_angle,geometry,thumb_2048_url,is_pano"
+#: `sequence` vient dans la **même** requête : l'enrichissement de séquence
+#: n'exige donc aucun appel supplémentaire. Sans lui, la continuité restait
+#: inconnue, et tout besoin l'exigeant demeurait borné à l'aperçu.
+FIELDS = "id,captured_at,compass_angle,geometry,thumb_2048_url,is_pano,sequence"
 
 #: Taille de page demandée à l'API.
 PAGE_SIZE = 200
@@ -104,6 +107,9 @@ def collect(
                 heading_deg=_normalise_heading(entry.get("compass_angle")),
                 lon=coordinates[0],
                 lat=coordinates[1],
+                sequence_id=(
+                    str(entry["sequence"]) if entry.get("sequence") else None
+                ),
                 extra={"is_pano": str(entry.get("is_pano", False))},
             )
         )

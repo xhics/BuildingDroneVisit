@@ -90,7 +90,10 @@ def candidate_from(panorama, framing: Framing, distance_m: float | None = None) 
         captured_at=_captured_at(panorama.date),
         advertised_width=_dimension(framing.size, 0),
         advertised_height=_dimension(framing.size, 1),
-        available_resolutions=[framing.size],
+        # Street View rend la taille demandée : ce n'est pas une liste fermée
+        # mais un plafond. Déclarer le seul cadrage nominal faisait refuser à
+        # l'exécution tout plan demandant un aperçu.
+        available_resolutions=sorted({framing.size, *PLAN_RESOLUTIONS}),
         request_spec=framing.as_request_spec(pano_id),
         # Street View publie des vues de voirie : la preuve d'extériorité vient
         # de la source elle-même, non d'une supposition sur le contenu.
@@ -240,6 +243,13 @@ def resolve_url(request_spec: dict[str, str], *, signed: bool = True) -> str:
     from ..config import secret
 
     return f"{url}&key={secret('GOOGLE_MAPS_API_KEY')}"
+
+
+#: Vocabulaire des résolutions que le **plan** manipule. Chaque collecteur les
+#: traduit dans le sien au moment d'acquérir : sans cette déclaration, un plan
+#: parlant « 256 » et un candidat parlant « 640x640 » ne se reconnaissaient
+#: pas, et les neuf acquisitions du brouillon auraient été refusées.
+PLAN_RESOLUTIONS: frozenset[str] = frozenset({"256", "2048"})
 
 
 def _captured_at(date: str | None):  # noqa: ANN201

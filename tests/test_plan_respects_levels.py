@@ -615,3 +615,78 @@ def test_an_evaluation_without_its_candidate_keeps_its_verdict() -> None:
     assert len(rows) == 1
     assert "framing" not in rows[0]
     assert rows[0]["candidate_id"] == "absent"
+
+
+def test_a_draft_plan_must_already_be_executable() -> None:
+    """Un brouillon irréalisable est un brouillon faux.
+
+    Les neuf acquisitions du pilote auraient toutes été refusées à
+    l'exécution : le plan demandait « 256 » ou « 2048 », les candidats
+    déclaraient « thumb_2048 » ou « 640x640 ». Trois couches, trois
+    vocabulaires, et la contradiction n'apparaissait qu'au moment de payer.
+    """
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan,
+        CandidateManifest,
+        CaptureDemandManifest,
+        PlanStatus,
+        bind_plan,
+    )
+
+    candidate = _candidate("c-1", available_resolutions=["thumb_2048", "256"])
+    planned = select(
+        [_evaluation("c-1")], [_demand()],
+        candidates={"c-1": candidate},
+        levels={("c-1", "obligation:front"): PREVIEW},
+        preview_resolution="256", full_resolution="2048",
+    )
+
+    plan = AcquisitionPlan(
+        plan_id="essai", hotel_id="pilote", status=PlanStatus.DRAFT,
+        acquisitions=planned,
+    )
+    problems = bind_plan(
+        plan,
+        CandidateManifest(
+            hotel_id="pilote", candidates=[candidate],
+            evaluations=[_evaluation("c-1")],
+        ),
+        CaptureDemandManifest(hotel_id="pilote", demands=[_demand()]),
+    )
+
+    assert problems == [], (
+        "le brouillon doit être exécutable au moment où il est produit"
+    )
+
+
+def test_a_resolution_the_provider_cannot_serve_is_still_refused() -> None:
+    """Le vocabulaire commun ne doit pas désarmer la garde."""
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan,
+        CandidateManifest,
+        CaptureDemandManifest,
+        PlanStatus,
+        bind_plan,
+    )
+
+    candidate = _candidate("c-1", available_resolutions=["thumb_2048"])
+    plan = AcquisitionPlan(
+        plan_id="essai", hotel_id="pilote", status=PlanStatus.DRAFT,
+        acquisitions=select(
+            [_evaluation("c-1")], [_demand()],
+            candidates={"c-1": candidate},
+            levels={("c-1", "obligation:front"): PREVIEW},
+            preview_resolution="256", full_resolution="2048",
+        ),
+    )
+    problems = bind_plan(
+        plan,
+        CandidateManifest(
+            hotel_id="pilote", candidates=[candidate],
+            evaluations=[_evaluation("c-1")],
+        ),
+        CaptureDemandManifest(hotel_id="pilote", demands=[_demand()]),
+    )
+
+    assert len(problems) == 1
+    assert "indisponible" in problems[0]

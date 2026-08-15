@@ -104,7 +104,10 @@ def test_what_remains_is_enough_to_rebuild_the_address() -> None:
 
     assert candidate.request_spec["provider_id"] == "42"
     assert candidate.request_spec["resolution"] == "thumb_2048"
-    assert candidate.available_resolutions == ["thumb_2048"]
+    # `thumb_256` est déclaré : un plan demandant un aperçu doit pouvoir
+    # l'obtenir, et le taire le faisait refuser à l'exécution.
+    assert "thumb_2048" in candidate.available_resolutions
+    assert "thumb_256" in candidate.available_resolutions
 
 
 # --- annoncé n'est pas mesuré -------------------------------------------------

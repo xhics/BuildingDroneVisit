@@ -140,13 +140,21 @@ def candidates_from(source: str, images: list) -> list[CaptureCandidate]:
                 original_heading_deg=image.heading_deg,
                 heading_is_measured=image.heading_is_measured,
                 captured_at=_captured_at(image),
+                # Le trajet dont la vue fait partie, quand la source le publie.
+                # Sans lui, la continuité restait inconnue et tout besoin
+                # l'exigeant demeurait borné à l'aperçu.
+                sequence_id=getattr(image, "sequence_id", None),
                 # Le nécessaire à la reconstruction de l'adresse, et rien qui
                 # ressemble à un secret ou à une URL.
                 request_spec={
                     "provider_id": provider_id,
                     "resolution": "thumb_2048",
                 },
-                available_resolutions=["thumb_2048"],
+                # `thumb_256` existe à l'API et n'était pas déclaré : un plan
+                # demandant un aperçu était refusé faute de l'avoir dit.
+                available_resolutions=sorted(
+                    {"thumb_256", "thumb_2048", "256", "2048"}
+                ),
             )
         )
     return candidates
@@ -351,7 +359,12 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     expliquer pourquoi un candidat n'a pas été retenu. Un candidat écarté
     conserve donc son évaluation.
     """
-    from .adaptive_search import SearchReport, measure_candidate, select_for_demand
+    from .adaptive_search import (
+        SearchReport,
+        SequenceStatus,
+        measure_candidate,
+        select_for_demand,
+    )
     from .schemas.acquisition import CandidateEvaluation, Eligibility
 
     empty_levels = {"enrichment": set(), "preview": set(), "full": set()}
@@ -383,8 +396,27 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
     viewpoints = dict(getattr(search, "viewpoints", None) or {})
     viewpoints.update(_viewpoints_of(candidates, search))
 
+    # Séquences rendues par les sources. Une source qui n'en publie pas laisse
+    # le statut à `NOT_RETURNED` : « le fournisseur n'en a pas rendu » n'est pas
+    # « nous n'avons pas demandé ».
+    sequences = {
+        candidate.candidate_id: candidate.sequence_id
+        for candidate in candidates
+        if candidate.sequence_id
+    }
+    sequence_status = (
+        SequenceStatus.KNOWN if sequences else SequenceStatus.NOT_RETURNED
+    )
+
     for demand in search.outstanding:
         anchors = search.anchors.get(demand.demand_id, [])
+        # Séquences déjà servies par une ancre de **ce** besoin : y appartenir
+        # rend le recouvrement plausible, jamais certain.
+        anchor_sequences = {
+            sequences[anchor.viewpoint_id]
+            for anchor in anchors
+            if anchor.viewpoint_id in sequences
+        }
         # Un besoin sans ancre compatible est le plus urgent : c'est un secteur
         # que rien ne couvre encore.
         priority = 3 if not anchors else 2
@@ -395,6 +427,9 @@ def _adaptive_pass(hotel_id: str, candidates: list, search, report):  # noqa: AN
                 target_lat=target_lat, target_lon=target_lon,
                 policy=search.policy,
                 sector=getattr(search, "sector", None),
+                sequence_of=sequences,
+                anchor_sequences=anchor_sequences,
+                sequence_status=sequence_status,
             )
             for candidate in candidates
         ]

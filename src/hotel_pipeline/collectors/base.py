@@ -109,6 +109,11 @@ class CollectedImage:
     extra: dict[str, str] = field(default_factory=dict)
     local_path: Path | None = None
 
+    #: Trajet dont cette vue fait partie, quand la source le publie. Deux vues
+    #: d'une même séquence ont un recouvrement **plausible** — pas prouvé : un
+    #: véhicule tourne. `None` signifie « non rendu », jamais « aucune ».
+    sequence_id: str | None = None
+
     #: Le cap est-il observé (imagerie de roulage) ou choisi par nous
     #: (extraction d'un panorama sphérique) ? Voir `Asset.heading_is_measured`.
     heading_is_measured: bool = True
