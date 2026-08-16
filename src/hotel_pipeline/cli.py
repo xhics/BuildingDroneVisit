@@ -3672,7 +3672,7 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
     # L'empreinte porte sur le fichier **tel qu'il est** : c'est lui qui a
     # servi, non la forme rattachée en mémoire.
     raw = workspace.read_json("06_geo/capture_geometry.json")
-    manifest = CaptureGeometryManifest.model_validate(raw)
+    manifest = _capture_geometry_if_any(workspace, context)
     if manifest is None:
         typer.secho(
             f"{KO} manifeste géométrique illisible ou sans référentiel résolu",
