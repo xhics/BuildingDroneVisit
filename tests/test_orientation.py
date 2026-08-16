@@ -358,3 +358,58 @@ def test_the_demand_activation_sorts_by_time_not_by_name() -> None:
         )
         assert len(canonique["demands"]) == 7
     os.environ.pop("HOTEL_PIPELINE_WORK", None)
+
+
+def test_the_bearing_accounts_for_meridian_convergence() -> None:
+    """Un `atan2` sur des degrés géographiques ignore la latitude.
+
+    À 45°, un degré de longitude vaut environ 0,71 degré de latitude en
+    distance : la formule naïve tordait 46 secteurs sur 313 du pilote. Et
+    vérifier avec la même formule qu'on applique ne prouve rien — c'est ce qui
+    avait fait conclure à « 0/313 » alors que 46 étaient faux.
+    """
+    import math
+
+    from hotel_pipeline.visibility import bearing_deg
+
+    # Un point au nord-est exact d'un bâtiment situé à 45° de latitude.
+    b_lat, b_lon = 45.0, -73.0
+    c_lat, c_lon = 45.001, -72.999
+
+    naif = math.degrees(math.atan2(c_lon - b_lon, c_lat - b_lat)) % 360.0
+    canonique = bearing_deg(b_lat, b_lon, c_lat, c_lon)
+
+    assert abs(naif - canonique) > 5.0, (
+        "les deux formules diffèrent assez pour changer de secteur"
+    )
+    # Le vrai relèvement penche vers le nord : à cette latitude, un degré de
+    # longitude est plus court qu'un degré de latitude.
+    assert canonique < naif
+
+
+def test_the_two_formulas_can_disagree_on_the_sector() -> None:
+    """Le cas qui compte : pas seulement un écart d'angle, un **secteur**
+    différent.
+
+    À 45° de latitude, une caméra 22 m au nord et 47 m à l'est du bâtiment est
+    classée « arrière » par le relèvement canonique et « coin arrière-gauche »
+    par la formule naïve. C'est ce genre d'écart qui rendait 46 secteurs faux.
+    """
+    import math
+
+    from hotel_pipeline.sectors import sector_for
+    from hotel_pipeline.visibility import bearing_deg
+
+    b_lat, b_lon, front = 45.0, -73.0, 227.89
+    lat, lon = b_lat + 0.0002, b_lon + 0.0006
+
+    canonique = sector_for(bearing_deg(b_lat, b_lon, lat, lon), front)
+    naif = sector_for(
+        math.degrees(math.atan2(lon - b_lon, lat - b_lat)) % 360.0, front
+    )
+
+    assert canonique.value == "rear"
+    assert naif.value == "rear_left_corner"
+    assert canonique != naif, (
+        "sans cette différence, le test ne prouverait rien sur la formule"
+    )
