@@ -216,3 +216,25 @@ def test_visibility_assess_loads_a_legacy_geometry_manifest(tmp_path, monkeypatc
     # Le fichier n'est pas réécrit : un manifeste qui change à la lecture ne se
     # relit plus comme ce qu'il fut.
     assert json.loads(path.read_text("utf-8")) == legacy
+
+
+def test_the_run_passes_the_manifest_referential_to_every_corridor() -> None:
+    """Appeler `_corridor` directement ne prouve rien sur ce que l'exécution
+    lui donne.
+
+    Sans ce test, remplacer `manifest.working_crs` par une constante passait
+    inaperçu : les mesures auraient été publiées sous un référentiel qui n'est
+    pas celui du manifeste.
+    """
+    import inspect
+
+    from hotel_pipeline.geo import visibility_run
+
+    source = inspect.getsource(visibility_run.run_assessment)
+    appel = source[source.index("_corridor("):]
+    appel = appel[: appel.index(")\n") + 1]
+
+    assert "crs=manifest.working_crs" in appel, (
+        "le référentiel transmis doit être celui du manifeste, non une valeur "
+        f"choisie ici — vu : {appel!r}"
+    )
