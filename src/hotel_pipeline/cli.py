@@ -1664,16 +1664,37 @@ def assets_acquire(
         raise typer.Exit(code=3)
 
     manifest = workspace.read_assets() or AssetManifest(hotel_id=hotel_id, assets=[])
+    # `merge` étend la liste **en place** et rend un rapport : lui demander
+    # `.assets` levait une AttributeError après le téléchargement, donc après
+    # la dépense. Le rapport dit ce qui a été ajouté ; la liste porte le
+    # résultat.
     merged = merge(manifest.assets, acquired)
-    manifest.assets = merged.assets
-    workspace.write_assets(manifest)
+    if merged.added:
+        workspace.write_assets(manifest)
+    else:
+        # Réécrire un manifeste inchangé après une acquisition refusée
+        # déplacerait son empreinte sans qu'aucun asset n'ait été ajouté : un
+        # relecteur y verrait une modification là où rien n'a eu lieu.
+        typer.echo("  manifeste inchangé : aucun asset ajouté, aucune réécriture")
     workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context, production="AcquiredImage")
 
     for candidate_id, reason in sorted(report.failed.items()):
-        typer.secho(f"    échec · {candidate_id} — {reason[:60]}", fg=typer.colors.YELLOW)
+        # Le motif entier : tronqué, il cachait précisément ce qui distingue un
+        # dépassement d'un mauvais format.
+        typer.secho(f"    échec · {candidate_id}", fg=typer.colors.YELLOW)
+        typer.secho(f"        {reason}", fg=typer.colors.YELLOW)
 
     typer.echo("")
-    typer.echo(f"{OK} {report.acquired}/{report.planned} fichier(s) acquis")
+    if report.failed:
+        typer.secho(
+            f"{KO} acquisition refusée : {len(report.failed)} échec(s) — aucun "
+            f"des {report.planned} assets n'est publié, le staging est vidé",
+            fg=typer.colors.RED,
+        )
+        typer.echo(f"    {report.bytes_downloaded} octets reçus, 0 publié")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"{OK} {report.published}/{report.planned} fichier(s) acquis")
     typer.echo(f"    {report.bytes_downloaded} octets téléchargés "
                f"sur {report.bytes_consented} consentis")
     typer.echo(f"    répertoire : {destination}")
@@ -4983,3 +5004,94 @@ def _head_budget(requests) -> dict:  # noqa: ANN001
         cost = 2 if request.source == mapillary_name else 1
         budget[request.source] = budget.get(request.source, 0) + cost
     return budget
+
+
+@assets_app.command("consent-plan")
+def assets_consent_plan(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    plan_file: Path = typer.Option(
+        ..., "--plan", help="Plan **mesuré** existant. Aucune reconstruction.",
+    ),
+    consent_bytes: int = typer.Option(
+        ..., "--consent-bytes",
+        help="Volume exact accepté, en octets. Doit égaler le total mesuré.",
+    ),
+) -> None:
+    """Rend exécutable un plan mesuré, sans le refaire.
+
+    `assets plan --consent-bytes` reconstruit la sélection : consentir par ce
+    chemin produirait un plan neuf, non celui dont le volume a été montré et
+    dont les empreintes ont été examinées. L'accord porterait alors sur des
+    requêtes que personne n'a vues.
+    """
+    from .plan import PlanRefused, consent
+    from .plan_invalidation import invalidated_plan_ids
+    from .schemas.acquisition import AcquisitionPlan, PlanStatus
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+    sources = workspace.path("01_sources")
+
+    path = Path(plan_file)
+    if not path.is_file():
+        typer.secho(f"{KO} plan introuvable : {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    plan = AcquisitionPlan.model_validate(json.loads(path.read_text("utf-8")))
+
+    problems: list[str] = []
+    if plan.hotel_id != hotel_id:
+        problems.append(f"plan de {plan.hotel_id!r}, non de {hotel_id!r}")
+    if plan.plan_id in invalidated_plan_ids(sources):
+        problems.append("plan invalidé : il a été retiré de la circulation")
+    if plan.status is not PlanStatus.DRAFT:
+        problems.append(f"déjà à l'état « {plan.status.value} »")
+    if plan.published_known_bytes is None:
+        problems.append(
+            "plan non mesuré : son volume n'a pas été montré, et consentir à "
+            "un total qu'on n'a pas vu n'engage rien"
+        )
+    elif consent_bytes != plan.published_known_bytes:
+        problems.append(
+            f"{consent_bytes} octets acceptés, {plan.published_known_bytes} "
+            "annoncés — le consentement porte sur le volume exact"
+        )
+
+    if problems:
+        for problem in problems:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Les empreintes viennent des **mêmes** documents que ceux du plan : les
+    # laisser nulles rendrait le plan inexécutable, et les inventer le
+    # rattacherait à un état qu'il n'a pas connu.
+    candidates_path = _latest_candidates(workspace)
+    demands_payload = workspace.read_json("01_sources/capture_demands.json")
+    candidates_payload = (
+        json.loads(candidates_path.read_text("utf-8")) if candidates_path else None
+    )
+
+    try:
+        accepted = consent(
+            plan,
+            _plan_digests(workspace, context, candidates_payload, demands_payload),
+            measured_from=plan.plan_id,
+            download_contract_version=(
+                context.policy.collection.download_contract_version
+            ),
+        )
+    except PlanRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    # Publié à côté : le plan mesuré n'est pas modifié, et l'accord se lit dans
+    # un artefact distinct de ce sur quoi il porte.
+    workspace.write_json(
+        f"01_sources/acquisition_plan_{accepted.plan_id}-consented.json",
+        json.loads(accepted.model_dump_json()),
+    )
+
+    typer.echo(f"{OK} plan consenti — {accepted.consented_max_bytes} octets")
+    typer.echo(f"    requêtes verrouillées : {len(accepted.consented_request_digests)}")
+    typer.echo(f"    contrat de téléchargement v{accepted.consented_download_contract_version}")
+    typer.echo(f"    mesuré depuis : {accepted.consented_from_plan_id}")

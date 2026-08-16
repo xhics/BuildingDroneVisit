@@ -275,3 +275,48 @@ def test_every_collector_declares_what_the_translation_will_ask() -> None:
     ])[0]
     for wanted in PROVIDER_RESOLUTIONS["mapillary"].values():
         assert wanted in mapillary.available_resolutions
+
+
+# --- ce qu'une source sait servir ---------------------------------------------
+
+
+def test_a_resolution_beyond_the_provider_ceiling_is_refused() -> None:
+    """Street View plafonne à 640 px : le premier passage réel a servi 640x640
+    pour 2048x2048 demandés.
+
+    La rabattre en silence livrerait autre chose que ce qui a été planifié ;
+    la refuser rend la source inéligible pour un besoin qui exige davantage.
+    """
+    candidate = _candidate(
+        "sv-1", source="street_view",
+        request_spec={"pano_id": "A", "size": "640x640"},
+        available_resolutions=["640x640"],
+    )
+
+    with pytest.raises(RequestUnresolvable, match="ne dépasse pas 640 px"):
+        resolve(candidate, _acquisition("sv-1", resolution="2048"))
+
+
+def test_full_available_resolves_to_what_the_provider_can_serve() -> None:
+    """« Le mieux que la source sache faire » : 640 chez l'un, 2048 chez
+    l'autre. Traduire 2048 en 640 aurait tronqué la demande."""
+    street_view = _candidate(
+        "sv-1", source="street_view",
+        request_spec={"pano_id": "A", "size": "640x640"},
+        available_resolutions=["640x640"],
+    )
+    mapillary = _candidate("mly-1")
+
+    assert resolve(
+        street_view, _acquisition("sv-1", resolution="full_available")
+    ).provider_resolution == "640x640"
+    assert resolve(
+        mapillary, _acquisition("mly-1", resolution="full_available")
+    ).provider_resolution == "thumb_2048"
+
+
+def test_the_ceiling_does_not_block_what_the_provider_can_serve() -> None:
+    """Sans quoi la garde rejetterait aussi les demandes légitimes."""
+    request = resolve(_candidate(), _acquisition(resolution="2048"))
+
+    assert request.provider_resolution == "thumb_2048"

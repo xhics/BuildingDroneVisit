@@ -381,7 +381,20 @@ def select(
             "recommended_for_preview" if is_preview
             else (served_levels[0] if served_levels else None)
         )
-        resolution = preview_resolution if is_preview else full_resolution
+        # « Le mieux que la source sache faire » quand aucun besoin servi
+        # n'exige un nombre de pixels. Demander 2048 à une source qui plafonne
+        # à 640 la rendait inéligible ; l'intention laisse chaque fournisseur
+        # répondre au maximum de sa capacité.
+        exige_un_nombre = any(
+            getattr(demand, "min_projected_width_fraction", 0.0) > 0
+            or getattr(demand, "min_visible_fraction", 0.0) > 0
+            for demand in demands
+            if demand.demand_id in served
+        )
+        resolution = (
+            preview_resolution if is_preview
+            else (full_resolution if exige_un_nombre else "full_available")
+        )
         planned.append(
             PlannedAcquisition(
                 candidate_id=candidate_id,

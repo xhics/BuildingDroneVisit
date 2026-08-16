@@ -74,9 +74,29 @@ def test_a_preview_is_planned_as_a_thumbnail() -> None:
     assert PREVIEW in planned[0].selection_rationale
 
 
-def test_a_fully_eligible_candidate_is_planned_at_full_resolution() -> None:
+def test_a_demand_without_a_pixel_requirement_asks_for_the_best_available() -> None:
+    """Demander 2048 à une source plafonnée à 640 la rendait inéligible.
+
+    L'intention laisse chaque fournisseur répondre au maximum de sa capacité,
+    sans que le plan invente un nombre que le besoin n'exige pas.
+    """
     planned = select(
         [_evaluation("c-complet", eligibility=Eligibility.ELIGIBLE)], [_demand()],
+        candidates={"c-complet": _candidate("c-complet")},
+        levels={("c-complet", "obligation:front"): FULL},
+        preview_resolution="256", full_resolution="2048",
+    )
+
+    assert planned[0].resolution == "full_available"
+
+
+def test_a_demand_with_a_pixel_requirement_keeps_the_exact_number() -> None:
+    """Une exigence réelle de taille projetée demande un nombre, non un
+    « au mieux » : c'est ce qui rend une source inéligible quand elle ne
+    l'atteint pas."""
+    exigeant = _demand(min_projected_width_fraction=0.25)
+    planned = select(
+        [_evaluation("c-complet", eligibility=Eligibility.ELIGIBLE)], [exigeant],
         candidates={"c-complet": _candidate("c-complet")},
         levels={("c-complet", "obligation:front"): FULL},
         preview_resolution="256", full_resolution="2048",
@@ -132,7 +152,7 @@ def test_without_any_levels_the_plan_keeps_its_former_behaviour() -> None:
     )
 
     assert len(planned) == 1
-    assert planned[0].resolution == "2048"
+    assert planned[0].resolution == "full_available"
 
 
 def test_a_rejected_candidate_stays_out_whatever_its_level() -> None:

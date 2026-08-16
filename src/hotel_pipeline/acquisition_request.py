@@ -39,10 +39,29 @@ class RequestUnresolvable(RuntimeError):
 #: déclarée, non une heuristique de nom : deviner marcherait pour `thumb_256`
 #: et échouerait au premier fournisseur nommant autrement.
 PROVIDER_RESOLUTIONS: dict[str, dict[str, str]] = {
-    "mapillary": {"256": "thumb_256", "2048": "thumb_2048"},
-    # Street View rend la taille demandée, dans la limite d'un plafond : le
-    # vocabulaire du plan s'y traduit en dimensions.
-    "street_view": {"256": "256x256", "2048": "2048x2048"},
+    "mapillary": {
+        "256": "thumb_256",
+        "2048": "thumb_2048",
+        # « Le mieux que la source sache faire », sans exiger un nombre : ce
+        # que 2048 vaut chez l'un ne vaut pas chez l'autre.
+        "full_available": "thumb_2048",
+    },
+    "street_view": {
+        "256": "256x256",
+        # Pas de « 2048 » : l'API Static plafonne à 640 px, et le premier
+        # passage réel l'a montré — 640x640 servi pour 2048x2048 demandés. La
+        # traduire en 640 aurait tronqué la demande en silence ; l'omettre fait
+        # refuser **avant** tout appel.
+        "full_available": "640x640",
+    },
+}
+
+#: Capacité maximale **vérifiée** de chaque source, en pixels du plus grand
+#: côté. Constatée sur les réponses réelles, non lue dans une documentation :
+#: c'est ce que le fournisseur a effectivement servi.
+PROVIDER_MAX_PIXELS: dict[str, int] = {
+    "street_view": 640,
+    "mapillary": 2048,
 }
 
 
@@ -131,6 +150,20 @@ def resolve(candidate, acquisition) -> ResolvedAcquisitionRequest:  # noqa: ANN0
         )
 
     wanted = acquisition.resolution
+
+    # Une exigence chiffrée au-delà de ce que la source sait servir rend cette
+    # source **inéligible** pour ce besoin : la rabattre silencieusement
+    # livrerait autre chose que ce qui a été planifié, et le premier passage
+    # réel l'a fait — 640x640 pour 2048x2048.
+    ceiling = PROVIDER_MAX_PIXELS.get(source)
+    if ceiling is not None and wanted.isdigit() and int(wanted) > ceiling:
+        raise RequestUnresolvable(
+            f"{candidate.candidate_id} : {source} ne dépasse pas {ceiling} px "
+            f"(capacité vérifiée) ; {wanted} demandés. Employez "
+            "« full_available » si le besoin n'exige pas ce nombre, ou "
+            "cherchez cette vue ailleurs."
+        )
+
     provider_resolution = table.get(wanted)
     if provider_resolution is None:
         # Le vocabulaire du fournisseur peut être employé directement — un

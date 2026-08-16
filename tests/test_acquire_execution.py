@@ -644,3 +644,61 @@ def test_consent_refuses_a_partial_volume(tmp_path) -> None:
 
     with pytest.raises(PlanRefused, match="inconnue"):
         consent(incomplet, DIGESTS)
+
+
+def test_a_wrong_sized_image_is_counted_as_received_and_staged(tmp_path) -> None:
+    """Le test décisif : un corps complet, mais aux mauvaises dimensions.
+
+    Le rapport inscrivait `bytes_received: 0` alors que les dimensions avaient
+    été décodées — donc que le fichier avait bien transité et été écrit. Il
+    faisait croire que rien n'avait été consommé du réseau.
+    """
+    import io
+
+    from PIL import Image
+
+    # 640x640 là où 2048x2048 est demandé : c'est ce que Street View a servi.
+    buffer = io.BytesIO()
+    Image.new("RGB", (640, 640), (10, 20, 30)).save(buffer, format="JPEG")
+    trop_petit = buffer.getvalue()
+
+    subject = candidate(
+        "c1", source="street_view", panorama_id="A",
+        request_spec={"pano_id": "A", "size": "2048x2048"},
+        available_resolutions=["2048x2048"],
+    )
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            resolution="2048x2048", expected_bytes=len(trop_petit),
+        )
+    ])
+
+    acquired, report = run(
+        planned, {"c1": subject}, tmp_path, DIGESTS, plan_digest="pd",
+        fetcher=fake_fetcher(trop_petit),
+    )
+
+    outcome = report.outcomes["c1"]
+    assert outcome["bytes_received"] == len(trop_petit), (
+        "le fichier a transité : l'inscrire à zéro cacherait la dépense"
+    )
+    assert outcome["bytes_staged"] == len(trop_petit), (
+        "historiquement écrit en temporaire, même supprimé depuis"
+    )
+    assert outcome["bytes_published"] == 0
+
+    # L'échec est structuré, non seulement lisible.
+    failure = outcome["failure"]
+    assert failure["code"] == "wrong_dimensions"
+    assert (failure["observed_width"], failure["observed_height"]) == (640, 640)
+    assert (failure["expected_width"], failure["expected_height"]) == (2048, 2048)
+    for secret in ("http", "token", "key="):
+        assert secret not in failure["message"]
+
+    assert acquired == []
+    assert list(tmp_path.glob("*.jpg")) == [], "aucun fichier final"
+    assert not list((tmp_path / ".staging").iterdir()) if (
+        tmp_path / ".staging"
+    ).exists() else True

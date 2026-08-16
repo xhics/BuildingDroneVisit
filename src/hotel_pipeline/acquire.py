@@ -242,13 +242,23 @@ def run(
             # illisible ou aux mauvaises dimensions n'est pas une acquisition.
             outcome = verify(Path(written), candidate.source, request)
         except (AcquisitionRefused, DownloadRefused, OSError, RuntimeError, ValueError) as exc:
+            # Mesuré **avant** la suppression : un refus aux dimensions arrive
+            # après l'écriture, et inscrire zéro ferait croire que rien n'a
+            # transité. Le réseau, lui, a bien été consommé.
+            staged_bytes = Path(target).stat().st_size if Path(target).is_file() else 0
             Path(target).unlink(missing_ok=True)
             report.failed[acquisition.candidate_id] = str(exc)
             outcomes[acquisition.candidate_id] = {
                 "candidate_id": acquisition.candidate_id,
                 "declared_bytes": acquisition.expected_bytes,
-                "bytes_received": 0, "bytes_staged": 0, "bytes_published": 0,
-                "refused": str(exc)[:160],
+                "bytes_received": staged_bytes,
+                # Historiquement écrit en temporaire, même supprimé depuis :
+                # c'est ce qui distingue un refus avant lecture d'un refus
+                # après décodage.
+                "bytes_staged": staged_bytes,
+                "bytes_published": 0,
+                "refused": str(exc),
+                "failure": _structured_failure(exc, request),
             }
             continue
 
@@ -416,3 +426,40 @@ def fetch(candidate, target: Path, request=None, ceiling: int | None = None) -> 
     if attempt is not None:
         transport.record_written(attempt, written)
     return target
+
+
+def _structured_failure(exc: Exception, request) -> dict:  # noqa: ANN001
+    """Un échec qu'on peut trier, non seulement lire.
+
+    Le message dit ce qui s'est passé ; le code dit à quelle famille il
+    appartient, et les dimensions attendues face aux observées permettent de
+    décider sans rouvrir le fichier. Aucune URL : elle porte le jeton.
+    """
+    import re
+
+    message = str(exc)
+    observed = re.search(r"dimensions (\d+)x(\d+) au lieu de", message)
+    expected = re.search(r"au lieu de (\d+)x(\d+)", message)
+
+    if observed:
+        code = "wrong_dimensions"
+    elif "dépassement" in message:
+        code = "size_over_ceiling"
+    elif "ne décrivent pas la même" in message:
+        code = "body_shorter_than_declared"
+    elif "non décodable" in message:
+        code = "undecodable_content"
+    elif "hors des formats acceptés" in message:
+        code = "unaccepted_format"
+    else:
+        code = "other"
+
+    return {
+        "code": code,
+        "message": message,
+        "expected_width": int(expected.group(1)) if expected else getattr(request, "width_px", None),
+        "expected_height": int(expected.group(2)) if expected else getattr(request, "height_px", None),
+        "observed_width": int(observed.group(1)) if observed else None,
+        "observed_height": int(observed.group(2)) if observed else None,
+        "provider_resolution": getattr(request, "provider_resolution", None),
+    }
