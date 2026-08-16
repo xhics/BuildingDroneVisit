@@ -259,3 +259,19 @@ def test_visibility_assess_does_not_validate_the_manifest_directly() -> None:
     assert "CaptureGeometryManifest.model_validate(raw)" not in source, (
         "le valider directement refuse tout manifeste antérieur au schéma"
     )
+
+
+def test_visibility_apply_also_uses_the_tolerant_loader() -> None:
+    """La projection butait sur le même défaut que la mesure.
+
+    Corriger `assess` seul laissait `apply` refuser le manifeste du pilote —
+    après que le calcul, long de plusieurs minutes, eut abouti.
+    """
+    import inspect
+
+    from hotel_pipeline import cli
+
+    source = inspect.getsource(cli.visibility_apply)
+
+    assert "_capture_geometry_if_any(workspace, context)" in source
+    assert "CaptureGeometryManifest.model_validate(raw_geometry)" not in source

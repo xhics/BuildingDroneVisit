@@ -3993,7 +3993,16 @@ def visibility_apply(
             fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
-    geometry = CaptureGeometryManifest.model_validate(raw_geometry)
+    # Par le **même** chargeur que `visibility assess` : le manifeste du pilote
+    # est antérieur au schéma courant, et le valider directement bloquait la
+    # projection après que la mesure eut abouti.
+    geometry = _capture_geometry_if_any(workspace, context)
+    if geometry is None:
+        typer.secho(
+            "manifeste géométrique illisible ou sans référentiel résolu",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
 
     # Les images sont relues : un checksum déclaré ne prouve pas le contenu.
     altered, absent = [], []
