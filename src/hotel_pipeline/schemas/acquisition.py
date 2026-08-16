@@ -1048,6 +1048,11 @@ class PlannedAcquisition(BaseModel):
     #: ensuite ce qui est demandé pour lui.
     request_digest: str | None = None
 
+    #: Niveau prononcé **par besoin**. Le fichier a une résolution unique, mais
+    #: sert parfois deux besoins à deux niveaux : la façade en aperçu, le
+    #: corridor pleinement. Les fondre perdrait la réserve du premier.
+    demand_levels: dict[str, str] = Field(default_factory=dict)
+
     #: Volume attendu. `None` signifie **inconnu**, jamais zéro : compter une
     #: taille absente comme nulle annonçait un total « exact » faux.
     expected_bytes: int | None = Field(default=None, ge=0)
@@ -1200,6 +1205,13 @@ class AcquisitionProvenance(BaseModel):
     #: Champ horizontal observé de l'optique, et ce que le modèle en fait.
     observed_horizontal_fov_deg: float | None = Field(default=None, gt=0, le=360)
     projection_support: ProjectionSupport = ProjectionSupport.UNKNOWN_INTRINSICS
+
+    #: Besoins que cette acquisition devait servir, et à quel niveau chacun.
+    #: Sans eux, un fichier téléchargé ne se rattachait à aucune exigence : la
+    #: preview arrivait sans qu'on sache ce qu'elle venait vérifier, ni pour
+    #: quel besoin le verdict comptera.
+    serves_demands: list[str] = Field(default_factory=list)
+    demand_levels: dict[str, str] = Field(default_factory=dict)
 
     #: Ce que le plan demandait, dans son propre vocabulaire.
     requested_resolution: str | None = None

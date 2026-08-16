@@ -52,6 +52,11 @@ class AssessReport:
     viewpoints_by_demand: dict[str, list[str]] = field(default_factory=dict)
     unresolved_targets: dict[str, str] = field(default_factory=dict)
 
+    #: Assets qui servent un besoin **parce qu'un aperçu l'a établi**, non
+    #: parce que leur secteur le laissait supposer. La distinction compte : le
+    #: premier est une mesure, le second une inférence.
+    established_by_preview: dict[str, list[str]] = field(default_factory=dict)
+
     @property
     def open_demands(self) -> list[str]:
         return sorted(
@@ -66,6 +71,7 @@ class AssessReport:
             "by_status": {k: sorted(v) for k, v in sorted(self.by_status.items())},
             "viewpoints_by_demand": self.viewpoints_by_demand,
             "unresolved_targets": self.unresolved_targets,
+            "established_by_preview": self.established_by_preview,
             "open_demands": self.open_demands,
             "bytes_downloaded": 0,
             "note": (
@@ -105,6 +111,7 @@ def assess(
     sector_of: dict[str, str] | None = None,
     unresolved_targets: dict[str, str] | None = None,
     demand_digest: str | None = None,
+    previews=None,  # noqa: ANN001 — PreviewAssessmentLog
 ) -> tuple[DemandAssessmentManifest, AssessReport]:
     """Confronte chaque besoin au corpus, sans rien collecter.
 
@@ -143,10 +150,21 @@ def assess(
             )
             continue
 
+        # Un aperçu **établit** ce que les champs plats de l'asset ne disent
+        # pas : la mesure vit dans le constat, pas dans l'inventaire. Sans ce
+        # raccord, une preview téléchargée puis examinée ne changeait rien à
+        # l'évaluation du besoin qui l'avait motivée.
+        established = (
+            previews.established_for(demand.demand_id) if previews else set()
+        )
         serving = [
             asset for asset in usable
-            if _serves(asset, demand, sectors)
+            if asset.id in established or _serves(asset, demand, sectors)
         ]
+        if established:
+            report.established_by_preview[demand.demand_id] = sorted(
+                {asset.id for asset in serving} & established
+            )
         found_viewpoints = sorted({
             grouping.get(asset.id, f"asset:{asset.id}") for asset in serving
         })

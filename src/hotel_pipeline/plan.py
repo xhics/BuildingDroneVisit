@@ -390,6 +390,11 @@ def select(
                 serves_demands=served,
                 # `None` et non zéro : une taille absente est inconnue.
                 resolution=resolution,
+                demand_levels={
+                    demand_id: graded[(candidate_id, demand_id)]
+                    for demand_id in served
+                    if (candidate_id, demand_id) in graded
+                },
                 expected_bytes=announced.get(candidate_id),
                 selection_rationale=(
                     "retenu pour " + ", ".join(sorted(reasons[candidate_id]))

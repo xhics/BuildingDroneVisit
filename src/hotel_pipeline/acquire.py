@@ -232,6 +232,11 @@ def run(
             # un fichier acquis d'un ultra-grand-angle doit le dire.
             observed_horizontal_fov_deg=candidate.observed_horizontal_fov_deg,
             projection_support=candidate.projection_support,
+            # Ce que ce fichier venait vérifier, besoin par besoin : la preview
+            # arrivait sinon sans rattachement, et son constat n'aurait su à
+            # quelle exigence répondre.
+            serves_demands=list(acquisition.serves_demands),
+            demand_levels=dict(acquisition.demand_levels or {}),
             requested_pitch_deg=candidate.requested_pitch_deg,
             sequence_id=candidate.sequence_id,
             panorama_id=candidate.panorama_id,
