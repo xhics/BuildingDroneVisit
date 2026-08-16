@@ -1111,6 +1111,14 @@ class AcquisitionPlan(BaseModel):
     #: photographique, et le laisser périmer le plan obligerait à tout refaire.
     policy_dependency_digests: dict[str, str] = Field(default_factory=dict)
 
+    #: Volume et statut **inscrits**, non seulement calculés. Un consentement
+    #: doit reposer sur un artefact autonome : ces valeurs étaient des
+    #: propriétés, donc absentes du document publié — un lecteur du fichier
+    #: seul ne savait pas que le volume était complet.
+    published_known_bytes: int | None = Field(default=None, ge=0)
+    published_unknown_size_items: int | None = Field(default=None, ge=0)
+    published_volume_status: VolumeStatus | None = None
+
     @property
     def known_bytes(self) -> int:
         return sum(a.expected_bytes for a in self.acquisitions if a.expected_bytes is not None)
@@ -1131,6 +1139,35 @@ class AcquisitionPlan(BaseModel):
 
     def missing_digests(self) -> list[str]:
         return [name for name in REQUIRED_PLAN_DIGESTS if not getattr(self, name)]
+
+    @model_validator(mode="after")
+    def _published_volume_agrees(self) -> "AcquisitionPlan":
+        """Les valeurs inscrites doivent dire la vérité sur les acquisitions.
+
+        Un plan annonçant « exact » avec des tailles manquantes ferait consentir
+        à un total dont une part est inconnue — précisément ce que le
+        consentement exact interdit.
+        """
+        if self.published_known_bytes is not None:
+            if self.published_known_bytes != self.known_bytes:
+                raise ValueError(
+                    f"volume publié {self.published_known_bytes} contre "
+                    f"{self.known_bytes} réellement portés par les acquisitions"
+                )
+        if self.published_unknown_size_items is not None:
+            if self.published_unknown_size_items != len(self.unknown_size_items):
+                raise ValueError(
+                    f"{self.published_unknown_size_items} taille(s) inconnue(s) "
+                    f"publiée(s) contre {len(self.unknown_size_items)} réelle(s)"
+                )
+        if self.published_volume_status is not None:
+            if self.published_volume_status is not self.volume_status:
+                raise ValueError(
+                    f"statut publié « {self.published_volume_status.value} » "
+                    f"contre « {self.volume_status.value} » : "
+                    "un plan ne peut pas se dire complet quand il ne l'est pas"
+                )
+        return self
 
     @model_validator(mode="after")
     def _executable_is_complete(self) -> "AcquisitionPlan":

@@ -311,3 +311,120 @@ def test_logical_operations_and_http_exchanges_are_published(
 
     assert "actual_logical_operations" in transport
     assert "actual_http_exchanges" in transport
+
+
+# --- le plan mesuré est autonome ----------------------------------------------
+
+
+def test_the_measured_plan_publishes_its_own_volume(tmp_path, monkeypatch) -> None:
+    """Un consentement doit reposer sur un artefact autonome.
+
+    `known_bytes` et `volume_status` étaient des propriétés calculées : absentes
+    du document publié, un lecteur du fichier seul ne savait pas que le volume
+    était complet.
+    """
+    runner, workspace = _project(tmp_path, monkeypatch)
+    path = _write_plan(workspace, [_candidate("c1"), _candidate("c2")])
+
+    monkeypatch.setattr("hotel_pipeline.volumes.content_length", lambda _r: 4096)
+    result = runner.invoke(app, ["assets", "measure-plan", "essai", "--plan", str(path)])
+    assert result.exit_code == 0, result.output
+
+    measured = sorted(
+        workspace.path("01_sources").glob("acquisition_plan_P1-measured-*.json")
+    )[0]
+    payload = json.loads(measured.read_text("utf-8"))
+
+    assert payload["published_known_bytes"] == 8192
+    assert payload["published_unknown_size_items"] == 0
+    assert payload["published_volume_status"] == "exact"
+
+
+def test_a_partial_measurement_says_so_in_the_document(tmp_path, monkeypatch) -> None:
+    """« Partiel » doit se lire dans le fichier, non se déduire des absences."""
+    runner, workspace = _project(tmp_path, monkeypatch)
+    path = _write_plan(workspace, [_candidate("c1"), _candidate("c2")])
+
+    def parfois(request):
+        return 4096 if request.candidate_id == "c1" else None
+
+    monkeypatch.setattr("hotel_pipeline.volumes.content_length", parfois)
+    runner.invoke(app, ["assets", "measure-plan", "essai", "--plan", str(path)])
+
+    measured = sorted(
+        workspace.path("01_sources").glob("acquisition_plan_P1-measured-*.json")
+    )[0]
+    payload = json.loads(measured.read_text("utf-8"))
+
+    assert payload["published_known_bytes"] == 4096
+    assert payload["published_unknown_size_items"] == 1
+    assert payload["published_volume_status"] == "partial"
+
+
+def test_a_contradictory_published_volume_is_refused() -> None:
+    """Un plan se disant complet quand il ne l'est pas ferait consentir à un
+    total dont une part est inconnue."""
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan,
+        CaptureIntent,
+        PlannedAcquisition,
+        PlanStatus,
+        VolumeStatus,
+    )
+
+    acquisitions = [
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d"], selection_rationale="x", expected_bytes=1000,
+        ),
+        PlannedAcquisition(
+            candidate_id="c2", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d"], selection_rationale="x",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="ne peut pas se dire complet"):
+        AcquisitionPlan(
+            plan_id="P", hotel_id="essai", status=PlanStatus.DRAFT,
+            acquisitions=acquisitions,
+            published_volume_status=VolumeStatus.EXACT,
+        )
+
+    with pytest.raises(ValueError, match="volume publié"):
+        AcquisitionPlan(
+            plan_id="P", hotel_id="essai", status=PlanStatus.DRAFT,
+            acquisitions=acquisitions, published_known_bytes=99999,
+        )
+
+    with pytest.raises(ValueError, match="taille\\(s\\) inconnue\\(s\\)"):
+        AcquisitionPlan(
+            plan_id="P", hotel_id="essai", status=PlanStatus.DRAFT,
+            acquisitions=acquisitions, published_unknown_size_items=0,
+        )
+
+
+def test_the_budget_is_announced_before_the_first_head(tmp_path, monkeypatch) -> None:
+    """Un plafond annoncé après coup n'est pas un budget mais un constat.
+
+    Mapillary coûte deux opérations par mesure — résolution d'adresse puis CDN
+    — Street View une seule.
+    """
+    runner, workspace = _project(tmp_path, monkeypatch)
+    path = _write_plan(workspace, [
+        _candidate("m1"), _candidate("m2"),
+        _candidate("s1", source="street_view", panorama_id="A",
+                   request_spec={"pano_id": "A", "size": "640x640"},
+                   available_resolutions=["640x640", "256x256", "2048x2048"]),
+    ])
+
+    monkeypatch.setattr("hotel_pipeline.volumes.content_length", lambda _r: 1024)
+    result = runner.invoke(app, ["assets", "measure-plan", "essai", "--plan", str(path)])
+    assert result.exit_code == 0, result.output
+
+    receipt = sorted(workspace.path("01_sources").glob("volume_measure_P1_*.json"))[0]
+    transport = json.loads(receipt.read_text("utf-8"))["transport"]
+
+    assert transport["planned_logical_operations"] == {
+        "mapillary": 4, "street_view": 1
+    }, "2 Mapillary × 2 + 1 Street View × 1"
+    assert "budget annoncé" in result.output

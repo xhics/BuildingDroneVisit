@@ -4873,6 +4873,18 @@ def assets_measure_plan(
     typer.echo(f"  {len(ordered)} acquisition(s) à mesurer, sélection inchangée")
 
     registry = reset_ledger()
+    # Le plafond est calculé **avant** le premier appel, depuis les requêtes
+    # résolues : l'annoncer après l'exécution ne serait pas un budget mais un
+    # constat. Mapillary coûte deux opérations par mesure — résolution
+    # d'adresse, puis CDN — Street View une seule.
+    registry.planned_max_requests.update(_head_budget(ordered))
+    typer.echo(
+        "    budget annoncé : "
+        + ", ".join(
+            f"{source} {count}"
+            for source, count in sorted(registry.planned_max_requests.items())
+        )
+    )
     report = None
     try:
         report = measure(ordered)
@@ -4909,12 +4921,27 @@ def assets_measure_plan(
                         fg=typer.colors.YELLOW)
 
     # Un plan **mesuré**, à côté du brouillon : celui-ci n'est pas modifié.
+    acquisitions = [
+        a.model_copy(update={"expected_bytes": report.measured.get(a.candidate_id)})
+        for a in plan.acquisitions
+    ]
+    unknown = [a for a in acquisitions if a.expected_bytes is None]
+    total = sum(a.expected_bytes for a in acquisitions if a.expected_bytes is not None)
+
+    # Inscrits, non seulement calculés : le consentement doit reposer sur un
+    # artefact autonome, lisible sans rejouer l'addition.
     measured = plan.model_copy(update={
         "plan_id": f"{plan.plan_id}-measured-{stamp}",
-        "acquisitions": [
-            a.model_copy(update={"expected_bytes": report.measured.get(a.candidate_id)})
-            for a in plan.acquisitions
-        ],
+        "acquisitions": acquisitions,
+        "published_known_bytes": total,
+        "published_unknown_size_items": len(unknown),
+        "published_volume_status": (
+            VolumeStatus.EXACT if not unknown
+            else (
+                VolumeStatus.UNKNOWN if len(unknown) == len(acquisitions)
+                else VolumeStatus.PARTIAL
+            )
+        ),
     })
     workspace.write_json(
         f"01_sources/acquisition_plan_{measured.plan_id}.json",
@@ -4928,3 +4955,22 @@ def assets_measure_plan(
     )
     typer.echo(f"    plan mesuré : {measured.plan_id}")
     typer.echo(f"    brouillon d'origine intact : {plan.plan_id}")
+
+
+def _head_budget(requests) -> dict:  # noqa: ANN001
+    """Opérations logiques qu'un `HEAD` coûtera, source par source.
+
+    Mapillary ne publie pas d'URL durable : mesurer une de ses vues demande
+    d'abord une résolution d'adresse, puis le `HEAD` sur le CDN — deux
+    opérations. Street View sert l'adresse directement.
+
+    Calculé depuis les requêtes **résolues**, avant tout appel : un plafond
+    annoncé après coup ne serait pas un budget mais un constat.
+    """
+    from .collectors.mapillary import name as mapillary_name
+
+    budget: dict[str, int] = {}
+    for request in requests:
+        cost = 2 if request.source == mapillary_name else 1
+        budget[request.source] = budget.get(request.source, 0) + cost
+    return budget
