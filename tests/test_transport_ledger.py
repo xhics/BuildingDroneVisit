@@ -345,3 +345,51 @@ def test_planned_and_actual_use_the_same_keys() -> None:
         "les plafonds se nomment comme les clés du registre"
     )
     assert planned["mapillary"] >= 1
+
+
+def test_forbidden_refuses_even_a_cache_hit() -> None:
+    """« Ni cache ni réseau » ne souffre pas d'exception.
+
+    Servir un cache en mode interdit rendait le garde-fou des tests inopérant :
+    une suite censée ne toucher à rien lisait un corpus figé.
+    """
+    from hotel_pipeline.providers.cache import cached_call, get_cache
+
+    key = "essai-forbidden::present"
+    get_cache().delete(key)
+    set_mode(NetworkMode.ONLINE)
+    cached_call(key, lambda: {"valeur": 1})
+
+    set_mode(NetworkMode.FORBIDDEN)
+    registre = reset_ledger()
+    try:
+        with pytest.raises(NetworkRefused, match="hors ligne"):
+            cached_call(key, lambda: {"valeur": 2})
+    finally:
+        set_mode(None)
+
+    assert registre.by_source()["essai-forbidden"]["refused"] == 1
+    assert registre.by_source()["essai-forbidden"]["cache_hits"] == 0
+
+
+def test_a_cache_only_miss_is_recorded_with_its_source() -> None:
+    """Un rejeu incomplet présentait les compteurs d'une exécution sans besoin
+    réseau : rien ne distinguait « tout servi » de « refusé faute de cache »."""
+    from hotel_pipeline.providers.cache import cached_call, get_cache
+
+    key = "essai-refus-inscrit::absent"
+    get_cache().delete(key)
+
+    set_mode(NetworkMode.CACHE_ONLY)
+    registre = reset_ledger()
+    try:
+        with pytest.raises(NetworkRefused):
+            cached_call(key, lambda: {"valeur": 1})
+    finally:
+        set_mode(None)
+
+    assert len(registre.attempts) == 1, "le refus est inscrit"
+    refusal = registre.attempts[0]
+    assert refusal.source == "essai-refus-inscrit"
+    assert refusal.outcome is Outcome.REFUSED
+    assert "cache_only" in refusal.error
