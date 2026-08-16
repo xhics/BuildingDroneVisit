@@ -275,10 +275,16 @@ def fetch(candidate, target: Path, request=None) -> Path:  # noqa: ANN001
 
     from .providers.cache import ensure_online
 
+    from .providers import transport
+
     spec = request.request_spec if request is not None else candidate.request_spec
     url = resolve_url(candidate.source, spec)
-    ensure_online("acquisition d'image")
-    response = requests.get(url, timeout=60, stream=True)
+    response = transport.request(
+        candidate.source, transport.Stage.DOWNLOAD, "GET",
+        lambda: requests.get(url, timeout=60, stream=True),
+        request_digest=getattr(request, "digest", None),
+        what="acquisition d'image",
+    )
     response.raise_for_status()
     with target.open("wb") as handle:
         for chunk in response.iter_content(1 << 16):

@@ -678,13 +678,13 @@ def assets_discover(
 
     # Le décompte porte sur **cette** commande : un total cumulé entre deux
     # exécutions ne dirait rien de l'une ni de l'autre.
-    from .providers.cache import call_counts, reset_call_counts
+    from .providers.transport import ledger, reset_ledger
 
-    reset_call_counts()
+    reset_ledger()
     queries = _query_sources(
         profile, context, workspace, radius, search.outstanding or demands.demands
     )
-    search.requests_by_source = _requests_by_source(call_counts())
+    search.requests_by_source = _requests_by_source(ledger().by_source())
 
     try:
         manifest, report = discover(
@@ -4418,8 +4418,12 @@ _CACHE_SOURCES: dict[str, str] = {
 }
 
 
-def _requests_by_source(counts: dict) -> dict:
-    """Appels émis par source du manifeste, agrégés depuis les clés de cache.
+def _requests_by_source(by_source: dict) -> dict:
+    """Appels **réellement émis** par source du manifeste.
+
+    Vient du registre de transport, où chaque tentative est inscrite avant
+    l'appel : la pagination et les échecs y figurent, ce que le décompte des
+    cache misses ne voyait pas.
 
     Une source absente du tableau n'a émis aucun appel — ce qui est une
     information, à distinguer d'un zéro par défaut : les sources non
@@ -4427,16 +4431,22 @@ def _requests_by_source(counts: dict) -> dict:
     """
     from .schemas.acquisition import SourceRequestCounts
 
-    merged: dict[str, int] = {}
-    for prefix, values in counts.items():
+    merged: dict[str, dict[str, int]] = {}
+    for prefix, row in by_source.items():
         source = _CACHE_SOURCES.get(prefix)
         if source is None:
             # Une clé qui n'appartient à aucune source d'images — géométrie,
             # réseau routier. La compter fausserait le coût de la collecte.
             continue
-        merged[source] = merged.get(source, 0) + values["requested"]
+        stages = merged.setdefault(source, {})
+        for stage, count in row.get("by_stage", {}).items():
+            stages[stage] = stages.get(stage, 0) + count
 
     return {
-        source: SourceRequestCounts(coarse_search=total)
-        for source, total in sorted(merged.items())
+        source: SourceRequestCounts(
+            coarse_search=stages.get("coarse_search", 0),
+            metadata_enrichment=stages.get("metadata_enrichment", 0),
+            sequence_expansion=stages.get("sequence_expansion", 0),
+        )
+        for source, stages in sorted(merged.items())
     }

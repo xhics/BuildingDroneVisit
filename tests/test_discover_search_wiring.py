@@ -614,19 +614,18 @@ def test_measured_requests_are_published(rear_demand, three_candidates):
 
 def test_cache_hits_are_not_counted_as_requests():
     """« 25 requêtes » là où le cache a tout servi surestimerait le coût."""
-    from hotel_pipeline.providers.cache import (
-        call_counts,
-        cached_call,
-        reset_call_counts,
+    from hotel_pipeline.providers.cache import cached_call
+    from hotel_pipeline.providers.transport import reset_ledger
+
+    registre = reset_ledger()
+    cached_call("essai-compteur::a", lambda: {"valeur": 1})
+    cached_call("essai-compteur::a", lambda: {"valeur": 1})
+
+    row = registre.by_source()["essai-compteur"]
+    assert row["cache_hits"] == 1, "le second appel vient du cache"
+    assert row["attempted"] == 0, (
+        "le producteur n'est pas passé par le transport : rien à compter ici"
     )
-
-    reset_call_counts()
-    cached_call("essai-compteur::a", lambda: {"valeur": 1})
-    cached_call("essai-compteur::a", lambda: {"valeur": 1})
-
-    counts = call_counts()["essai-compteur"]
-    assert counts["requested"] == 1, "le second appel vient du cache"
-    assert counts["served_by_cache"] == 1
 
 
 def test_non_image_sources_do_not_inflate_the_cost():
@@ -634,9 +633,9 @@ def test_non_image_sources_do_not_inflate_the_cost():
     from hotel_pipeline.cli import _requests_by_source
 
     merged = _requests_by_source({
-        "mapillary": {"requested": 2, "served_by_cache": 0},
-        "streetview-meta": {"requested": 40, "served_by_cache": 1200},
-        "overpass-roads": {"requested": 1, "served_by_cache": 0},
+        "mapillary": {"by_stage": {"coarse_search": 2}},
+        "streetview-meta": {"by_stage": {"coarse_search": 40}},
+        "overpass-roads": {"by_stage": {"coarse_search": 1}},
     })
 
     assert set(merged) == {"mapillary", "street_view"}

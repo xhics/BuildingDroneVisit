@@ -121,10 +121,18 @@ def content_length(request) -> int | None:  # noqa: ANN001
     from .acquire import resolve_url
     from .providers.cache import ensure_online
 
-    ensure_online("mesure de volume")
+    from .providers import transport
+
+    # `resolve_url` peut lui-même appeler l'API — pour Mapillary, c'est le cas.
+    # Ce HEAD-ci est le second appel, sur le CDN.
     url = resolve_url(request.source, request.request_spec)
 
-    response = http.head(url, timeout=30, allow_redirects=True)
+    response = transport.request(
+        request.source, transport.Stage.VOLUME_PROBE, "HEAD",
+        lambda: http.head(url, timeout=30, allow_redirects=True),
+        request_digest=getattr(request, "digest", None),
+        what="mesure de volume",
+    )
     response.raise_for_status()
 
     declared = response.headers.get("Content-Length")

@@ -56,41 +56,31 @@ def cached_call(key: str, producer: Callable[[], Any], ttl: int = DEFAULT_TTL_SE
     zéro faute de compteur ; un zéro ne distinguait pas « rien demandé » de
     « pas mesuré ».
     """
+    from .transport import NetworkMode, NetworkRefused, Stage, current_mode
+    from .transport import record_cache_hit
+
+    source = str(key).split("::", 1)[0]
+
     if os.environ.get("HOTEL_PIPELINE_NO_CACHE") == "1":
-        _record(key, served_by_cache=False)
         return producer()
 
     cache = get_cache()
     hit = cache.get(key, default=None)
     if hit is not None:
-        _record(key, served_by_cache=True)
+        # Comptée à part : une lecture de cache n'est pas un appel réseau.
+        record_cache_hit(source, Stage.COARSE_SEARCH)
         return hit
 
+    if current_mode() is NetworkMode.CACHE_ONLY:
+        # Le producteur n'est **pas** appelé : en mode fermé, un miss se refuse
+        # avant tout paquet, et non après avoir tenté sa chance.
+        raise NetworkRefused(
+            f"mode cache_only — {source} : réponse absente du cache, aucun "
+            "appel émis"
+        )
+
     value = producer()
-    _record(key, served_by_cache=False)
     cache.set(key, value, expire=ttl)
     return value
 
 
-#: Décompte de la commande en cours, par préfixe de clé — c'est-à-dire par
-#: source. Remis à zéro par `reset_call_counts` : un total cumulé entre deux
-#: exécutions ne dirait rien de l'une ni de l'autre.
-_CALLS: dict[str, dict[str, int]] = {}
-
-
-def _record(key: str, served_by_cache: bool) -> None:
-    source = str(key).split("::", 1)[0]
-    counts = _CALLS.setdefault(source, {"requested": 0, "served_by_cache": 0})
-    if served_by_cache:
-        counts["served_by_cache"] += 1
-    else:
-        counts["requested"] += 1
-
-
-def reset_call_counts() -> None:
-    _CALLS.clear()
-
-
-def call_counts() -> dict[str, dict[str, int]]:
-    """Appels émis et lectures de cache, par source, depuis la remise à zéro."""
-    return {source: dict(counts) for source, counts in sorted(_CALLS.items())}

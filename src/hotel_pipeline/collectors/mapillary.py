@@ -14,6 +14,7 @@ import requests
 
 from ..config import secret
 from ..logging import get_logger
+from ..providers import transport
 from ..providers.cache import cached_call, ensure_online
 from .base import CollectedImage
 
@@ -75,12 +76,21 @@ def collect(
         url = GRAPH_URL
         params: dict | None = {"fields": FIELDS, "bbox": bbox, "limit": page_size}
 
+        page = 0
         while url and len(entries) < max_images:
-            response = requests.get(
-                url,
-                params=params,
-                headers={"Authorization": f"OAuth {token}"},
-                timeout=TIMEOUT,
+            page += 1
+            # Chaque page est une requête : les fondre en une seule sous-
+            # estimait le coût d'un facteur égal au nombre de pages.
+            response = transport.request(
+                "mapillary", transport.Stage.COARSE_SEARCH, "GET",
+                lambda: requests.get(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"OAuth {token}"},
+                    timeout=TIMEOUT,
+                ),
+                page=page,
+                what="Mapillary Graph (recherche)",
             )
             response.raise_for_status()
             payload = response.json()
@@ -153,12 +163,18 @@ def thumbnail_url(image_id: str, resolution: str = "thumb_2048") -> str:
             f"disponibles : {sorted(THUMBNAIL_FIELDS)}"
         )
 
-    ensure_online("Mapillary Graph")
-    response = requests.get(
-        f"https://graph.mapillary.com/{image_id}",
-        params={"fields": field},
-        headers={"Authorization": f"OAuth {secret('MAPILLARY_TOKEN')}"},
-        timeout=TIMEOUT,
+    # Résolution d'adresse : un appel **distinct** de celui qui suivra sur le
+    # CDN. Les confondre ferait passer un HEAD Mapillary pour une requête là
+    # où il en coûte deux.
+    response = transport.request(
+        "mapillary", transport.Stage.URL_RESOLUTION, "GET",
+        lambda: requests.get(
+            f"https://graph.mapillary.com/{image_id}",
+            params={"fields": field},
+            headers={"Authorization": f"OAuth {secret('MAPILLARY_TOKEN')}"},
+            timeout=TIMEOUT,
+        ),
+        what="Mapillary Graph (adresse)",
     )
     response.raise_for_status()
     url = response.json().get(field)

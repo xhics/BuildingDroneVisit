@@ -227,11 +227,10 @@ def test_the_head_url_is_built_from_the_resolved_request(monkeypatch) -> None:
     import hotel_pipeline.acquire as acquire_module
 
     monkeypatch.setattr(acquire_module, "resolve_url", fake_resolve_url)
-    # `ensure_online` est importé dans la fonction : c'est la source qu'il
-    # faut patcher, non le module appelant.
-    monkeypatch.setattr(
-        "hotel_pipeline.providers.cache.ensure_online", lambda *_: None
-    )
+    # Le HEAD passe par le transport : c'est son mode qui autorise l'appel.
+    from hotel_pipeline.providers import transport
+
+    monkeypatch.setattr(transport, "current_mode", lambda: transport.NetworkMode.ONLINE)
     monkeypatch.setattr(
         "requests.head", lambda *a, **k: FakeResponse()
     )
