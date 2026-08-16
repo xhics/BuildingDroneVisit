@@ -195,3 +195,60 @@ def test_the_decision_states_what_it_does_not_establish() -> None:
     assert any("ne le localise pas" in limite for limite in publié["limits"])
     assert any("jamais décider seuls" in limite for limite in publié["limits"])
     assert publié["evidence"][0]["sha256"] == "c" * 64
+
+
+def test_a_nearer_wall_turning_its_back_loses_to_a_farther_facing_one() -> None:
+    """Le filtre des 90° n'est pas redondant : sans lui, un mur plus proche
+    mais tourné à l'opposé pourrait être choisi.
+
+    Un rectangle simple ne le montre pas — l'écart nul du mur qui fait face
+    gagne de toute façon. Il faut une forme où l'écart le plus faible n'est pas
+    celui du mur observé.
+    """
+    from hotel_pipeline.orientation import Segment, segment_seen_from
+
+    # Une forme en L : la caméra est logée dans le creux, où un retour de mur
+    # lui tourne le dos tout en étant plus proche qu'elle.
+    from shapely.geometry import Polygon
+
+    forme = Polygon([
+        (0, 0), (40, 0), (40, 30), (20, 30), (20, 10), (0, 10), (0, 0),
+    ])
+    segments = segments_of(forme)
+    vu = segment_seen_from(forme, (10, -20), segments)
+
+    # Depuis le sud, seul le mur du bas (normale 180°) fait face.
+    assert round(vu.outward_normal_deg) == 180, (
+        f"segment {vu.index} de normale {vu.outward_normal_deg}° retenu"
+    )
+    écart = abs((180 - vu.outward_normal_deg + 180) % 360 - 180)
+    assert écart < 90
+
+
+def test_all_walls_turning_their_backs_yield_nothing() -> None:
+    """Une caméra à l'intérieur ne photographie aucune façade extérieure :
+    rendre un segment quand même inventerait une observation."""
+    from hotel_pipeline.orientation import segment_seen_from
+
+    assert segment_seen_from(CARRÉ, (20, 10), segments_of(CARRÉ)) is None
+
+
+def test_a_long_wall_is_not_outvoted_by_two_short_offsets() -> None:
+    """La pondération par la longueur, éprouvée sur un cas qui la discrimine.
+
+    Deux décrochements de deux mètres à 240° contre un mur de quarante à 226° :
+    sans pondération, la moyenne partirait vers 235°.
+    """
+    from hotel_pipeline.orientation import FacadeGroup, Segment
+
+    mur = FacadeGroup(segments=[
+        Segment(index=0, length_m=40.0, outward_normal_deg=226.0),
+        Segment(index=1, length_m=2.0, outward_normal_deg=240.0),
+        Segment(index=2, length_m=2.0, outward_normal_deg=240.0),
+    ])
+
+    assert mur.normal_deg == pytest.approx(227.3, abs=0.4), (
+        "le mur de quarante mètres l'emporte sur deux décrochements"
+    )
+    # Sans pondération, la moyenne des trois vaudrait environ 235,3°.
+    assert abs(mur.normal_deg - 235.3) > 5.0
