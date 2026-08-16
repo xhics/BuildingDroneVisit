@@ -479,6 +479,15 @@ def measure_candidate(
 
     _apply_sector(measure, candidate, demand, sector)
 
+    # Un aperçu déjà examiné et réfuté pour **ce** besoin ne se repropose pas :
+    # la dépense serait faite deux fois pour la même conclusion.
+    if sector is not None and (
+        candidate.candidate_id, demand.demand_id
+    ) in getattr(sector, "refuted_pairs", ()):
+        measure.rejection_reason = (
+            "aperçu déjà examiné et réfuté pour ce besoin"
+        )
+
     # --- parallaxe : contre les ancres **de ce besoin**, ou rien -------------
     if not anchors:
         measure.parallax_utility = None
@@ -1035,6 +1044,11 @@ class SectorContext:
     #: Écart toléré entre cap mesuré et direction de la cible. Vient de la
     #: politique : le fixer ici en ferait une constante arbitraire de plus.
     heading_tolerance_deg: float | None = None
+
+    #: Couples `(asset_id, demand_id)` qu'un aperçu a déjà réfutés. Les
+    #: reproposer ferait racheter ce qu'on vient d'examiner et d'écarter — le
+    #: constat serait sans effet sur la recherche suivante.
+    refuted_pairs: set = field(default_factory=set)
 
 
 def _apply_sector(measure, candidate, demand, sector) -> None:  # noqa: ANN001

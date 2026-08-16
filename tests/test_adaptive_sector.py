@@ -733,3 +733,41 @@ def test_a_supported_optic_keeps_the_ordinary_requirements() -> None:
     _select([measure], {ordinary.candidate_id: ordinary}, need)
 
     assert measure.unmeasured_requirements == ["taille projetée"]
+
+
+def test_a_refuted_preview_is_never_proposed_again() -> None:
+    """Racheter ce qu'on vient d'examiner et d'écarter.
+
+    Sans cette exclusion, les neuf couples réfutés du pilote — dont deux
+    intérieurs de concession — seraient reproposés au plan suivant, et le
+    constat n'aurait eu aucun effet sur la recherche.
+    """
+    need = demand("obligation:front", "front")
+    seen = candidate("c-deja-vu", *at_bearing(0.0), original_heading_deg=180.0)
+    context = sector_context(need.demand_id, 0.0)
+    context.refuted_pairs = {("c-deja-vu", "obligation:front")}
+
+    measure = measure_candidate(
+        seen, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    retained = _select([measure], {seen.candidate_id: seen}, need)
+
+    assert retained == []
+    assert "déjà examiné et réfuté" in measure.rejection_reason
+
+
+def test_a_refusal_on_one_demand_leaves_the_candidate_free_for_another() -> None:
+    """Le constat porte sur un couple : réfuter la façade ne disqualifie pas la
+    vue pour l'enseigne."""
+    autre = demand("obligation:PROPERTY_SIGN", "front")
+    seen = candidate("c-deja-vu", *at_bearing(0.0), original_heading_deg=180.0)
+    context = sector_context(autre.demand_id, 0.0)
+    context.refuted_pairs = {("c-deja-vu", "obligation:front")}
+
+    measure = measure_candidate(
+        seen, autre, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+
+    assert measure.rejection_reason is None

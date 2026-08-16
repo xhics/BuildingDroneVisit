@@ -4412,6 +4412,15 @@ def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN
         targets=targets,
         projection=projection,
         front_azimuth_deg=front,
+        # Ce qu'un aperçu a déjà réfuté ne se repropose pas : sans cela, la
+        # recherche suivante rachèterait ce qu'on vient d'écarter.
+        refuted_pairs={
+            (entry.asset_id, entry.demand_id)
+            for entry in (
+                getattr(workspace.read_previews(), "entries", None) or []
+            )
+            if entry.verdict.value == "refuted"
+        },
         unresolved=unresolved,
         proxies={k: v for k, v in proxies.items() if k in proxy_targets},
         proxy_targets=proxy_targets,
