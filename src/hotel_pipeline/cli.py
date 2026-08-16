@@ -731,8 +731,23 @@ def assets_discover(
     # donc à part, sous `replays/`, où le tri par date ne va pas le chercher.
     from .providers.transport import NetworkMode, current_mode
 
+    # Une source d'images en échec produit un corpus **partiel**. Le publier
+    # comme manifeste courant ferait planifier sur ce qui a répondu, en
+    # présentant l'absence de l'autre comme une absence de vues. Il reste
+    # écrit — le diagnostic en dépend — mais à part.
+    image_sources = {"mapillary", "street_view"}
+    failed = sorted(image_sources & set(report.sources_skipped))
+    partial = bool(failed)
+
     replay = current_mode() is NetworkMode.CACHE_ONLY
-    prefix = "01_sources/replays" if replay else "01_sources"
+    prefix = "01_sources/replays" if (replay or partial) else "01_sources"
+    if partial:
+        typer.secho(
+            f"  · corpus partiel — {', '.join(failed)} n'a pas répondu : écrit "
+            "sous 01_sources/replays/, il ne devient pas le manifeste courant. "
+            "Planifier dessus prendrait une source absente pour une source vide.",
+            fg=typer.colors.YELLOW,
+        )
     if replay:
         typer.secho(
             "  · rejeu sur cache figé : écrit sous 01_sources/replays/, il ne "

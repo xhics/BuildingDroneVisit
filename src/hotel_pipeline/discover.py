@@ -67,6 +67,11 @@ class DiscoveryReport:
     #: Cadrages regroupés faute de différer : `écarté` → `retenu`.
     framings_merged: dict = field(default_factory=dict)
 
+    #: Combien de vues portent **réellement** ce que le contrat promet. Un
+    #: corpus servi par un cache antérieur passerait sinon pour enrichi : ces
+    #: chiffres le démentent immédiatement.
+    contract_coverage: dict = field(default_factory=dict)
+
     #: Cadrages, panoramas et points de vue comptés **séparément**. Un seul
     #: chiffre les confondrait, et 1442 candidats pour 721 panoramas se lirait
     #: comme un doublon alors que ce sont deux acquisitions légitimes.
@@ -103,6 +108,7 @@ class DiscoveryReport:
             "adaptive_search": self.search.as_dict() if self.search else None,
             "viewpoint_counts": self.viewpoint_counts,
             "framings_merged": self.framings_merged,
+            "contract_coverage": self.contract_coverage,
             "bytes_downloaded": 0,
             "limits": self.limits or LIMITS,
         }
@@ -349,6 +355,7 @@ def discover(
         policy_digest=policy_digest,
     )
     report.search = search_report
+    report.contract_coverage = _contract_coverage(unique)
     panoramas = {c.panorama_id for c in unique if c.panorama_id}
     report.viewpoint_counts = {
         # Trois nombres distincts, parce que ce sont trois choses distinctes.
@@ -631,3 +638,29 @@ def _declared_fov(image) -> float | None:  # noqa: ANN001
     if fov is None or fov <= 0 or fov > MAX_DECLARABLE_FOV_DEG:
         return None
     return fov
+
+
+def _contract_coverage(candidates: list) -> dict:
+    """Ce que les candidats portent **effectivement**, source par source.
+
+    Demander un champ ne garantit pas de le recevoir : une source peut ne pas
+    le publier, et un cache antérieur au contrat n'en sait rien. Compter ce qui
+    est là évite qu'un corpus incomplet passe pour enrichi.
+    """
+    coverage: dict[str, dict] = {}
+    for candidate in candidates:
+        row = coverage.setdefault(
+            candidate.source,
+            {"candidates": 0, "with_sequence": 0, "with_fov": 0,
+             "with_dimensions": 0, "with_camera_type": 0},
+        )
+        row["candidates"] += 1
+        if candidate.sequence_id:
+            row["with_sequence"] += 1
+        if candidate.requested_fov_deg:
+            row["with_fov"] += 1
+        if candidate.advertised_width and candidate.advertised_height:
+            row["with_dimensions"] += 1
+        if candidate.camera_type:
+            row["with_camera_type"] += 1
+    return coverage

@@ -91,10 +91,22 @@ def cached_call(key: str, producer: Callable[[], Any], ttl: int = DEFAULT_TTL_SE
         # inscrit — sans quoi un rejeu incomplet présenterait les compteurs
         # d'une exécution sans besoin réseau.
         record_refusal(source, Stage.COARSE_SEARCH, mode)
-        raise NetworkRefused(
-            f"mode cache_only — {source} : réponse absente du cache, aucun "
-            "appel émis"
+
+        # « Absente » et « présente sous un contrat antérieur » ne se corrigent
+        # pas de la même façon : la première demande une collecte, la seconde
+        # dit qu'un rejeu figé ne peut plus servir. Les confondre enverrait
+        # chercher une réponse qui est là, sous une forme périmée.
+        stale = any(
+            str(existing).startswith(f"{source}::")
+            for existing in cache.iterkeys()
         )
+        detail = (
+            "réponse présente sous un contrat antérieur — cache_miss/"
+            "incompatible : le rejeu figé ne porte pas les champs demandés"
+            if stale
+            else "réponse absente du cache"
+        )
+        raise NetworkRefused(f"mode cache_only — {source} : {detail}, aucun appel émis")
 
     value = producer()
     cache.set(key, value, expire=ttl)

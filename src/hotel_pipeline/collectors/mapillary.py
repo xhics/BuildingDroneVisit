@@ -34,6 +34,31 @@ FIELDS = (
     "camera_type,camera_parameters,width,height"
 )
 
+#: Version du **parseur** : ce que le code fait des champs reçus. Une réponse
+#: identique lue autrement n'est plus la même donnée — dériver le FOV d'un
+#: rapport focal en est l'exemple. À incrémenter quand l'interprétation change,
+#: même à champs constants.
+PARSER_VERSION = 2
+
+
+def contract_digest() -> str:
+    """Empreinte de ce qu'on demande et de ce qu'on en fait.
+
+    La clé de cache ne portait que la géographie : une entrée obtenue sous
+    l'ancien contrat — sans `sequence` ni paramètres de caméra — se relisait
+    comme si elle les contenait. Un lancement `online` aurait servi 194 lignes
+    incomplètes sans appeler l'API, et reproduit le défaut qu'on venait de
+    corriger.
+
+    Ni jeton ni URL : la clé vit sur le disque, et une empreinte n'est pas un
+    endroit où ranger un secret.
+    """
+    import hashlib
+
+    material = f"fields={FIELDS}|parser={PARSER_VERSION}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+
+
 #: Taille de page demandée à l'API.
 PAGE_SIZE = 200
 
@@ -101,7 +126,12 @@ def collect(
 
     # La clé de cache exclut le jeton : deux jetons différents ne doivent pas
     # produire deux entrées, et aucun secret ne doit atterrir sur le disque.
-    data = cached_call(f"mapillary::{bbox}::{page_size}::{max_images}", fetch_all)
+    # Le contrat entre dans la clé : une entrée de l'ancien contrat n'est plus
+    # trouvée, sans être effacée — elle devient simplement incompatible.
+    data = cached_call(
+        f"mapillary::{contract_digest()}::{bbox}::{page_size}::{max_images}",
+        fetch_all,
+    )
 
     images: list[CollectedImage] = []
     for entry in data:
