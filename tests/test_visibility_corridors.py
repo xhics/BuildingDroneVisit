@@ -238,3 +238,24 @@ def test_the_run_passes_the_manifest_referential_to_every_corridor() -> None:
         "le référentiel transmis doit être celui du manifeste, non une valeur "
         f"choisie ici — vu : {appel!r}"
     )
+
+
+def test_visibility_assess_does_not_validate_the_manifest_directly() -> None:
+    """Le chemin du CLI, non seulement le chargeur.
+
+    Vérifier `load_capture_geometry` isolément ne dit rien de ce que
+    `visibility assess` emprunte : il validait le schéma directement, et
+    refusait le manifeste du pilote.
+    """
+    import inspect
+
+    from hotel_pipeline import cli
+
+    source = inspect.getsource(cli.visibility_assess)
+
+    assert "_capture_geometry_if_any(workspace, context)" in source, (
+        "le manifeste doit passer par le chargeur tolérant"
+    )
+    assert "CaptureGeometryManifest.model_validate(raw)" not in source, (
+        "le valider directement refuse tout manifeste antérieur au schéma"
+    )
