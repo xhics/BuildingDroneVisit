@@ -180,7 +180,7 @@ def test_distance_is_a_reprieve_not_a_verdict(rear_demand):
     serait trop petite. Faute de candidat plus proche, le lointain redevient
     donc examinable — plutôt que de laisser le besoin sans rien.
     """
-    remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
+    remote = candidate("mly-loin", TARGET[0] + 0.0036, TARGET[1])
 
     manifest, report = discover(
         HOTEL, _demands(rear_demand), {"mapillary": [remote]},
@@ -199,7 +199,7 @@ def test_distance_is_a_reprieve_not_a_verdict(rear_demand):
 def test_a_closer_candidate_wins_over_a_distant_one(rear_demand):
     """Le repli ne doit pas mettre lointains et proches sur le même rang."""
     near = candidate("mly-proche", *_south_of(TARGET, 40))
-    remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
+    remote = candidate("mly-loin", TARGET[0] + 0.0036, TARGET[1])
 
     manifest, _ = discover(
         HOTEL, _demands(rear_demand), {"mapillary": [near, remote]},
@@ -284,8 +284,12 @@ def test_framings_panoramas_and_viewpoints_are_counted_separately(rear_demand):
 
 
 def test_a_fallback_recommendation_says_so(rear_demand):
-    """Retenu faute de mieux n'est pas retenu ordinairement."""
-    remote = candidate("mly-loin", TARGET[0] + 0.072, TARGET[1])
+    """Retenu faute de mieux n'est pas retenu ordinairement.
+
+    À 400 m : au-delà du seuil de recommandation automatique (250 m), en deçà
+    de la portée dure (600 m). C'est la zone où le repli a un sens.
+    """
+    remote = candidate("mly-loin", TARGET[0] + 0.0036, TARGET[1])
 
     _, report = discover(
         HOTEL, _demands(rear_demand), {"mapillary": [remote]},
@@ -638,3 +642,28 @@ def test_non_image_sources_do_not_inflate_the_cost():
     assert set(merged) == {"mapillary", "street_view"}
     assert merged["street_view"].coarse_search == 40
     assert "overpass-roads" not in merged
+
+
+def test_the_hard_range_is_not_bypassed_by_the_fallback(rear_demand):
+    """Une contrainte qu'un repli contourne n'en est pas une.
+
+    Le repli faute de mieux proposait une vue à 1,7 km : bornée à l'aperçu,
+    mais recommandée. Au-delà de la portée dure, aucun manque de couverture ne
+    justifie une vue.
+    """
+    # 0,072° de latitude ≈ 8 km.
+    remote = candidate("mly-tres-loin", TARGET[0] + 0.072, TARGET[1])
+
+    manifest, report = discover(
+        HOTEL, _demands(rear_demand), {"mapillary": [remote]},
+        search=FakeContext(outstanding=[rear_demand]),
+    )
+
+    assert _recommended(manifest) == set(), (
+        "aucun manque ne justifie une vue au-delà de la portée dure"
+    )
+    measure = report.search.measures[0]
+    assert measure.rejection_reason is not None
+    assert "portée maximale" in measure.rejection_reason
+    assert not measure.recommended_by_fallback
+    assert manifest.candidates, "le candidat reste au manifeste, écarté"

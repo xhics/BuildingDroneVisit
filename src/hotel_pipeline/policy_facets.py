@@ -102,6 +102,7 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
     # besoins eux-mêmes — l'objectif n'a pas bougé.
     Facet.SEARCH_PREFERENCE: (
         "adaptive_search.automatic_candidate_max_distance_m",
+        "adaptive_search.hard_max_distance_m",
         "adaptive_search.heading_tolerance_deg",
         "adaptive_search.parallax_preferred_min_deg",
         "adaptive_search.parallax_preferred_max_deg",

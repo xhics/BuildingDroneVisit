@@ -82,13 +82,20 @@ def fake_fetcher(payload: bytes = JPEG):
     laissait la résolution appeler l'API derrière un téléchargeur injecté.
     """
     calls: list[str] = []
+    requested: list[str] = []
 
-    def fetch(candidate, target):  # noqa: ANN001, ANN202
+    def fetch(candidate, target, request=None):  # noqa: ANN001, ANN202
         calls.append(candidate.candidate_id)
+        # Ce que le téléchargeur reçoit **réellement** : sans cette trace, le
+        # plan pouvait annoncer 256 et l'image arriver en 2048.
+        requested.append(
+            request.provider_resolution if request is not None else "sans-requête"
+        )
         target.write_bytes(payload)
         return target
 
     fetch.calls = calls  # type: ignore[attr-defined]
+    fetch.requested = requested  # type: ignore[attr-defined]
     return fetch
 
 
@@ -292,3 +299,110 @@ def test_a_tampered_file_is_caught_by_verification(tmp_path) -> None:
 
     problems = verify_acquired(acquired)
     assert any("empreinte du fichier" in problem for problem in problems)
+
+
+# --- ce qui est demandé, mesuré et publié doit être la même chose ------------
+
+
+def test_a_preview_downloads_a_thumbnail_and_says_so(tmp_path) -> None:
+    """Le défaut d'origine : le plan annonçait 256, l'image arrivait en 2048.
+
+    `fetch()` ne recevait que le candidat, dont `request_spec` portait encore
+    `thumb_2048` ; la provenance inscrivait pourtant `256`. Elle décrivait donc
+    un fichier qui n'était pas celui du disque.
+    """
+    fetcher = fake_fetcher()
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="aperçu",
+            resolution="256", expected_bytes=len(JPEG),
+        )
+    ])
+
+    acquired, report = run(
+        planned, {"c1": candidate("c1")}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fetcher,
+    )
+
+    assert fetcher.requested == ["thumb_256"], (
+        "le téléchargeur doit recevoir la résolution fournisseur, non celle "
+        "du vocabulaire du plan"
+    )
+    assert acquired
+    trace = report.requested["c1"]
+    assert trace["provider_resolution"] == "thumb_256", (
+        "la provenance décrit le fichier obtenu"
+    )
+    assert trace["semantic_resolution"] == "256", (
+        "et conserve ce que le plan demandait"
+    )
+    assert trace["request_digest"]
+
+
+def test_a_full_acquisition_downloads_the_full_image(tmp_path) -> None:
+    fetcher = fake_fetcher()
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="complet",
+            resolution="2048", expected_bytes=len(JPEG),
+        )
+    ])
+
+    acquired, report = run(
+        planned, {"c1": candidate("c1")}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fetcher,
+    )
+
+    assert fetcher.requested == ["thumb_2048"]
+    assert report.requested["c1"]["provider_resolution"] == "thumb_2048"
+
+
+def test_an_untranslatable_resolution_downloads_nothing(tmp_path) -> None:
+    """Un plan qu'on ne sait pas exécuter ne doit pas s'exécuter à moitié."""
+    fetcher = fake_fetcher()
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            resolution="une-résolution-inconnue", expected_bytes=len(JPEG),
+        )
+    ])
+    limited = candidate("c1", available_resolutions=["thumb_2048"])
+
+    with pytest.raises(AcquisitionRefused, match="aucune acquisition lancée"):
+        run(planned, {"c1": limited}, tmp_path, DIGESTS,
+            plan_digest="pd", fetcher=fetcher)
+
+    assert fetcher.calls == [], "rien n'a été téléchargé"
+
+
+def test_the_provenance_names_the_file_that_is_on_disk(tmp_path) -> None:
+    """La provenance décrit ce qui a été obtenu, non ce qui était demandé.
+
+    Elle inscrivait `acquisition.resolution` — le vocabulaire du plan — alors
+    que `fetch` téléchargeait selon `request_spec`. Un lecteur y aurait lu
+    « 256 » sur une image de 2048.
+    """
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="aperçu",
+            resolution="256", expected_bytes=len(JPEG),
+        )
+    ])
+
+    acquired, _ = run(
+        planned, {"c1": candidate("c1")}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fake_fetcher(),
+    )
+
+    provenance = acquired[0].acquisition
+    assert provenance.resolution == "thumb_256", (
+        "la résolution inscrite est celle du fournisseur"
+    )
+    assert provenance.requested_resolution == "256", (
+        "ce que le plan demandait reste consultable, à côté"
+    )
+    assert provenance.request_digest, "l'empreinte de la requête est publiée"

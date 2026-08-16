@@ -79,6 +79,10 @@ PILOT_POLICY_DIGESTS = {
         "avec framing_merge_bearing_deg et les deux résolutions — une preview "
         "se vérifie en miniature, jamais en pleine résolution"
     ),
+    "eaffffd88cd45280": (
+        "avec hard_max_distance_m — une contrainte qu'un repli contourne n'en "
+        "est pas une : le repli proposait une vue à 1,7 km"
+    ),
 }
 
 

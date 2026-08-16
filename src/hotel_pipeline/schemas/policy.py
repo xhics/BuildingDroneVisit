@@ -282,6 +282,15 @@ class AdaptiveSearchPolicy(BaseModel, Calibrated):
     #: sans rendre le seuil moins provisoire. Valeur **non calibrée**.
     automatic_candidate_max_distance_m: float = Field(default=250.0, gt=0)
 
+    #: **Portée dure** : au-delà, un candidat n'est jamais recommandé, quel que
+    #: soit le manque. Le repli faute de mieux pouvait proposer une vue à
+    #: 1,7 km — bornée à l'aperçu, mais recommandée quand même. Une contrainte
+    #: qu'un repli contourne n'est pas une contrainte.
+    #:
+    #: Distincte du seuil de recommandation automatique : entre les deux, un
+    #: candidat reste examinable ; au-delà, il ne l'est plus.
+    hard_max_distance_m: float = Field(default=600.0, gt=0)
+
     #: Écart toléré entre le cap mesuré et la direction de la cible. Répond à
     #: « l'objectif est-il tourné vers elle ? », question distincte de « de
     #: quel côté du bâtiment se tient la caméra ? ». Un cap **absent** ne vaut

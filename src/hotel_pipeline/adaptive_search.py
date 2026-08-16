@@ -665,6 +665,27 @@ def select_for_demand(
         eligible = principal
 
     if policy is not None:
+        # --- exclusion **dure** : ce que le repli ne peut pas contourner ----
+        #
+        # Au-delà de cette portée, un candidat n'est jamais recommandé. Le
+        # repli faute de mieux proposait une vue à 1,7 km ; bornée à l'aperçu,
+        # mais recommandée. Une contrainte qu'un repli contourne n'en est pas
+        # une.
+        hard_limit = policy.hard_max_distance_m
+        for measure in eligible:
+            if (
+                measure.distance_to_target_m is not None
+                and measure.distance_to_target_m > hard_limit
+            ):
+                measure.rejection_reason = (
+                    f"à {measure.distance_to_target_m:.0f} m de la cible, "
+                    f"au-delà de la portée maximale ({hard_limit:.0f} m) : "
+                    "aucun manque de couverture ne justifie cette vue"
+                )
+        eligible = [m for m in eligible if m.rejection_reason is None]
+        if not eligible:
+            return []
+
         # Le classement ne borne rien : sans ce filtre, le premier du tri est
         # retenu même s'il est à des kilomètres de la cible.
         #

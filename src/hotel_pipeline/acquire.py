@@ -43,11 +43,17 @@ class AcquireReport:
     bytes_downloaded: int = 0
     bytes_consented: int = 0
 
+    #: Ce qui a été **réellement** demandé, par candidat : résolution
+    #: fournisseur et empreinte de requête. Sans cette trace, rien ne permet de
+    #: vérifier que le fichier obtenu est celui que le plan décrivait.
+    requested: dict = field(default_factory=dict)
+
     def as_dict(self) -> dict:
         return {
             "run_id": self.run_id,
             "plan_id": self.plan_id,
             "planned": self.planned,
+            "requested": self.requested,
             "acquired": self.acquired,
             "failed": self.failed,
             "volume": {
@@ -147,6 +153,16 @@ def run(
         planned=len(plan.acquisitions),
         bytes_consented=plan.known_bytes,
     )
+    # Résolues **avant** toute écriture : un plan dont une acquisition ne se
+    # traduit pas annoncerait un volume qu'il ne saurait pas obtenir, et le
+    # découvrir au milieu du lot laisserait des fichiers orphelins.
+    from .acquisition_request import RequestUnresolvable, resolve_all
+
+    try:
+        requests_by_candidate = resolve_all(candidates, plan.acquisitions)
+    except RequestUnresolvable as exc:
+        raise AcquisitionRefused(f"aucune acquisition lancée — {exc}") from exc
+
     destination.mkdir(parents=True, exist_ok=True)
     acquired = []
 
@@ -158,9 +174,17 @@ def run(
             )
             continue
 
+        request = requests_by_candidate.get(acquisition.candidate_id)
+        if request is None:
+            report.failed[acquisition.candidate_id] = (
+                "requête non résolue : ce que le plan demande ne se traduit "
+                "pas dans les termes de la source"
+            )
+            continue
+
         try:
             target = destination / f"{acquisition.candidate_id}.jpg"
-            written = (fetcher or fetch)(candidate, target)
+            written = (fetcher or fetch)(candidate, target, request)
         except (AcquisitionRefused, OSError, RuntimeError, ValueError) as exc:
             report.failed[acquisition.candidate_id] = str(exc)
             continue
@@ -182,7 +206,12 @@ def run(
             sequence_id=candidate.sequence_id,
             panorama_id=candidate.panorama_id,
             camera_type=candidate.camera_type,
-            resolution=acquisition.resolution,
+            # La résolution **fournisseur**, non celle du vocabulaire du plan :
+            # inscrire « 256 » sur une image obtenue en `thumb_2048` décrirait
+            # un fichier qui n'est pas celui du disque.
+            resolution=request.provider_resolution,
+            requested_resolution=request.semantic_resolution,
+            request_digest=request.digest,
             acquired_at=datetime.now(timezone.utc),
             # Annoncées, conservées **à côté** des mesures : les faire
             # coïncider d'office masquerait un rendu tronqué ou redimensionné.
@@ -194,6 +223,11 @@ def run(
         # L'acquisition constate un fait ; elle ne tranche aucun droit. Une
         # source tierce téléchargée est `public_uncleared`, et la licence
         # revendiquée par le fournisseur reste une **revendication**.
+        report.requested[acquisition.candidate_id] = {
+            "semantic_resolution": request.semantic_resolution,
+            "provider_resolution": request.provider_resolution,
+            "request_digest": request.digest,
+        }
         asset = as_asset(candidate, provenance, written, Rights.PUBLIC_UNCLEARED)
         asset = asset.model_copy(
             update=acquisition_rights(candidate.request_spec.get("licence_claim"))
@@ -210,16 +244,22 @@ def run(
     return acquired, report
 
 
-def fetch(candidate, target: Path) -> Path:  # noqa: ANN001
+def fetch(candidate, target: Path, request=None) -> Path:  # noqa: ANN001
     """Résout l'adresse puis la télécharge : un seul geste, un seul refus.
 
     C'est ici, et nulle part ailleurs, qu'une URL existe.
+
+    `request` porte la résolution **fournisseur** décidée au plan. Sans elle,
+    le téléchargement retombait sur celle qu'y avait laissée la découverte :
+    le plan annonçait 256, l'image arrivait en 2048, et la provenance
+    inscrivait 256.
     """
     import requests
 
     from .providers.cache import ensure_online
 
-    url = resolve_url(candidate.source, candidate.request_spec)
+    spec = request.request_spec if request is not None else candidate.request_spec
+    url = resolve_url(candidate.source, spec)
     ensure_online("acquisition d'image")
     response = requests.get(url, timeout=60, stream=True)
     response.raise_for_status()

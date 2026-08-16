@@ -1125,7 +1125,17 @@ class AcquisitionProvenance(BaseModel):
     sequence_id: str | None = None
     panorama_id: str | None = None
     camera_type: str | None = None
+    #: Résolution **fournisseur** de ce qui a été téléchargé — `thumb_2048`,
+    #: `640x640`. Distincte de ce que le plan demandait : inscrire le
+    #: vocabulaire du plan décrirait un fichier qui n'est pas celui du disque.
     resolution: str | None = None
+
+    #: Ce que le plan demandait, dans son propre vocabulaire.
+    requested_resolution: str | None = None
+
+    #: Empreinte de la requête effectivement émise. C'est elle que le
+    #: consentement verrouille : changer la résolution change l'empreinte.
+    request_digest: str | None = None
     acquired_at: datetime | None = None
 
     #: Dimensions annoncées par le fournisseur, conservées **à côté** de celles
