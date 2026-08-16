@@ -10,12 +10,11 @@ SiteManifest                       quels objets existent, sont ciblables,
 
 Les mêler ferait d'un objet non résolu une lacune de couverture, ou d'une
 façade non photographiée un objet inexistant. Ce sont deux manques qui
-appellent deux réponses : l'un demande une localisation ou une preuve, l'autre
+appellent deux réponses : l'un demande une existence et une géométrie, l'autre
 une prise de vue.
 
 **Deux axes, non un seul.** La route dit par quels matériaux le site se
-reconstruit ; le statut dit si l'on peut engager. `capture_required` et
-`blocked_prerequisites` sont des états d'une route, non des routes :
+reconstruit ; le statut dit si l'on peut engager :
 
 ```text
 path             PATH_A_OPEN_3D | PATH_B_PHOTO_FIRST | PATH_C_GEO_FIRST
@@ -24,24 +23,31 @@ decision_status  ready | capture_required | blocked_prerequisites
                  validation_required
 ```
 
-**Jamais depuis le nombre brut d'images.** Trois cent treize vues autour d'un
-bâtiment peuvent n'en montrer aucune façade utilement ; sur ce site, six
-acquisitions ont été réfutées une à une. Ce qui compte est `meets()` — vues
-**et** continuité mesurée — et l'**union** des points de vue : un panorama qui
-sert trois besoins reste un point de vue.
+**Ce qui déclenche une campagne, et ce qui n'en déclenche pas** :
 
-La décision cite ce sur quoi elle se fonde, et ses entrées sont **fermées** :
-une empreinte absente refuse la décision plutôt que de la rendre sur un corpus
-inconnu.
+```text
+non ciblable, non critique   forbidden_claim + action de résolution
+                             jamais capture_required : aucune caméra
+                             ne comble l'absence d'un objet
+ciblable, sans photo
+ni proxy qualifié            capture_required
+ciblable, couvert par un
+proxy qualifié               compatible avec ready, sous restrictions
+```
+
+**Jamais depuis le nombre brut d'images.** Trois cent treize vues autour d'un
+bâtiment peuvent n'en montrer aucune façade utilement. Ce qui compte est
+`meets()` — vues **et** continuité mesurée — et l'**union** des points de vue.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .logging import get_logger
 from .schemas.acquisition import CaptureDemand, DemandAssessment, DemandStatus
@@ -50,35 +56,30 @@ from .schemas.enums import RouterPath
 log = get_logger("router")
 
 #: Version du **contrat de décision** : ce que le Router promet d'examiner et
-#: dans quel ordre. La changer périme les décisions antérieures, qui ont été
-#: prises sur d'autres règles.
-ROUTER_CONTRACT_VERSION = 1
+#: dans quel ordre. Elle entre dans l'identité de la décision — deux versions
+#: n'ont pas jugé selon les mêmes règles, et leurs verdicts ne se comparent pas
+#: même à entrées identiques.
+#:
+#: 2 : les empreintes du manifeste d'évaluation et de son rapport sont
+#: distinctes, et la version entre dans `input_digest`.
+ROUTER_CONTRACT_VERSION = 2
 
 
 class DecisionStatus(StrEnum):
-    """Peut-on engager, et sinon qu'est-ce qui manque ?
-
-    Orthogonal à la route : `PATH_D_HYBRID` peut être `ready` ou
-    `capture_required` selon ce qui est couvert, sans changer de matériaux.
-    """
+    """Peut-on engager, et sinon qu'est-ce qui manque ?"""
 
     #: Prêt à engager la reconstruction **par cette route**. Jamais
-    #: `ENVIRONMENT_3D_READY`, qui est un résultat de fin de Phase 1.
+    #: `ENVIRONMENT_3D_READY`, qui conclut la Phase 1.
     READY = "ready"
 
-    #: Ce qui manque se prend à la caméra. Aucun obstacle ne l'empêche : c'est
-    #: une campagne, non un blocage.
+    #: Un besoin **ciblable** manque de photo et de proxy : cela se prend à la
+    #: caméra.
     CAPTURE_REQUIRED = "capture_required"
 
-    #: Quelque chose doit être établi avant toute capture : un objet critique
-    #: non localisé, un référentiel absent. Envoyer quelqu'un sur place sans
-    #: cela ferait photographier au hasard.
+    #: Un objet critique n'est pas établi : on ne saurait pas où viser.
     BLOCKED_PREREQUISITES = "blocked_prerequisites"
 
-    #: La couverture paraît suffisante, mais une validation manque encore —
-    #: Gate G5 (SfM) pour Path B. Avant le Lot 2, aucune reconstruction
-    #: photogrammétrique n'a été éprouvée : l'annoncer prête serait annoncer
-    #: un résultat qu'on n'a pas.
+    #: Couverture suffisante, validation manquante — Gate G5 (SfM).
     VALIDATION_REQUIRED = "validation_required"
 
 
@@ -91,30 +92,35 @@ class ObjectStanding(StrEnum):
     #: Connu, mais sans géométrie : on sait qu'il existe, pas où.
     KNOWN_NOT_TARGETABLE = "known_not_targetable"
 
-    #: Instancié au gabarit, sans que rien n'établisse son existence. Ni son
-    #: existence, ni son état temporel ne sont acquis : rien ne peut en être
-    #: affirmé.
+    #: Ni existence, ni état temporel établis. Rien ne peut en être affirmé.
+    #:
+    #: `PARKING_HOTEL` est ici, et non « réfuté » : c'est l'**association** au
+    #: stationnement candidat qui a été démentie, pas l'existence d'un
+    #: stationnement. Inventer un état « objet réfuté » changerait le sens de
+    #: ce qui a été constaté.
     UNRESOLVED = "unresolved"
-
-    #: Démenti par une preuve : ce n'est pas une absence de données, c'est un
-    #: constat. Sur ce site, le stationnement associé par proximité montrait le
-    #: bâtiment voisin.
-    REFUTED = "refuted"
 
 
 class MissingInput(RuntimeError):
-    """Une entrée absente, implicite ou périmée : la décision est refusée.
+    """Une entrée absente, implicite ou périmée : la décision est refusée."""
 
-    Rendre une route sur un corpus inconnu produirait un document qui paraît
-    fondé sans l'être — pire qu'une absence de décision.
+
+class DecisionConflict(RuntimeError):
+    """Deux décisions portent la même identité mais divergent.
+
+    À entrées identiques, le verdict doit être identique. Une divergence
+    signifie qu'une entrée non déclarée a pesé — republier écraserait la trace
+    de ce défaut.
     """
 
 
-#: Les empreintes sans lesquelles la décision ne se rattache à rien. Une
-#: décision se relit des mois plus tard : ce qu'elle ne nomme pas ne pourra
-#: plus être retrouvé.
+#: Les empreintes sans lesquelles la décision ne se rattache à rien.
 REQUIRED_INPUTS: tuple[str, ...] = (
     "demands_digest",
+    #: Le manifeste d'évaluation **et** son rapport : le premier porte les
+    #: verdicts, le second les identifiants de points de vue. Une seule
+    #: empreinte laissait trois rapports différents produire la même identité.
+    "assessment_manifest_digest",
     "assessment_report_digest",
     "site_manifest_digest",
     "capture_geometry_digest",
@@ -126,15 +132,17 @@ REQUIRED_INPUTS: tuple[str, ...] = (
 )
 
 
-@dataclass(frozen=True)
-class InputManifest:
+class InputManifest(BaseModel):
     """Ce sur quoi la décision est prise, nommé et empreint.
 
-    Fermé : un champ libre laisserait passer une entrée oubliée, et la
-    décision paraîtrait fondée sur un corpus qu'elle n'a pas lu.
+    Fermé : un champ libre laisserait passer une entrée oubliée, et la décision
+    paraîtrait fondée sur un corpus qu'elle n'a pas lu.
     """
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     demands_digest: str = ""
+    assessment_manifest_digest: str = ""
     assessment_report_digest: str = ""
     site_manifest_digest: str = ""
     capture_geometry_digest: str = ""
@@ -147,6 +155,26 @@ class InputManifest:
     #: Facettes de politique réellement consommées : le digest global change à
     #: chaque retouche, y compris sur une facette étrangère à cette décision.
     policy_facets: tuple[str, ...] = ()
+
+    #: Version du contrat, dans l'identité : deux versions n'ont pas jugé selon
+    #: les mêmes règles.
+    contract_version: int = Field(default=ROUTER_CONTRACT_VERSION, ge=1)
+
+    @model_validator(mode="after")
+    def _the_two_assessment_digests_differ(self) -> "InputManifest":
+        """Le manifeste et son rapport sont deux fichiers.
+
+        Les confondre — ou recopier l'un dans l'autre — reproduirait le défaut
+        qu'ils existent pour éviter.
+        """
+        both = self.assessment_manifest_digest, self.assessment_report_digest
+        if all(d.strip() for d in both) and both[0] == both[1]:
+            raise ValueError(
+                "le manifeste d'évaluation et son rapport portent la même "
+                "empreinte : ce sont deux fichiers, et les confondre laisserait "
+                "des rapports différents produire la même décision"
+            )
+        return self
 
     def check(self) -> None:
         """Refuse la décision plutôt que de la rendre sur un corpus inconnu."""
@@ -163,6 +191,7 @@ class InputManifest:
     def as_dict(self) -> dict:
         payload = {name: getattr(self, name) for name in REQUIRED_INPUTS}
         payload["policy_facets"] = sorted(self.policy_facets)
+        payload["contract_version"] = self.contract_version
         return payload
 
     @property
@@ -177,8 +206,7 @@ class InputManifest:
         return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-@dataclass
-class DemandStanding:
+class DemandStanding(BaseModel):
     """Où en est **un** besoin — jugé par le besoin lui-même.
 
     `viewpoints_required` n'a **pas** de défaut : la valeur vient de la
@@ -187,14 +215,15 @@ class DemandStanding:
     seuil que personne n'a arbitré.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     demand_id: str
     status: DemandStatus
-    viewpoints_required: int
-    viewpoints_found: int = 0
+    viewpoints_required: int = Field(ge=1)
+    viewpoints_found: int = Field(default=0, ge=0)
 
     #: Résultat de `DemandAssessment.meets(CaptureDemand)` : vues, continuité
-    #: **mesurée**, niveau de continuité. Un compte de vues seul laisserait
-    #: deux clichés sans recouvrement passer pour une couverture SfM.
+    #: **mesurée**, niveau de continuité.
     meets_demand: bool = False
 
     targetable: bool = True
@@ -228,10 +257,7 @@ def standing_for(
     viewpoint_ids: tuple[str, ...] = (),
     note: str = "",
 ) -> DemandStanding:
-    """Construit l'état d'un besoin **depuis ses propres contrats**.
-
-    Le seuil de points de vue est lu sur le besoin, jamais choisi ici.
-    """
+    """Construit l'état d'un besoin **depuis ses propres contrats**."""
     return DemandStanding(
         demand_id=demand.demand_id,
         status=assessment.status,
@@ -244,37 +270,66 @@ def standing_for(
     )
 
 
-@dataclass(frozen=True)
-class ProxyZone:
+class ProxyZone(BaseModel):
     """Un artefact géométrique, et **ce qu'il couvre nommément**.
 
     Un proxy qualifié ne comble pas ce qu'il ne touche pas : un modèle de
-    terrain ne donne ni la façade arrière, ni l'entrée. Sans déclaration de
-    portée, n'importe quel proxy qualifié suffirait à rendre une route hybride
-    — et le document annoncerait une couverture qui n'existe pas.
+    terrain ne donne ni la façade arrière, ni l'entrée. Sans portée déclarée,
+    n'importe quel proxy suffirait à rendre une route hybride, et le document
+    annoncerait une couverture qui n'existe pas.
 
-    Un proxy donne une **forme**, jamais une apparence : `appearance_provided`
-    reste faux, et les plans rapprochés restent interdits sur ces zones, faute
-    de quoi un rendu texturé passerait pour une observation.
+    « Qualifié » ne se déduit pas de la présence d'un fichier : il faut un
+    verdict de qualification et les artefacts qui le portent, empreintes
+    comprises. `capture_geometry.json` existe sur tout site ayant tourné une
+    fois — s'en contenter qualifierait des proxies jamais éprouvés.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     zone: str
     artifact: str
-    qualified: bool
 
-    #: Objets de site que ce proxy couvre réellement.
+    #: Verdict de qualification, non une présence de fichier.
+    qualified: bool = False
+
+    #: Rapport qui porte le verdict, et son empreinte.
+    qualification_report: str = ""
+    qualification_digest: str = ""
+
+    #: Artefacts effectivement retenus, avec leurs empreintes : sans elles, on
+    #: ne saurait pas laquelle des dérivations a été employée.
+    source_artifacts: tuple[str, ...] = ()
+    source_digests: tuple[str, ...] = ()
+
     covered_objects: tuple[str, ...] = ()
-
-    #: Besoins dont il comble la part **géométrique**, jamais l'apparence.
     covered_demands: tuple[str, ...] = ()
 
-    #: Toujours faux : un proxy ne montre pas à quoi les choses ressemblent.
+    #: Toujours faux : un proxy donne une forme, jamais une apparence.
     appearance_provided: bool = False
 
-    #: Ce que la caméra ne doit pas faire sur ces zones.
     camera_restrictions: tuple[str, ...] = ()
-
     note: str = ""
+
+    @model_validator(mode="after")
+    def _a_qualified_proxy_carries_its_evidence(self) -> "ProxyZone":
+        """Qualifié sans preuve serait une affirmation, non un constat."""
+        if self.qualified:
+            if not self.qualification_digest.strip():
+                raise ValueError(
+                    f"proxy {self.zone!r} déclaré qualifié sans empreinte de "
+                    "rapport : la qualification serait invérifiable"
+                )
+            if not self.source_artifacts:
+                raise ValueError(
+                    f"proxy {self.zone!r} déclaré qualifié sans artefact "
+                    "source : on ne saurait pas ce qui a été mesuré"
+                )
+        if self.appearance_provided:
+            raise ValueError(
+                "un proxy géométrique ne fournit jamais l'apparence : un rendu "
+                "texturé sur une forme non observée passerait pour une photo"
+            )
+        return self
 
     def covers_object(self, kind: str) -> bool:
         return self.qualified and kind in self.covered_objects
@@ -287,6 +342,10 @@ class ProxyZone:
             "zone": self.zone,
             "artifact": self.artifact,
             "qualified": self.qualified,
+            "qualification_report": self.qualification_report,
+            "qualification_digest": self.qualification_digest,
+            "source_artifacts": list(self.source_artifacts),
+            "source_digests": list(self.source_digests),
             "covered_objects": sorted(self.covered_objects),
             "covered_demands": sorted(self.covered_demands),
             "appearance_provided": self.appearance_provided,
@@ -295,48 +354,80 @@ class ProxyZone:
         }
 
 
-@dataclass
-class RouterDecision:
+class RouterDecision(BaseModel):
     """La décision, et de quoi la contester."""
+
+    model_config = ConfigDict(extra="forbid")
 
     hotel_id: str
     path: RouterPath
     decision_status: DecisionStatus
     inputs: InputManifest
-    contract_version: int = ROUTER_CONTRACT_VERSION
+    contract_version: int = Field(default=ROUTER_CONTRACT_VERSION, ge=1)
 
-    #: --- ce qui fonde la décision, côté photographique ---------------------
-    demands_satisfied: list[str] = field(default_factory=list)
-    demands_partial: list[str] = field(default_factory=list)
-    demands_open: list[str] = field(default_factory=list)
-    demands_not_targetable: list[str] = field(default_factory=list)
-    demands_unreachable: list[str] = field(default_factory=list)
+    #: --- côté photographique ------------------------------------------------
+    demands_satisfied: list[str] = Field(default_factory=list)
+    demands_partial: list[str] = Field(default_factory=list)
+    demands_open: list[str] = Field(default_factory=list)
+    demands_not_targetable: list[str] = Field(default_factory=list)
+    demands_unreachable: list[str] = Field(default_factory=list)
 
-    #: **Union** des identifiants, non une somme : un panorama servant trois
-    #: besoins reste un point de vue.
-    independent_viewpoints: int = 0
-    viewpoint_ids: list[str] = field(default_factory=list)
+    #: **Union** des identifiants, non une somme.
+    independent_viewpoints: int = Field(default=0, ge=0)
+    viewpoint_ids: list[str] = Field(default_factory=list)
 
-    #: --- ce qui fonde la décision, côté site --------------------------------
-    objects_by_standing: dict = field(default_factory=dict)
-    critical_objects_unestablished: list[str] = field(default_factory=list)
+    #: --- côté site -----------------------------------------------------------
+    objects_by_standing: dict = Field(default_factory=dict)
+    critical_objects_unestablished: list[str] = Field(default_factory=list)
 
-    #: --- ce qui comble, et par quoi ----------------------------------------
-    proxy_zones: list[ProxyZone] = field(default_factory=list)
+    #: --- ce qui comble, et par quoi ------------------------------------------
+    proxy_zones: list[ProxyZone] = Field(default_factory=list)
+    appearance_gaps: list[str] = Field(default_factory=list)
+    camera_restrictions: list[str] = Field(default_factory=list)
 
-    #: Ce que les proxies **ne** fournissent pas : dit explicitement, sans quoi
-    #: la route hybride laisserait croire à une couverture complète.
-    appearance_gaps: list[str] = field(default_factory=list)
-    camera_restrictions: list[str] = field(default_factory=list)
-
-    #: --- ce qui reste à faire ----------------------------------------------
+    #: --- ce qui reste à faire -------------------------------------------------
     rationale: str = ""
-    blocking: list[str] = field(default_factory=list)
-    forbidden_claims: list[str] = field(default_factory=list)
-    next_actions: list[str] = field(default_factory=list)
-    limits: list[str] = field(default_factory=list)
+    blocking: list[str] = Field(default_factory=list)
+    forbidden_claims: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    limits: list[str] = Field(default_factory=list)
 
     decided_at: str = ""
+
+    @model_validator(mode="after")
+    def _a_status_matches_what_it_claims(self) -> "RouterDecision":
+        """Invariants structurels : le statut doit refléter les listes.
+
+        Sans eux, une décision pourrait annoncer `ready` en portant un objet
+        critique non établi — et le document ferait autorité.
+        """
+        if self.decision_status is DecisionStatus.BLOCKED_PREREQUISITES:
+            if not self.critical_objects_unestablished and not self.blocking:
+                raise ValueError(
+                    "décision bloquée sans prérequis manquant nommé : ce qui "
+                    "bloque doit être dit, sinon rien ne peut être débloqué"
+                )
+        elif self.critical_objects_unestablished:
+            raise ValueError(
+                "un objet critique n'est pas établi, mais la décision ne "
+                f"bloque pas : {sorted(self.critical_objects_unestablished)}"
+            )
+
+        if self.independent_viewpoints != len(set(self.viewpoint_ids)):
+            raise ValueError(
+                f"{self.independent_viewpoints} point(s) de vue annoncé(s) pour "
+                f"{len(set(self.viewpoint_ids))} identifiant(s) distinct(s) : "
+                "un panorama servant plusieurs besoins reste un point de vue"
+            )
+
+        if self.path is RouterPath.PATH_B_PHOTO_FIRST:
+            if self.decision_status is DecisionStatus.READY:
+                raise ValueError(
+                    "Path B ne peut pas être « prêt » avant la validation SfM "
+                    "(Gate G5) : ce serait livrer une préparation comme un "
+                    "résultat acquis"
+                )
+        return self
 
     @property
     def input_digest(self) -> str:
@@ -348,8 +439,6 @@ class RouterDecision:
             "path": self.path.value,
             "decision_status": self.decision_status.value,
             "contract_version": self.contract_version,
-            #: Déterministe : un rejeu sans changement d'entrée rend la même
-            #: valeur, quand `decided_at` diffère à chaque exécution.
             "input_digest": self.input_digest,
             "inputs": self.inputs.as_dict(),
             "photographic": {
@@ -384,19 +473,48 @@ class RouterDecision:
                 "demande une existence et une géométrie, non une prise de vue",
                 "« ready » signifie prêt à engager cette route, jamais "
                 "ENVIRONMENT_3D_READY, qui conclut la Phase 1",
+                "Path A et Path C ne sont pas implémentés : ce Router est "
+                "opérationnel pour Path B et Path D, non générique",
             ],
         }
 
 
-#: Objets sans lesquels on ne saurait pas où pointer une caméra. Leur absence
-#: bloque ; celle des autres se documente.
+#: Le contenu **sémantique** d'une décision : tout sauf l'instant où elle a été
+#: rendue. Deux décisions de même identité doivent s'accorder là-dessus.
+def semantic_payload(payload: dict) -> dict:
+    """Ce qui doit être identique à entrées identiques.
+
+    `decided_at` change à chaque exécution sans qu'aucune entrée bouge : le
+    comparer ferait échouer tout rejeu légitime.
+    """
+    return {key: value for key, value in payload.items() if key != "decided_at"}
+
+
+def compare_with_existing(fresh: dict, existing: dict) -> None:
+    """Refuse une divergence à identité égale.
+
+    Une différence signifie qu'une entrée non déclarée a pesé sur le verdict.
+    Republier écraserait la trace de ce défaut ; `--force` ne doit pas le
+    permettre, car forcer ne rend pas la décision cohérente.
+    """
+    if semantic_payload(fresh) != semantic_payload(existing):
+        écarts = sorted(
+            key for key in set(semantic_payload(fresh)) | set(semantic_payload(existing))
+            if semantic_payload(fresh).get(key) != semantic_payload(existing).get(key)
+        )
+        raise DecisionConflict(
+            "une décision de même identité existe et diverge sur "
+            f"{', '.join(écarts)} : une entrée non déclarée a pesé sur le "
+            "verdict, et forcer n'y changerait rien"
+        )
+
+
+#: Objets sans lesquels on ne saurait pas où pointer une caméra.
 CRITICAL_OBJECTS: frozenset[str] = frozenset({"BUILDING_MAIN"})
 
 
-def standing_of(state: str, has_geometry: bool, refuted: bool = False) -> ObjectStanding:
+def standing_of(state: str, has_geometry: bool) -> ObjectStanding:
     """Traduit l'état d'un objet de site en portée décisionnelle."""
-    if refuted:
-        return ObjectStanding.REFUTED
     if state == "unresolved":
         return ObjectStanding.UNRESOLVED
     return (
@@ -406,12 +524,7 @@ def standing_of(state: str, has_geometry: bool, refuted: bool = False) -> Object
 
 
 def _claims_forbidden_by(objects: dict) -> list[str]:
-    """Ce dont rien ne peut être affirmé.
-
-    Un objet non résolu n'a ni existence, ni état temporel établis : dire
-    « l'entrée actuelle se trouve là » supposerait deux faits qu'aucun artefact
-    ne porte.
-    """
+    """Ce dont rien ne peut être affirmé."""
     return [
         f"{kind} : ni existence, ni état temporel, ni géométrie établis — "
         "aucune affirmation à son sujet"
@@ -427,12 +540,7 @@ def decide(
     proxies: list[ProxyZone],
     inputs: InputManifest,
 ) -> RouterDecision:
-    """Arrête une route et un statut, en citant ce qui les fonde.
-
-    L'ordre des tests n'est pas indifférent : un prérequis manquant l'emporte
-    sur toute couverture, car photographier sans savoir quoi viser ne produit
-    rien d'exploitable.
-    """
+    """Arrête une route et un statut, en citant ce qui les fonde."""
     inputs.check()
 
     satisfied = [d.demand_id for d in demands if d.satisfied and d.targetable]
@@ -458,7 +566,6 @@ def decide(
     vues: set[str] = set()
     for demand in demands:
         vues.update(demand.viewpoint_ids)
-    independants = len(vues) if vues else 0
 
     critiques = [
         kind for kind, standing in objects.items()
@@ -467,22 +574,29 @@ def decide(
 
     # Un proxy ne comble que ce qu'il déclare couvrir.
     comblés = {
-        demand_id for demand_id in partial + open_demands + not_targetable
+        demand_id for demand_id in partial + open_demands
         if any(zone.covers_demand(demand_id) for zone in proxies)
     }
     qualifiés = [zone for zone in proxies if zone.qualified]
 
-    decision = RouterDecision(
+    #: **Seuls les besoins ciblables** pèsent sur le statut. Un besoin sans
+    #: cible n'appelle pas une caméra : aucune prise de vue ne comble l'absence
+    #: d'un objet dont on ignore s'il existe. Le compter ici confondrait les
+    #: deux sources que le Router sépare.
+    reste = [
+        demand_id for demand_id in partial + open_demands
+        if demand_id not in comblés
+    ]
+
+    decision_fields = dict(
         hotel_id=hotel_id,
-        path=RouterPath.REJECT,
-        decision_status=DecisionStatus.BLOCKED_PREREQUISITES,
         inputs=inputs,
         demands_satisfied=satisfied,
         demands_partial=partial,
         demands_open=open_demands,
         demands_not_targetable=not_targetable,
         demands_unreachable=unreachable,
-        independent_viewpoints=independants,
+        independent_viewpoints=len(vues),
         viewpoint_ids=sorted(vues),
         objects_by_standing={
             standing.value: sorted(
@@ -501,76 +615,79 @@ def decide(
         decided_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    # 1. Un prérequis manquant l'emporte sur tout le reste.
-    if critiques:
-        decision.decision_status = DecisionStatus.BLOCKED_PREREQUISITES
-        decision.blocking = [
-            f"{kind} : objet critique non établi — on ne saurait pas où viser"
-            for kind in sorted(critiques)
-        ]
-        decision.rationale = (
-            "un objet critique n'est pas établi : photographier sans savoir "
-            "quoi viser ne produirait rien d'exploitable"
-        )
-        decision.next_actions = ["établir la géométrie des objets critiques"]
-        return decision
-
-    reste = [
-        demand_id for demand_id in partial + open_demands + not_targetable
-        if demand_id not in comblés
+    #: Ce qu'un objet non ciblable appelle : une résolution, jamais une caméra.
+    résolutions = [
+        f"établir existence, état temporel et géométrie de {demand_id}"
+        for demand_id in sorted(not_targetable)
     ]
 
-    # 2. Tout couvert par la photographie : Path B — mais non validé.
-    if not partial and not open_demands and not not_targetable:
-        decision.path = RouterPath.PATH_B_PHOTO_FIRST
-        # Gate G5 : aucune reconstruction SfM n'a été éprouvée avant le Lot 2.
-        # Annoncer « prêt » anticiperait un résultat qu'on n'a pas.
-        decision.decision_status = DecisionStatus.VALIDATION_REQUIRED
-        decision.rationale = (
-            f"les {len(satisfied)} besoin(s) sont satisfaits au sens de "
-            f"meets() par {independants} point(s) de vue indépendant(s) ; "
-            "la validation SfM (Gate G5) reste à faire"
+    # 1. Un prérequis manquant l'emporte sur tout le reste.
+    if critiques:
+        return RouterDecision(
+            path=RouterPath.REJECT,
+            decision_status=DecisionStatus.BLOCKED_PREREQUISITES,
+            blocking=[
+                f"{kind} : objet critique non établi — on ne saurait pas où viser"
+                for kind in sorted(critiques)
+            ],
+            rationale=(
+                "un objet critique n'est pas établi : photographier sans savoir "
+                "quoi viser ne produirait rien d'exploitable"
+            ),
+            next_actions=["établir la géométrie des objets critiques"] + résolutions,
+            **decision_fields,
         )
-        decision.next_actions = ["valider la reconstruction SfM (Gate G5)"]
-        return decision
+
+    # 2. Tout ce qui est ciblable est couvert par la photographie : Path B.
+    if not partial and not open_demands:
+        return RouterDecision(
+            path=RouterPath.PATH_B_PHOTO_FIRST,
+            # Gate G5 : aucune reconstruction SfM n'a été éprouvée avant le
+            # Lot 2. Annoncer « prêt » anticiperait un résultat qu'on n'a pas.
+            decision_status=DecisionStatus.VALIDATION_REQUIRED,
+            rationale=(
+                f"les {len(satisfied)} besoin(s) ciblables sont satisfaits au "
+                f"sens de meets() par {len(vues)} point(s) de vue "
+                "indépendant(s) ; la validation SfM (Gate G5) reste à faire"
+            ),
+            next_actions=["valider la reconstruction SfM (Gate G5)"] + résolutions,
+            **decision_fields,
+        )
 
     # 3. Des proxies qualifiés comblent nommément ce que la photo ne couvre pas.
     if comblés:
-        decision.path = RouterPath.PATH_D_HYBRID
-        decision.decision_status = (
-            DecisionStatus.READY if not reste
-            else DecisionStatus.CAPTURE_REQUIRED
+        return RouterDecision(
+            path=RouterPath.PATH_D_HYBRID,
+            decision_status=(
+                DecisionStatus.READY if not reste
+                else DecisionStatus.CAPTURE_REQUIRED
+            ),
+            rationale=(
+                f"{len(satisfied)} besoin(s) satisfait(s), {len(partial)} "
+                f"partiel(s), {len(open_demands)} ouvert(s) ; "
+                f"{len(comblés)} besoin(s) reposent sur un proxy géométrique "
+                "qualifié qui les couvre nommément, "
+                f"{len(not_targetable)} sans cible établie. La reconstruction "
+                "hybride est possible, en sachant ce qui vient d'une photo et "
+                "ce qui vient d'une forme."
+            ),
+            next_actions=[
+                f"chercher des vues pour {demand_id}" for demand_id in sorted(reste)
+            ] + résolutions,
+            **decision_fields,
         )
-        decision.rationale = (
-            f"{len(satisfied)} besoin(s) satisfait(s), {len(partial)} "
-            f"partiel(s), {len(open_demands)} ouvert(s) ; "
-            f"{len(comblés)} besoin(s) reposent sur un proxy géométrique "
-            "qualifié qui les couvre nommément. La reconstruction hybride est "
-            "possible, en sachant ce qui vient d'une photo et ce qui vient "
-            "d'une forme."
-        )
-        decision.next_actions = [
-            f"chercher des vues pour {demand_id}"
-            for demand_id in sorted(partial + open_demands)
-        ]
-        decision.next_actions.extend(
-            f"établir existence, état temporel et géométrie de {demand_id}"
-            for demand_id in sorted(not_targetable)
-        )
-        return decision
 
     # 4. Ni couverture, ni proxy qui couvre ce qui manque.
-    decision.path = RouterPath.PATH_D_HYBRID if qualifiés else RouterPath.REJECT
-    decision.decision_status = DecisionStatus.CAPTURE_REQUIRED
-    decision.rationale = (
-        f"{len(reste)} besoin(s) sans couverture photographique ni proxy qui "
-        "les couvre nommément : ce qui manque se prend à la caméra"
+    return RouterDecision(
+        path=RouterPath.PATH_D_HYBRID if qualifiés else RouterPath.REJECT,
+        decision_status=DecisionStatus.CAPTURE_REQUIRED,
+        rationale=(
+            f"{len(reste)} besoin(s) ciblables sans couverture photographique "
+            "ni proxy qui les couvre nommément : ce qui manque se prend à la "
+            "caméra"
+        ),
+        next_actions=[
+            f"capturer {demand_id}" for demand_id in sorted(reste)
+        ] + résolutions,
+        **decision_fields,
     )
-    decision.next_actions = [
-        f"capturer {demand_id}" for demand_id in sorted(partial + open_demands)
-    ]
-    decision.next_actions.extend(
-        f"établir existence, état temporel et géométrie de {demand_id}"
-        for demand_id in sorted(not_targetable)
-    )
-    return decision

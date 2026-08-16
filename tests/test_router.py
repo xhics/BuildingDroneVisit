@@ -15,16 +15,22 @@ from __future__ import annotations
 
 import pytest
 
+import pydantic
+
 from hotel_pipeline.router import (
     CRITICAL_OBJECTS,
     REQUIRED_INPUTS,
+    ROUTER_CONTRACT_VERSION,
+    DecisionConflict,
     DecisionStatus,
     DemandStanding,
     InputManifest,
     MissingInput,
     ObjectStanding,
     ProxyZone,
+    compare_with_existing,
     decide,
+    semantic_payload,
     standing_for,
     standing_of,
 )
@@ -45,7 +51,9 @@ SITE_SAIN = {"BUILDING_MAIN": ObjectStanding.TARGETABLE}
 def _entrées(**overrides) -> InputManifest:
     """Un manifeste complet : les tests de route ne doivent pas échouer pour
     une entrée manquante, qui est un autre défaut."""
-    base = {name: f"{name[:4]}0000" for name in REQUIRED_INPUTS}
+    # Une empreinte distincte par entrée : `name[:6]` rendait la même valeur
+    # pour le manifeste d'évaluation et son rapport, que l'invariant refuse.
+    base = {name: f"{abs(hash(name)) % 10**12:012x}" for name in REQUIRED_INPUTS}
     base.update(overrides)
     return InputManifest(**base, policy_facets=("coverage", "visibility"))
 
@@ -64,9 +72,14 @@ def _couvert(demand_id, ids):
                    meets=True, ids=ids)
 
 
-#: Une toiture qualifiée, reliée à ce qu'elle couvre nommément.
+#: Une toiture qualifiée : verdict, rapport empreint et artefacts sources —
+#: « qualifié » est un constat, non une déclaration.
 TOITURE = ProxyZone(
-    zone="ROOFLINE_MAIN", artifact="capture_geometry+lidar", qualified=True,
+    zone="ROOFLINE_MAIN", artifact="dsm+ndsm", qualified=True,
+    qualification_report="qualification_report_essai.json",
+    qualification_digest="q" * 16,
+    source_artifacts=("dsm_roof_class6@essai", "ndsm@essai"),
+    source_digests=("d" * 16,),
     covered_objects=("ROOFLINE_MAIN", "BUILDING_MAIN"),
     covered_demands=("obligation:FACADE_REAR",),
     camera_restrictions=("plans rapprochés interdits sur les zones proxy",),
@@ -132,7 +145,7 @@ def test_the_required_threshold_comes_from_the_demand() -> None:
     """`viewpoints_required` n'a pas de défaut : la valeur vient de la
     politique, matérialisée dans le besoin. En inventer une ici ferait décider
     le Router sur un seuil que personne n'a arbitré."""
-    with pytest.raises(TypeError):
+    with pytest.raises(pydantic.ValidationError, match="viewpoints_required"):
         DemandStanding(demand_id="d", status=DemandStatus.OPEN)  # type: ignore[call-arg]
 
     demand = CaptureDemand(
@@ -186,7 +199,8 @@ def test_a_qualified_proxy_does_not_cover_what_it_never_touches() -> None:
     hybride, et le document annoncerait une couverture inexistante.
     """
     terrain = ProxyZone(
-        zone="TERRAIN_MAIN", artifact="capture_geometry", qualified=True,
+        zone="TERRAIN_MAIN", artifact="dtm", qualified=True,
+        qualification_digest="q" * 16, source_artifacts=("dtm@essai",),
         covered_objects=("TERRAIN_MAIN",), covered_demands=(),
     )
 
@@ -247,7 +261,7 @@ def test_an_unqualified_proxy_covers_nothing() -> None:
 def test_an_unresolved_object_is_not_a_coverage_gap() -> None:
     """`PARKING_HOTEL` n'est pas une façade non photographiée : l'un demande
     une preuve, l'autre une prise de vue."""
-    objets = dict(SITE_SAIN, PARKING_HOTEL=ObjectStanding.REFUTED)
+    objets = dict(SITE_SAIN, PARKING_HOTEL=ObjectStanding.UNRESOLVED)
 
     decision = decide(
         "essai", [_couvert("obligation:FACADE_PRIMARY", ("v1", "v2"))],
@@ -256,7 +270,7 @@ def test_an_unresolved_object_is_not_a_coverage_gap() -> None:
     publié = decision.as_dict()
 
     assert "PARKING_HOTEL" not in publié["photographic"]["open"]
-    assert publié["site"]["by_standing"]["refuted"] == ["PARKING_HOTEL"]
+    assert publié["site"]["by_standing"]["unresolved"] == ["PARKING_HOTEL"]
 
 
 def test_an_unresolved_object_forbids_any_claim_about_it() -> None:
@@ -286,11 +300,17 @@ def test_an_unresolved_object_forbids_any_claim_about_it() -> None:
     )
 
 
-def test_standing_distinguishes_refuted_from_merely_unresolved() -> None:
+def test_standing_reads_the_site_state_without_inventing_one() -> None:
+    """`PARKING_HOTEL` reste `unresolved` : c'est l'**association** au
+    stationnement candidat qui a été démentie, non l'existence d'un
+    stationnement. Un état « objet réfuté » changerait le sens du constat."""
     assert standing_of("inferred", True) is ObjectStanding.TARGETABLE
     assert standing_of("inferred", False) is ObjectStanding.KNOWN_NOT_TARGETABLE
     assert standing_of("unresolved", False) is ObjectStanding.UNRESOLVED
-    assert standing_of("unresolved", False, refuted=True) is ObjectStanding.REFUTED
+
+    assert not hasattr(ObjectStanding, "REFUTED"), (
+        "réfuter l'objet dirait autre chose que réfuter son association"
+    )
 
 
 # --- route et statut sont deux axes -------------------------------------------
@@ -439,3 +459,185 @@ def test_the_critical_set_stays_a_deliberate_choice() -> None:
     assert "BUILDING_MAIN" in CRITICAL_OBJECTS
     assert "PROPERTY_SIGN" not in CRITICAL_OBJECTS
     assert "PARKING_HOTEL" not in CRITICAL_OBJECTS
+
+
+# --- un besoin non ciblable n'appelle pas une caméra ---------------------------
+
+
+def test_an_untargetable_demand_never_triggers_a_capture() -> None:
+    """La règle que le pilote a fait apparaître.
+
+    Aucune prise de vue ne comble l'absence d'un objet dont on ignore s'il
+    existe : compter ces besoins dans le statut confondrait les deux sources
+    que le Router sépare — ce qui est photographiquement couvert, et ce qui est
+    établi.
+    """
+    besoins = [
+        _besoin("obligation:FACADE_REAR"),                       # comblé par proxy
+        _besoin("obligation:PROPERTY_SIGN", ciblable=False),
+        _besoin("obligation:ENTRANCE_MAIN_CURRENT", ciblable=False),
+    ]
+    objets = dict(
+        SITE_SAIN,
+        PROPERTY_SIGN=ObjectStanding.KNOWN_NOT_TARGETABLE,
+        ENTRANCE_MAIN_CURRENT=ObjectStanding.UNRESOLVED,
+    )
+
+    decision = decide("essai", besoins, objets, [TOITURE], _entrées())
+
+    assert decision.decision_status is DecisionStatus.READY, (
+        "les deux besoins sans cible ne sont pas des lacunes de capture"
+    )
+    assert len(decision.demands_not_targetable) == 2
+    assert not any(
+        action.startswith("capturer") or action.startswith("chercher des vues")
+        for action in decision.next_actions
+        if "PROPERTY_SIGN" in action or "ENTRANCE_MAIN_CURRENT" in action
+    ), "ces besoins appellent une résolution, jamais une caméra"
+    assert sum(
+        "établir existence, état temporel et géométrie" in action
+        for action in decision.next_actions
+    ) == 2
+
+
+def test_a_targetable_demand_without_photo_or_proxy_requires_capture() -> None:
+    """L'autre branche : ce qui est ciblable et non couvert se prend bien à la
+    caméra."""
+    besoins = [
+        _besoin("obligation:FACADE_REAR"),                     # comblé
+        _besoin("obligation:ACCESS_ROAD_MAIN"),                # ciblable, non comblé
+    ]
+
+    decision = decide("essai", besoins, SITE_SAIN, [TOITURE], _entrées())
+
+    assert decision.decision_status is DecisionStatus.CAPTURE_REQUIRED
+    assert any(
+        "ACCESS_ROAD_MAIN" in action and "chercher des vues" in action
+        for action in decision.next_actions
+    )
+
+
+# --- « qualifié » est un constat, non une déclaration --------------------------
+
+
+def test_a_proxy_cannot_claim_qualification_without_evidence() -> None:
+    """`capture_geometry.json` existe sur tout site ayant tourné une fois : s'en
+    contenter qualifierait des proxies jamais éprouvés."""
+    with pytest.raises(pydantic.ValidationError, match="sans empreinte de rapport"):
+        ProxyZone(zone="Z", artifact="a", qualified=True,
+                  source_artifacts=("x",))
+
+    with pytest.raises(pydantic.ValidationError, match="sans artefact source"):
+        ProxyZone(zone="Z", artifact="a", qualified=True,
+                  qualification_digest="q" * 16)
+
+
+def test_a_proxy_can_never_declare_appearance() -> None:
+    with pytest.raises(pydantic.ValidationError, match="jamais l'apparence"):
+        ProxyZone(zone="Z", artifact="a", appearance_provided=True)
+
+
+# --- l'identité de la décision -------------------------------------------------
+
+
+def test_the_two_assessment_digests_cannot_be_confused() -> None:
+    """Une empreinte unique laissait trois rapports différents produire la même
+    identité — c'est arrivé sur le pilote."""
+    with pytest.raises(pydantic.ValidationError, match="deux fichiers"):
+        InputManifest(
+            assessment_manifest_digest="même", assessment_report_digest="même"
+        )
+
+
+def test_the_contract_version_enters_the_identity() -> None:
+    """Deux versions n'ont pas jugé selon les mêmes règles : leurs verdicts ne
+    se comparent pas, même à entrées identiques."""
+    avant = _entrées(contract_version=1)
+    après = _entrées(contract_version=2)
+
+    assert avant.digest != après.digest
+    assert ROUTER_CONTRACT_VERSION >= 2
+
+
+def test_the_report_digest_enters_the_identity() -> None:
+    """Le défaut constaté : trois décisions de contenus différents portaient la
+    même identité parce que le rapport n'était pas empreint."""
+    avant = _entrées()
+    après = _entrées(assessment_report_digest="un_autre_rapport")
+
+    assert avant.digest != après.digest
+
+
+# --- à identité égale, le verdict est identique --------------------------------
+
+
+def test_a_divergence_at_equal_identity_is_refused() -> None:
+    """Une différence signifie qu'une entrée non déclarée a pesé. Republier
+    effacerait la trace de ce défaut sans le corriger."""
+    besoins = [_besoin("obligation:FACADE_REAR")]
+    rendue = decide("essai", besoins, SITE_SAIN, [TOITURE], _entrées()).as_dict()
+
+    divergente = dict(rendue, decision_status="ready", path="path_b_photo_first")
+
+    with pytest.raises(DecisionConflict, match="path|decision_status"):
+        compare_with_existing(rendue, divergente)
+
+
+def test_only_the_timestamp_may_differ_between_replays() -> None:
+    """Comparer `decided_at` ferait échouer tout rejeu légitime."""
+    besoins = [_besoin("obligation:FACADE_REAR")]
+    première = decide("essai", besoins, SITE_SAIN, [TOITURE], _entrées()).as_dict()
+    seconde = decide("essai", besoins, SITE_SAIN, [TOITURE], _entrées()).as_dict()
+
+    assert première["decided_at"] != seconde["decided_at"]
+    compare_with_existing(première, seconde)          # ne lève pas
+    assert "decided_at" not in semantic_payload(première)
+
+
+# --- invariants structurels de la décision -------------------------------------
+
+
+def test_a_decision_cannot_claim_ready_while_a_prerequisite_is_missing() -> None:
+    """Sans cet invariant, un document pourrait annoncer « prêt » en portant un
+    objet critique non établi — et faire autorité."""
+    from hotel_pipeline.router import RouterDecision
+
+    with pytest.raises(pydantic.ValidationError, match="ne bloque pas"):
+        RouterDecision(
+            hotel_id="essai", path=RouterPath.PATH_D_HYBRID,
+            decision_status=DecisionStatus.READY, inputs=_entrées(),
+            critical_objects_unestablished=["BUILDING_MAIN"],
+        )
+
+
+def test_a_decision_cannot_miscount_its_own_viewpoints() -> None:
+    from hotel_pipeline.router import RouterDecision
+
+    with pytest.raises(pydantic.ValidationError, match="point\\(s\\) de vue"):
+        RouterDecision(
+            hotel_id="essai", path=RouterPath.PATH_D_HYBRID,
+            decision_status=DecisionStatus.READY, inputs=_entrées(),
+            independent_viewpoints=3, viewpoint_ids=["PANO_1"],
+        )
+
+
+def test_path_b_can_never_be_ready_before_the_sfm_gate() -> None:
+    from hotel_pipeline.router import RouterDecision
+
+    with pytest.raises(pydantic.ValidationError, match="Gate G5"):
+        RouterDecision(
+            hotel_id="essai", path=RouterPath.PATH_B_PHOTO_FIRST,
+            decision_status=DecisionStatus.READY, inputs=_entrées(),
+        )
+
+
+def test_the_decision_refuses_unknown_fields() -> None:
+    """Un champ libre laisserait une entrée non déclarée peser sur le verdict."""
+    from hotel_pipeline.router import RouterDecision
+
+    with pytest.raises(pydantic.ValidationError):
+        RouterDecision(
+            hotel_id="essai", path=RouterPath.PATH_D_HYBRID,
+            decision_status=DecisionStatus.READY, inputs=_entrées(),
+            coverage_score=0.9,  # type: ignore[call-arg]
+        )

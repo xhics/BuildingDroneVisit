@@ -5640,40 +5640,50 @@ router_app = typer.Typer(
 app.add_typer(router_app, name="router")
 
 
-def _targetable(demand, objets, site) -> bool:  # noqa: ANN001
+def _targetable(demand, geometry, front_azimuth_deg, site) -> bool:  # noqa: ANN001
     """Ce besoin vise-t-il quelque chose que l'on sait pointer ?
 
-    La ciblabilité dépend de ce que le besoin vise, non d'un nom : les besoins
-    de façade visent un **secteur de vue** (`front`, `left`…), non un objet de
-    site. Les chercher parmi les objets ne trouvait rien, et quatre façades
-    géoréférencées passaient pour non ciblables — le contraire de ce que la
-    géométrie établit.
+    Par le résolveur **canonique**, jamais par une table locale : une seconde
+    règle de ciblabilité divergerait de celle qui sert partout ailleurs. Une
+    version locale classait `ACCESS_ROAD_MAIN` non ciblable alors que sa
+    géométrie est résolue dans `CaptureGeometry` — le contraire de ce que le
+    pipeline établit.
     """
-    from .router import ObjectStanding
-    from .schemas.acquisition import TargetKind
+    from .demand_targets import TargetUnresolved, resolve
 
-    if demand.target_kind is TargetKind.VIEW_SECTOR:
-        # Un secteur se vise dès que le bâtiment qui le porte est géoréférencé
-        # et que la façade correspondante a été instanciée.
-        facade = SECTEUR_VERS_FACADE.get(demand.target_ref)
-        if facade is None:
-            return False
-        return objets.get(facade) is ObjectStanding.TARGETABLE
-
-    return objets.get(demand.target_ref) is ObjectStanding.TARGETABLE
+    if geometry is None:
+        return False
+    try:
+        resolve(demand, geometry, front_azimuth_deg=front_azimuth_deg, site=site)
+    except TargetUnresolved:
+        return False
+    return True
 
 
-#: Quel mur un secteur de vue regarde. Les besoins parlent secteurs, le site
-#: parle façades : sans cette table, les deux vocabulaires ne se rejoignent pas.
-SECTEUR_VERS_FACADE = {
-    "front": "FACADE_PRIMARY",
-    "rear": "FACADE_REAR",
-    "left": "FACADE_LEFT",
-    "right": "FACADE_RIGHT",
-}
+def _qualification(workspace):  # noqa: ANN001, ANN201
+    """Le rapport de qualification en vigueur, et son empreinte.
+
+    « Qualifié » est un verdict, non la présence d'un fichier :
+    `capture_geometry.json` existe sur tout site ayant tourné une fois, et s'en
+    contenter qualifierait des proxies jamais éprouvés.
+    """
+    from .intake import sha256_file
+
+    rapports = sorted(
+        workspace.path("06_geo").glob("qualification_report_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not rapports:
+        return None, "", "", {}
+    payload = json.loads(rapports[-1].read_text("utf-8"))
+    verdicts = {
+        kind: row for kind, row in (payload.get("verdicts") or {}).items()
+        if row.get("passed")
+    }
+    return payload, rapports[-1].name, sha256_file(rapports[-1])[:16], verdicts
 
 
-def _proxies_for(site, geometry) -> list:  # noqa: ANN001, ANN201
+def _proxies_for(workspace, site, geometry) -> list:  # noqa: ANN001, ANN201
     """Les proxies géométriques **et ce qu'ils couvrent nommément**.
 
     Un modèle de terrain qualifié ne comble ni la façade arrière, ni l'entrée :
@@ -5682,43 +5692,50 @@ def _proxies_for(site, geometry) -> list:  # noqa: ANN001, ANN201
     """
     from .router import ProxyZone
 
-    par_type = {obj.kind: obj for obj in site.objects}
-    facades = [
-        kind for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT",
-                          "FACADE_REAR")
-        if par_type.get(kind) is not None and par_type[kind].geometry_wkt
-    ]
+    payload, nom, empreinte, verdicts = _qualification(workspace)
+    if payload is None:
+        return []
 
-    #: Un proxy n'est qualifié que si son artefact porte la géométrie : le
-    #: déclarer sur une intention laisserait une forme non mesurée combler une
-    #: lacune réelle.
-    volume_mesuré = bool(facades) and geometry is not None
+    artefacts = tuple(payload.get("selected_artifacts") or ())
+    # L'empreinte de la dérivation retenue : sans elle, on ne saurait pas
+    # laquelle des dérivations successives a porté la qualification.
+    dérivation = (payload.get("qualified_derivation_digest") or "",)
     interdits = (
         "plans rapprochés interdits sur les zones proxy : la forme est mesurée, "
         "l'apparence ne l'est pas",
     )
 
-    return [
-        ProxyZone(
-            zone="TERRAIN_MAIN", artifact="capture_geometry",
-            qualified=geometry is not None,
-            covered_objects=("TERRAIN_MAIN",),
-            covered_demands=(),
-            camera_restrictions=interdits,
-            note="terrain dérivé de l'empreinte géoréférencée",
-        ),
-        ProxyZone(
-            zone="ROOFLINE_MAIN", artifact="capture_geometry+visibility_run",
-            qualified=volume_mesuré,
-            covered_objects=("ROOFLINE_MAIN", "BUILDING_MAIN"),
-            covered_demands=tuple(f"obligation:{kind}" for kind in facades),
-            camera_restrictions=interdits,
-            note=(
-                "volume et façades proxy : empreinte confirmée et hauteur, "
-                "sans apparence latérale ni arrière observée"
-            ),
-        ),
-    ]
+    par_type = {obj.kind: obj for obj in site.objects}
+    facades = tuple(
+        kind for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT",
+                          "FACADE_REAR")
+        if par_type.get(kind) is not None and par_type[kind].geometry_wkt
+    )
+
+    zones = []
+    for kind, couverts in (
+        ("TERRAIN_MAIN", ()),
+        # Le volume proxy porte les façades : empreinte confirmée et hauteur
+        # mesurée donnent leur forme, jamais leur apparence.
+        ("ROOFLINE_MAIN", tuple(f"obligation:{f}" for f in facades)),
+    ):
+        verdict = verdicts.get(kind)
+        zones.append(
+            ProxyZone(
+                zone=kind,
+                artifact="+".join(artefacts) or "capture_geometry",
+                qualified=verdict is not None and geometry is not None,
+                qualification_report=nom if verdict else "",
+                qualification_digest=empreinte if verdict else "",
+                source_artifacts=artefacts if verdict else (),
+                source_digests=dérivation if verdict else (),
+                covered_objects=(kind,),
+                covered_demands=couverts,
+                camera_restrictions=interdits,
+                note=(verdict or {}).get("rationale", ""),
+            )
+        )
+    return zones
 
 
 @router_app.command("decide")
@@ -5740,9 +5757,11 @@ def router_decide(
     from .intake import sha256_file
     from .provenance import digest_of
     from .router import (
+        DecisionConflict,
         InputManifest,
         MissingInput,
         ObjectStanding,
+        compare_with_existing,
         decide,
         standing_for,
         standing_of,
@@ -5801,26 +5820,68 @@ def router_decide(
 
     site = workspace.read_site()
     assets = workspace.read_assets()
-    geometry = _capture_geometry_if_any(workspace, context)
     if site is None or assets is None:
         typer.secho(
-            f"{KO} manifeste de site et d'assets requis", fg=typer.colors.RED, err=True
+            f"{KO} manifeste de site et d'assets requis",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    geometry = _capture_geometry_if_any(workspace, context)
+
+    # L'azimut de façade **décidé**, par le même chemin que le reste : sans
+    # lui, « avant » et « arrière » ne se distinguent pas, et un besoin de
+    # secteur paraîtrait ciblable depuis n'importe où.
+    spatial = _safe_read(workspace.read_spatial)
+    front_azimuth = getattr(spatial, "front_azimuth_deg", None) if spatial else None
+    if front_azimuth is None:
+        typer.secho(
+            f"{KO} orientation de façade inconnue : les besoins de secteur ne "
+            "se départageraient pas, et « ciblable » n'aurait pas de sens",
+            fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
 
-    # --- la visibilité **appliquée**, non simplement mesurée -------------------
-    applications = sorted(
-        workspace.path("06_geo").glob("visibility_application_*.json"),
-        key=lambda p: p.stat().st_mtime,
-    )
+    # --- la visibilité **réellement portée par les assets** --------------------
+    # Le dernier fichier par date n'est pas nécessairement celui qui est en
+    # vigueur : une application peut avoir été écrite sans être projetée, ou
+    # une plus ancienne rester celle que les assets portent. La preuve est dans
+    # les assets eux-mêmes.
+    portés = {
+        asset.visibility_run_id for asset in assets.assets
+        if asset.visibility_run_id
+    }
+    if len(portés) > 1:
+        typer.secho(
+            f"{KO} les assets portent {len(portés)} exécutions différentes "
+            f"({', '.join(sorted(portés))}) : aucune n'est « la » visibilité "
+            "appliquée, et décider sur l'une d'elles serait arbitraire",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    en_vigueur = next(iter(portés), None)
+    applications = [
+        chemin for chemin in sorted(
+            workspace.path("06_geo").glob("visibility_application_*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if en_vigueur and f"_{en_vigueur}_" in chemin.name
+    ]
+    if en_vigueur and not applications:
+        typer.secho(
+            f"{KO} les assets portent l'exécution {en_vigueur}, dont aucun "
+            "reçu d'application n'existe : la projection ne se vérifie pas",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
     previews = workspace.path("01_sources", "preview_assessments.json")
 
     # --- l'état de chaque objet, tel que le site le dit ------------------------
-    réfutés = _refuted_objects(workspace)
+    # `PARKING_HOTEL` reste `unresolved` : c'est l'**association** au
+    # stationnement candidat qui a été démentie, non l'existence d'un
+    # stationnement. Un registre de « réfutations d'objets » changerait le sens
+    # de ce qui a été constaté.
     objets = {
-        obj.kind: standing_of(
-            obj.state.value, bool(obj.geometry_wkt), refuted=obj.kind in réfutés
-        )
+        obj.kind: standing_of(obj.state.value, bool(obj.geometry_wkt))
         for obj in site.objects
     }
 
@@ -5838,14 +5899,18 @@ def router_decide(
         états.append(
             standing_for(
                 demand, assessment,
-                targetable=_targetable(demand, objets, site),
+                targetable=_targetable(demand, geometry, front_azimuth, site),
                 viewpoint_ids=tuple(vues_par_besoin.get(demand.demand_id, [])),
             )
         )
 
     inputs = InputManifest(
         demands_digest=digest_of(raw_demands),
-        assessment_report_digest=sha256_file(évaluations[-1])[:16],
+        # Deux fichiers, deux empreintes : le manifeste porte les verdicts, le
+        # rapport les identifiants de points de vue. N'en retenir qu'une
+        # laissait trois rapports différents produire la même identité.
+        assessment_manifest_digest=sha256_file(évaluations[-1])[:16],
+        assessment_report_digest=sha256_file(joint)[:16],
         site_manifest_digest=digest_of(json.loads(site.model_dump_json())),
         capture_geometry_digest=(
             digest_of(json.loads(geometry.model_dump_json())) if geometry else ""
@@ -5868,7 +5933,10 @@ def router_decide(
     # La décision est construite et validée **en mémoire** : un document écrit
     # puis jugé invalide resterait sur le disque comme s'il faisait autorité.
     try:
-        decision = decide(hotel_id, états, objets, _proxies_for(site, geometry), inputs)
+        decision = decide(
+            hotel_id, états, objets,
+            _proxies_for(workspace, site, geometry), inputs,
+        )
     except MissingInput as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         typer.secho(
@@ -5882,19 +5950,37 @@ def router_decide(
     dossier = workspace.path("10_validation")
     dossier.mkdir(parents=True, exist_ok=True)
     existante = sorted(dossier.glob(f"router_decision_*_{decision.input_digest}.json"))
-    if existante and not force:
-        typer.secho(
-            f"{OK} entrées inchangées : décision {existante[-1].name} réutilisée",
-            fg=typer.colors.GREEN,
-        )
-        typer.echo(
-            f"  {decision.path.value} · {decision.decision_status.value}"
-        )
-        return
+    payload = decision.as_dict()
+
+    if existante:
+        # À identité égale, le verdict doit être identique. Une divergence
+        # signifie qu'une entrée non déclarée a pesé : `--force` ne la rendrait
+        # pas cohérente, il effacerait seulement la trace du défaut.
+        ancienne = json.loads(existante[-1].read_text("utf-8"))
+        try:
+            compare_with_existing(payload, ancienne)
+        except DecisionConflict as exc:
+            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+            typer.secho(
+                f"  décision existante : {existante[-1].name} — rien n'est "
+                "écrit, y compris avec --force",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=3) from exc
+
+        if not force:
+            typer.secho(
+                f"{OK} entrées inchangées : décision {existante[-1].name} "
+                "réutilisée",
+                fg=typer.colors.GREEN,
+            )
+            typer.echo(
+                f"  {decision.path.value} · {decision.decision_status.value}"
+            )
+            return
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     nom = f"router_decision_{stamp}_{decision.input_digest}.json"
-    payload = decision.as_dict()
 
     # Immuable : une décision réécrite ne se relirait plus comme ce qu'elle fut.
     workspace.write_json(f"10_validation/{nom}", payload)
@@ -5908,18 +5994,8 @@ def router_decide(
         typer.echo(f"    → {action}")
 
 
-def _refuted_objects(workspace) -> set:  # noqa: ANN001, ANN201
-    """Objets démentis par une preuve, non simplement non résolus.
-
-    La distinction est décisive : `PARKING_HOTEL` a été associé par proximité,
-    puis démenti par inspection — ce n'est pas une absence de données.
-    """
-    payload = workspace.read_json("01_sources/site_refutations.json") or {}
-    return {row["kind"] for row in payload.get("refutations", []) if row.get("kind")}
-
-
-# En **fin** de fichier : ce garde était placé au milieu, et `app()` s'exécutait
-# avant que les commandes définies plus bas — visibility, orientation, router —
-# ne soient enregistrées. Sous `python -m`, elles restaient introuvables.
+# En **fin** de fichier : placé au milieu, `app()` s'exécutait avant que les
+# commandes définies plus bas — visibility, orientation, router — ne soient
+# enregistrées, et elles restaient introuvables sous `python -m`.
 if __name__ == "__main__":
     app()

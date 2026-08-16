@@ -380,9 +380,81 @@ décision par les objets du site, les zones de confiance et les contraintes de
 caméra. Les objets ne remplacent pas les besoins : ils disent **quoi** existe ;
 les besoins disent **quelle observation** est nécessaire.
 
-Le Router n'est pas encore implémenté. Les étapes SfM, reconstruction,
-alignement, composite et validation finale restent également hors de l'état
-courant.
+### État courant
+
+Le Router est implémenté et **opérationnel pour le pilote (Path D)**. Il n'est
+pas générique : `PATH_A_OPEN_3D` et `PATH_C_GEO_FIRST` restent à écrire, et le
+qualifier de complet avant cela ferait passer une couverture partielle pour un
+contrat rempli.
+
+Sa décision porte **deux axes**, jamais un seul :
+
+```text
+path             PATH_A_OPEN_3D | PATH_B_PHOTO_FIRST | PATH_C_GEO_FIRST
+                 PATH_D_HYBRID  | REJECT
+decision_status  ready | capture_required | blocked_prerequisites
+                 validation_required
+```
+
+`capture_required` et `blocked_prerequisites` sont des **états** d'une route,
+non des routes : une même route hybride peut être prête ou incomplète sans que
+ses matériaux changent.
+
+Trois règles gouvernent le statut :
+
+```text
+non ciblable, non critique   forbidden_claim + action de résolution ;
+                             jamais capture_required, car aucune caméra
+                             ne comble l'absence d'un objet
+ciblable, sans photo
+ni proxy qualifié            capture_required
+ciblable, couvert par un
+proxy qualifié               compatible avec ready, sous restrictions caméra
+```
+
+La satisfaction d'un besoin passe par `DemandAssessment.meets(CaptureDemand)` —
+vues **et** continuité mesurée : deux vues sans recouvrement ne font pas une
+couverture SfM. Les points de vue se comptent en **union** d'identifiants : un
+panorama servant trois besoins reste un point de vue. Un proxy ne comble que ce
+qu'il déclare couvrir, ne fournit jamais l'apparence, et « qualifié » est un
+verdict de qualification empreint, non la présence d'un fichier.
+
+Les entrées sont **fermées** : dix empreintes obligatoires, dont le manifeste
+d'évaluation et son rapport séparément. L'`input_digest` est déterministe et
+distinct de `decided_at`, si bien qu'un rejeu ne crée pas une décision
+différente ; à identité égale, une divergence de contenu est refusée, y compris
+avec `--force`.
+
+```bash
+hotel-pipeline router decide <hotel_id>
+```
+
+La décision est construite et validée **en mémoire**, puis publiée versionnée et
+immuable sous `10_validation/router_decision_<horodatage>_<input_digest>.json`.
+Les besoins ne sont jamais recalculés : le Router juge une couverture, il ne la
+définit pas.
+
+**Décision courante du pilote** — `router_decision_20260816T223315830888Z_dc83503227e96867.json` :
+
+```text
+path             PATH_D_HYBRID
+decision_status  CAPTURE_REQUIRED
+```
+
+Un besoin partiel (`FACADE_PRIMARY`), quatre ouverts, un seul point de vue
+indépendant. Les quatre façades reposent sur le volume proxy qualifié
+(`TERRAIN_MAIN` et `ROOFLINE_MAIN`, verdicts empreints), sans apparence
+latérale ni arrière observée et plans rapprochés interdits sur ces zones.
+`ACCESS_ROAD_MAIN` est **ciblable** — sa géométrie est résolue — mais aucun
+proxy routier qualifié ne le couvre : c'est ce besoin qui porte le statut.
+`ENTRANCE_MAIN_CURRENT` et `PROPERTY_SIGN` restent sans cible établie et
+appellent une résolution, non une caméra.
+
+« ready » signifierait prêt à engager cette route, jamais
+`ENVIRONMENT_3D_READY`, qui conclut la Phase 1.
+
+Les étapes SfM, reconstruction, alignement, composite et validation finale
+restent hors de l'état courant.
 
 ---
 
