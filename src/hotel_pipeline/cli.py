@@ -3657,14 +3657,28 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
-    raw = workspace.read_json("06_geo/capture_geometry.json")
-    if raw is None:
+    # Par le **même** chargeur que le reste du pipeline : un manifeste
+    # antérieur au schéma courant ne porte ni `schema_version`, ni
+    # `working_crs`, ni `spatial_context_digest`. Le valider directement le
+    # refusait, alors que `_capture_geometry_if_any` sait le rattacher au
+    # référentiel du contexte sans réécrire le fichier.
+    if not workspace.path("06_geo", "capture_geometry.json").is_file():
         typer.secho(
             f"{KO} aucun manifeste géométrique — lancez d'abord : geo resolve",
             fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
-    manifest = CaptureGeometryManifest.model_validate(raw)
+
+    # L'empreinte porte sur le fichier **tel qu'il est** : c'est lui qui a
+    # servi, non la forme rattachée en mémoire.
+    raw = workspace.read_json("06_geo/capture_geometry.json")
+    manifest = _capture_geometry_if_any(workspace, context)
+    if manifest is None:
+        typer.secho(
+            f"{KO} manifeste géométrique illisible ou sans référentiel résolu",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
 
     assets_manifest = workspace.read_assets()
     site = workspace.read_site()
