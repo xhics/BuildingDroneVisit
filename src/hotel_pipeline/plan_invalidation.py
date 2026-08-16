@@ -49,6 +49,13 @@ class InvalidationReason(StrEnum):
         "pre_resolved_acquisition_request_contract"
     )
 
+    #: Mesures exactes, publication incomplète : le volume et son statut
+    #: n'étaient pas inscrits au document, et le consentement aurait reposé sur
+    #: un calcul reconstitué hors du plan.
+    INCOMPLETE_MEASUREMENT_PUBLICATION_CONTRACT = (
+        "incomplete_measurement_publication_contract"
+    )
+
     #: Les besoins ont changé depuis : le plan répond à une question qu'on ne
     #: pose plus.
     STALE_DEMANDS = "stale_demands"
