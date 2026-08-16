@@ -1,0 +1,22 @@
+{
+  "property_id": "essai",
+  "address": "1 rue Test",
+  "official_name": "Essai",
+  "aliases": [],
+  "competitor_names": [],
+  "country_code": "CA",
+  "subdivision_code": null,
+  "timezone": "America/Toronto",
+  "ocr_languages": [
+    "fr"
+  ],
+  "renovation_events": [],
+  "room_count": null,
+  "expected_levels": null,
+  "footprint_min_m2": null,
+  "footprint_max_m2": null,
+  "lat": 45.5,
+  "lon": -73.4,
+  "website_url": null,
+  "place_query": null
+}

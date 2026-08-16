@@ -1588,9 +1588,13 @@ def assets_acquire(
     path = plan_file or _latest_plan(workspace)
     if path is None:
         typer.secho(
-            f"{KO} aucun plan — lancez : assets plan", fg=typer.colors.RED, err=True
+            f"{KO} aucun plan en circulation — lancez : assets plan",
+            fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
+
+    # Avant toute création de répertoire, lecture de cache ou appel réseau.
+    _refuse_invalidated(workspace, path)
 
     plan_payload = json.loads(Path(path).read_text("utf-8"))
     plan = AcquisitionPlan.model_validate(plan_payload)
@@ -1654,8 +1658,44 @@ def assets_acquire(
 
 
 def _latest_plan(workspace) -> Path | None:  # noqa: ANN001
-    found = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
+    """Dernier plan **encore en circulation**.
+
+    Un plan invalidé n'est pas supprimé — ce qu'il disait reste lisible — mais
+    il ne doit plus être choisi. Sans ce filtre, invalider le dernier ferait
+    simplement remonter l'avant-dernier, qui porte le même défaut.
+
+    Si tous sont invalidés, `None` : il n'y a pas de repli historique. Se
+    rabattre sur un plan retiré ferait exécuter ce qu'on venait d'écarter.
+    """
+    from .plan_invalidation import invalidated_plan_ids
+
+    sources = workspace.path("01_sources")
+    retired = invalidated_plan_ids(sources)
+    found = [
+        path for path in sorted(sources.glob("acquisition_plan_*.json"))
+        if path.name[len("acquisition_plan_"):-len(".json")] not in retired
+    ]
     return found[-1] if found else None
+
+
+def _refuse_invalidated(workspace, path: Path) -> None:  # noqa: ANN001
+    """Refuse un plan retiré, y compris désigné explicitement.
+
+    `--plan` court-circuite la sélection : sans ce contrôle, il suffisait de
+    nommer le fichier pour exécuter ce qu'une invalidation avait écarté.
+    """
+    from .plan_invalidation import invalidated_plan_ids
+
+    plan_id = Path(path).name[len("acquisition_plan_"):-len(".json")]
+    if plan_id not in invalidated_plan_ids(workspace.path("01_sources")):
+        return
+
+    typer.secho(
+        f"{KO} plan {plan_id} invalidé : il a été retiré de la circulation. "
+        "Le fichier reste lisible, mais il ne s'exécute pas.",
+        fg=typer.colors.RED, err=True,
+    )
+    raise typer.Exit(code=2)
 
 
 def _new_run_id() -> str:
@@ -4630,3 +4670,79 @@ def _resume_pending(workspace, policy_path) -> None:  # noqa: ANN001
             f"{resolution['state']} — {resolution['resolution']}",
             fg=typer.colors.YELLOW,
         )
+
+
+@assets_app.command("invalidate-plans")
+def assets_invalidate_plans(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    plan_id: list[str] = typer.Option(
+        ..., "--plan-id",
+        help="Identifiant à invalider. Répétable ; aucun motif générique.",
+    ),
+    reason: str = typer.Option(
+        ..., "--reason", help="Motif structuré, parmi ceux déclarés.",
+    ),
+    rationale: str = typer.Option(
+        ..., "--rationale", help="Ce qu'un relecteur doit comprendre.",
+    ),
+) -> None:
+    """Retire des plans de la circulation sans effacer ce qu'ils disaient.
+
+    Les fichiers restent intacts : l'événement publié les nomme, avec leur
+    empreinte, et c'est lui que la sélection consulte.
+    """
+    from .plan_invalidation import (
+        InvalidationReason,
+        InvalidationRefused,
+        build,
+    )
+    from .transaction import commit, prepare
+
+    workspace = Workspace(hotel_id)
+    sources = workspace.path("01_sources")
+
+    try:
+        structured = InvalidationReason(reason)
+    except ValueError as exc:
+        typer.secho(
+            f"{KO} motif {reason!r} inconnu ; déclarés : "
+            f"{[r.value for r in InvalidationReason]}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    paths = [sources / f"acquisition_plan_{identifier}.json" for identifier in plan_id]
+
+    try:
+        event = build(paths, structured, rationale)
+    except InvalidationRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    # L'événement est le fichier muté : `prepared` décrit ce qu'on s'apprête à
+    # publier, `committed` atteste. Un manifeste préparé seul n'invalide rien.
+    target = sources / f"plan_invalidation_{event.invalidation_id}_committed.json"
+    payload = json.dumps(event.as_dict(state="committed"), indent=2, ensure_ascii=False) + "\n"
+
+    transaction = prepare(
+        target, payload, kind="plan_invalidation",
+        intent={
+            "reason": structured.value,
+            "plan_ids": [plan.plan_id for plan in event.plans],
+        },
+    )
+
+    commit(
+        transaction, payload,
+        publish_prepared=lambda data: workspace.write_json(
+            f"01_sources/plan_invalidation_{event.invalidation_id}_prepared.json",
+            data,
+        ),
+        publish_committed=lambda _data: None,
+    )
+
+    typer.echo(f"{OK} {len(event.plans)} plan(s) retirés de la circulation")
+    for plan in event.plans:
+        typer.echo(f"    {plan.plan_id}  sha={plan.sha256}")
+    typer.echo(f"  motif    {structured.value}")
+    typer.echo("  fichiers intacts : l'événement les nomme, il ne les efface pas")
