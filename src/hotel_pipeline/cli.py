@@ -1128,12 +1128,13 @@ def assets_plan(
         workspace, context, candidates.candidates, demands.demands
     )
 
-    sizes, volume_report = _measure_volumes(candidates.candidates, measure_volumes)
-
+    # La mesure vient **après** la sélection : mesurer les 1 636 candidats pour
+    # n'en retenir que neuf lancerait des milliers d'appels inutiles, dont la
+    # quasi-totalité sur des vues que le plan n'acquerra jamais.
     try:
         plan, evaluations, report = build(
             hotel_id, candidates.candidates, demands.demands, digests,
-            geometries=geometries, sizes=sizes,
+            geometries=geometries, sizes=None,
             separation_m=context.policy.geometry.viewpoint_separation_m,
             policy=context.policy,
             # Les niveaux prononcés par la recherche **contraignent** le plan :
@@ -1144,6 +1145,46 @@ def assets_plan(
     except PlanRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
+
+    # Les requêtes résolues : c'est sur elles que porteront la mesure, le
+    # téléchargement et le consentement — jamais sur le candidat, dont la
+    # résolution est celle qu'y a laissée la découverte.
+    from .acquisition_request import RequestUnresolvable, resolve_all
+
+    try:
+        acquisition_requests = resolve_all(
+            {c.candidate_id: c for c in candidates.candidates}, plan.acquisitions
+        )
+    except RequestUnresolvable as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  aucun plan écrit : ce qu'il demande ne se traduit pas dans les "
+            "termes de la source",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    sizes, volume_report = _measure_volumes(
+        [acquisition_requests[a.candidate_id] for a in plan.acquisitions
+         if a.candidate_id in acquisition_requests],
+        measure_volumes,
+    )
+    # Chaque acquisition porte désormais ce qui sera demandé pour elle : le
+    # consentement verrouille l'empreinte, non le seul candidat.
+    plan = plan.model_copy(update={"acquisitions": [
+        a.model_copy(update={
+            "provider_resolution": (
+                acquisition_requests[a.candidate_id].provider_resolution
+                if a.candidate_id in acquisition_requests else None
+            ),
+            "request_digest": (
+                acquisition_requests[a.candidate_id].digest
+                if a.candidate_id in acquisition_requests else None
+            ),
+            **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
+        })
+        for a in plan.acquisitions
+    ]})
 
     # Un brouillon irréalisable est un brouillon faux. `bind_plan` existait,
     # était testé, et n'était appelé nulle part : la contradiction entre ce que

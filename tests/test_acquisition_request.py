@@ -162,3 +162,42 @@ def test_a_missing_candidate_does_not_block_the_others() -> None:
     )
 
     assert set(resolved) == {"mly-1"}
+
+
+# --- l'invariant : la même empreinte du plan au fichier ----------------------
+
+
+def test_the_head_measures_what_will_be_downloaded() -> None:
+    """Mesurer `thumb_2048` quand le plan demande `thumb_256` annonçait un
+    volume qui n'était pas celui du téléchargement."""
+    from hotel_pipeline.volumes import measure
+
+    probed: list[str] = []
+
+    def prober(request):
+        probed.append(request.request_spec["resolution"])
+        return 4096
+
+    request = resolve(_candidate(), _acquisition(resolution="256"))
+    report = measure([request], prober=prober)
+
+    assert probed == ["thumb_256"], (
+        "le HEAD porte sur ce qui sera téléchargé, non sur le candidat"
+    )
+    assert report.measured["mly-1"] == 4096
+
+
+def test_one_head_per_acquisition_not_per_candidate() -> None:
+    """Mesurer 1 636 candidats pour en retenir 9 lancerait des milliers
+    d'appels sur des vues que le plan n'acquerra jamais."""
+    from hotel_pipeline.volumes import measure
+
+    calls: list[str] = []
+    resolved = resolve_all(
+        {f"mly-{i}": _candidate(f"mly-{i}") for i in range(50)},
+        [_acquisition(f"mly-{i}") for i in range(3)],
+    )
+
+    measure(list(resolved.values()), prober=lambda r: calls.append(r.candidate_id) or 1)
+
+    assert len(calls) == 3, "un HEAD par acquisition retenue, pas par candidat"

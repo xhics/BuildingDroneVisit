@@ -990,9 +990,20 @@ class PlannedAcquisition(BaseModel):
     #: Celle qui classe l'acquisition quand il faut trancher.
     primary_intent: CaptureIntent | None = None
 
-    #: Résolution demandée. Une vérification de contenu se fait en 256 ou 1024 ;
-    #: la pleine résolution ne vient qu'après sélection.
+    #: Résolution demandée, dans le vocabulaire du **plan**. Une vérification
+    #: de contenu se fait en 256 ou 1024 ; la pleine résolution ne vient
+    #: qu'après sélection.
     resolution: str = "2048"
+
+    #: Ce que le fournisseur comprendra — `thumb_256`, `256x256`. Renseignée à
+    #: la résolution des requêtes : sans elle, le plan et le téléchargement
+    #: parlaient deux langues sans que rien ne les confronte.
+    provider_resolution: str | None = None
+
+    #: Empreinte de la requête qui sera émise. C'est **elle** que le
+    #: consentement verrouille : consentir à un candidat laisserait redéfinir
+    #: ensuite ce qui est demandé pour lui.
+    request_digest: str | None = None
 
     #: Volume attendu. `None` signifie **inconnu**, jamais zéro : compter une
     #: taille absente comme nulle annonçait un total « exact » faux.

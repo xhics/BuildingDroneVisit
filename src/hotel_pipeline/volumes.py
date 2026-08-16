@@ -61,10 +61,15 @@ class VolumeReport:
         }
 
 
-def measure(candidates: list, prober=None) -> VolumeReport:  # noqa: ANN001
-    """Mesure la taille de chaque candidat, sans télécharger.
+def measure(requests: list, prober=None) -> VolumeReport:  # noqa: ANN001
+    """Mesure la taille de chaque **requête résolue**, sans télécharger.
 
-    `prober` reçoit un candidat et rend une taille en octets, ou `None` si le
+    Les `ResolvedAcquisitionRequest` d'un plan, non les candidats d'un
+    manifeste : mesurer `thumb_2048` quand le plan demande `thumb_256`
+    annonçait un volume qui n'était pas celui du téléchargement, et le
+    consentement portait sur un chiffre faux.
+
+    `prober` reçoit une requête et rend une taille en octets, ou `None` si le
     service ne la déclare pas. L'injecter rend la mesure éprouvable sans clé ni
     réseau — et c'est la même couture que l'acquisition, pour la même raison :
     une résolution d'adresse cachée derrière un faux téléchargeur ne prouverait
@@ -73,7 +78,7 @@ def measure(candidates: list, prober=None) -> VolumeReport:  # noqa: ANN001
     report = VolumeReport()
     probe = prober or content_length
 
-    for candidate in candidates:
+    for candidate in requests:
         try:
             size = probe(candidate)
         except (OSError, RuntimeError, ValueError) as exc:
@@ -100,22 +105,26 @@ def measure(candidates: list, prober=None) -> VolumeReport:  # noqa: ANN001
     return report
 
 
-def content_length(candidate) -> int | None:  # noqa: ANN001
+def content_length(request) -> int | None:  # noqa: ANN001
     """Longueur annoncée par le service, sans recevoir le corps.
 
     Une requête `HEAD` demande les en-têtes seuls. Certains services n'y
     répondent pas, ou omettent `Content-Length` : dans les deux cas la taille
     reste inconnue, et la deviner serait pire que l'ignorer.
+
+    Le `HEAD` porte sur **ce qui sera téléchargé** : le `request_spec` de la
+    requête résolue, résolution fournisseur comprise. Mesurer celui du candidat
+    interrogeait une autre image que celle du plan.
     """
-    import requests
+    import requests as http
 
     from .acquire import resolve_url
     from .providers.cache import ensure_online
 
     ensure_online("mesure de volume")
-    url = resolve_url(candidate.source, candidate.request_spec)
+    url = resolve_url(request.source, request.request_spec)
 
-    response = requests.head(url, timeout=30, allow_redirects=True)
+    response = http.head(url, timeout=30, allow_redirects=True)
     response.raise_for_status()
 
     declared = response.headers.get("Content-Length")

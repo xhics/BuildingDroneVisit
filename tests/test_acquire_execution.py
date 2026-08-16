@@ -406,3 +406,54 @@ def test_the_provenance_names_the_file_that_is_on_disk(tmp_path) -> None:
         "ce que le plan demandait reste consultable, à côté"
     )
     assert provenance.request_digest, "l'empreinte de la requête est publiée"
+
+
+def test_a_request_that_differs_from_the_consented_one_is_refused(tmp_path) -> None:
+    """Le consentement porte sur des requêtes précises.
+
+    Si celles qu'on émet diffèrent, ce qui a été accepté n'est pas ce qui
+    serait téléchargé — et le volume consenti ne décrit plus rien.
+    """
+    fetcher = fake_fetcher()
+    planned = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            resolution="256", expected_bytes=len(JPEG),
+            # Une empreinte qui ne correspond à aucune requête réelle : le plan
+            # a été consenti pour autre chose.
+            request_digest="0" * 16,
+        )
+    ])
+
+    with pytest.raises(AcquisitionRefused, match="différentes de celles consenties"):
+        run(planned, {"c1": candidate("c1")}, tmp_path, DIGESTS,
+            plan_digest="pd", fetcher=fetcher)
+
+    assert fetcher.calls == [], "rien n'a été téléchargé"
+
+
+def test_a_matching_digest_lets_the_acquisition_proceed(tmp_path) -> None:
+    """Sans quoi le verrou bloquerait tout, y compris le cas légitime."""
+    from hotel_pipeline.acquisition_request import resolve
+
+    subject = candidate("c1")
+    acquisition = PlannedAcquisition(
+        candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+        serves_demands=["d1"], selection_rationale="essai",
+        resolution="256", expected_bytes=len(JPEG),
+    )
+    request = resolve(subject, acquisition)
+    planned = plan(acquisitions=[
+        acquisition.model_copy(update={"request_digest": request.digest})
+    ])
+
+    acquired, report = run(
+        planned, {"c1": subject}, tmp_path, DIGESTS,
+        plan_digest="pd", fetcher=fake_fetcher(),
+    )
+
+    assert acquired
+    assert report.requested["c1"]["request_digest"] == request.digest, (
+        "la même empreinte, du plan jusqu'au fichier produit"
+    )

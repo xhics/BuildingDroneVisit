@@ -163,6 +163,23 @@ def run(
     except RequestUnresolvable as exc:
         raise AcquisitionRefused(f"aucune acquisition lancée — {exc}") from exc
 
+    # Le consentement portait sur des requêtes précises. Si celles qu'on
+    # s'apprête à émettre diffèrent, ce qui a été accepté n'est pas ce qui
+    # serait téléchargé — et le volume consenti ne décrit plus rien.
+    diverged = [
+        acquisition.candidate_id
+        for acquisition in plan.acquisitions
+        if acquisition.request_digest
+        and acquisition.candidate_id in requests_by_candidate
+        and requests_by_candidate[acquisition.candidate_id].digest
+        != acquisition.request_digest
+    ]
+    if diverged:
+        raise AcquisitionRefused(
+            "requête(s) différentes de celles consenties : "
+            f"{sorted(diverged)} — le volume accepté ne les décrit pas"
+        )
+
     destination.mkdir(parents=True, exist_ok=True)
     acquired = []
 

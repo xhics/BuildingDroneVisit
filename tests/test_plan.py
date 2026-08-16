@@ -661,7 +661,9 @@ def test_the_cli_refuses_to_write_an_unexecutable_draft(project) -> None:
     result = runner.invoke(app, ["assets", "plan", "hotel-test"])
 
     assert result.exit_code == 1, result.output
-    assert "indisponible" in result.output
+    # Le refus vient désormais de la traduction, plus tôt et plus précisément :
+    # ce que le plan demande ne se dit pas dans les termes de la source.
+    assert "une-taille-que-le-plan-ignore" in result.output
     assert "aucun plan écrit" in result.output
     written = sorted(workspace.path("01_sources").glob("acquisition_plan_*.json"))
     assert written == [], "rien ne doit être écrit quand le plan est irréalisable"
