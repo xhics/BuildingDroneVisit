@@ -201,3 +201,44 @@ def test_one_head_per_acquisition_not_per_candidate() -> None:
     measure(list(resolved.values()), prober=lambda r: calls.append(r.candidate_id) or 1)
 
     assert len(calls) == 3, "un HEAD par acquisition retenue, pas par candidat"
+
+
+def test_the_head_url_is_built_from_the_resolved_request(monkeypatch) -> None:
+    """Le `prober` injecté court-circuite `content_length` : sans ce test,
+    rien ne garantit que le `HEAD` réel vise la bonne adresse.
+
+    C'est précisément le chemin où la mesure et le téléchargement pouvaient
+    diverger.
+    """
+    from hotel_pipeline import volumes
+
+    seen: dict = {}
+
+    def fake_resolve_url(source, request_spec):
+        seen.update({"source": source, "spec": dict(request_spec)})
+        return "https://exemple.test/image"
+
+    class FakeResponse:
+        headers = {"Content-Length": "12345"}
+
+        def raise_for_status(self):
+            return None
+
+    import hotel_pipeline.acquire as acquire_module
+
+    monkeypatch.setattr(acquire_module, "resolve_url", fake_resolve_url)
+    # `ensure_online` est importé dans la fonction : c'est la source qu'il
+    # faut patcher, non le module appelant.
+    monkeypatch.setattr(
+        "hotel_pipeline.providers.cache.ensure_online", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "requests.head", lambda *a, **k: FakeResponse()
+    )
+
+    request = resolve(_candidate(), _acquisition(resolution="256"))
+    assert volumes.content_length(request) == 12345
+
+    assert seen["spec"]["resolution"] == "thumb_256", (
+        "le HEAD interroge la résolution du plan, non celle du candidat"
+    )
