@@ -77,6 +77,9 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
     Facet.ACQUISITION_SIZING: (
         "collection.preview_resolution",
         "collection.full_resolution",
+        # Ce que « télécharger » garantit fait partie de ce qu'on consent : un
+        # volume accepté sous d'autres garanties n'est plus le même engagement.
+        "collection.download_contract_version",
     ),
     Facet.CANDIDATE_GEOMETRY: (
         "geometry.half_fov_deg",

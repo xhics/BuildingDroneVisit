@@ -184,6 +184,13 @@ class CollectionPolicy(BaseModel):
     #: trois par panorama dont deux à 1,5° l'une de l'autre.
     framing_merge_bearing_deg: float = Field(default=15.0, gt=0, le=180)
 
+    #: Version du contrat de **téléchargement** : ce que « télécharger »
+    #: garantit — plafonds simultanés, refus avant lecture, format décodé,
+    #: dimensions selon le fournisseur, publication atomique. La changer périme
+    #: un plan mesuré sous l'ancien contrat : son volume avait été consenti
+    #: sous d'autres garanties.
+    download_contract_version: int = Field(default=1, ge=1)
+
     preview_resolution: str = Field(default="256", min_length=1)
 
     #: Résolution d'une acquisition complète, une fois le niveau établi.

@@ -84,13 +84,21 @@ def fake_fetcher(payload: bytes = JPEG):
     calls: list[str] = []
     requested: list[str] = []
 
-    def fetch(candidate, target, request=None):  # noqa: ANN001, ANN202
+    def fetch(candidate, target, request=None, ceiling=None):  # noqa: ANN001, ANN202
         calls.append(candidate.candidate_id)
         # Ce que le téléchargeur reçoit **réellement** : sans cette trace, le
         # plan pouvait annoncer 256 et l'image arriver en 2048.
         requested.append(
             request.provider_resolution if request is not None else "sans-requête"
         )
+        # Le plafond est respecté ici comme il le serait sur le réseau : un
+        # faux téléchargeur qui l'ignorerait ne prouverait rien.
+        if ceiling is not None and len(payload) > ceiling:
+            from hotel_pipeline.download import DownloadRefused
+
+            raise DownloadRefused(
+                f"dépassement : {len(payload)} octets pour un plafond de {ceiling}"
+            )
         target.write_bytes(payload)
         return target
 
@@ -271,16 +279,24 @@ def test_the_report_compares_downloaded_against_consented(tmp_path) -> None:
     assert volume["within_consent"] is True
 
 
-def test_a_download_larger_than_announced_is_visible_in_the_report(tmp_path) -> None:
-    """Un dépassement doit se lire, pas se découvrir sur le disque."""
-    _, report = run(
+def test_a_download_larger_than_announced_is_refused_not_just_reported(
+    tmp_path,
+) -> None:
+    """Le dépassement était constaté après coup, donc déjà sur le disque.
+
+    Il est désormais refusé pendant le flux : le fichier n'atteint jamais sa
+    place, et aucun asset n'est publié.
+    """
+    acquired, report = run(
         plan(), {"c1": candidate()}, tmp_path, DIGESTS, plan_digest="pd",
         fetcher=fake_fetcher(JPEG + b"\x00" * 5000),
     )
 
-    volume = report.as_dict()["volume"]
-    assert volume["downloaded_bytes"] > volume["consented_bytes"]
-    assert volume["within_consent"] is False
+    assert acquired == [], "aucun asset publié"
+    assert "dépassement" in report.failed["c1"]
+    assert report.published == 0
+    assert list(tmp_path.glob("*.jpg")) == [], "aucun fichier final"
+    assert report.outcomes["c1"]["bytes_published"] == 0
 
 
 # --- le fichier acquis est confronté à son empreinte --------------------------
@@ -457,3 +473,120 @@ def test_a_matching_digest_lets_the_acquisition_proceed(tmp_path) -> None:
     assert report.requested["c1"]["request_digest"] == request.digest, (
         "la même empreinte, du plan jusqu'au fichier produit"
     )
+
+
+# --- publication : les six ou aucun -------------------------------------------
+
+
+def _six_plan(sizes):
+    """Un plan de six acquisitions, chacune avec sa taille annoncée."""
+    return plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id=f"c{i}", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            resolution="256", expected_bytes=size,
+        )
+        for i, size in enumerate(sizes, start=1)
+    ])
+
+
+def test_the_sixth_failure_publishes_nothing_of_the_first_five(tmp_path) -> None:
+    """Publier ce qui a réussi ferait croire à une acquisition partielle
+    consentie, et le manifeste décrirait un lot qui n'a jamais existé.
+    """
+    candidates = {f"c{i}": candidate(f"c{i}") for i in range(1, 7)}
+    planned = _six_plan([len(JPEG)] * 6)
+
+    appels: list[str] = []
+
+    def fetch(subject, target, request=None, ceiling=None):  # noqa: ANN001
+        appels.append(subject.candidate_id)
+        if subject.candidate_id == "c6":
+            # Le sixième dépasse : les cinq premiers sont déjà en staging.
+            from hotel_pipeline.download import DownloadRefused
+
+            raise DownloadRefused("dépassement sur le sixième")
+        target.write_bytes(JPEG)
+        return target
+
+    acquired, report = run(
+        planned, candidates, tmp_path, DIGESTS, plan_digest="pd", fetcher=fetch,
+    )
+
+    assert len(appels) == 6, "les six ont bien été tentés"
+    assert acquired == [], "aucun asset publié"
+    assert report.published == 0
+    assert sorted(p.name for p in tmp_path.glob("*.jpg")) == [], (
+        "aucun fichier final des cinq premiers"
+    )
+    assert not (tmp_path / ".staging").exists() or not list(
+        (tmp_path / ".staging").iterdir()
+    ), "le staging est vidé"
+
+
+def test_six_successes_publish_atomically(tmp_path) -> None:
+    """Sans quoi le refus bloquerait aussi le cas nominal."""
+    candidates = {f"c{i}": candidate(f"c{i}") for i in range(1, 7)}
+    planned = _six_plan([len(JPEG)] * 6)
+
+    acquired, report = run(
+        planned, candidates, tmp_path, DIGESTS, plan_digest="pd",
+        fetcher=fake_fetcher(),
+    )
+
+    assert len(acquired) == 6
+    assert report.published == 6
+    assert len(list(tmp_path.glob("*.jpg"))) == 6
+    for asset in acquired:
+        assert ".staging" not in asset.local_path, (
+            "l'asset porte sa place définitive, non celle du staging"
+        )
+
+
+def test_the_receipt_separates_the_four_byte_counts(tmp_path) -> None:
+    """Déclaré, reçu, en staging, publié : les fondre masquerait le cas qu'on
+    veut voir."""
+    candidates = {"c1": candidate("c1")}
+    planned = _six_plan([len(JPEG)])[:1] if False else plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            resolution="256", expected_bytes=len(JPEG),
+        )
+    ])
+
+    _, report = run(
+        planned, candidates, tmp_path, DIGESTS, plan_digest="pd",
+        fetcher=fake_fetcher(),
+    )
+
+    outcome = report.outcomes["c1"]
+    assert outcome["declared_bytes"] == len(JPEG)
+    assert outcome["bytes_received"] == len(JPEG)
+    assert outcome["bytes_staged"] == len(JPEG)
+    assert outcome["bytes_published"] == len(JPEG)
+
+
+def test_a_refusal_reports_zero_published_despite_bytes_received(tmp_path) -> None:
+    """Le cas qui distingue les quatre comptes."""
+    candidates = {"c1": candidate("c1"), "c2": candidate("c2")}
+    planned = _six_plan([len(JPEG), len(JPEG)])
+
+    def fetch(subject, target, request=None, ceiling=None):  # noqa: ANN001
+        if subject.candidate_id == "c2":
+            from hotel_pipeline.download import DownloadRefused
+
+            raise DownloadRefused("corps trop court")
+        target.write_bytes(JPEG)
+        return target
+
+    _, report = run(
+        planned, candidates, tmp_path, DIGESTS, plan_digest="pd", fetcher=fetch,
+    )
+
+    assert report.outcomes["c1"]["bytes_staged"] == len(JPEG)
+    assert report.outcomes["c1"]["bytes_published"] == 0, (
+        "reçu et mis en staging, jamais publié"
+    )
+    assert report.outcomes["c2"]["bytes_received"] == 0
+    assert "trop court" in report.outcomes["c2"]["refused"]

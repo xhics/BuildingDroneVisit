@@ -43,6 +43,13 @@ class AcquireReport:
     bytes_downloaded: int = 0
     bytes_consented: int = 0
 
+    #: Fichiers réellement publiés — distinct de ce qui a été téléchargé. Un
+    #: lot refusé laisse zéro publié malgré des octets reçus.
+    published: int = 0
+
+    #: Ce que chaque acquisition a coûté et produit, étape par étape.
+    outcomes: dict = field(default_factory=dict)
+
     #: Registre des appels de cette acquisition. Publié **même sur échec** :
     #: une exécution interrompue a coûté des appels, et les taire donnerait à
     #: croire qu'elle n'a rien consommé.
@@ -59,6 +66,8 @@ class AcquireReport:
             "plan_id": self.plan_id,
             "planned": self.planned,
             "requested": self.requested,
+            "published": self.published,
+            "outcomes": self.outcomes,
             "transport": self.transport,
             "acquired": self.acquired,
             "failed": self.failed,
@@ -189,7 +198,24 @@ def run(
             f"{sorted(diverged)} — le volume accepté ne les décrit pas"
         )
 
+    # Staging : rien n'atteint sa place définitive avant que les six soient
+    # prêts. Publier ce qui a réussi ferait croire à une acquisition partielle
+    # consentie, et le manifeste décrirait un lot qui n'a jamais existé.
+    from .download import Budget, DownloadRefused, verify
+
     destination.mkdir(parents=True, exist_ok=True)
+    staging = destination / ".staging"
+    staging.mkdir(parents=True, exist_ok=True)
+
+    budget = Budget(
+        total_consented=plan.known_bytes,
+        per_request={
+            a.candidate_id: a.expected_bytes
+            for a in plan.acquisitions if a.expected_bytes is not None
+        },
+    )
+    outcomes: dict = {}
+    staged: list[tuple[Path, Path]] = []
     acquired = []
 
     for acquisition in plan.acquisitions:
@@ -208,12 +234,29 @@ def run(
             )
             continue
 
+        target = staging / f"{acquisition.candidate_id}.jpg"
+        ceiling = budget.ceiling_for(acquisition.candidate_id)
         try:
-            target = destination / f"{acquisition.candidate_id}.jpg"
-            written = (fetcher or fetch)(candidate, target, request)
-        except (AcquisitionRefused, OSError, RuntimeError, ValueError) as exc:
+            written = (fetcher or fetch)(candidate, target, request, ceiling)
+            # Vérifié **avant** de compter l'octet comme acquis : un fichier
+            # illisible ou aux mauvaises dimensions n'est pas une acquisition.
+            outcome = verify(Path(written), candidate.source, request)
+        except (AcquisitionRefused, DownloadRefused, OSError, RuntimeError, ValueError) as exc:
+            Path(target).unlink(missing_ok=True)
             report.failed[acquisition.candidate_id] = str(exc)
+            outcomes[acquisition.candidate_id] = {
+                "candidate_id": acquisition.candidate_id,
+                "declared_bytes": acquisition.expected_bytes,
+                "bytes_received": 0, "bytes_staged": 0, "bytes_published": 0,
+                "refused": str(exc)[:160],
+            }
             continue
+
+        outcome.declared_bytes = acquisition.expected_bytes
+        outcome.bytes_received = outcome.bytes_staged
+        outcomes[acquisition.candidate_id] = outcome.as_dict()
+        budget.spent += outcome.bytes_staged
+        staged.append((Path(written), destination / f"{acquisition.candidate_id}.jpg"))
 
         provenance = AcquisitionProvenance(
             provider_id=candidate.provider_id,
@@ -263,13 +306,45 @@ def run(
             "provider_resolution": request.provider_resolution,
             "request_digest": request.digest,
         }
-        asset = as_asset(candidate, provenance, written, Rights.PUBLIC_UNCLEARED)
+        # L'asset porte sa place **définitive**, non celle du staging : ce
+        # chemin temporaire n'existera plus après publication, et un manifeste
+        # qui le citerait décrirait un fichier introuvable.
+        final_path = destination / f"{acquisition.candidate_id}.jpg"
+        asset = as_asset(
+            candidate, provenance, final_path, Rights.PUBLIC_UNCLEARED,
+            measured_from=Path(written),
+        )
         asset = asset.model_copy(
             update=acquisition_rights(candidate.request_spec.get("licence_claim"))
         )
         acquired.append(asset)
         report.acquired += 1
         report.bytes_downloaded += asset.file_size_bytes or 0
+
+    # --- publication : les six ou aucun -----------------------------------
+    if report.failed:
+        for temporary, _final in staged:
+            temporary.unlink(missing_ok=True)
+        acquired = []
+        report.published = 0
+        log.info(
+            "acquisition refusée : %d échec(s) — %d fichier(s) en staging "
+            "supprimés, aucun asset publié",
+            len(report.failed), len(staged),
+        )
+    else:
+        import os
+
+        for temporary, final in staged:
+            os.replace(temporary, final)
+            outcomes[final.stem]["bytes_published"] = final.stat().st_size
+        report.published = len(staged)
+
+    report.outcomes = outcomes
+    try:
+        staging.rmdir()
+    except OSError:
+        pass
 
     report.transport = transport_ledger().as_dict()
     log.info(
@@ -280,7 +355,7 @@ def run(
     return acquired, report
 
 
-def fetch(candidate, target: Path, request=None) -> Path:  # noqa: ANN001
+def fetch(candidate, target: Path, request=None, ceiling: int | None = None) -> Path:  # noqa: ANN001
     """Résout l'adresse puis la télécharge : un seul geste, un seul refus.
 
     C'est ici, et nulle part ailleurs, qu'une URL existe.
@@ -306,10 +381,34 @@ def fetch(candidate, target: Path, request=None) -> Path:  # noqa: ANN001
     )
     response.raise_for_status()
 
-    written = 0
-    with target.open("wb") as handle:
-        for chunk in response.iter_content(1 << 16):
-            written += handle.write(chunk)
+    from .download import DownloadRefused, stream_to
+
+    declared = None
+    header = (getattr(response, "headers", None) or {}).get("Content-Length")
+    if header is not None:
+        try:
+            declared = int(header)
+        except (TypeError, ValueError):
+            declared = None
+
+    # Refus **avant lecture** quand le service annonce déjà trop : lire pour
+    # s'en apercevoir ensuite aurait consommé la bande passante qu'on refuse.
+    if ceiling is not None and declared is not None and declared > ceiling:
+        raise DownloadRefused(
+            f"{candidate.candidate_id} : {declared} octets annoncés dépassent "
+            f"le plafond de {ceiling} — aucun octet n'a été lu"
+        )
+
+    try:
+        written = stream_to(
+            response, target, ceiling if ceiling is not None else declared or (1 << 30),
+            declared,
+        )
+    except DownloadRefused:
+        # Aucun fichier partiel ne subsiste : il serait pris pour une
+        # acquisition à la reprise.
+        target.unlink(missing_ok=True)
+        raise
 
     # Ce qui a **réellement** été écrit, à côté de ce qui était annoncé : leur
     # écart est précisément ce qu'un rapport doit rendre visible.

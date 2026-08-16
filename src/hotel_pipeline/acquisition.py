@@ -290,7 +290,9 @@ def _is_uniform(image) -> bool:  # noqa: ANN001
     return all(low == high for low, high in extrema)
 
 
-def as_asset(candidate, provenance, local_path: Path, rights) -> Asset:  # noqa: ANN001
+def as_asset(  # noqa: ANN001
+    candidate, provenance, local_path: Path, rights, measured_from: Path | None = None,
+) -> Asset:
     """Construit l'asset d'un candidat acquis, provenance et mesures comprises.
 
     L'identité durable vient du fournisseur, jamais de l'URL : celles des CDN
@@ -300,7 +302,9 @@ def as_asset(candidate, provenance, local_path: Path, rights) -> Asset:  # noqa:
     """
     from .schemas import AssetCategory, ExteriorInterior
 
-    measured = measure(local_path)
+    # Mesuré sur le fichier **présent** — en staging tant que la publication
+    # n'a pas eu lieu — mais publié sous son chemin définitif.
+    measured = measure(measured_from or local_path)
 
     try:
         return Asset(
