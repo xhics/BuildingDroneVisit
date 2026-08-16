@@ -661,6 +661,10 @@ def assets_discover(
     radius_m: int | None = typer.Option(
         None, "--radius", help="Rayon d'interrogation ; défaut : politique de collecte."
     ),
+    demand: list[str] = typer.Option(
+        None, "--demand",
+        help="Restreint la découverte à ce besoin. Répétable.",
+    ),
 ) -> None:
     """Interroge les index des sources. **Aucune image n'est téléchargée.**
 
@@ -671,7 +675,10 @@ def assets_discover(
     """
     from .discover import DiscoveryRefused, discover
     from .provenance import digest_of
-    from .schemas.acquisition import CaptureDemandManifest
+    from .schemas.acquisition import (
+        CaptureDemandManifest,
+        DiscoveryMode,
+    )
 
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
     workspace = Workspace(hotel_id)
@@ -685,9 +692,25 @@ def assets_discover(
         )
         raise typer.Exit(code=1)
 
+    # Le manifeste **canonique complet** est chargé d'abord : un filtre qui
+    # lirait un sous-ensemble ne pourrait pas dire qu'un identifiant est
+    # inconnu — il le prendrait pour un besoin d'un autre manifeste.
     demands = CaptureDemandManifest.model_validate(payload)
     profile = context.profile
     radius = radius_m or context.policy.collection.radius_m
+
+    # --- la portée, arrêtée **avant** toute interrogation ---------------------
+    scope, demands = _discovery_scope(demands, demand or [], digest_of(payload))
+    if scope.mode is DiscoveryMode.TARGETED:
+        typer.secho(
+            f"  découverte ciblée sur {len(scope.demand_ids)} besoin(s) : "
+            f"{', '.join(scope.demand_ids)}",
+            fg=typer.colors.CYAN,
+        )
+        typer.echo(
+            "  le corpus obtenu ne dira rien des autres besoins : il ne "
+            "deviendra pas le manifeste courant"
+        )
 
     typer.echo(f"  besoins     {len(demands.demands)}")
     typer.echo(f"  position    {profile.lat:.6f}, {profile.lon:.6f}")
@@ -747,20 +770,36 @@ def assets_discover(
     replay = current_mode() is NetworkMode.CACHE_ONLY and (
         partial or not manifest.candidates
     )
-    prefix = "01_sources/replays" if (replay or partial) else "01_sources"
+    # Une découverte ciblée vit **à part**, quoi qu'il arrive : son corpus ne
+    # dit rien des besoins qu'elle n'a pas cherchés, et le tri par date ne doit
+    # jamais aller l'y chercher comme manifeste courant.
+    if scope.mode is DiscoveryMode.TARGETED:
+        prefix = f"01_sources/targeted/{report.run_id}"
+    else:
+        prefix = "01_sources/replays" if (replay or partial) else "01_sources"
+    # Le message doit nommer **le dossier réellement employé** : annoncer
+    # `replays/` en écrivant sous `targeted/` enverrait chercher au mauvais
+    # endroit le fichier qu'un plan ciblé doit désigner explicitement.
     if partial:
         typer.secho(
             f"  · corpus partiel — {', '.join(failed)} n'a pas répondu : écrit "
-            "sous 01_sources/replays/, il ne devient pas le manifeste courant. "
+            f"sous {prefix}/, il ne devient pas le manifeste courant. "
             "Planifier dessus prendrait une source absente pour une source vide.",
             fg=typer.colors.YELLOW,
         )
     if replay:
         typer.secho(
-            "  · rejeu sur cache figé : écrit sous 01_sources/replays/, il ne "
+            f"  · rejeu sur cache figé : écrit sous {prefix}/, il ne "
             "sera pas repris comme manifeste courant",
             fg=typer.colors.YELLOW,
         )
+
+    # La portée est inscrite **au manifeste** : sans elle, deux corpus de
+    # contenus incomparables se ressembleraient.
+    manifest = manifest.model_copy(update={"scope": scope})
+
+    if scope.mode is DiscoveryMode.TARGETED:
+        manifest = _targeted_manifest(workspace, manifest, scope)
 
     workspace.write_json(
         f"{prefix}/candidates_{report.run_id}.json",
@@ -1002,6 +1041,115 @@ def _target_position(workspace):  # noqa: ANN001, ANN201
         return None
     building = spatial.candidate(spatial.confirmed_building_id)
     return (building.centroid_lat, building.centroid_lon)
+
+
+def _discovery_scope(demands, selected: list[str], demand_digest: str):  # noqa: ANN001, ANN201
+    """Arrête ce que cette découverte couvrira, **avant** d'interroger quoi que ce soit.
+
+    Valider après un appel réseau aurait déjà émis la requête, dépensé le quota
+    et écrit une trace pour un besoin qui n'existe pas. Un identifiant inconnu
+    doit donc être refusé ici, sans cache ni réseau.
+
+    Le manifeste rendu ne porte que les besoins retenus : filtrer plus loin
+    laisserait les autres être interrogés « pour rien », et le rapport dirait
+    qu'on les a cherchés.
+    """
+    from .schemas.acquisition import (
+        DiscoveryMode,
+        DiscoveryScope,
+        TargetKind,
+    )
+
+    if not selected:
+        return DiscoveryScope(demand_manifest_digest=demand_digest), demands
+
+    connus = {d.demand_id for d in demands.demands}
+    inconnus = sorted(set(selected) - connus)
+    if inconnus:
+        typer.secho(
+            f"{KO} besoin(s) inconnu(s) du manifeste canonique : "
+            f"{', '.join(inconnus)}",
+            fg=typer.colors.RED, err=True,
+        )
+        typer.secho(
+            "  aucune source n'a été interrogée : chercher pour un besoin qui "
+            "n'existe pas dépenserait un quota et écrirait une trace que rien "
+            "ne justifie",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    retenus = [d for d in demands.demands if d.demand_id in set(selected)]
+    # Le corridor du besoin, quand il en désigne un : la recherche s'y cadre,
+    # au lieu de balayer le rayon entier.
+    corridors = sorted({
+        d.target_ref for d in retenus
+        if d.target_kind is TargetKind.CONTEXT_CORRIDOR
+    })
+
+    scope = DiscoveryScope(
+        mode=DiscoveryMode.TARGETED,
+        demand_ids=tuple(sorted(d.demand_id for d in retenus)),
+        demand_manifest_digest=demand_digest,
+        corridor_ref=corridors[0] if len(corridors) == 1 else "",
+    )
+    # Un manifeste restreint aux seuls besoins visés : les autres ne doivent
+    # être ni interrogés, ni évalués, ni comptés comme non satisfaits.
+    restreint = demands.model_copy(update={"demands": retenus})
+    return scope, restreint
+
+
+def _targeted_manifest(workspace, manifest, scope):  # noqa: ANN001, ANN201
+    """Écarte ce qu'un aperçu a déjà réfuté, et borne le reste à l'aperçu.
+
+    Deux règles, pour deux raisons distinctes :
+
+    - **un couple réfuté ne se repropose pas.** Un examen humain a constaté que
+      cette vue ne montre pas ce besoin ; la resservir ferait refaire le même
+      examen, et la réfutation n'aurait servi à rien.
+    - **rien n'entre en pleine résolution avant un aperçu établi.** Une
+      acquisition ciblée porte sur un besoin qu'aucune vue ne couvre encore :
+      engager la pleine résolution reviendrait à payer pour une image dont
+      personne n'a vérifié qu'elle montre ce qu'on cherche.
+    """
+    from .schemas.preview import PreviewAssessmentLog
+
+    payload = workspace.read_json("01_sources/preview_assessments.json") or {}
+    log = PreviewAssessmentLog.model_validate(payload) if payload else None
+
+    réfutés: set[str] = set()
+    if log is not None:
+        for demand_id in scope.demand_ids:
+            réfutés |= log.refuted_for(demand_id)
+
+    gardés = [c for c in manifest.candidates if c.candidate_id not in réfutés]
+    écartés = len(manifest.candidates) - len(gardés)
+    if écartés:
+        typer.secho(
+            f"  · {écartés} candidat(s) écarté(s) : un aperçu humain les a "
+            "déjà réfutés pour ce besoin",
+            fg=typer.colors.YELLOW,
+        )
+
+    restants = {c.candidate_id for c in gardés}
+    return manifest.model_copy(update={
+        "candidates": gardés,
+        "evaluations": [
+            e for e in manifest.evaluations if e.candidate_id in restants
+        ],
+        "recommendations": [
+            r for r in manifest.recommendations if r.candidate_id in restants
+        ],
+        "recommended_for_enrichment": [
+            c for c in manifest.recommended_for_enrichment if c in restants
+        ],
+        "recommended_for_preview": [
+            c for c in manifest.recommended_for_preview if c in restants
+        ],
+        # Aucune pleine résolution planifiable : l'aperçu et son examen humain
+        # sont le seul chemin vers l'acquisition complète d'une vue ciblée.
+        "eligible_for_full_acquisition": [],
+    })
 
 
 def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:  # noqa: ANN001
@@ -4553,6 +4701,22 @@ def _validate_manifest_pairing(hotel_id, candidates, demands, demands_payload): 
             f"{current} aujourd'hui : les besoins ont changé depuis la "
             "découverte — relancez « assets discover »"
         )
+
+    # Une découverte ciblée ne juge que les besoins qu'elle a cherchés. Planifier
+    # dessus contre les besoins canoniques ferait lire l'absence de vues pour les
+    # six autres comme un constat, alors qu'aucune n'a été cherchée.
+    scope = getattr(candidates, "scope", None)
+    if scope is not None and scope.demand_ids:
+        hors_portée = sorted(
+            {d.demand_id for d in demands.demands} - set(scope.demand_ids)
+        )
+        if hors_portée:
+            problems.append(
+                "manifeste de candidats ciblé sur "
+                f"{', '.join(scope.demand_ids)}, mais le plan porte aussi sur "
+                f"{', '.join(hors_portée)} : ces besoins n'ont pas été "
+                "cherchés, et leur absence de vues n'est pas un constat"
+            )
     return problems
 
 

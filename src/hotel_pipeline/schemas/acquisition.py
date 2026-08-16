@@ -822,6 +822,62 @@ class DemandRecommendation(BaseModel):
     unmeasured_requirements: list[str] = Field(default_factory=list)
 
 
+class DiscoveryMode(StrEnum):
+    """Une découverte porte-t-elle sur tous les besoins, ou sur quelques-uns ?
+
+    La distinction est décisive pour ce qui suit : un corpus rassemblé pour un
+    seul besoin ne dit **rien** des autres. Le prendre pour un manifeste
+    courant ferait lire l'absence de vues de façade comme un constat, alors
+    qu'aucune façade n'a été cherchée.
+    """
+
+    #: Tous les besoins ouverts du manifeste canonique.
+    FULL = "full"
+
+    #: Un sous-ensemble explicitement nommé.
+    TARGETED = "targeted"
+
+
+class DiscoveryScope(BaseModel):
+    """Sur quoi cette découverte a porté — et sur quoi elle ne dit rien.
+
+    Sans portée inscrite, deux manifestes de contenus incomparables se
+    ressembleraient : rien ne distinguerait « aucune vue trouvée pour ces sept
+    besoins » de « un seul besoin a été cherché ».
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: DiscoveryMode = DiscoveryMode.FULL
+
+    #: Besoins réellement interrogés. Vide en mode `full` : la liste ferait
+    #: doublon avec le manifeste, et deux sources de vérité divergeraient.
+    demand_ids: tuple[str, ...] = ()
+
+    #: Empreinte du manifeste de besoins **complet**, celui qui a servi à
+    #: valider les identifiants. Une découverte ciblée reste rattachée aux
+    #: besoins canoniques, sinon elle définirait son propre objectif.
+    demand_manifest_digest: str = ""
+
+    #: Corridor employé pour cadrer la recherche, quand le besoin en désigne un.
+    corridor_ref: str = ""
+
+    @model_validator(mode="after")
+    def _a_targeted_scope_names_its_demands(self) -> "DiscoveryScope":
+        if self.mode is DiscoveryMode.TARGETED and not self.demand_ids:
+            raise ValueError(
+                "portée ciblée sans besoin nommé : elle ne se distinguerait "
+                "pas d'une découverte complète, et son manifeste partiel "
+                "passerait pour un corpus entier"
+            )
+        if self.mode is DiscoveryMode.FULL and self.demand_ids:
+            raise ValueError(
+                "portée complète nommant des besoins : deux sources de vérité "
+                "divergeraient sur ce qui a été cherché"
+            )
+        return self
+
+
 class CandidateManifest(BaseModel):
     """Tout ce qui a été découvert, et ce qu'on en a pensé, besoin par besoin.
 
@@ -876,6 +932,10 @@ class CandidateManifest(BaseModel):
 
     demand_digest: str | None = None
     policy_digest: str | None = None
+
+    #: Ce que cette découverte a couvert. Par défaut complète : les manifestes
+    #: écrits avant ce champ portaient bien sur tous les besoins.
+    scope: DiscoveryScope = Field(default_factory=DiscoveryScope)
 
     @model_validator(mode="after")
     def _consistent(self) -> "CandidateManifest":
