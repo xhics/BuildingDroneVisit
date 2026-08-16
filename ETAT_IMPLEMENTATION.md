@@ -1,7 +1,7 @@
 # État d'implémentation — BuildingDroneVisit
 
 **Photographie vérifiée :** 16 août 2026  
-**Jalon stable observé :** `85a1e48`  
+**Jalon stable observé :** `2977969`
 **Pilote :** WelcomINNS Boucherville
 
 Ce document répond à la question « qu'est-ce qui fonctionne réellement
@@ -24,12 +24,12 @@ Statuts :
 |---|---|---|
 | Socle reproductible | livré | CLI, schémas, profils, politique, workspace, smoke |
 | Portabilité second site | livré | territoire et CRS dynamiques, refus hors emprise |
-| Vérité du site | partiel | structure solide, neuf objets encore non résolus |
+| Vérité du site | partiel | structure solide, cinq objets encore non résolus |
 | Revue et qualification | livré | décisions et protocoles append-only |
 | Collecte ciblée V2 | partiel | boucle réelle jusqu'à l'aperçu ; expansion Mapillary non raccordée |
 | LiDAR, terrain, toiture | livré | dérivations qualifiées comme inférences |
 | Orthophoto et cadastre | partiel | catalogue présent, acquisition absente |
-| Orientation des façades | partiel | décision à 227,89°, aval non recalculé |
+| Orientation des façades | livré | décision à 227,89° propagée et vérifiée indépendamment |
 | Contexte et contraintes caméra | absent | livrables finaux Lot 1B non produits |
 | Router | absent | enum seulement, aucune décision exécutable |
 | SfM et reconstruction | hors lot courant | Lot 2 non commencé |
@@ -73,18 +73,19 @@ fait d'avoir été téléchargée.
 | `PARKING_HOTEL` | unresolved | association précédente réfutée |
 | `ENTRANCE_MAIN_CURRENT` | unresolved | emplacement et état courant non établis |
 | `PROPERTY_PARCEL` | unresolved | cadastre non acquis |
-| `FACADE_PRIMARY/LEFT/RIGHT/REAR` | unresolved | dépendaient de l'orientation à réappliquer |
+| `FACADE_PRIMARY/LEFT/RIGHT/REAR` | inferred | segments d'empreinte réinstanciés depuis l'orientation |
 | `DRIVEWAY_MAIN` | unresolved | existence non établie |
 | `PARK_AND_RIDE` | unresolved | distinction attendue, absence non vérifiée |
 
-Total : 14 objets, dont 1 confirmé, 4 inférés et 9 non résolus.
+Total : 14 objets, dont 1 confirmé, 8 inférés et 5 non résolus.
 
 ### 2.3 Besoins et aperçus
 
 | Mesure | Valeur |
 |---|---:|
-| Besoins | 8 |
-| Besoins ouverts | 8 |
+| Besoins | 7 |
+| Besoins ouverts | 6 |
+| Besoins partiellement couverts | 1 |
 | Constats d'aperçu établis | 0 |
 | Constats réfutés | 9 |
 | Constats indécis | 0 |
@@ -102,14 +103,15 @@ aperçus sont réfutés reste ouvert.
 | nDSM | environ 96,9 % valide |
 | Hauteur médiane | environ 10,26 m |
 | Qualification | `inferred`, confiance moyenne, provisoire |
-| Assets évalués en visibilité | 307 |
-| Directions dégagées en plan | 215 |
-| Partiels | 49 |
-| À risque exclusif | 43 |
-| Blocages verticaux prouvés | 0 |
+| Dernier run historique | 307 assets, désormais périmé |
+| Productions de visibilité périmées | 20 rapports, runs et applications |
+| Run courant après orientation | à recalculer |
 
-« Dégagé » signifie qu'une direction vers l'empreinte n'est pas masquée en
-plan. Cela n'établit ni l'identité, ni le cadrage, ni l'utilité géométrique.
+Les anciens nombres de visibilité restent auditables, mais ne sont plus un état
+courant : leurs secteurs dépendaient de l'azimut rétracté. Lors du prochain
+run, « dégagé » signifiera seulement qu'une direction vers l'empreinte n'est
+pas masquée en plan ; cela n'établira toujours ni l'identité, ni le cadrage, ni
+l'utilité géométrique.
 
 ---
 
@@ -157,32 +159,27 @@ stationnement soient confirmés par des preuves enregistrées.
 
 ## 5. Blocages prioritaires
 
-### P0 — Recalculer tout ce qui dépend de l'orientation
+### P0 fermé — Propager l'orientation
 
-L'orientation courante vaut `227,89°`, mais les 313 assets positionnés portent
-encore un secteur calculé depuis l'ancienne orientation. La confrontation
-directe rend 313 divergences sur 313.
+L'orientation courante vaut `227,89°`. `orientation apply` a :
 
-À fermer atomiquement :
+- vérifié l'empreinte du bâtiment et les SHA-256 des deux preuves ;
+- réinstancié les quatre façades ;
+- recalculé les 313 secteurs avec `bearing_deg` ;
+- périmé 20 productions de visibilité, sans toucher au LiDAR ni à sa
+  qualification ;
+- activé le manifeste canonique à 7 besoins ;
+- permis une évaluation à 6 besoins ouverts et 1 partiellement couvert ;
+- promu le manifeste courant à 916 candidats sans appel réseau.
 
-1. valider et publier la décision d'orientation par une commande officielle ;
-2. recalculer les secteurs des assets ;
-3. périmer visibilité, candidats, recherches, évaluations et plans dépendants ;
-4. reconstruire les besoins ciblables ;
-5. relancer `demands assess`.
-
-### P0 — Fermer la décision d'orientation
-
-Les tests algorithmiques existent, mais la preuve persistée doit aussi vérifier
-que les checksums, positions, segments et normales correspondent aux assets et
-à l'empreinte courante. Le calcul du segment observé ne doit pas dépendre d'un
-indice fourni sans confrontation.
+Contrôle indépendant : `pyproj.Geod.inv`, distinct du code d'application,
+retrouve zéro divergence sur les 313 assets positionnés.
 
 ### P1 — Ne plus reproposer un aperçu réfuté
 
 Le raccord est livré dans les derniers commits : un couple asset/besoin réfuté
-est retiré avant la mesure et ne consomme plus le budget. Il doit être vérifié
-sur la prochaine découverte réelle après recalcul des secteurs.
+est retiré avant la mesure et ne consomme plus le budget. La découverte courante
+à 916 candidats confirme qu'aucun des neuf couples réfutés n'a été reproposé.
 
 ### P1 — Implémenter le Router
 

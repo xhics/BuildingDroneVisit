@@ -2,7 +2,7 @@
 
 **État vérifié :** 16 août 2026  
 **Périmètre :** pipeline générique et pilote WelcomINNS Boucherville  
-**Jalon stable observé :** `85a1e48`
+**Jalon stable observé :** `2977969`
 
 Ce document décrit le système réellement implémenté. Il complète les documents
 de destination suivants sans les remplacer :
@@ -355,8 +355,13 @@ par une moyenne entre des murs opposés.
 
 Une nouvelle orientation doit périmer et recalculer les secteurs des assets,
 les évaluations de candidats, la visibilité, les recherches adaptatives, les
-plans et les évaluations de besoins qui en dépendent. Ce raccord n'est pas
-encore fermé dans l'état courant.
+plans et les évaluations de besoins qui en dépendent.
+
+Ce raccord est fermé sur le pilote : `orientation apply` vérifie l'empreinte du
+bâtiment et les SHA-256 des preuves, réinstancie les quatre façades, recalcule
+les secteurs avec le relèvement géodésique canonique, périme les productions de
+visibilité et active les besoins dérivés. Une vérification indépendante avec
+`pyproj.Geod.inv` retrouve zéro divergence sur les 313 assets positionnés.
 
 ---
 

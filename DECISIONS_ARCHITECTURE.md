@@ -216,7 +216,7 @@ d'accès.
 
 ## D-017 — Orienter le bâtiment depuis les façades documentées
 
-**Statut : à fermer**
+**Statut : adoptée**
 
 **Décision.** L'orientation principale vient des normales de segments
 colinéaires que des images d'identité confirmée désignent comme façade avant.
@@ -226,8 +226,10 @@ Le stationnement et la voie d'accès peuvent corroborer, jamais décider seuls.
 l'orientation non résolue. Une nouvelle orientation périme tous les secteurs et
 calculs dérivés.
 
-**Reste.** Fermer la validation persistante de la preuve et la propagation
-atomique vers les 313 assets positionnés et leurs productions aval.
+**Vérification du pilote.** La décision à `227,89°` réinstancie quatre façades,
+recalcule les 313 secteurs, périme 20 productions de visibilité et active les
+sept besoins courants. Un contrôle indépendant par `pyproj.Geod.inv` retrouve
+zéro divergence sectorielle.
 
 ---
 
@@ -265,4 +267,3 @@ peuvent établir.
 
 **Conséquence.** Trajectoires créatives, génération vidéo, montage et QA de la
 vidéo appartiennent à une Phase 2 séparée.
-
