@@ -165,8 +165,17 @@ class Ledger:
 
             if attempt.bytes_received:
                 row["bytes_received"] += attempt.bytes_received
-            stage = row["by_stage"].setdefault(attempt.stage.value, 0)
-            row["by_stage"][attempt.stage.value] = stage + 1
+
+            # `by_stage` compte les **tentatives réseau**. Y inclure les
+            # lectures de cache faisait annoncer 1 215 appels au rapport du
+            # pilote là où aucun paquet n'était parti — l'erreur même que ce
+            # registre remplace.
+            if attempt.outcome not in (Outcome.CACHE_HIT, Outcome.REFUSED):
+                stage = row["by_stage"].setdefault(attempt.stage.value, 0)
+                row["by_stage"][attempt.stage.value] = stage + 1
+            else:
+                served = row.setdefault("cache_by_stage", {})
+                served[attempt.stage.value] = served.get(attempt.stage.value, 0) + 1
         return counts
 
     def as_dict(self) -> dict:

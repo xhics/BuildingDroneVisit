@@ -251,3 +251,28 @@ def test_planned_and_actual_are_published_side_by_side(online) -> None:
     published = online.as_dict()
     assert published["planned_max_requests"]["mapillary"] == 8
     assert published["actual_requests"]["mapillary"] == 3
+
+
+def test_cache_hits_stay_out_of_the_stage_counts() -> None:
+    """Le rapport du pilote annonçait 1 215 appels là où zéro paquet partait.
+
+    `by_stage` alimente `requests_by_source` : y inclure les lectures de cache
+    reproduisait exactement l'erreur que ce registre remplace.
+    """
+    from hotel_pipeline.providers.transport import record_cache_hit
+
+    set_mode(NetworkMode.ONLINE)
+    registre = reset_ledger()
+    try:
+        request("street_view", Stage.COARSE_SEARCH, "GET", lambda: FakeResponse(200))
+        for _ in range(5):
+            record_cache_hit("street_view", Stage.COARSE_SEARCH)
+    finally:
+        set_mode(None)
+
+    row = registre.by_source()["street_view"]
+    assert row["by_stage"] == {"coarse_search": 1}, (
+        "seule la tentative réseau compte comme appel"
+    )
+    assert row["cache_by_stage"] == {"coarse_search": 5}
+    assert row["cache_hits"] == 5
