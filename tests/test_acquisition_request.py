@@ -241,3 +241,37 @@ def test_the_head_url_is_built_from_the_resolved_request(monkeypatch) -> None:
     assert seen["spec"]["resolution"] == "thumb_256", (
         "le HEAD interroge la résolution du plan, non celle du candidat"
     )
+
+
+def test_every_collector_declares_what_the_translation_will_ask() -> None:
+    """Deux vocabulaires pour une même chose font refuser le plan.
+
+    Le collecteur Street View déclarait `256`, la traduction demandait
+    `256x256` : le premier plan réel a été refusé à la liaison. La table de
+    traduction fait autorité ; ce test la confronte à ce que les collecteurs
+    annoncent.
+    """
+    from hotel_pipeline.acquisition_request import PROVIDER_RESOLUTIONS
+    from hotel_pipeline.collectors.streetview_v2 import (
+        Framing,
+        candidate_from,
+    )
+    from hotel_pipeline.discover import candidates_from
+    from hotel_pipeline.collectors.base import CollectedImage
+
+    class Panorama:
+        pano_id, lat, lon = "A", 45.5, -73.4
+        date, copyright = "2024-06", "© Google"
+
+    street_view = candidate_from(Panorama(), Framing(heading_deg=0.0))
+    for wanted in PROVIDER_RESOLUTIONS["street_view"].values():
+        assert wanted in street_view.available_resolutions, (
+            f"{wanted!r} sera demandé mais n'est pas déclaré"
+        )
+
+    mapillary = candidates_from("mapillary", [
+        CollectedImage(source="mapillary", source_id="1", url="http://x",
+                       lat=45.0, lon=-73.0)
+    ])[0]
+    for wanted in PROVIDER_RESOLUTIONS["mapillary"].values():
+        assert wanted in mapillary.available_resolutions

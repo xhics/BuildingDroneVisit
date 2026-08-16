@@ -455,9 +455,15 @@ def bind_plan(
                 "dont l'évaluation l'a écarté"
             )
 
-        if candidate.available_resolutions and item.resolution not in candidate.available_resolutions:
+        # C'est la résolution **traduite** qu'on confronte : le plan parle
+        # « 256 », le fournisseur « 256x256 », et comparer les deux
+        # vocabulaires faisait refuser un plan parfaitement exécutable.
+        # `provider_resolution` absente signifie qu'aucune traduction n'a eu
+        # lieu — on retombe alors sur ce que le plan demande, faute de mieux.
+        asked = item.provider_resolution or item.resolution
+        if candidate.available_resolutions and asked not in candidate.available_resolutions:
             problems.append(
-                f"{item.candidate_id} : résolution {item.resolution!r} indisponible ; "
+                f"{item.candidate_id} : résolution {asked!r} indisponible ; "
                 f"le fournisseur propose {candidate.available_resolutions}"
             )
 

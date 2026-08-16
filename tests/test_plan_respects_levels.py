@@ -665,6 +665,7 @@ def test_a_resolution_the_provider_cannot_serve_is_still_refused() -> None:
         AcquisitionPlan,
         CandidateManifest,
         CaptureDemandManifest,
+        PlannedAcquisition,
         PlanStatus,
         bind_plan,
     )
@@ -690,3 +691,81 @@ def test_a_resolution_the_provider_cannot_serve_is_still_refused() -> None:
 
     assert len(problems) == 1
     assert "indisponible" in problems[0]
+
+
+def test_bind_plan_compares_the_translated_resolution() -> None:
+    """Le plan parle « 256 », le fournisseur « 256x256 ».
+
+    Comparer les deux vocabulaires faisait refuser un plan parfaitement
+    exécutable : c'est ce qui a bloqué le premier plan réel du pilote, après
+    que la traduction eut pourtant été correctement calculée.
+    """
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan,
+        CandidateManifest,
+        CaptureDemandManifest,
+        PlannedAcquisition,
+        PlanStatus,
+        bind_plan,
+    )
+
+    candidate = _candidate("c-1", available_resolutions=["256x256", "2048x2048"])
+    acquisition = PlannedAcquisition(
+        candidate_id="c-1", intents=[CaptureIntent.BUILDING_CAPTURE],
+        serves_demands=["obligation:front"], selection_rationale="aperçu",
+        resolution="256", provider_resolution="256x256",
+    )
+    plan = AcquisitionPlan(
+        plan_id="essai", hotel_id="pilote", status=PlanStatus.DRAFT,
+        acquisitions=[acquisition],
+    )
+
+    problems = bind_plan(
+        plan,
+        CandidateManifest(
+            hotel_id="pilote", candidates=[candidate],
+            evaluations=[_evaluation("c-1")],
+        ),
+        CaptureDemandManifest(hotel_id="pilote", demands=[_demand()]),
+    )
+
+    assert problems == [], (
+        "la résolution traduite est servable : le plan est exécutable"
+    )
+
+
+def test_an_untranslated_plan_falls_back_on_what_it_asks() -> None:
+    """Un plan antérieur à la traduction ne porte pas `provider_resolution`.
+
+    Le refuser d'office casserait les plans existants ; on retombe sur ce
+    qu'il demande, faute de mieux.
+    """
+    from hotel_pipeline.schemas.acquisition import (
+        AcquisitionPlan,
+        CandidateManifest,
+        CaptureDemandManifest,
+        PlannedAcquisition,
+        PlanStatus,
+        bind_plan,
+    )
+
+    candidate = _candidate("c-1", available_resolutions=["thumb_2048"])
+    plan = AcquisitionPlan(
+        plan_id="essai", hotel_id="pilote", status=PlanStatus.DRAFT,
+        acquisitions=[PlannedAcquisition(
+            candidate_id="c-1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["obligation:front"], selection_rationale="ancien",
+            resolution="thumb_2048",
+        )],
+    )
+
+    problems = bind_plan(
+        plan,
+        CandidateManifest(
+            hotel_id="pilote", candidates=[candidate],
+            evaluations=[_evaluation("c-1")],
+        ),
+        CaptureDemandManifest(hotel_id="pilote", demands=[_demand()]),
+    )
+
+    assert problems == []

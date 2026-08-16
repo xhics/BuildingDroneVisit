@@ -261,4 +261,10 @@ def test_the_announced_size_is_not_a_measurement() -> None:
     # plan manipule — Street View rend la taille demandée, dans la limite d'un
     # plafond, et non une liste fermée.
     assert "2048x2048" in candidate.available_resolutions
-    assert {"256", "2048"} <= set(candidate.available_resolutions)
+    # Les résolutions déclarées doivent être celles que la traduction produit :
+    # déclarer « 256 » quand elle demande « 256x256 » faisait refuser le plan.
+    from hotel_pipeline.acquisition_request import PROVIDER_RESOLUTIONS
+
+    assert set(PROVIDER_RESOLUTIONS["street_view"].values()) <= set(
+        candidate.available_resolutions
+    )

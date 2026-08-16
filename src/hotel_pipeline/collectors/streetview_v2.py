@@ -93,7 +93,7 @@ def candidate_from(panorama, framing: Framing, distance_m: float | None = None) 
         # Street View rend la taille demandée : ce n'est pas une liste fermée
         # mais un plafond. Déclarer le seul cadrage nominal faisait refuser à
         # l'exécution tout plan demandant un aperçu.
-        available_resolutions=sorted({framing.size, *PLAN_RESOLUTIONS}),
+        available_resolutions=sorted({framing.size, *_plan_resolutions()}),
         request_spec=framing.as_request_spec(pano_id),
         # Street View publie des vues de voirie : la preuve d'extériorité vient
         # de la source elle-même, non d'une supposition sur le contenu.
@@ -245,11 +245,18 @@ def resolve_url(request_spec: dict[str, str], *, signed: bool = True) -> str:
     return f"{url}&key={secret('GOOGLE_MAPS_API_KEY')}"
 
 
-#: Vocabulaire des résolutions que le **plan** manipule. Chaque collecteur les
-#: traduit dans le sien au moment d'acquérir : sans cette déclaration, un plan
-#: parlant « 256 » et un candidat parlant « 640x640 » ne se reconnaissaient
-#: pas, et les neuf acquisitions du brouillon auraient été refusées.
-PLAN_RESOLUTIONS: frozenset[str] = frozenset({"256", "2048"})
+def _plan_resolutions() -> frozenset[str]:
+    """Ce que le plan sait demander à Street View, **dans les termes de la
+    source**.
+
+    Déclarer `256` quand la traduction produit `256x256` faisait refuser le
+    plan à la liaison : deux vocabulaires pour une même chose, introduits à
+    deux moments différents. La table de traduction fait autorité — la
+    recopier ici l'aurait dupliquée, et les deux auraient divergé de nouveau.
+    """
+    from ..acquisition_request import PROVIDER_RESOLUTIONS
+
+    return frozenset(PROVIDER_RESOLUTIONS["street_view"].values())
 
 
 def _captured_at(date: str | None):  # noqa: ANN201
