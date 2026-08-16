@@ -319,8 +319,13 @@ def test_an_unmeasured_continuity_is_none_never_zero() -> None:
     """Zéro dirait « mesurée, et nulle » — une affirmation qu'on n'a pas."""
     manifest, _ = assess("h", demands_for("front"), [asset("a1")], corpus_digest="c0")
 
-    assert manifest.assessments[0].continuity_achieved is not 0.0  # noqa: F632
-    assert manifest.assessments[0].continuity_achieved is None
+    mesure = manifest.assessments[0].continuity_achieved
+
+    # `is not 0.0` comparait des **identités d'objets** : vrai pour presque
+    # tout, y compris un zéro calculé. L'assertion ne disait donc rien de ce
+    # que sa docstring annonce.
+    assert mesure is None
+    assert mesure != 0.0, "zéro affirmerait une mesure qu'on n'a pas faite"
 
 
 def test_an_unresolved_target_is_not_unreachable() -> None:
