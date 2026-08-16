@@ -154,27 +154,36 @@ def test_an_already_complete_policy_is_left_alone(tmp_path) -> None:
     assert policy_path.read_text("utf-8") == original
 
 
-def test_the_receipt_is_written_before_the_policy(tmp_path) -> None:
-    """Une interruption entre les deux laisserait une migration sans trace.
+def test_the_migration_runs_in_three_recorded_steps(tmp_path) -> None:
+    """Un reçu avant la mutation peut mentir ; après, il peut manquer.
 
-    C'est arrivé : une erreur après l'écriture du fichier a laissé la politique
-    du pilote migrée et son reçu absent. Un reçu sans migration est visible et
-    se corrige ; l'inverse ne se voit pas.
+    C'est arrivé dans les deux sens : une erreur après l'écriture a laissé la
+    politique du pilote migrée sans reçu, puis l'inversion aurait permis à un
+    reçu d'affirmer une migration jamais faite. Le manifeste préparé lève
+    l'ambiguïté — à la reprise, l'empreinte du fichier tranche.
     """
     policy_path = _write(tmp_path, _without("adaptive_search"))
     order: list[str] = []
 
-    def publish(_receipt) -> None:
-        order.append("reçu")
-        # Le fichier n'est pas encore réécrit à cet instant.
+    def prepared(payload) -> None:
+        order.append("prepared")
+        assert payload["state"] == "prepared"
+        # Rien n'a bougé à cet instant : le manifeste décrit une intention.
         assert "adaptive_search" not in json.loads(
             policy_path.read_text("utf-8")
         )
 
-    materialise(policy_path, publish_receipt=publish)
-    order.append("politique")
+    def committed(_receipt) -> None:
+        order.append("committed")
+        # Le fichier porte désormais l'état final.
+        assert "adaptive_search" in json.loads(policy_path.read_text("utf-8"))
 
-    assert order == ["reçu", "politique"]
+    receipt = materialise(
+        policy_path, publish_receipt=committed, publish_prepared=prepared
+    )
+
+    assert order == ["prepared", "committed"]
+    assert receipt.transaction_id, "le reçu référence sa transaction"
 
 
 # --- ce que la migration ne périme pas ----------------------------------------

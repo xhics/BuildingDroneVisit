@@ -4558,18 +4558,33 @@ def policy_materialise_command(
         )
         raise typer.Exit(code=1)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    # Une transaction laissée sans reçu se reprend **avant** d'en ouvrir une
+    # autre : la relancer à l'aveugle empilerait deux mutations sur un état
+    # qu'on n'a pas tranché.
+    _resume_pending(workspace, policy_path)
 
-    def publish(receipt) -> None:  # noqa: ANN001
-        # Append-only : chaque migration laisse son reçu, aucun ne remplace un
-        # autre. Écrit avant la politique — une interruption entre les deux
-        # laisserait sinon une migration sans trace.
+    def publish_prepared(payload: dict) -> None:
+        # Jamais modifié ensuite : c'est le reçu qui atteste, et son absence
+        # qui signale une transaction à reprendre.
         workspace.write_json(
-            f"00_manifest/policy_materialisation_{stamp}.json", receipt.as_dict()
+            f"00_manifest/policy_materialisation_{payload['transaction_id']}"
+            "_prepared.json",
+            payload,
+        )
+
+    def publish_committed(receipt) -> None:  # noqa: ANN001
+        workspace.write_json(
+            f"00_manifest/policy_materialisation_{receipt.transaction_id}"
+            "_committed.json",
+            receipt.as_dict(),
         )
 
     try:
-        receipt = materialise(policy_path, publish_receipt=publish)
+        receipt = materialise(
+            policy_path,
+            publish_receipt=publish_committed,
+            publish_prepared=publish_prepared,
+        )
     except MaterialisationRefused as exc:
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
@@ -4583,3 +4598,35 @@ def policy_materialise_command(
     typer.echo(f"  version      {receipt.version_before} (inchangée)")
     typer.echo(f"  fichier      {receipt.sha_before} → {receipt.sha_after}")
     typer.echo("  aucune valeur modifiée ni disparue")
+
+
+def _resume_pending(workspace, policy_path) -> None:  # noqa: ANN001
+    """Tranche les transactions préparées dont le reçu manque.
+
+    L'empreinte du fichier fait foi : elle dit ce qui s'est **passé**, là où une
+    date ou un ordre d'écriture ne diraient que ce qu'on espérait. Une reprise
+    ne réécrit jamais le manifeste préparé — elle ajoute son constat à côté.
+    """
+    from .transaction import TransactionConflict, pending, recover
+
+    directory = workspace.path("00_manifest")
+    if not directory.is_dir():
+        return
+
+    for prepared in pending(directory, "policy_materialisation"):
+        try:
+            resolution = recover(prepared, policy_path)
+        except TransactionConflict as exc:
+            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+
+        workspace.write_json(
+            f"00_manifest/policy_materialisation_"
+            f"{prepared['transaction_id']}_committed.json",
+            resolution,
+        )
+        typer.secho(
+            f"  · transaction {prepared['transaction_id']} reprise : "
+            f"{resolution['state']} — {resolution['resolution']}",
+            fg=typer.colors.YELLOW,
+        )

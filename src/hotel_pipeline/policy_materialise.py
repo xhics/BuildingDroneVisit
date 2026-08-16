@@ -59,6 +59,10 @@ class MaterialisationReceipt:
     version_before: str = ""
     version_after: str = ""
 
+    #: Transaction qui a porté la mutation. Le manifeste préparé du même
+    #: identifiant dit ce qui était prévu, avant qu'on ne sache si ce fut fait.
+    transaction_id: str = ""
+
     #: Chemins rendus explicites, avec la valeur inscrite.
     materialised: dict = field(default_factory=dict)
 
@@ -84,6 +88,7 @@ class MaterialisationReceipt:
             "policy_digest_after": self.digest_after,
             "version_before": self.version_before,
             "version_after": self.version_after,
+            "transaction_id": self.transaction_id,
             "materialised_paths": sorted(self.materialised),
             "materialised_values": self.materialised,
             "altered_fields": self.altered,
@@ -114,7 +119,9 @@ def _flatten(value, prefix: str = "") -> dict:
 
 
 def materialise(
-    policy_path: Path, publish_receipt=None,  # noqa: ANN001
+    policy_path: Path,
+    publish_receipt=None,  # noqa: ANN001 — rétrocompatibilité des tests
+    publish_prepared=None,  # noqa: ANN001
 ) -> MaterialisationReceipt:
     """Rend explicite tout ce que le code comblait, sans rien changer d'autre.
 
@@ -180,14 +187,30 @@ def materialise(
             "migration de représentation ne recalibre rien"
         )
 
-    # Le reçu **avant** le fichier : une interruption entre les deux laisserait
-    # sinon une migration sans trace, et le fichier réécrit se relirait comme
-    # s'il avait toujours eu cette forme. Un reçu sans migration est visible et
-    # se corrige ; l'inverse ne se voit pas.
-    if publish_receipt is not None:
-        publish_receipt(receipt)
+    # Trois temps, dont le second seul est irréversible. Un reçu avant la
+    # mutation peut mentir ; un reçu après peut manquer. Le manifeste préparé
+    # lève l'ambiguïté : à la reprise, l'empreinte du fichier tranche.
+    from .transaction import commit, prepare
 
-    policy_path.write_text(after_text, "utf-8")
+    transaction = prepare(
+        policy_path, after_text, kind="policy_materialisation",
+        intent={
+            "materialised_paths": sorted(receipt.materialised),
+            "policy_digest": receipt.digest_after,
+            "version": receipt.version_after,
+        },
+    )
+    receipt.transaction_id = transaction.transaction_id
+
+    commit(
+        transaction, after_text,
+        publish_prepared=publish_prepared or (lambda _payload: None),
+        publish_committed=(
+            (lambda _payload: publish_receipt(receipt))
+            if publish_receipt is not None
+            else (lambda _payload: None)
+        ),
+    )
     log.info(
         "politique matérialisée : %d chemin(s) explicites, empreinte %s "
         "inchangée",
