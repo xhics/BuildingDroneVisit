@@ -37,6 +37,11 @@ class PreviewVerdict(StrEnum):
     ESTABLISHED = "established"
 
     #: Elle ne le montre pas — et l'on sait pourquoi.
+    #:
+    #: Ce verdict qualifie **cet élément de preuve**, jamais le besoin. Rejeter
+    #: une vue ne rend pas la façade inatteignable : elle reste à chercher
+    #: ailleurs. Les confondre ferait d'un mauvais candidat une impossibilité,
+    #: et le pipeline cesserait de chercher ce qui existe peut-être.
     REFUTED = "refuted"
 
     #: Vue examinée, verdict impossible : une métrique exigée n'a pas pu être
@@ -136,6 +141,23 @@ class PreviewAssessmentLog(BaseModel):
             if entry.asset_id == asset_id and entry.demand_id == demand_id
         ]
         return max(matching, key=lambda e: e.assessed_at) if matching else None
+
+    def refuted_for(self, demand_id: str) -> set[str]:
+        """Assets dont l'aperçu **réfute** ce besoin.
+
+        Un besoin dont toutes les preuves sont réfutées reste **ouvert** : ce
+        qu'on a examiné ne montre pas ce qu'il faut, non que rien ne le montre.
+        Cette distinction est la raison pour laquelle rien ici ne rend un
+        besoin inatteignable.
+        """
+        refuted: set[str] = set()
+        for entry in self.entries:
+            if entry.demand_id != demand_id:
+                continue
+            latest = self.latest_for(entry.asset_id, demand_id)
+            if latest is not None and latest.verdict is PreviewVerdict.REFUTED:
+                refuted.add(entry.asset_id)
+        return refuted
 
     def established_for(self, demand_id: str) -> set[str]:
         """Assets dont l'aperçu **établit** ce besoin.

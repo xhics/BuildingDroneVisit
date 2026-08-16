@@ -172,6 +172,11 @@ class ResolvedGeometry(BaseModel):
     role: GeometryRole
     resolution_status: GeometryResolutionStatus
 
+    #: Pourquoi cette géométrie a cessé d'être rattachée au site. `stale` sans
+    #: motif se relit comme une donnée périmée par le temps, alors qu'ici c'est
+    #: une association qui a été démentie.
+    stale_reason: str | None = None
+
     #: Référence telle que la source la nomme — `way/938806358`.
     source_ref: str | None = None
     snapshot_id: str | None = None

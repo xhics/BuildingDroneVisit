@@ -5095,3 +5095,276 @@ def assets_consent_plan(
     typer.echo(f"    requêtes verrouillées : {len(accepted.consented_request_digests)}")
     typer.echo(f"    contrat de téléchargement v{accepted.consented_download_contract_version}")
     typer.echo(f"    mesuré depuis : {accepted.consented_from_plan_id}")
+
+
+preview_app = typer.Typer(
+    no_args_is_help=True,
+    help="Constats d'aperçu : ce qu'une vue téléchargée établit, besoin par besoin.",
+)
+assets_app.add_typer(preview_app, name="preview")
+
+
+@preview_app.command("list")
+def preview_list(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+) -> None:
+    """Couples asset/besoin en attente de constat.
+
+    L'unité est le **couple**, non le fichier : une même acquisition sert
+    souvent deux besoins, et le verdict n'est pas le même pour l'un et l'autre.
+    """
+    from .schemas.preview import PreviewVerdict
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    log = workspace.read_previews()
+    rows: list[tuple[str, str, str, str]] = []
+    for asset in manifest.assets:
+        provenance = getattr(asset, "acquisition", None)
+        for demand_id in getattr(provenance, "serves_demands", None) or []:
+            latest = log.latest_for(asset.id, demand_id) if log else None
+            rows.append((
+                asset.id, demand_id,
+                (provenance.demand_levels or {}).get(demand_id, "—"),
+                latest.verdict.value if latest else "en attente",
+            ))
+
+    if not rows:
+        typer.echo("  aucun couple rattaché : rien n'a encore été acquis pour un besoin")
+        return
+
+    typer.echo(f"  {len(rows)} couple(s) asset/besoin")
+    en_attente = 0
+    for asset_id, demand_id, level, verdict in sorted(rows):
+        if verdict == "en attente":
+            en_attente += 1
+        typer.echo(
+            f"    {asset_id[-24:]:<26} {demand_id:<34} {level[:24]:<26} {verdict}"
+        )
+    typer.echo("")
+    typer.echo(f"  {en_attente} en attente de constat")
+    established = sum(1 for *_x, v in rows if v == PreviewVerdict.ESTABLISHED.value)
+    typer.echo(f"  {established} établi(s) — seuls ceux-là créditent un besoin")
+
+
+@preview_app.command("assess")
+def preview_assess(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    asset_id: str = typer.Option(..., "--asset", help="Asset examiné."),
+    demand_id: str = typer.Option(..., "--demand", help="Besoin **précis** jugé."),
+    verdict: str = typer.Option(
+        ..., "--verdict", help="established | refuted | inconclusive",
+    ),
+    rationale: str = typer.Option(
+        ..., "--rationale", help="Ce qu'un relecteur doit comprendre.",
+    ),
+    assessed_by: str = typer.Option(..., "--by", help="Qui prononce ce constat."),
+    in_frame: float | None = typer.Option(None, "--in-frame"),
+    projected_width: float | None = typer.Option(None, "--projected-width"),
+    visible: float | None = typer.Option(None, "--visible"),
+    unmeasured: list[str] = typer.Option(
+        None, "--unmeasured", help="Ce qui reste inconnu. Répétable.",
+    ),
+    evidence: list[str] = typer.Option(
+        None, "--evidence", help="Capture annotée, rapport. Répétable.",
+    ),
+) -> None:
+    """Inscrit un constat pour **un** couple asset/besoin.
+
+    Append-only : un couple réexaminé garde ses deux constats, le plus récent
+    faisant foi. Rien n'est promu ici — c'est `demands assess` qui lira ces
+    constats, et seuls les `established` créditent un besoin.
+    """
+    from .schemas.preview import PreviewAssessment, PreviewVerdict
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    asset = next(
+        (a for a in (manifest.assets if manifest else []) if a.id == asset_id), None
+    )
+    if asset is None:
+        typer.secho(f"{KO} asset {asset_id!r} absent du manifeste",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    provenance = getattr(asset, "acquisition", None)
+    rattachés = getattr(provenance, "serves_demands", None) or []
+    if demand_id not in rattachés:
+        # Constater sur un besoin que ce fichier n'a jamais servi ferait porter
+        # à celui-ci une mesure prise pour autre chose.
+        typer.secho(
+            f"{KO} {asset_id} n'a pas été acquis pour {demand_id} ; il servait "
+            f"{rattachés}",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        assessment = PreviewAssessment(
+            asset_id=asset_id,
+            demand_id=demand_id,
+            plan_id=provenance.plan_id,
+            request_digest=provenance.request_digest or "",
+            checksum=asset.checksum or "",
+            target_ref=demand_id.split(":", 1)[-1],
+            in_frame_fraction=in_frame,
+            projected_width_fraction=projected_width,
+            visible_fraction=visible,
+            verdict=PreviewVerdict(verdict),
+            unmeasured=list(unmeasured or []),
+            rationale=rationale,
+            assessed_by=assessed_by,
+            evidence=list(evidence or []),
+        )
+    except ValueError as exc:
+        typer.secho(f"{KO} {str(exc).split('Value error, ')[-1].split(' [type')[0]}",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    workspace.append_preview(assessment)
+    typer.echo(f"{OK} constat inscrit : {asset_id[-22:]} / {demand_id}")
+    typer.echo(f"    verdict  {assessment.verdict.value}")
+    if assessment.unmeasured:
+        typer.echo(f"    inconnu  {', '.join(assessment.unmeasured)}")
+    typer.echo("    ce constat ne promeut rien : demands assess le lira")
+
+
+@site_app.command("unresolve")
+def site_unresolve(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    kind: str = typer.Option(..., "--kind", help="Type d'objet à dé-résoudre."),
+    rationale: str = typer.Option(
+        ..., "--rationale", help="Pourquoi l'association ne tient plus.",
+    ),
+    decided_by: str = typer.Option(..., "--by", help="Qui décide."),
+) -> None:
+    """Rend un objet de site `unresolved` quand sa preuve a échoué.
+
+    Une association fondée sur la proximité et « à confirmer visuellement »
+    n'est pas établie tant que la confirmation n'a pas eu lieu. Quand elle
+    échoue, laisser l'objet `inferred` ferait passer une hypothèse démentie
+    pour un fait.
+
+    Ce qui **dérivait** de cet objet devient caduc du même coup : sur le
+    pilote, `front_azimuth_deg` vient du centroïde du stationnement supposé, et
+    avec lui l'orientation des façades, les secteurs et tout ce qui s'y
+    appuie.
+    """
+    from datetime import datetime, timezone
+
+    workspace = Workspace(hotel_id)
+    site = workspace.read_site()
+    if site is None:
+        typer.secho(f"{KO} aucun manifeste de site", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    cible = [obj for obj in site.objects if obj.kind == kind]
+    if not cible:
+        typer.secho(f"{KO} aucun objet de type {kind!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    from .schemas.enums import ObjectState
+
+    stamp = datetime.now(timezone.utc).isoformat()
+    touchés: list[str] = []
+    for obj in cible:
+        if obj.state is ObjectState.UNRESOLVED:
+            continue
+        obj.state = ObjectState.UNRESOLVED
+        obj.unresolved_reason = rationale
+        # La géométrie part avec l'état : la conserver laisserait viser une
+        # cible dont on vient de dire qu'on ne sait pas où elle est.
+        obj.geometry_wkt = None
+        obj.centroid_lat = None
+        obj.centroid_lon = None
+        touchés.append(obj.object_id)
+
+    if not touchés:
+        typer.echo(f"{OK} {kind} déjà non résolu — rien à faire")
+        return
+
+    workspace.write_site(site)
+
+    # La géométrie porte le même objet sous un **rôle** : la laisser
+    # `resolved` ferait résoudre le besoin sur une cible qu'on vient de
+    # démentir, `demand_targets` la trouvant par ce rôle.
+    périmées = _stale_geometry_for(workspace, kind, rationale)
+
+    # Trace append-only : une dé-résolution est une décision, et l'effacer
+    # ferait relire le manifeste comme s'il avait toujours dit cela.
+    workspace.write_json(
+        f"00_manifest/site_unresolve_{kind}_{_new_run_id()}.json",
+        {
+            "kind": kind,
+            "objects": touchés,
+            "rationale": rationale,
+            "decided_by": decided_by,
+            "decided_at": stamp,
+            "stale_geometries": périmées,
+            "note": (
+                "ce qui dérivait de cet objet devient caduc : sur ce site, "
+                "front_azimuth_deg vient du centroïde du stationnement, et avec "
+                "lui l'orientation des façades et les secteurs"
+            ),
+        },
+    )
+
+    typer.echo(f"{OK} {len(touchés)} objet(s) rendus non résolus")
+    for object_id in touchés:
+        typer.echo(f"    {object_id}")
+    for feature_id in périmées:
+        typer.echo(f"    géométrie {feature_id} → stale")
+    typer.secho(
+        "  · ce qui en dérivait est périmé : front_azimuth_deg, secteurs, "
+        "recherches adaptatives et plans qui s'y appuient",
+        fg=typer.colors.YELLOW,
+    )
+
+
+def _stale_geometry_for(workspace, kind: str, rationale: str) -> list[str]:  # noqa: ANN001
+    """Marque `stale` la géométrie qui porte l'objet dé-résolu.
+
+    `demand_targets` retrouve un objet de site par son **rôle** de géométrie —
+    `PARKING_HOTEL` par `hotel_parking`. Dé-résoudre le seul manifeste de site
+    laisserait donc le besoin se résoudre sur une cible démentie.
+
+    `stale` plutôt que `unresolved` : la géométrie a bien été obtenue, elle
+    n'est simplement plus rattachée à ce site. La dire jamais résolue effacerait
+    ce qui a réellement été téléchargé.
+    """
+    from .demand_targets import OBJECT_KIND_ROLES
+
+    role = OBJECT_KIND_ROLES.get(kind)
+    if role is None:
+        return []
+
+    payload = workspace.read_json("06_geo/capture_geometry.json")
+    if not payload:
+        return []
+
+    touched: list[str] = []
+    for geometry in payload.get("geometries", []):
+        if geometry.get("role") != role.value:
+            continue
+        if geometry.get("resolution_status") == "stale":
+            continue
+        geometry["resolution_status"] = "stale"
+        geometry["stale_reason"] = rationale
+        # Le schéma exige un motif sur tout état non résolu : le renseigner
+        # ailleurs seulement laisserait la géométrie muette sur sa propre
+        # invalidité.
+        geometry["unresolved_reason"] = rationale
+        # La forme part avec l'état — le schéma l'exige, et à raison : garder
+        # le polygone laisserait viser une cible dont on vient de dire qu'elle
+        # n'est pas celle du site.
+        for shape in ("wgs84_wkt", "projected_wkt", "source_wkt", "wkt"):
+            geometry.pop(shape, None)
+        touched.append(geometry.get("feature_id", "?"))
+
+    if touched:
+        workspace.write_json("06_geo/capture_geometry.json", payload)
+    return touched

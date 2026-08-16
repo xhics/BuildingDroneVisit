@@ -96,6 +96,11 @@ class SpatialManifest(BaseModel):
     #: Comment cet azimut a été obtenu — la valeur seule ne dit pas si elle
     #: est mesurée, déduite ou décidée.
     front_azimuth_method: str | None = None
+
+    #: Pourquoi l'azimut a été **retiré**, quand il l'a été. Un champ vidé sans
+    #: motif se relit comme s'il n'avait jamais été renseigné : ici, il l'avait
+    #: été à partir d'un stationnement dont l'association a été démentie.
+    front_azimuth_retracted_reason: str | None = None
     assertions: list[GeometricAssertion] = Field(default_factory=list)
 
     @property

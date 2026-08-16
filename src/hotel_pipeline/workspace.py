@@ -162,6 +162,40 @@ class Workspace:
     def assets_path(self) -> Path:
         return self.root / "00_manifest" / ASSET_MANIFEST_NAME
 
+    @property
+    def previews_path(self) -> Path:
+        return self.path("01_sources", "preview_assessments.json")
+
+    def read_previews(self):  # noqa: ANN201
+        """Journal des constats d'aperçu, ou `None` s'il n'existe pas encore."""
+        from .schemas.preview import PreviewAssessmentLog
+
+        if not self.previews_path.is_file():
+            return None
+        return PreviewAssessmentLog.model_validate_json(
+            self.previews_path.read_text("utf-8")
+        )
+
+    def append_preview(self, assessment) -> None:  # noqa: ANN001
+        """Ajoute un constat **sans** remplacer les précédents.
+
+        Un couple réexaminé garde ses deux constats : l'écraser effacerait ce
+        qui a été vu la première fois, et la révision se lirait comme une
+        certitude.
+        """
+        import json
+
+        from .schemas.preview import PreviewAssessmentLog
+
+        log = self.read_previews() or PreviewAssessmentLog(
+            hotel_id=self.hotel_id, entries=[]
+        )
+        log.entries.append(assessment)
+        self.write_json(
+            "01_sources/preview_assessments.json",
+            json.loads(log.model_dump_json()),
+        )
+
     def read_assets(self) -> "AssetManifest | None":
         if not self.assets_path.is_file():
             return None

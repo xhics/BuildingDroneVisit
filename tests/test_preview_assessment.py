@@ -210,3 +210,27 @@ def test_the_provenance_keeps_what_the_file_was_for() -> None:
     assert provenance.demand_levels["obligation:front"] == (
         "recommended_for_preview"
     ), "le niveau est par besoin : un fichier peut servir deux exigences"
+
+
+def test_refuting_every_preview_leaves_the_demand_open() -> None:
+    """Rejeter une vue ne rend pas la façade inatteignable.
+
+    Les confondre ferait d'un mauvais candidat une impossibilité, et le
+    pipeline cesserait de chercher ce qui existe peut-être ailleurs.
+    """
+    log = PreviewAssessmentLog(hotel_id="pilote", entries=[
+        _assessment(asset_id="a1", verdict=PreviewVerdict.REFUTED,
+                    rationale="autoroute, aucun bâtiment d'hôtel"),
+        _assessment(asset_id="a2", verdict=PreviewVerdict.REFUTED,
+                    rationale="intérieur de concession automobile"),
+    ])
+
+    assert log.refuted_for("obligation:front") == {"a1", "a2"}
+    assert log.established_for("obligation:front") == set()
+
+    # Rien dans le journal ne dit que le besoin est clos : il n'a simplement
+    # aucune preuve établie.
+    assert not hasattr(log, "unreachable")
+    assert not any(
+        getattr(entry, "closes_demand", False) for entry in log.entries
+    )
