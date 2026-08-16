@@ -84,6 +84,10 @@ PILOT_POLICY_DIGESTS = {
         "partie de ce qu'on consent : plafonds, refus avant lecture, format "
         "décodé, publication atomique"
     ),
+    "8c63ab1b0bcc8ddd": (
+        "avec facade_segment_merge_deg — un mur réel est découpé en plusieurs "
+        "segments par les décrochements du relevé"
+    ),
     "eaffffd88cd45280": (
         "avec hard_max_distance_m — une contrainte qu'un repli contourne n'en "
         "est pas une : le repli proposait une vue à 1,7 km"

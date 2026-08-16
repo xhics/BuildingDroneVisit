@@ -115,6 +115,13 @@ class GeometryPolicy(BaseModel):
     #: dépasse le huitième de tour, et pourquoi deux secteurs se recouvrent.
     sector_observer_half_width_deg: float = Field(default=67.5, gt=0, le=180)
 
+    #: Écart de normale en deçà duquel deux segments d'empreinte appartiennent
+    #: à la **même** façade. Un mur réel est découpé en plusieurs segments par
+    #: les décrochements du relevé ; les traiter séparément ferait dépendre
+    #: l'orientation du segment qu'un rayon touche en premier, non de la façade
+    #: qu'il documente.
+    facade_segment_merge_deg: float = Field(default=8.0, gt=0, le=45)
+
     #: Distance en deçà de laquelle deux caméras ne produisent pas deux
     #: observations indépendantes. Mesurée en mètres projetés, jamais en
     #: cellules de grille : deux positions distantes de six mètres tombant de

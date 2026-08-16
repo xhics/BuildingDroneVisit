@@ -127,6 +127,10 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
     Facet.BUILDING_RESOLUTION: (
         "geometry.adjacency_strong_m",
         "geometry.adjacency_max_m",
+        # Regrouper les segments d'une même façade décide de l'orientation du
+        # bâtiment, non du jugement d'un candidat : c'est une décision sur le
+        # bâtiment lui-même.
+        "geometry.facade_segment_merge_deg",
     ),
     Facet.DEDUPLICATION: (
         "dedup.phash_hamming_threshold",
