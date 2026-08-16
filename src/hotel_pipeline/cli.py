@@ -4373,10 +4373,6 @@ def smoke() -> None:
     typer.secho("smoke test réussi", fg=typer.colors.GREEN)
 
 
-if __name__ == "__main__":
-    app()
-
-
 def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN201
     """Cibles résolues et projection, par le **même** chemin que la géométrie.
 
@@ -5636,3 +5632,294 @@ def _activate_latest_demands(workspace) -> str:  # noqa: ANN001
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8"
     )
     return f"{len(payload.get('demands', []))} besoin(s) depuis {latest.name}"
+
+
+router_app = typer.Typer(
+    no_args_is_help=True, help="Route de reconstruction (plan directeur §12)."
+)
+app.add_typer(router_app, name="router")
+
+
+def _targetable(demand, objets, site) -> bool:  # noqa: ANN001
+    """Ce besoin vise-t-il quelque chose que l'on sait pointer ?
+
+    La ciblabilité dépend de ce que le besoin vise, non d'un nom : les besoins
+    de façade visent un **secteur de vue** (`front`, `left`…), non un objet de
+    site. Les chercher parmi les objets ne trouvait rien, et quatre façades
+    géoréférencées passaient pour non ciblables — le contraire de ce que la
+    géométrie établit.
+    """
+    from .router import ObjectStanding
+    from .schemas.acquisition import TargetKind
+
+    if demand.target_kind is TargetKind.VIEW_SECTOR:
+        # Un secteur se vise dès que le bâtiment qui le porte est géoréférencé
+        # et que la façade correspondante a été instanciée.
+        facade = SECTEUR_VERS_FACADE.get(demand.target_ref)
+        if facade is None:
+            return False
+        return objets.get(facade) is ObjectStanding.TARGETABLE
+
+    return objets.get(demand.target_ref) is ObjectStanding.TARGETABLE
+
+
+#: Quel mur un secteur de vue regarde. Les besoins parlent secteurs, le site
+#: parle façades : sans cette table, les deux vocabulaires ne se rejoignent pas.
+SECTEUR_VERS_FACADE = {
+    "front": "FACADE_PRIMARY",
+    "rear": "FACADE_REAR",
+    "left": "FACADE_LEFT",
+    "right": "FACADE_RIGHT",
+}
+
+
+def _proxies_for(site, geometry) -> list:  # noqa: ANN001, ANN201
+    """Les proxies géométriques **et ce qu'ils couvrent nommément**.
+
+    Un modèle de terrain qualifié ne comble ni la façade arrière, ni l'entrée :
+    sans portée déclarée, n'importe quel proxy rendrait la route hybride et le
+    document annoncerait une couverture qui n'existe pas.
+    """
+    from .router import ProxyZone
+
+    par_type = {obj.kind: obj for obj in site.objects}
+    facades = [
+        kind for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT",
+                          "FACADE_REAR")
+        if par_type.get(kind) is not None and par_type[kind].geometry_wkt
+    ]
+
+    #: Un proxy n'est qualifié que si son artefact porte la géométrie : le
+    #: déclarer sur une intention laisserait une forme non mesurée combler une
+    #: lacune réelle.
+    volume_mesuré = bool(facades) and geometry is not None
+    interdits = (
+        "plans rapprochés interdits sur les zones proxy : la forme est mesurée, "
+        "l'apparence ne l'est pas",
+    )
+
+    return [
+        ProxyZone(
+            zone="TERRAIN_MAIN", artifact="capture_geometry",
+            qualified=geometry is not None,
+            covered_objects=("TERRAIN_MAIN",),
+            covered_demands=(),
+            camera_restrictions=interdits,
+            note="terrain dérivé de l'empreinte géoréférencée",
+        ),
+        ProxyZone(
+            zone="ROOFLINE_MAIN", artifact="capture_geometry+visibility_run",
+            qualified=volume_mesuré,
+            covered_objects=("ROOFLINE_MAIN", "BUILDING_MAIN"),
+            covered_demands=tuple(f"obligation:{kind}" for kind in facades),
+            camera_restrictions=interdits,
+            note=(
+                "volume et façades proxy : empreinte confirmée et hauteur, "
+                "sans apparence latérale ni arrière observée"
+            ),
+        ),
+    ]
+
+
+@router_app.command("decide")
+def router_decide(
+    hotel_id: str = typer.Argument(...),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Publier une nouvelle version même si les entrées sont identiques.",
+    ),
+) -> None:
+    """Arrête la route de reconstruction, et la publie.
+
+    Ne recalcule **jamais** les besoins : il lit ceux qui ont été arrêtés. Les
+    recalculer ici laisserait la décision définir son propre corpus, et deux
+    exécutions ne se compareraient plus.
+    """
+    from datetime import datetime, timezone
+
+    from .intake import sha256_file
+    from .provenance import digest_of
+    from .router import (
+        InputManifest,
+        MissingInput,
+        ObjectStanding,
+        decide,
+        standing_for,
+        standing_of,
+    )
+    from .schemas.acquisition import CaptureDemandManifest, DemandAssessment
+
+    workspace = Workspace(hotel_id)
+    context = _context(hotel_id, Capability.GEOSPATIAL)
+
+    # --- les besoins arrêtés, non recalculés ---------------------------------
+    raw_demands = workspace.read_json("01_sources/capture_demands.json")
+    if raw_demands is None:
+        typer.secho(
+            f"{KO} aucun besoin canonique : le Router juge une couverture, il "
+            "ne l'invente pas",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    demands = CaptureDemandManifest.model_validate(raw_demands)
+
+    # --- leur évaluation la plus récente --------------------------------------
+    évaluations = sorted(
+        workspace.path("01_sources").glob("demand_assessment_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    évaluations = [p for p in évaluations if "report" not in p.name]
+    if not évaluations:
+        typer.secho(
+            f"{KO} aucune évaluation de besoins : sans elle, « couvert » serait "
+            "une supposition",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    rapport = json.loads(évaluations[-1].read_text("utf-8"))
+    par_besoin = {
+        row["demand_id"]: DemandAssessment.model_validate(row)
+        for row in rapport.get("assessments", [])
+    }
+    # Les identifiants de points de vue vivent dans le **rapport** joint, non
+    # dans l'évaluation : les lire au mauvais endroit rendait un décompte de
+    # zéro alors que des vues servaient les besoins.
+    joint = évaluations[-1].with_name(
+        évaluations[-1].name.replace("demand_assessment_", "demand_assessment_report_")
+    )
+    if not joint.is_file():
+        typer.secho(
+            f"{KO} rapport d'évaluation absent ({joint.name}) : sans les "
+            "identifiants de points de vue, l'union ne se calcule pas et un "
+            "même panorama compterait plusieurs fois",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=1)
+    vues_par_besoin = json.loads(joint.read_text("utf-8")).get(
+        "viewpoints_by_demand", {}
+    )
+
+    site = workspace.read_site()
+    assets = workspace.read_assets()
+    geometry = _capture_geometry_if_any(workspace, context)
+    if site is None or assets is None:
+        typer.secho(
+            f"{KO} manifeste de site et d'assets requis", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+
+    # --- la visibilité **appliquée**, non simplement mesurée -------------------
+    applications = sorted(
+        workspace.path("06_geo").glob("visibility_application_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    previews = workspace.path("01_sources", "preview_assessments.json")
+
+    # --- l'état de chaque objet, tel que le site le dit ------------------------
+    réfutés = _refuted_objects(workspace)
+    objets = {
+        obj.kind: standing_of(
+            obj.state.value, bool(obj.geometry_wkt), refuted=obj.kind in réfutés
+        )
+        for obj in site.objects
+    }
+
+    # --- l'état de chaque besoin, jugé par le besoin lui-même ------------------
+    états = []
+    for demand in demands.demands:
+        assessment = par_besoin.get(demand.demand_id)
+        if assessment is None:
+            typer.secho(
+                f"{KO} besoin {demand.demand_id} sans évaluation : le corpus "
+                "évalué ne couvre pas les besoins arrêtés",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=1)
+        états.append(
+            standing_for(
+                demand, assessment,
+                targetable=_targetable(demand, objets, site),
+                viewpoint_ids=tuple(vues_par_besoin.get(demand.demand_id, [])),
+            )
+        )
+
+    inputs = InputManifest(
+        demands_digest=digest_of(raw_demands),
+        assessment_report_digest=sha256_file(évaluations[-1])[:16],
+        site_manifest_digest=digest_of(json.loads(site.model_dump_json())),
+        capture_geometry_digest=(
+            digest_of(json.loads(geometry.model_dump_json())) if geometry else ""
+        ),
+        asset_manifest_digest=digest_of(json.loads(assets.model_dump_json())),
+        visibility_application_digest=(
+            sha256_file(applications[-1])[:16] if applications else ""
+        ),
+        spatial_reference_digest=(
+            digest_of(json.loads(context.spatial_reference.model_dump_json()))
+            if context.spatial_reference else ""
+        ),
+        preview_assessment_digest=(
+            sha256_file(previews)[:16] if previews.is_file() else ""
+        ),
+        policy_digest=context.provenance["policy_digest"],
+        policy_facets=("coverage", "visibility", "geospatial"),
+    )
+
+    # La décision est construite et validée **en mémoire** : un document écrit
+    # puis jugé invalide resterait sur le disque comme s'il faisait autorité.
+    try:
+        decision = decide(hotel_id, états, objets, _proxies_for(site, geometry), inputs)
+    except MissingInput as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  une route rendue sur un corpus inconnu paraîtrait fondée sans "
+            "l'être : rien n'est écrit",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2) from exc
+
+    # --- réutiliser une décision identique -------------------------------------
+    dossier = workspace.path("10_validation")
+    dossier.mkdir(parents=True, exist_ok=True)
+    existante = sorted(dossier.glob(f"router_decision_*_{decision.input_digest}.json"))
+    if existante and not force:
+        typer.secho(
+            f"{OK} entrées inchangées : décision {existante[-1].name} réutilisée",
+            fg=typer.colors.GREEN,
+        )
+        typer.echo(
+            f"  {decision.path.value} · {decision.decision_status.value}"
+        )
+        return
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    nom = f"router_decision_{stamp}_{decision.input_digest}.json"
+    payload = decision.as_dict()
+
+    # Immuable : une décision réécrite ne se relirait plus comme ce qu'elle fut.
+    workspace.write_json(f"10_validation/{nom}", payload)
+
+    typer.secho(f"{OK} décision publiée : {nom}", fg=typer.colors.GREEN)
+    typer.echo(f"  path            {decision.path.value}")
+    typer.echo(f"  decision_status {decision.decision_status.value}")
+    typer.echo(f"  input_digest    {decision.input_digest}")
+    typer.echo(f"  {decision.rationale}")
+    for action in decision.next_actions:
+        typer.echo(f"    → {action}")
+
+
+def _refuted_objects(workspace) -> set:  # noqa: ANN001, ANN201
+    """Objets démentis par une preuve, non simplement non résolus.
+
+    La distinction est décisive : `PARKING_HOTEL` a été associé par proximité,
+    puis démenti par inspection — ce n'est pas une absence de données.
+    """
+    payload = workspace.read_json("01_sources/site_refutations.json") or {}
+    return {row["kind"] for row in payload.get("refutations", []) if row.get("kind")}
+
+
+# En **fin** de fichier : ce garde était placé au milieu, et `app()` s'exécutait
+# avant que les commandes définies plus bas — visibility, orientation, router —
+# ne soient enregistrées. Sous `python -m`, elles restaient introuvables.
+if __name__ == "__main__":
+    app()
