@@ -4761,3 +4761,170 @@ def assets_invalidate_plans(
         typer.echo(f"    {plan.plan_id}  sha={plan.sha256}")
     typer.echo(f"  motif    {structured.value}")
     typer.echo("  fichiers intacts : l'événement les nomme, il ne les efface pas")
+
+
+@assets_app.command("measure-plan")
+def assets_measure_plan(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    plan_file: Path = typer.Option(
+        ..., "--plan", help="Plan **existant** à mesurer. Aucune reconstruction.",
+    ),
+) -> None:
+    """Mesure les acquisitions d'un plan déjà arrêté, sans le refaire.
+
+    `assets plan --measure-volumes` reconstruit la sélection : les appels
+    autorisés pourraient alors porter sur d'autres candidats que ceux examinés.
+    Ici la sélection n'est **jamais** rappelée — on mesure ce que le plan dit,
+    ou l'on refuse.
+
+    Le brouillon n'est pas modifié : un plan qui change après examen ne se
+    relit plus comme celui qui a été approuvé. Un plan mesuré est publié à
+    côté, et le registre de transport avec lui — y compris sur échec partiel,
+    car une mesure interrompue a coûté des appels.
+    """
+    from .acquisition_request import RequestUnresolvable, resolve_all
+    from .plan_invalidation import invalidated_plan_ids
+    from .providers.transport import ledger, reset_ledger
+    from .schemas.acquisition import (
+        AcquisitionPlan,
+        CandidateManifest,
+        PlanStatus,
+        VolumeStatus,
+    )
+    from .volumes import measure
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+    sources = workspace.path("01_sources")
+
+    path = Path(plan_file)
+    if not path.is_file():
+        typer.secho(f"{KO} plan introuvable : {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    plan = AcquisitionPlan.model_validate(json.loads(path.read_text("utf-8")))
+
+    # --- ce qu'on refuse **avant** tout appel ------------------------------
+    problems: list[str] = []
+    if plan.hotel_id != hotel_id:
+        problems.append(f"plan de {plan.hotel_id!r}, non de {hotel_id!r}")
+    if plan.plan_id in invalidated_plan_ids(sources):
+        problems.append("plan invalidé : il a été retiré de la circulation")
+    if plan.status is not PlanStatus.DRAFT:
+        problems.append(
+            f"statut « {plan.status.value} » : seul un brouillon se mesure — "
+            "un plan consenti porte déjà son volume"
+        )
+
+    current = _latest_plan(workspace)
+    if current is None or current.resolve() != path.resolve():
+        problems.append(
+            "ce n'est pas le plan courant : mesurer un plan écarté dépenserait "
+            "des appels sur ce qui ne sera pas acquis"
+        )
+
+    if problems:
+        for problem in problems:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    candidates_path = _latest_candidates(workspace)
+    if candidates_path is None:
+        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    candidates = {
+        c.candidate_id: c
+        for c in CandidateManifest.model_validate(
+            json.loads(candidates_path.read_text("utf-8"))
+        ).candidates
+    }
+
+    # Les requêtes sont **recalculées** puis confrontées à celles du plan : si
+    # elles diffèrent, le plan décrit autre chose que ce qu'on s'apprête à
+    # mesurer, et mesurer d'abord pour s'en apercevoir ensuite serait payer
+    # pour rien.
+    try:
+        requests_by_candidate = resolve_all(candidates, plan.acquisitions)
+    except RequestUnresolvable as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    diverged = [
+        acquisition.candidate_id
+        for acquisition in plan.acquisitions
+        if acquisition.request_digest
+        and acquisition.candidate_id in requests_by_candidate
+        and requests_by_candidate[acquisition.candidate_id].digest
+        != acquisition.request_digest
+    ]
+    if diverged:
+        typer.secho(
+            f"{KO} requête(s) différentes de celles du plan : {sorted(diverged)} — "
+            "aucun appel émis",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    ordered = [
+        requests_by_candidate[a.candidate_id]
+        for a in plan.acquisitions
+        if a.candidate_id in requests_by_candidate
+    ]
+    typer.echo(f"  {len(ordered)} acquisition(s) à mesurer, sélection inchangée")
+
+    registry = reset_ledger()
+    report = None
+    try:
+        report = measure(ordered)
+    finally:
+        # Publié **même sur échec** : une mesure interrompue a coûté des
+        # appels, et les taire donnerait à croire qu'elle n'a rien consommé.
+        stamp = _new_run_id()
+        workspace.write_json(
+            f"01_sources/volume_measure_{plan.plan_id}_{stamp}.json",
+            {
+                "plan_id": plan.plan_id,
+                "measured_at": stamp,
+                "requests": [request.as_dict() for request in ordered],
+                "volumes": report.as_dict() if report else None,
+                "transport": registry.as_dict(),
+                "note": (
+                    "mesure d'un plan **existant** : la sélection n'a pas été "
+                    "rejouée, et le brouillon n'est pas modifié"
+                ),
+            },
+        )
+
+    for source, counts in sorted(registry.by_source().items()):
+        typer.echo(
+            f"    {source:<16} {counts['logical_operations']} opération(s) "
+            f"logique(s), {counts['attempted']} échange(s) HTTP"
+        )
+
+    if report.unmeasured:
+        typer.secho(f"  {len(report.unmeasured)} taille(s) inconnue(s) :",
+                    fg=typer.colors.YELLOW)
+        for candidate_id, reason in sorted(report.unmeasured.items()):
+            typer.secho(f"    {candidate_id[-22:]} — {reason[:60]}",
+                        fg=typer.colors.YELLOW)
+
+    # Un plan **mesuré**, à côté du brouillon : celui-ci n'est pas modifié.
+    measured = plan.model_copy(update={
+        "plan_id": f"{plan.plan_id}-measured-{stamp}",
+        "acquisitions": [
+            a.model_copy(update={"expected_bytes": report.measured.get(a.candidate_id)})
+            for a in plan.acquisitions
+        ],
+    })
+    workspace.write_json(
+        f"01_sources/acquisition_plan_{measured.plan_id}.json",
+        json.loads(measured.model_dump_json()),
+    )
+
+    typer.echo("")
+    typer.echo(
+        f"{OK} {len(report.measured)} taille(s) mesurée(s), "
+        f"{report.known_bytes} octets — statut {measured.volume_status.value}"
+    )
+    typer.echo(f"    plan mesuré : {measured.plan_id}")
+    typer.echo(f"    brouillon d'origine intact : {plan.plan_id}")
