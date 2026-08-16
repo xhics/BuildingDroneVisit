@@ -49,6 +49,11 @@ class PlanReport:
     plan_id: str = ""
     candidates: int = 0
     evaluations: int = 0
+
+    #: Registre des appels de **cette** commande — les mesures de volume, quand
+    #: elles ont lieu. Un plan héritant des appels de la découverte annoncerait
+    #: un coût qui n'est pas le sien.
+    transport: dict = field(default_factory=dict)
     selected: int = 0
     rejected_by_reason: dict[str, int] = field(default_factory=dict)
     preview_required: int = 0
@@ -67,6 +72,7 @@ class PlanReport:
         return {
             "plan_id": self.plan_id,
             "candidates": self.candidates,
+            "transport": self.transport,
             "evaluations": self.evaluations,
             "selected": self.selected,
             "rejected_by_reason": self.rejected_by_reason,

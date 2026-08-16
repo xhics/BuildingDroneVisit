@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from ..logging import get_logger
+from .cache import OfflineError
 
 log = get_logger("transport")
 
@@ -77,8 +78,14 @@ class Outcome(StrEnum):
     REFUSED = "refused"
 
 
-class NetworkRefused(RuntimeError):
-    """Le mode en cours interdit cet appel."""
+class NetworkRefused(OfflineError):
+    """Le mode en cours interdit cet appel.
+
+    Hérite d'`OfflineError` : le garde-fou hors ligne existait avant les trois
+    modes, et les appelants qui l'attrapent doivent continuer de fonctionner.
+    Introduire une exception sœur aurait laissé passer en silence ce qu'ils
+    interceptaient jusque-là.
+    """
 
 
 @dataclass
@@ -95,7 +102,15 @@ class Attempt:
     page: int = 1
 
     status_code: int | None = None
-    bytes_received: int | None = None
+
+    #: `Content-Length` **annoncé** par le service. Sur un `HEAD`, aucun octet
+    #: n'arrive : nommer cela « reçu » ferait passer une déclaration pour une
+    #: mesure, et un service qui ment resterait invisible.
+    declared_content_length: int | None = None
+
+    #: Octets réellement écrits, quand un corps a été lu. `None` sur un `HEAD`.
+    bytes_written: int | None = None
+
     error: str | None = None
 
     #: Ce à quoi l'appel se rapporte, quand une requête d'acquisition l'a
@@ -110,7 +125,8 @@ class Attempt:
             "outcome": self.outcome.value,
             "page": self.page,
             "status_code": self.status_code,
-            "bytes_received": self.bytes_received,
+            "declared_content_length": self.declared_content_length,
+            "bytes_written": self.bytes_written,
             "error": self.error,
             "request_digest": self.request_digest,
         }
@@ -145,7 +161,7 @@ class Ledger:
                 {
                     "attempted": 0, "succeeded": 0, "http_errors": 0,
                     "network_errors": 0, "cache_hits": 0, "refused": 0,
-                    "bytes_received": 0, "by_stage": {},
+                    "declared_bytes": 0, "bytes_written": 0, "by_stage": {},
                 },
             )
             # Une lecture de cache n'est pas une tentative réseau : les compter
@@ -163,8 +179,10 @@ class Ledger:
                 else:
                     row["network_errors"] += 1
 
-            if attempt.bytes_received:
-                row["bytes_received"] += attempt.bytes_received
+            if attempt.declared_content_length:
+                row["declared_bytes"] += attempt.declared_content_length
+            if attempt.bytes_written:
+                row["bytes_written"] += attempt.bytes_written
 
             # `by_stage` compte les **tentatives réseau**. Y inclure les
             # lectures de cache faisait annoncer 1 215 appels au rapport du
@@ -237,6 +255,16 @@ def record_cache_hit(source: str, stage: Stage) -> None:
     )
 
 
+def record_refusal(source: str, stage: Stage, mode: "NetworkMode") -> None:
+    """Un accès refusé par le mode. Inscrit, jamais silencieux."""
+    ledger().record(
+        Attempt(
+            source=source, stage=stage, method="-", outcome=Outcome.REFUSED,
+            error=f"mode {mode.value}",
+        )
+    )
+
+
 def guard(source: str, stage: Stage, what: str) -> None:
     """Refuse l'appel si le mode ne l'autorise pas, et l'inscrit.
 
@@ -303,8 +331,53 @@ def request(
         declared = headers.get("Content-Length")
     if declared is not None:
         try:
-            attempt.bytes_received = int(declared)
+            attempt.declared_content_length = int(declared)
         except (TypeError, ValueError):
-            attempt.bytes_received = None
+            attempt.declared_content_length = None
 
     return response
+
+
+def get(source: str, stage: Stage, url: str, **kwargs):  # noqa: ANN201
+    """`GET` inscrit. Le seul chemin autorisé vers `requests.get`.
+
+    Un `caller` libre laissait passer n'importe quel appel sous couvert
+    d'inscription : rien n'obligeait la fonction passée à viser l'URL déclarée,
+    ni même à faire une requête.
+    """
+    import requests
+
+    page = kwargs.pop("page", 1)
+    digest = kwargs.pop("request_digest", None)
+    what = kwargs.pop("what", None)
+    return request(
+        source, stage, "GET", lambda: requests.get(url, **kwargs),
+        page=page, request_digest=digest, what=what,
+    )
+
+
+def head(source: str, stage: Stage, url: str, **kwargs):  # noqa: ANN201
+    """`HEAD` inscrit. Aucun octet n'arrive : seule une longueur est annoncée."""
+    import requests
+
+    digest = kwargs.pop("request_digest", None)
+    what = kwargs.pop("what", None)
+    return request(
+        source, stage, "HEAD", lambda: requests.head(url, **kwargs),
+        request_digest=digest, what=what,
+    )
+
+
+def record_written(attempt: Attempt, byte_count: int) -> None:
+    """Inscrit ce qui a **réellement** été écrit, après lecture du corps.
+
+    Distinct de la longueur annoncée : leur écart est précisément ce qu'un
+    rapport doit rendre visible.
+    """
+    attempt.bytes_written = byte_count
+
+
+def last_attempt() -> Attempt | None:
+    """Dernière tentative inscrite — pour y rattacher les octets écrits."""
+    attempts = ledger().attempts
+    return attempts[-1] if attempts else None

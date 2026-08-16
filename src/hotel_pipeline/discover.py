@@ -59,6 +59,11 @@ class DiscoveryReport:
     #: Rapport de recherche adaptative, quand elle a eu lieu.
     search: object = None
 
+    #: Registre complet des appels de **cette** commande. Les compteurs par
+    #: source n'en montraient qu'un extrait : ni les échecs, ni les pages, ni
+    #: les refus n'étaient lisibles.
+    transport: dict = field(default_factory=dict)
+
     #: Cadrages regroupés faute de différer : `écarté` → `retenu`.
     framings_merged: dict = field(default_factory=dict)
 
@@ -94,6 +99,7 @@ class DiscoveryReport:
                 source: counts.as_dict()
                 for source, counts in self.requests_by_source.items()
             },
+            "transport": self.transport,
             "adaptive_search": self.search.as_dict() if self.search else None,
             "viewpoint_counts": self.viewpoint_counts,
             "framings_merged": self.framings_merged,

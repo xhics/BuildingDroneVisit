@@ -680,7 +680,11 @@ def assets_discover(
     # exécutions ne dirait rien de l'une ni de l'autre.
     from .providers.transport import ledger, reset_ledger
 
-    reset_ledger()
+    registre = reset_ledger()
+    # Ce qu'on s'attend à émettre **au plus**. La pagination interdit un compte
+    # exact d'avance ; annoncer un plafond vaut mieux que se taire, et le
+    # comparer à l'effectif dit si l'estimation valait.
+    registre.planned_max_requests.update(_planned_calls(context, radius))
     queries = _query_sources(
         profile, context, workspace, radius, search.outstanding or demands.demands
     )
@@ -697,11 +701,29 @@ def assets_discover(
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    # Le registre entier, non un extrait : les échecs, les pages et les refus
+    # ne se lisaient nulle part.
+    report.transport = ledger().as_dict()
+
+    # Un rejeu sur cache figé n'est pas une découverte : il ne doit jamais
+    # devenir le « dernier manifeste » que `assets plan` ramasserait. Il vit
+    # donc à part, sous `replays/`, où le tri par date ne va pas le chercher.
+    from .providers.transport import NetworkMode, current_mode
+
+    replay = current_mode() is NetworkMode.CACHE_ONLY
+    prefix = "01_sources/replays" if replay else "01_sources"
+    if replay:
+        typer.secho(
+            "  · rejeu sur cache figé : écrit sous 01_sources/replays/, il ne "
+            "sera pas repris comme manifeste courant",
+            fg=typer.colors.YELLOW,
+        )
+
     workspace.write_json(
-        f"01_sources/candidates_{report.run_id}.json",
+        f"{prefix}/candidates_{report.run_id}.json",
         json.loads(manifest.model_dump_json()),
     )
-    workspace.write_report(f"01_sources/discovery_{report.run_id}.json", report, context, production="CandidateManifest")
+    workspace.write_report(f"{prefix}/discovery_{report.run_id}.json", report, context, production="CandidateManifest")
 
     for source in report.sources_queried:
         returned = report.candidates_by_source[source]
@@ -1090,6 +1112,12 @@ def assets_plan(
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
     workspace = Workspace(hotel_id)
 
+    # Registre propre : un plan hérité des appels de la découverte annoncerait
+    # un coût qui n'est pas le sien.
+    from .providers.transport import ledger as plan_ledger, reset_ledger
+
+    plan_registry = reset_ledger()
+
     demands_payload = workspace.read_json("01_sources/capture_demands.json")
     if not demands_payload:
         typer.secho(f"{KO} aucun besoin déclaré", fg=typer.colors.RED, err=True)
@@ -1294,6 +1322,7 @@ def assets_plan(
         f"01_sources/acquisition_plan_{plan.plan_id}.json",
         json.loads(plan.model_dump_json()),
     )
+    report.transport = plan_ledger().as_dict()
     workspace.write_report(
         f"01_sources/plan_report_{plan.plan_id}.json", report, context,
         production="AcquisitionPlan",
@@ -1460,6 +1489,13 @@ def _measure_volumes(candidates, requested: bool):  # noqa: ANN001, ANN201
 
 
 def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
+    """Dernier manifeste **de production**.
+
+    `glob` ne descend pas dans les sous-dossiers : les rejeux sur cache figé,
+    écrits sous `replays/`, ne peuvent pas devenir le manifeste courant. Un
+    rejeu ramassé par le plan ferait acquérir sur un corpus qu'aucune
+    interrogation récente n'a produit.
+    """
     found = sorted(workspace.path("01_sources").glob("candidates_*.json"))
     return found[-1] if found else None
 
@@ -4449,4 +4485,31 @@ def _requests_by_source(by_source: dict) -> dict:
             sequence_expansion=stages.get("sequence_expansion", 0),
         )
         for source, stages in sorted(merged.items())
+    }
+
+
+def _planned_calls(context, radius_m: int) -> dict:  # noqa: ANN001
+    """Plafond d'appels annoncé **avant** d'interroger.
+
+    Mapillary pagine : on ne sait pas d'avance combien de pages viendront, mais
+    on connaît le plafond que le collecteur s'impose. Street View interroge un
+    point de corridor à la fois, ce qui se compte.
+
+    Un plafond n'est pas une prédiction : c'est ce qu'on s'autorise. Le
+    comparer à l'effectif dit si l'estimation valait.
+    """
+    from .collectors.mapillary import MAX_IMAGES, PAGE_SIZE
+
+    collection = context.policy.collection
+    spacing = max(collection.sample_spacing_m, 1.0)
+    # Deux fois le rayon divisé par l'espacement : ordre de grandeur du nombre
+    # de points d'un réseau routier couvrant la zone.
+    corridor_points = int((2 * collection.road_radius_m) / spacing) ** 2 // 4
+
+    # Les clés sont celles du **registre** — `streetview-meta`, non
+    # `street_view` : un plafond annoncé sous un autre nom que l'effectif ne se
+    # confronte à rien.
+    return {
+        "mapillary": -(-MAX_IMAGES // PAGE_SIZE),
+        "streetview-meta": max(corridor_points, 1),
     }

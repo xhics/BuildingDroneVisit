@@ -43,6 +43,11 @@ class AcquireReport:
     bytes_downloaded: int = 0
     bytes_consented: int = 0
 
+    #: Registre des appels de cette acquisition. Publié **même sur échec** :
+    #: une exécution interrompue a coûté des appels, et les taire donnerait à
+    #: croire qu'elle n'a rien consommé.
+    transport: dict = field(default_factory=dict)
+
     #: Ce qui a été **réellement** demandé, par candidat : résolution
     #: fournisseur et empreinte de requête. Sans cette trace, rien ne permet de
     #: vérifier que le fichier obtenu est celui que le plan décrivait.
@@ -54,6 +59,7 @@ class AcquireReport:
             "plan_id": self.plan_id,
             "planned": self.planned,
             "requested": self.requested,
+            "transport": self.transport,
             "acquired": self.acquired,
             "failed": self.failed,
             "volume": {
@@ -147,6 +153,9 @@ def run(
             "état : " + " ; ".join(stale)
         )
 
+    from .providers.transport import ledger as transport_ledger, reset_ledger
+
+    reset_ledger()
     report = AcquireReport(
         run_id=run_id or new_run_id(),
         plan_id=plan.plan_id,
@@ -253,6 +262,7 @@ def run(
         report.acquired += 1
         report.bytes_downloaded += asset.file_size_bytes or 0
 
+    report.transport = transport_ledger().as_dict()
     log.info(
         "acquisition %s : %d/%d fichier(s), %d octet(s) sur %d consenti(s)",
         report.run_id, report.acquired, report.planned,
@@ -279,14 +289,22 @@ def fetch(candidate, target: Path, request=None) -> Path:  # noqa: ANN001
 
     spec = request.request_spec if request is not None else candidate.request_spec
     url = resolve_url(candidate.source, spec)
-    response = transport.request(
-        candidate.source, transport.Stage.DOWNLOAD, "GET",
-        lambda: requests.get(url, timeout=60, stream=True),
+    response = transport.get(
+        candidate.source, transport.Stage.DOWNLOAD, url,
+        timeout=60, stream=True,
         request_digest=getattr(request, "digest", None),
         what="acquisition d'image",
     )
     response.raise_for_status()
+
+    written = 0
     with target.open("wb") as handle:
         for chunk in response.iter_content(1 << 16):
-            handle.write(chunk)
+            written += handle.write(chunk)
+
+    # Ce qui a **réellement** été écrit, à côté de ce qui était annoncé : leur
+    # écart est précisément ce qu'un rapport doit rendre visible.
+    attempt = transport.last_attempt()
+    if attempt is not None:
+        transport.record_written(attempt, written)
     return target

@@ -615,11 +615,21 @@ def test_measured_requests_are_published(rear_demand, three_candidates):
 def test_cache_hits_are_not_counted_as_requests():
     """« 25 requêtes » là où le cache a tout servi surestimerait le coût."""
     from hotel_pipeline.providers.cache import cached_call
-    from hotel_pipeline.providers.transport import reset_ledger
+    from hotel_pipeline.providers.transport import (
+        NetworkMode,
+        reset_ledger,
+        set_mode,
+    )
 
+    # La suite tourne en mode `forbidden`, qui refuse désormais jusqu'aux
+    # lectures de cache : c'est ici le comportement `online` qu'on éprouve.
+    set_mode(NetworkMode.ONLINE)
     registre = reset_ledger()
-    cached_call("essai-compteur::a", lambda: {"valeur": 1})
-    cached_call("essai-compteur::a", lambda: {"valeur": 1})
+    try:
+        cached_call("essai-compteur::a", lambda: {"valeur": 1})
+        cached_call("essai-compteur::a", lambda: {"valeur": 1})
+    finally:
+        set_mode(None)
 
     row = registre.by_source()["essai-compteur"]
     assert row["cache_hits"] == 1, "le second appel vient du cache"

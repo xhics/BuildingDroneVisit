@@ -127,9 +127,9 @@ def content_length(request) -> int | None:  # noqa: ANN001
     # Ce HEAD-ci est le second appel, sur le CDN.
     url = resolve_url(request.source, request.request_spec)
 
-    response = transport.request(
-        request.source, transport.Stage.VOLUME_PROBE, "HEAD",
-        lambda: http.head(url, timeout=30, allow_redirects=True),
+    response = transport.head(
+        request.source, transport.Stage.VOLUME_PROBE, url,
+        timeout=30, allow_redirects=True,
         request_digest=getattr(request, "digest", None),
         what="mesure de volume",
     )

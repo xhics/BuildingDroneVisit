@@ -81,14 +81,11 @@ def collect(
             page += 1
             # Chaque page est une requête : les fondre en une seule sous-
             # estimait le coût d'un facteur égal au nombre de pages.
-            response = transport.request(
-                "mapillary", transport.Stage.COARSE_SEARCH, "GET",
-                lambda: requests.get(
-                    url,
-                    params=params,
-                    headers={"Authorization": f"OAuth {token}"},
-                    timeout=TIMEOUT,
-                ),
+            response = transport.get(
+                "mapillary", transport.Stage.COARSE_SEARCH, url,
+                params=params,
+                headers={"Authorization": f"OAuth {token}"},
+                timeout=TIMEOUT,
                 page=page,
                 what="Mapillary Graph (recherche)",
             )
@@ -166,14 +163,12 @@ def thumbnail_url(image_id: str, resolution: str = "thumb_2048") -> str:
     # Résolution d'adresse : un appel **distinct** de celui qui suivra sur le
     # CDN. Les confondre ferait passer un HEAD Mapillary pour une requête là
     # où il en coûte deux.
-    response = transport.request(
-        "mapillary", transport.Stage.URL_RESOLUTION, "GET",
-        lambda: requests.get(
-            f"https://graph.mapillary.com/{image_id}",
-            params={"fields": field},
-            headers={"Authorization": f"OAuth {secret('MAPILLARY_TOKEN')}"},
-            timeout=TIMEOUT,
-        ),
+    response = transport.get(
+        "mapillary", transport.Stage.URL_RESOLUTION,
+        f"https://graph.mapillary.com/{image_id}",
+        params={"fields": field},
+        headers={"Authorization": f"OAuth {secret('MAPILLARY_TOKEN')}"},
+        timeout=TIMEOUT,
         what="Mapillary Graph (adresse)",
     )
     response.raise_for_status()
@@ -193,16 +188,17 @@ def image_metadata(image_ids: list[str]) -> dict[str, dict]:
     corrélation ne peut donc pas être affirmée depuis le corpus. Elle se
     demande à la source, image par image.
     """
-    import requests
-
-    ensure_online("Mapillary Graph")
     token = secret("MAPILLARY_TOKEN")
     fields = "id,captured_at,sequence,compass_angle,computed_compass_angle,geometry"
     found: dict[str, dict] = {}
 
     for image_id in image_ids:
-        response = requests.get(
+        # Un appel par image : c'est le coût de l'enrichissement, et il doit
+        # figurer au registre comme tel.
+        response = transport.get(
+            "mapillary", transport.Stage.METADATA_ENRICHMENT,
             f"https://graph.mapillary.com/{image_id}",
+            what="Mapillary Graph (métadonnées)",
             params={"fields": fields},
             headers={"Authorization": f"OAuth {token}"},
             timeout=TIMEOUT,

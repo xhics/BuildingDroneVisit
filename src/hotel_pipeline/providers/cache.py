@@ -56,10 +56,24 @@ def cached_call(key: str, producer: Callable[[], Any], ttl: int = DEFAULT_TTL_SE
     zéro faute de compteur ; un zéro ne distinguait pas « rien demandé » de
     « pas mesuré ».
     """
-    from .transport import NetworkMode, NetworkRefused, Stage, current_mode
-    from .transport import record_cache_hit
+    from .transport import (
+        NetworkMode,
+        NetworkRefused,
+        Stage,
+        current_mode,
+        record_cache_hit,
+        record_refusal,
+    )
 
     source = str(key).split("::", 1)[0]
+    mode = current_mode()
+
+    # `forbidden` passe **avant** toute lecture : « ni cache ni réseau » ne
+    # souffre pas d'exception, et servir un cache en mode interdit rendrait le
+    # garde-fou des tests inopérant.
+    if mode is NetworkMode.FORBIDDEN:
+        record_refusal(source, Stage.COARSE_SEARCH, mode)
+        raise NetworkRefused(f"mode hors ligne actif — accès {source} refusé")
 
     if os.environ.get("HOTEL_PIPELINE_NO_CACHE") == "1":
         return producer()
@@ -71,9 +85,12 @@ def cached_call(key: str, producer: Callable[[], Any], ttl: int = DEFAULT_TTL_SE
         record_cache_hit(source, Stage.COARSE_SEARCH)
         return hit
 
-    if current_mode() is NetworkMode.CACHE_ONLY:
+    if mode is NetworkMode.CACHE_ONLY:
         # Le producteur n'est **pas** appelé : en mode fermé, un miss se refuse
-        # avant tout paquet, et non après avoir tenté sa chance.
+        # avant tout paquet, et non après avoir tenté sa chance. Le refus est
+        # inscrit — sans quoi un rejeu incomplet présenterait les compteurs
+        # d'une exécution sans besoin réseau.
+        record_refusal(source, Stage.COARSE_SEARCH, mode)
         raise NetworkRefused(
             f"mode cache_only — {source} : réponse absente du cache, aucun "
             "appel émis"

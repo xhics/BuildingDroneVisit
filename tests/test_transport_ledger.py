@@ -199,7 +199,10 @@ def test_a_mapillary_head_costs_two_calls(online) -> None:
     row = online.by_source()["mapillary"]
     assert row["attempted"] == 2
     assert row["by_stage"] == {"url_resolution": 1, "volume_probe": 1}
-    assert row["bytes_received"] == 4096
+    assert row["declared_bytes"] == 4096, (
+        "un HEAD annonce une longueur ; aucun octet n'arrive"
+    )
+    assert row["bytes_written"] == 0
 
 
 # --- isolation entre exécutions ------------------------------------------------
@@ -276,3 +279,69 @@ def test_cache_hits_stay_out_of_the_stage_counts() -> None:
     )
     assert row["cache_by_stage"] == {"coarse_search": 5}
     assert row["cache_hits"] == 5
+
+
+def test_declared_length_is_not_bytes_written(online) -> None:
+    """Sur un `HEAD`, aucun octet n'arrive.
+
+    Nommer cela « reçu » ferait passer une déclaration pour une mesure, et un
+    service qui annonce autre chose que ce qu'il sert resterait invisible.
+    """
+    from hotel_pipeline.providers.transport import last_attempt, record_written
+
+    request("mapillary", Stage.VOLUME_PROBE, "HEAD", lambda: FakeResponse(200, 5000))
+    probe = last_attempt()
+    assert probe.declared_content_length == 5000
+    assert probe.bytes_written is None, "un HEAD n'écrit rien"
+
+    request("mapillary", Stage.DOWNLOAD, "GET", lambda: FakeResponse(200, 5000))
+    # Le service annonçait 5 000 ; il en a servi 4 210.
+    record_written(last_attempt(), 4210)
+
+    row = online.by_source()["mapillary"]
+    assert row["declared_bytes"] == 10_000
+    assert row["bytes_written"] == 4210, (
+        "l'écart entre annoncé et écrit est ce qu'un rapport doit montrer"
+    )
+
+
+def test_a_replay_never_becomes_the_current_manifest(tmp_path, monkeypatch) -> None:
+    """Un rejeu sur cache figé n'est pas une découverte.
+
+    Le laisser en tête du tri par date ferait planifier une acquisition sur un
+    corpus qu'aucune interrogation récente n'a produit.
+    """
+    from hotel_pipeline.cli import _latest_candidates
+    from hotel_pipeline.workspace import Workspace
+
+    monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path))
+    workspace = Workspace("essai")
+    sources = workspace.path("01_sources")
+    (sources / "replays").mkdir(parents=True, exist_ok=True)
+
+    (sources / "candidates_20260101T000000Z.json").write_text("{}", "utf-8")
+    # Postérieur : sans l'isolation, c'est lui que le tri par date rendrait.
+    (sources / "replays" / "candidates_20260901T000000Z.json").write_text("{}", "utf-8")
+
+    latest = _latest_candidates(workspace)
+
+    assert latest is not None
+    assert latest.name == "candidates_20260101T000000Z.json"
+    assert "replays" not in str(latest)
+
+
+def test_planned_and_actual_use_the_same_keys() -> None:
+    """Un plafond annoncé sous un autre nom que l'effectif ne se confronte à
+    rien : le rapport montrerait deux colonnes sans intersection."""
+    from hotel_pipeline.cli import _CACHE_SOURCES, _planned_calls
+    from hotel_pipeline.schemas import DEFAULT_POLICY
+
+    class Context:
+        policy = DEFAULT_POLICY
+
+    planned = _planned_calls(Context(), 500)
+
+    assert set(planned) <= set(_CACHE_SOURCES), (
+        "les plafonds se nomment comme les clés du registre"
+    )
+    assert planned["mapillary"] >= 1
