@@ -509,8 +509,11 @@ def test_the_pilot_manifest_carries_at_least_the_seven_mandatory_demands() -> No
     ):
         assert demand_id_for(object_id) in identifiers, object_id
 
-    # Le stationnement existe au site : son obligation conditionnelle joue.
-    assert demand_id_for("PARKING_HOTEL") in identifiers
+    # Le stationnement, lui, a été **dé-résolu** : son association reposait sur
+    # la proximité et l'inspection l'a démentie. Son obligation conditionnelle
+    # ne joue donc plus — l'exiger ferait chercher un objet dont rien
+    # n'établit l'existence.
+    assert demand_id_for("PARKING_HOTEL") not in identifiers
 
 
 # --- l'existence s'établit, elle ne se présume pas -----------------------------
@@ -593,8 +596,14 @@ def test_existence_is_distinct_from_instantiation() -> None:
     assert established.exists is True
 
 
-def test_the_pilot_holds_eight_demands_and_one_pending() -> None:
-    """Non-régression sur le résultat réel."""
+def test_the_pilot_holds_seven_demands_after_the_parking_was_unresolved() -> None:
+    """Non-régression sur le résultat réel.
+
+    Le pilote portait huit besoins tant que `PARKING_HOTEL` passait pour
+    établi. L'inspection de son aperçu a montré le bâtiment 1205 là où l'hôtel
+    est au 1195 : l'objet est redevenu `unresolved`, et son obligation
+    conditionnelle ne s'applique plus.
+    """
     from pathlib import Path
 
     demands_path = Path(
@@ -606,6 +615,6 @@ def test_the_pilot_holds_eight_demands_and_one_pending() -> None:
     payload = json.loads(demands_path.read_text("utf-8"))
     identifiers = {demand["demand_id"] for demand in payload["demands"]}
 
-    assert len(payload["demands"]) == 8
-    assert demand_id_for("PARKING_HOTEL") in identifiers
+    assert len(payload["demands"]) == 7
+    assert demand_id_for("PARKING_HOTEL") not in identifiers
     assert demand_id_for("DRIVEWAY_MAIN") not in identifiers

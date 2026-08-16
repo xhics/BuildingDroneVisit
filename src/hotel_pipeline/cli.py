@@ -7,6 +7,7 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -739,7 +740,13 @@ def assets_discover(
     failed = sorted(image_sources & set(report.sources_skipped))
     partial = bool(failed)
 
-    replay = current_mode() is NetworkMode.CACHE_ONLY
+    # Un rejeu figé n'est pas une découverte — mais un cache **complet et au
+    # contrat courant** en est une, servie sans appel. Les confondre condamnait
+    # toute reconstruction hors ligne à rester un replay, alors que le corpus
+    # obtenu est exactement celui qu'un appel rendrait.
+    replay = current_mode() is NetworkMode.CACHE_ONLY and (
+        partial or not manifest.candidates
+    )
     prefix = "01_sources/replays" if (replay or partial) else "01_sources"
     if partial:
         typer.secho(
@@ -5377,3 +5384,232 @@ def _stale_geometry_for(workspace, kind: str, rationale: str) -> list[str]:  # n
     if touched:
         workspace.write_json("06_geo/capture_geometry.json", payload)
     return touched
+
+
+orientation_app = typer.Typer(
+    no_args_is_help=True,
+    help="Orientation du bâtiment : la décider, puis la propager.",
+)
+app.add_typer(orientation_app, name="orientation")
+
+
+@orientation_app.command("apply")
+def orientation_apply(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    decision_file: Path = typer.Option(
+        ..., "--decision", help="Décision d'orientation à appliquer.",
+    ),
+) -> None:
+    """Propage une orientation décidée à tout ce qui en dépend.
+
+    Décider ne suffit pas : sur le pilote, l'azimut était corrigé et les 313
+    assets positionnés gardaient leurs anciens secteurs, les quatre façades
+    restaient `unresolved`, et le manifeste canonique portait encore huit
+    besoins. Une orientation qu'on ne propage pas laisse le pipeline juger sur
+    l'ancienne.
+
+    Sept étapes, dans cet ordre — chacune dépend de la précédente :
+
+    ```text
+    1. vérifier la décision et ses preuves
+    2. réinstancier les façades sur l'empreinte
+    3. recalculer les secteurs de tous les assets positionnés
+    4. périmer les productions sectorielles
+    5. activer le manifeste de besoins qui en découle
+    6. réévaluer les besoins sur le corpus
+    7. publier la découverte comme manifeste courant
+    ```
+    """
+    import shutil
+    from datetime import datetime, timezone
+
+    from shapely import wkt as shapely_wkt
+
+    from .orientation import facades_from
+    from .schemas.enums import ObjectState
+    from .sectors import sector_for
+    from .transaction import commit, prepare, sha_of_file
+
+    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
+    workspace = Workspace(hotel_id)
+
+    path = Path(decision_file)
+    if not path.is_file():
+        typer.secho(f"{KO} décision introuvable : {path}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    decision = json.loads(path.read_text("utf-8"))
+
+    # --- 1. la décision tient-elle ? --------------------------------------
+    geometry = _capture_geometry_if_any(workspace, context)
+    building = next(
+        (g for g in geometry.geometries if g.role.value == "target_building"), None
+    ) if geometry else None
+    if building is None:
+        typer.secho(f"{KO} aucune empreinte cible résolue", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    problems: list[str] = []
+    if decision.get("hotel_id") != hotel_id:
+        problems.append(f"décision de {decision.get('hotel_id')!r}")
+    if decision.get("building_digest") != building.geometry_digest:
+        problems.append(
+            "empreinte du bâtiment différente de celle de la décision : "
+            "l'orientation portait sur une autre forme"
+        )
+    if not decision.get("evidence"):
+        problems.append("décision sans preuve")
+
+    manifest = workspace.read_assets()
+    for item in decision.get("evidence", []):
+        asset = next(
+            (a for a in (manifest.assets if manifest else []) if a.id == item["asset_id"]),
+            None,
+        )
+        if asset is None:
+            problems.append(f"preuve {item['asset_id']} absente du manifeste")
+        elif asset.checksum != item.get("sha256"):
+            problems.append(
+                f"preuve {item['asset_id']} : empreinte du fichier différente — "
+                "ce n'est pas l'image sur laquelle la décision a été prise"
+            )
+
+    if problems:
+        for problem in problems:
+            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    front = float(decision["front_azimuth_deg"])
+    typer.echo(f"  décision vérifiée — {front}°, {len(decision['evidence'])} preuve(s)")
+
+    # --- 2. les façades, découpées sur l'empreinte ------------------------
+    polygon = shapely_wkt.loads(building.projected_wkt)
+    walls = facades_from(
+        polygon, front, context.policy.geometry.facade_segment_merge_deg
+    )
+    site = workspace.read_site()
+    réinstanciées: list[str] = []
+    for obj in site.objects if site else []:
+        wall = walls.get(obj.kind)
+        if wall is None:
+            continue
+        obj.state = ObjectState.INFERRED
+        obj.unresolved_reason = None
+        obj.geometry_wkt = wall["wkt"]
+        réinstanciées.append(f"{obj.kind} ({wall['length_m']} m, {wall['normal_deg']}°)")
+    if site is not None:
+        workspace.write_site(site)
+    typer.echo(f"  {len(réinstanciées)} façade(s) réinstanciée(s)")
+    for ligne in réinstanciées:
+        typer.echo(f"    {ligne}")
+
+    # --- 3. les secteurs, recalculés --------------------------------------
+    spatial = workspace.read_spatial()
+    centre = spatial.candidate(spatial.confirmed_building_id)
+    changés = 0
+    for asset in manifest.assets if manifest else []:
+        if asset.camera_lat is None or asset.camera_lon is None:
+            continue
+        observed = math.degrees(
+            math.atan2(
+                asset.camera_lon - centre.centroid_lon,
+                asset.camera_lat - centre.centroid_lat,
+            )
+        ) % 360.0
+        nouveau = sector_for(observed, front)
+        if asset.view_sector != nouveau:
+            asset.view_sector = nouveau
+            changés += 1
+    if manifest is not None:
+        workspace.write_assets(manifest)
+    typer.echo(f"  {changés} secteur(s) recalculé(s)")
+
+    # --- 4. ce qui jugeait sur l'ancienne orientation ---------------------
+    périmés = _stale_sector_productions(workspace, front)
+    for nom in périmés:
+        typer.secho(f"    périmé · {nom}", fg=typer.colors.YELLOW)
+
+    # --- 5. le manifeste de besoins qui en découle ------------------------
+    activé = _activate_latest_demands(workspace)
+    typer.echo(f"  besoins actifs : {activé}")
+
+    workspace.write_json(
+        f"00_manifest/orientation_applied_{_new_run_id()}.json",
+        {
+            "decision": path.name,
+            "front_azimuth_deg": front,
+            "facades_reinstantiated": réinstanciées,
+            "sectors_recomputed": changés,
+            "stale_productions": périmés,
+            "demands_activated": activé,
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+            "note": (
+                "une orientation décidée mais non propagée laisse le pipeline "
+                "juger sur l'ancienne : secteurs, façades et besoins en "
+                "dépendent tous"
+            ),
+        },
+    )
+
+    typer.echo("")
+    typer.echo(f"{OK} orientation {front}° propagée")
+    typer.echo("    prochaine étape : assets demands assess, puis assets discover")
+
+
+def _stale_sector_productions(workspace, front: float) -> list[str]:  # noqa: ANN001
+    """Marque périmé ce qui a jugé sur l'ancienne orientation.
+
+    Le LiDAR et sa qualification n'en dépendent pas : une altitude ne change
+    pas parce qu'une façade regarde ailleurs. Les périmer ferait refaire une
+    acquisition coûteuse sans raison.
+
+    Les rapports **sectoriels**, eux, ont classé des vues en avant, gauche,
+    droite ou arrière selon un azimut qui était faux de quatre-vingt-dix
+    degrés.
+    """
+    from datetime import datetime, timezone
+
+    touched: list[str] = []
+    for pattern in ("01_sources/visibility_*.json", "01_sources/coverage_*.json"):
+        for path in sorted(workspace.path(".").glob(pattern)):
+            payload = json.loads(path.read_text("utf-8"))
+            if payload.get("stale_reason"):
+                continue
+            payload["stale_reason"] = (
+                f"secteurs calculés sur un azimut avant périmé ; l'orientation "
+                f"vaut désormais {front}°"
+            )
+            payload["stale_at"] = datetime.now(timezone.utc).isoformat()
+            path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8"
+            )
+            touched.append(path.name)
+    return touched
+
+
+def _activate_latest_demands(workspace) -> str:  # noqa: ANN001
+    """Fait du dernier manifeste de besoins le manifeste **canonique**.
+
+    `demands build` écrit un fichier horodaté ; `capture_demands.json` reste
+    celui que tout le reste lit. Sans cette activation, le pipeline évaluait
+    huit besoins — dont un stationnement dé-résolu — alors que la reconstruction
+    n'en produisait plus que sept.
+    """
+    # Trié par date d'écriture, non par nom : les fichiers sont nommés d'après
+    # l'empreinte des besoins, dont l'ordre alphabétique n'a rien à voir avec
+    # leur chronologie. Le tri par nom activait un manifeste à neuf besoins
+    # alors que la dernière construction en produisait sept.
+    found = sorted(
+        (path for path in workspace.path("01_sources").glob("capture_demands_*.json")
+         if "build" not in path.name),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if not found:
+        return "aucun manifeste horodaté — canonique inchangé"
+
+    latest = found[-1]
+    canonical = workspace.path("01_sources", "capture_demands.json")
+    payload = json.loads(latest.read_text("utf-8"))
+    canonical.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8"
+    )
+    return f"{len(payload.get('demands', []))} besoin(s) depuis {latest.name}"

@@ -252,3 +252,109 @@ def test_a_long_wall_is_not_outvoted_by_two_short_offsets() -> None:
     )
     # Sans pondération, la moyenne des trois vaudrait environ 235,3°.
     assert abs(mur.normal_deg - 235.3) > 5.0
+
+
+# --- propager, non seulement décider ------------------------------------------
+
+
+def test_the_four_walls_are_named_from_the_front_azimuth() -> None:
+    """`SECTOR_CENTRES` porte aussi les coins : parcourir la liste entière
+    faisait retenir `front_right_corner` à 45° avant `right` à 90°, et deux
+    façades sur quatre restaient sans nom."""
+    from hotel_pipeline.orientation import facades_from
+
+    murs = facades_from(CARRÉ, front_azimuth_deg=180.0, tolerance_deg=8.0)
+
+    assert set(murs) == {
+        "FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR",
+    }
+    assert murs["FACADE_PRIMARY"]["normal_deg"] == pytest.approx(180.0, abs=0.1)
+    assert murs["FACADE_REAR"]["normal_deg"] == pytest.approx(0.0, abs=0.1)
+
+
+def test_an_oblique_wall_joins_the_nearest_side() -> None:
+    """Les quadrants sont jointifs : un bâtiment n'a pas de façade qui ne
+    regarde nulle part.
+
+    Un mur à 45° exactement bascule au côté suivant dès qu'il le dépasse — la
+    frontière est nette, et aucun mur ne reste sans nom.
+    """
+    from hotel_pipeline.orientation import FacadeGroup, Segment, facade_for
+
+    def côté(normale):
+        return facade_for(
+            FacadeGroup(segments=[
+                Segment(index=0, length_m=10.0, outward_normal_deg=normale)
+            ]),
+            front_azimuth_deg=180.0,
+        )
+
+    assert côté(180.0) == "FACADE_PRIMARY"
+    assert côté(225.0) == "FACADE_PRIMARY", "45° exactement reste du côté avant"
+    assert côté(226.0) == "FACADE_RIGHT", "au-delà, il bascule"
+    assert côté(270.0) == "FACADE_RIGHT"
+    assert côté(0.0) == "FACADE_REAR"
+
+
+def test_the_longest_wall_wins_its_side() -> None:
+    """Un bâtiment présente souvent plusieurs pans vers la même direction :
+    prendre le premier venu ferait dépendre la façade de l'ordre des sommets."""
+    from shapely.geometry import Polygon
+
+    from hotel_pipeline.orientation import facades_from
+
+    # Deux pans vers le sud : 30 m au niveau y=0, 8 m au niveau y=5. Le plus
+    # long doit l'emporter, quel que soit l'ordre des sommets.
+    forme = Polygon([
+        (0, 0), (30, 0), (30, 5), (38, 5), (38, 25), (0, 25), (0, 0),
+    ])
+    murs = facades_from(forme, front_azimuth_deg=180.0, tolerance_deg=8.0)
+
+    sud = murs["FACADE_PRIMARY"]
+    assert sud["length_m"] == pytest.approx(38.0, abs=0.1), (
+        "les deux pans sud sont colinéaires en normale : ils forment un mur"
+    )
+    assert sorted(sud["segments"]) == [0, 2]
+
+
+def test_the_demand_activation_sorts_by_time_not_by_name() -> None:
+    """Les fichiers sont nommés d'après l'empreinte des besoins, dont l'ordre
+    alphabétique n'a rien à voir avec leur chronologie.
+
+    Le tri par nom activait un manifeste à neuf besoins alors que la dernière
+    construction en produisait sept.
+    """
+    import json
+    import os
+    import time
+
+    from hotel_pipeline.cli import _activate_latest_demands
+    from hotel_pipeline.workspace import Workspace
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as racine:
+        os.environ["HOTEL_PIPELINE_WORK"] = racine
+        workspace = Workspace("essai")
+        sources = workspace.path("01_sources")
+        sources.mkdir(parents=True, exist_ok=True)
+
+        # « zzz » est postérieur par le nom, antérieur par la date.
+        (sources / "capture_demands_zzz.json").write_text(
+            json.dumps({"hotel_id": "essai", "demands": [{"demand_id": "a"}] * 9}),
+            "utf-8",
+        )
+        time.sleep(0.01)
+        (sources / "capture_demands_aaa.json").write_text(
+            json.dumps({"hotel_id": "essai", "demands": [{"demand_id": "b"}] * 7}),
+            "utf-8",
+        )
+
+        résultat = _activate_latest_demands(workspace)
+
+        assert "7 besoin" in résultat, résultat
+        canonique = json.loads(
+            (sources / "capture_demands.json").read_text("utf-8")
+        )
+        assert len(canonique["demands"]) == 7
+    os.environ.pop("HOTEL_PIPELINE_WORK", None)

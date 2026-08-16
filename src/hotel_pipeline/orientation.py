@@ -327,3 +327,71 @@ def decide(
         facade.total_length_m, len(evidence),
     )
     return decision
+
+
+def facade_for(group: "FacadeGroup", front_azimuth_deg: float) -> str | None:
+    """Quel côté du bâtiment ce mur constitue, l'avant étant connu.
+
+    Le mur qui regarde dans la direction de l'avant **est** la façade avant :
+    c'est la définition même de l'azimut. Les trois autres s'en déduisent par
+    quarts de tour, et un mur oblique n'en est aucune — le forcer dans le
+    quadrant le plus proche inventerait une façade là où le bâtiment n'en a
+    qu'un pan coupé.
+    """
+    # Les quatre côtés **cardinaux** seulement : `SECTOR_CENTRES` porte aussi
+    # les coins, et parcourir la liste entière faisait retenir
+    # `front_right_corner` à 45° avant `right` à 90° — deux façades sur quatre
+    # restaient alors sans nom.
+    cotes = (
+        (0.0, "FACADE_PRIMARY"),
+        (90.0, "FACADE_RIGHT"),
+        (180.0, "FACADE_REAR"),
+        (270.0, "FACADE_LEFT"),
+    )
+    offset = (group.normal_deg - front_azimuth_deg) % 360.0
+    # Les quatre quadrants sont **jointifs** : tout mur reçoit un côté, celui
+    # dont la direction est la plus proche. Un bâtiment n'a pas de mur qui ne
+    # regarde nulle part, et prévoir un cas « aucun côté » créerait une
+    # branche que rien n'atteindrait.
+    nom, _ecart = min(
+        ((nom, abs((offset - centre + 180.0) % 360.0 - 180.0)) for centre, nom in cotes),
+        key=lambda row: row[1],
+    )
+    return nom
+
+
+def facades_from(polygon, front_azimuth_deg: float, tolerance_deg: float) -> dict:  # noqa: ANN001
+    """Découpe l'empreinte en façades nommées, une fois l'avant établi.
+
+    Chaque côté retient le **mur le plus long** de son quadrant : un bâtiment
+    présente souvent plusieurs pans vers la même direction, et prendre le
+    premier venu ferait dépendre la façade de l'ordre des sommets.
+    """
+    from shapely.geometry import LineString, MultiLineString
+
+    coords = list(polygon.exterior.coords)
+    walls: dict[str, FacadeGroup] = {}
+
+    for group in group_collinear(segments_of(polygon), tolerance_deg):
+        name = facade_for(group, front_azimuth_deg)
+        if name is None:
+            continue
+        if name not in walls or group.total_length_m > walls[name].total_length_m:
+            walls[name] = group
+
+    shapes: dict[str, dict] = {}
+    for name, group in walls.items():
+        parts = [
+            LineString([coords[s.index], coords[s.index + 1]])
+            for s in sorted(group.segments, key=lambda s: s.index)
+        ]
+        shapes[name] = {
+            "normal_deg": round(group.normal_deg, 2),
+            "length_m": round(group.total_length_m, 2),
+            "segments": [s.index for s in group.segments],
+            "wkt": (
+                MultiLineString([list(part.coords) for part in parts]).wkt
+                if len(parts) > 1 else parts[0].wkt
+            ),
+        }
+    return shapes
