@@ -535,16 +535,51 @@ def _report(
     return report
 
 
-def consent(plan: AcquisitionPlan, digests: dict[str, str | None]) -> AcquisitionPlan:
+def consent(  # noqa: ANN001
+    plan: AcquisitionPlan,
+    digests: dict[str, str | None],
+    measured_from: str | None = None,
+    download_contract_version: int | None = None,
+) -> AcquisitionPlan:
     """Rend le plan exécutable, une fois le volume montré et accepté.
 
     Le passage n'est pas un changement d'étiquette : le schéma exige alors
     **toutes** les empreintes. Un plan qu'on ne peut pas rattacher à un état ne
     s'acquiert pas — il aurait choisi ses images pour un autre.
+
+    L'accord s'attache aussi aux **requêtes** et au plafond. Sans cet ancrage,
+    réécrire une résolution après coup téléchargerait autre chose sous le même
+    consentement : le statut disait « accepté » sans dire de quoi.
     """
+    # Le volume d'abord : c'est ce qu'on montre avant de dire à quoi il
+    # s'applique. Un total partiel se refuse quel que soit l'état des requêtes.
+    if plan.unknown_size_items:
+        raise PlanRefused(
+            f"{len(plan.unknown_size_items)} taille(s) inconnue(s) : consentir "
+            "à un total dont une part n'est pas mesurée serait consentir à ce "
+            "qui n'a pas été montré"
+        )
+
+    ungrounded = [
+        acquisition.candidate_id
+        for acquisition in plan.acquisitions
+        if not acquisition.request_digest
+    ]
+    if ungrounded:
+        raise PlanRefused(
+            f"acquisition(s) sans empreinte de requête : {sorted(ungrounded)} — "
+            "consentir sans savoir ce qui sera demandé n'engage rien"
+        )
+
     updated = plan.model_copy(
         update={
             "status": PlanStatus.EXECUTABLE,
+            "consented_max_bytes": plan.known_bytes,
+            "consented_request_digests": sorted(
+                a.request_digest for a in plan.acquisitions
+            ),
+            "consented_from_plan_id": measured_from or plan.plan_id,
+            "consented_download_contract_version": download_contract_version,
             **{
                 name: digests.get(name) or getattr(plan, name)
                 for name in _PLAN_DIGEST_FIELDS

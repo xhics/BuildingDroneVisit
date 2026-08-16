@@ -1349,7 +1349,16 @@ def assets_plan(
             )
             raise typer.Exit(code=2)
         try:
-            plan = consent(plan, digests)
+            plan = consent(
+                plan, digests,
+                measured_from=plan.plan_id,
+                # Ce que « télécharger » garantit fait partie de ce qu'on
+                # accepte : un volume consenti sous d'autres garanties n'est
+                # plus le même engagement.
+                download_contract_version=(
+                    context.policy.collection.download_contract_version
+                ),
+            )
         except PlanRefused as exc:
             typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc

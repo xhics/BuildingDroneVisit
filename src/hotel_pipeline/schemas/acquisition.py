@@ -1119,6 +1119,25 @@ class AcquisitionPlan(BaseModel):
     published_unknown_size_items: int | None = Field(default=None, ge=0)
     published_volume_status: VolumeStatus | None = None
 
+    #: --- ce à quoi le consentement s'attache ------------------------------
+    #: Plafond accepté, en octets. Le vérifier au moment d'acquérir ne suffit
+    #: pas : un plan dont les acquisitions changeraient après coup porterait un
+    #: consentement donné pour autre chose.
+    consented_max_bytes: int | None = Field(default=None, ge=0)
+
+    #: Empreintes des requêtes au moment du consentement. Elles ancrent
+    #: l'accord à **ces** demandes-là : sans elles, réécrire une résolution
+    #: après l'accord téléchargerait autre chose sous le même consentement.
+    consented_request_digests: list[str] = Field(default_factory=list)
+
+    #: Plan mesuré dont le volume a été montré. Consentir sans lui reviendrait
+    #: à accepter un total qu'aucune mesure n'a établi.
+    consented_from_plan_id: str | None = None
+
+    #: Version du contrat de téléchargement en vigueur à l'accord. Ce que
+    #: « télécharger » garantit fait partie de ce qui est consenti.
+    consented_download_contract_version: int | None = Field(default=None, ge=1)
+
     @property
     def known_bytes(self) -> int:
         return sum(a.expected_bytes for a in self.acquisitions if a.expected_bytes is not None)

@@ -118,9 +118,15 @@ def test_a_partial_measurement_still_refuses_consent() -> None:
     )
 
     assert plan.volume_status is not VolumeStatus.EXACT
-    # Le plan reste consentable en tant qu'objet ; c'est la CLI qui refuse un
-    # consentement sur un total partiel, et le statut le lui dit.
-    assert consent(plan, DIGESTS).volume_status is VolumeStatus.PARTIAL
+
+    # Le refus vivait dans la CLI, donc un autre appelant pouvait consentir un
+    # total partiel. Il vit désormais dans `consent` : le consentement porte
+    # sur un plafond exact, et ce qui n'est pas mesuré ne peut pas en faire
+    # partie.
+    from hotel_pipeline.plan import PlanRefused
+
+    with pytest.raises(PlanRefused, match="inconnue"):
+        consent(plan, DIGESTS)
 
 
 # --- ce qui est invraisemblable n'est pas mesuré ------------------------------

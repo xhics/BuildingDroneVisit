@@ -590,3 +590,57 @@ def test_a_refusal_reports_zero_published_despite_bytes_received(tmp_path) -> No
     )
     assert report.outcomes["c2"]["bytes_received"] == 0
     assert "trop court" in report.outcomes["c2"]["refused"]
+
+
+# --- le consentement s'attache aux requêtes et au plafond ---------------------
+
+
+def test_acquiring_a_request_that_was_not_consented_is_refused(tmp_path) -> None:
+    """Réécrire une résolution après l'accord téléchargerait autre chose sous
+    le même consentement."""
+    from hotel_pipeline.plan import consent
+
+    subject = candidate("c1")
+    acquisition = PlannedAcquisition(
+        candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+        serves_demands=["d1"], selection_rationale="essai",
+        resolution="256", expected_bytes=len(JPEG),
+        request_digest="empreinte-consentie",
+    )
+    accepted = consent(
+        plan(acquisitions=[acquisition]), DIGESTS, download_contract_version=1
+    )
+
+    assert accepted.consented_max_bytes == len(JPEG)
+    assert accepted.consented_request_digests == ["empreinte-consentie"]
+    assert accepted.consented_download_contract_version == 1
+
+    # La requête réelle diffère de celle consentie : `run` doit refuser.
+    fetcher = fake_fetcher()
+    with pytest.raises(AcquisitionRefused, match="différentes de celles consenties"):
+        run(accepted, {"c1": subject}, tmp_path, DIGESTS,
+            plan_digest="pd", fetcher=fetcher)
+
+    assert fetcher.calls == [], "rien n'a été téléchargé"
+
+
+def test_consent_refuses_a_partial_volume(tmp_path) -> None:
+    """Consentir à un total dont une part n'est pas mesurée serait consentir à
+    ce qui n'a pas été montré."""
+    from hotel_pipeline.plan import PlanRefused, consent
+
+    incomplet = plan(acquisitions=[
+        PlannedAcquisition(
+            candidate_id="c1", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            expected_bytes=len(JPEG), request_digest="d1",
+        ),
+        PlannedAcquisition(
+            candidate_id="c2", intents=[CaptureIntent.BUILDING_CAPTURE],
+            serves_demands=["d1"], selection_rationale="essai",
+            request_digest="d2",
+        ),
+    ])
+
+    with pytest.raises(PlanRefused, match="inconnue"):
+        consent(incomplet, DIGESTS)

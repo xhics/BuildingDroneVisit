@@ -265,13 +265,47 @@ def test_a_plan_is_born_a_draft() -> None:
     assert plan.status is PlanStatus.DRAFT
 
 
+def _grounded(plan, sizes=None):
+    """Un plan tel que le CLI le publie : requêtes résolues et tailles mesurées.
+
+    `build` ne renseigne ni `request_digest` ni `expected_bytes` — c'est la
+    résolution puis la mesure qui les ajoutent. Consentir sans eux n'engagerait
+    rien, et le test porterait sur un plan que le CLI ne produit jamais.
+    """
+    return plan.model_copy(update={"acquisitions": [
+        a.model_copy(update={
+            "request_digest": f"digest-{a.candidate_id}",
+            "expected_bytes": (sizes or {}).get(a.candidate_id, 4096),
+        })
+        for a in plan.acquisitions
+    ]})
+
+
 def test_consent_turns_a_draft_into_an_executable_plan() -> None:
     plan, _, _ = build("h", [candidate()], [demand()], DIGESTS)
 
-    executable = consent(plan, DIGESTS)
+    executable = consent(_grounded(plan), DIGESTS)
 
     assert executable.status is PlanStatus.EXECUTABLE
     assert executable.missing_digests() == []
+    # L'accord s'attache aux requêtes et au plafond, non au seul statut.
+    assert executable.consented_max_bytes == executable.known_bytes
+    assert executable.consented_request_digests == ["digest-c1"]
+
+
+def test_consent_is_refused_without_request_digests() -> None:
+    """Consentir sans savoir ce qui sera demandé n'engage rien.
+
+    Réécrire une résolution après l'accord téléchargerait alors autre chose
+    sous le même consentement.
+    """
+    plan, _, _ = build("h", [candidate()], [demand()], DIGESTS)
+    mesuré = plan.model_copy(update={"acquisitions": [
+        a.model_copy(update={"expected_bytes": 4096}) for a in plan.acquisitions
+    ]})
+
+    with pytest.raises(PlanRefused, match="sans empreinte de requête"):
+        consent(mesuré, DIGESTS)
 
 
 def test_consent_is_refused_when_an_imprint_is_missing() -> None:
@@ -282,7 +316,7 @@ def test_consent_is_refused_when_an_imprint_is_missing() -> None:
     plan, _, _ = build("h", [candidate()], [demand()], partial)
 
     with pytest.raises(PlanRefused, match="corpus_digest"):
-        consent(plan, partial)
+        consent(_grounded(plan), partial)
 
 
 def test_consent_revalidates_rather_than_relabelling() -> None:
