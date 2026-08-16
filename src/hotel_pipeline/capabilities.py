@@ -88,8 +88,15 @@ REQUIREMENTS: dict[Capability, tuple[Requirement, ...]] = {
     Capability.BOOTSTRAP: (),
     Capability.INSPECTION: (),
     Capability.IDENTITY_CLASSIFICATION: (Requirement.PROFILE,),
+    # La collecte ciblée **décide** sur des seuils : secteur, portée, quotas,
+    # résolutions. Une politique implicite les ferait venir du code, et aucun
+    # rapport ne pourrait citer ce sur quoi il a jugé. `POLICY` seul exigeait
+    # qu'une politique existe, non que ses facettes décisionnelles soient
+    # inscrites.
     Capability.TARGETED_COLLECTION: (
-        Requirement.PROFILE, Requirement.POSITION, Requirement.POLICY,
+        Requirement.PROFILE,
+        Requirement.POSITION,
+        Requirement.MATERIALISED_POLICY,
     ),
     Capability.GEOSPATIAL: (Requirement.SPATIAL_CONTEXT,),
     Capability.GEOSPATIAL_QUALIFICATION: (

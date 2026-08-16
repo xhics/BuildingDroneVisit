@@ -131,8 +131,23 @@ def init(
             assume_rights=assume_rights,
         )
     )
+    # Une politique **complète** dès l'origine : un fichier partiel ferait
+    # venir du code des seuils décisionnels, qu'aucun rapport ne pourrait
+    # ensuite citer. L'établissement suivant n'aura pas à migrer.
+    from .schemas import DEFAULT_POLICY
+
+    policy_path = workspace.path("00_manifest", "pipeline_policy.json")
+    if not policy_path.is_file():
+        policy_path.write_text(
+            json.dumps(
+                json.loads(DEFAULT_POLICY.model_dump_json()),
+                indent=2, ensure_ascii=False,
+            ) + "\n",
+            "utf-8",
+        )
+
     typer.echo(f"{OK} espace de travail créé : {workspace.root}")
-    typer.echo(f"  {len(SUBDIRS)} répertoires, manifeste initialisé")
+    typer.echo(f"  {len(SUBDIRS)} répertoires, manifeste et politique initialisés")
 
     _scaffold_profile(
         hotel_id, address, official_name, country, subdivision, tz,
@@ -378,6 +393,12 @@ def _context(
 
 assets_app = typer.Typer(no_args_is_help=True, help="Inventaire et droits des médias (§9).")
 app.add_typer(assets_app, name="assets")
+
+policy_app = typer.Typer(
+    no_args_is_help=True,
+    help="Politique de l'établissement : ce sur quoi les décisions se fondent.",
+)
+app.add_typer(policy_app, name="policy")
 
 
 @assets_app.command("import")
@@ -4513,3 +4534,52 @@ def _planned_calls(context, radius_m: int) -> dict:  # noqa: ANN001
         "mapillary": -(-MAX_IMAGES // PAGE_SIZE),
         "streetview-meta": max(corridor_points, 1),
     }
+
+
+@policy_app.command("materialise")
+def policy_materialise_command(
+    hotel_id: str = typer.Argument(..., help="Établissement dont la politique est à rendre explicite."),
+) -> None:
+    """Inscrit au fichier les seuils que le code comblait, sans rien changer.
+
+    Migration de **représentation** : les valeurs effectives sont celles déjà
+    appliquées. Le reçu le prouve — empreinte identique avant et après — plutôt
+    que d'en donner l'assurance.
+    """
+    from datetime import datetime, timezone
+
+    from .policy_materialise import MaterialisationRefused, materialise
+
+    workspace = Workspace(hotel_id)
+    policy_path = workspace.path("00_manifest", "pipeline_policy.json")
+    if not policy_path.is_file():
+        typer.secho(
+            f"{KO} aucune politique à {policy_path}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+    def publish(receipt) -> None:  # noqa: ANN001
+        # Append-only : chaque migration laisse son reçu, aucun ne remplace un
+        # autre. Écrit avant la politique — une interruption entre les deux
+        # laisserait sinon une migration sans trace.
+        workspace.write_json(
+            f"00_manifest/policy_materialisation_{stamp}.json", receipt.as_dict()
+        )
+
+    try:
+        receipt = materialise(policy_path, publish_receipt=publish)
+    except MaterialisationRefused as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    if not receipt.materialised:
+        typer.echo(f"{OK} politique déjà complète — rien à matérialiser")
+        return
+
+    typer.echo(f"{OK} {len(receipt.materialised)} chemin(s) rendus explicites")
+    typer.echo(f"  empreinte    {receipt.digest_before} → {receipt.digest_after}")
+    typer.echo(f"  version      {receipt.version_before} (inchangée)")
+    typer.echo(f"  fichier      {receipt.sha_before} → {receipt.sha_after}")
+    typer.echo("  aucune valeur modifiée ni disparue")
