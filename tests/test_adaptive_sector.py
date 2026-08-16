@@ -743,10 +743,20 @@ def test_a_refuted_preview_is_never_proposed_again() -> None:
     constat n'aurait eu aucun effet sur la recherche.
     """
     need = demand("obligation:front", "front")
+    # Une vue **par ailleurs excellente** : bon secteur, cap sur la cible. Sans
+    # cela, le test passerait pour une autre raison que celle qu'il éprouve.
     seen = candidate("c-deja-vu", *at_bearing(0.0), original_heading_deg=180.0)
     context = sector_context(need.demand_id, 0.0)
-    context.refuted_pairs = {("c-deja-vu", "obligation:front")}
 
+    sans_constat = measure_candidate(
+        seen, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    assert sans_constat.rejection_reason is None, (
+        "sans constat, cette vue est retenue : c'est bien le constat qui l'écarte"
+    )
+
+    context.refuted_pairs = {("c-deja-vu", "obligation:front")}
     measure = measure_candidate(
         seen, need, [], 3, target_lat=0.0, target_lon=0.0,
         policy=SEARCH, sector=context,

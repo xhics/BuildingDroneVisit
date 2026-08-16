@@ -459,6 +459,16 @@ def measure_candidate(
         projection_note=getattr(candidate, "projection_note", "") or "",
     )
 
+    # **Avant toute mesure** : un aperçu examiné et réfuté pour ce besoin ne se
+    # repropose pas. Posé plus bas, le contrôle était contourné par les retours
+    # anticipés de `_apply_sector` — les deux couples dont la cible n'est pas
+    # résolue revenaient ainsi au plan suivant.
+    if sector is not None and (
+        candidate.candidate_id, demand.demand_id
+    ) in (getattr(sector, "refuted_pairs", None) or ()):
+        measure.rejection_reason = "aperçu déjà examiné et réfuté pour ce besoin"
+        return measure
+
     if candidate.camera_lat is None or candidate.camera_lon is None:
         measure.rejection_reason = "position de caméra inconnue"
         return measure
@@ -478,15 +488,6 @@ def measure_candidate(
         measure.distance_measured_on = "position du site"
 
     _apply_sector(measure, candidate, demand, sector)
-
-    # Un aperçu déjà examiné et réfuté pour **ce** besoin ne se repropose pas :
-    # la dépense serait faite deux fois pour la même conclusion.
-    if sector is not None and (
-        candidate.candidate_id, demand.demand_id
-    ) in getattr(sector, "refuted_pairs", ()):
-        measure.rejection_reason = (
-            "aperçu déjà examiné et réfuté pour ce besoin"
-        )
 
     # --- parallaxe : contre les ancres **de ce besoin**, ou rien -------------
     if not anchors:
