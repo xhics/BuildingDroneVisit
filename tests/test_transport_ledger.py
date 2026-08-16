@@ -393,3 +393,95 @@ def test_a_cache_only_miss_is_recorded_with_its_source() -> None:
     assert refusal.source == "essai-refus-inscrit"
     assert refusal.outcome is Outcome.REFUSED
     assert "cache_only" in refusal.error
+
+
+# --- redirections : une opération, plusieurs échanges -------------------------
+
+
+class RedirectingResponse:
+    """Réponse qui renvoie ailleurs, comme un CDN le fait."""
+
+    def __init__(self, location: str, status_code: int = 302):
+        self.status_code = status_code
+        self.headers = {"Location": location}
+
+    def raise_for_status(self):
+        return None
+
+
+def test_a_redirect_counts_as_two_exchanges_for_one_operation(
+    online, monkeypatch
+) -> None:
+    """`allow_redirects=True` cachait le second échange dans `requests`.
+
+    Le budget annoncé décrivait alors des opérations là où le réseau voyait des
+    échanges — et « 8 requêtes » n'était plus vérifiable.
+    """
+    from hotel_pipeline.providers import transport
+
+    calls: list[str] = []
+
+    def fake_head(url, **_kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return RedirectingResponse("https://cdn.exemple.test/image?sig=xyz")
+        return FakeResponse(200, 4096)
+
+    monkeypatch.setattr("requests.head", fake_head)
+
+    response = transport.head(
+        "mapillary", Stage.VOLUME_PROBE, "https://graph.exemple.test/1"
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 2, "deux échanges HTTP ont bien eu lieu"
+
+    row = online.by_source()["mapillary"]
+    assert row["logical_operations"] == 1, "une seule mesure de volume demandée"
+    assert row["redirect_hops"] == 1
+    assert row["attempted"] == 2, "deux échanges inscrits"
+
+    published = online.as_dict()
+    assert published["actual_logical_operations"]["mapillary"] == 1
+    assert published["actual_http_exchanges"]["mapillary"] == 2
+
+
+def test_a_redirect_loop_is_stopped_by_a_closed_maximum(online, monkeypatch) -> None:
+    """Une boucle consommerait le budget sans jamais aboutir."""
+    from hotel_pipeline.providers import transport
+
+    monkeypatch.setattr(
+        "requests.head",
+        lambda url, **_k: RedirectingResponse("https://exemple.test/tourne"),
+    )
+
+    with pytest.raises(NetworkRefused, match="ne converge pas"):
+        transport.head("mapillary", Stage.VOLUME_PROBE, "https://exemple.test/a")
+
+    row = online.by_source()["mapillary"]
+    assert row["attempted"] == transport.MAX_REDIRECTS + 1, (
+        "les sauts tentés sont inscrits, y compris celui qui dépasse"
+    )
+    assert row["logical_operations"] == 1
+
+
+def test_the_redirect_target_never_reaches_the_ledger(online, monkeypatch) -> None:
+    """Un `Location` porte le jeton aussi souvent que l'URL initiale."""
+    from hotel_pipeline.providers import transport
+
+    signee = "https://cdn.exemple.test/img?token=SECRET&key=AUSSI_SECRET"
+    calls: list[str] = []
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        return RedirectingResponse(signee) if len(calls) == 1 else FakeResponse(200)
+
+    monkeypatch.setattr("requests.get", fake_get)
+    transport.get("mapillary", Stage.DOWNLOAD, "https://graph.exemple.test/1")
+
+    assert calls[1] == signee, "la redirection a bien été suivie"
+    published = repr(online.as_dict()) + repr(
+        [a.as_dict() for a in online.attempts]
+    )
+    for secret in ("SECRET", "token=", "cdn.exemple.test", "https://"):
+        assert secret not in published, f"{secret!r} ne doit pas figurer au registre"

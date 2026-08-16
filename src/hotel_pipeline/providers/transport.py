@@ -53,6 +53,12 @@ class NetworkMode(StrEnum):
     FORBIDDEN = "forbidden"
 
 
+#: Sauts de redirection tolérés pour une opération. Fermé : une boucle
+#: `302 → 302 → …` consommerait sinon le budget sans jamais aboutir, et le
+#: registre ne montrerait qu'une opération en cours.
+MAX_REDIRECTS = 5
+
+
 class Stage(StrEnum):
     """À quel étage du travail cet appel appartient."""
 
@@ -101,6 +107,12 @@ class Attempt:
     #: se lisaient comme une seule requête.
     page: int = 1
 
+    #: Rang du saut de redirection, 0 pour la requête initiale. Une opération
+    #: logique peut coûter plusieurs échanges : `allow_redirects=True` les
+    #: cachait dans `requests`, et le budget annoncé comptait des opérations
+    #: là où le réseau voyait des échanges.
+    redirect_hop: int = 0
+
     status_code: int | None = None
 
     #: `Content-Length` **annoncé** par le service. Sur un `HEAD`, aucun octet
@@ -124,6 +136,7 @@ class Attempt:
             "method": self.method,
             "outcome": self.outcome.value,
             "page": self.page,
+            "redirect_hop": self.redirect_hop,
             "status_code": self.status_code,
             "declared_content_length": self.declared_content_length,
             "bytes_written": self.bytes_written,
@@ -162,6 +175,8 @@ class Ledger:
                     "attempted": 0, "succeeded": 0, "http_errors": 0,
                     "network_errors": 0, "cache_hits": 0, "refused": 0,
                     "declared_bytes": 0, "bytes_written": 0, "by_stage": {},
+                    # Une opération logique, plusieurs échanges possibles.
+                    "logical_operations": 0, "redirect_hops": 0,
                 },
             )
             # Une lecture de cache n'est pas une tentative réseau : les compter
@@ -191,6 +206,10 @@ class Ledger:
             if attempt.outcome not in (Outcome.CACHE_HIT, Outcome.REFUSED):
                 stage = row["by_stage"].setdefault(attempt.stage.value, 0)
                 row["by_stage"][attempt.stage.value] = stage + 1
+                if attempt.redirect_hop:
+                    row["redirect_hops"] += 1
+                else:
+                    row["logical_operations"] += 1
             else:
                 served = row.setdefault("cache_by_stage", {})
                 served[attempt.stage.value] = served.get(attempt.stage.value, 0) + 1
@@ -199,9 +218,23 @@ class Ledger:
     def as_dict(self) -> dict:
         by_source = self.by_source()
         return {
+            # Le plafond porte sur des **opérations logiques** : une mesure de
+            # volume, une page d'index. Les échanges HTTP peuvent être plus
+            # nombreux — chaque redirection en est un — et confondre les deux
+            # ferait passer un budget respecté pour un budget dépassé, ou
+            # l'inverse.
+            "planned_logical_operations": self.planned_max_requests,
+            "actual_logical_operations": {
+                source: row["logical_operations"]
+                for source, row in by_source.items()
+            },
+            "actual_http_exchanges": {
+                source: row["attempted"] for source, row in by_source.items()
+            },
             "planned_max_requests": self.planned_max_requests,
             "actual_requests": {
-                source: row["attempted"] for source, row in by_source.items()
+                source: row["logical_operations"]
+                for source, row in by_source.items()
             },
             "by_source": by_source,
             "note": (
@@ -298,6 +331,7 @@ def request(
     page: int = 1,
     request_digest: str | None = None,
     what: str | None = None,
+    redirect_hop: int = 0,
 ):  # noqa: ANN201
     """Émet un appel, en l'inscrivant **avant** de le tenter.
 
@@ -310,7 +344,7 @@ def request(
     attempt = ledger().record(
         Attempt(
             source=source, stage=stage, method=method, page=page,
-            request_digest=request_digest,
+            request_digest=request_digest, redirect_hop=redirect_hop,
         )
     )
     try:
@@ -338,6 +372,42 @@ def request(
     return response
 
 
+def _follow(source, stage, method, url, verb, page, digest, what, kwargs):  # noqa: ANN001
+    """Émet la requête et **suit les redirections une par une**.
+
+    `allow_redirects=True` les suivait dans `requests` : trois échanges
+    partaient, le registre en comptait un, et le budget annoncé décrivait des
+    opérations là où le réseau voyait des échanges.
+
+    L'adresse de destination n'est **pas** conservée : un `Location` porte le
+    jeton aussi souvent que l'URL initiale.
+    """
+    kwargs = dict(kwargs)
+    kwargs["allow_redirects"] = False
+    current = url
+
+    for hop in range(MAX_REDIRECTS + 1):
+        response = request(
+            source, stage, method, lambda: verb(current, **kwargs),
+            page=page, request_digest=digest, what=what, redirect_hop=hop,
+        )
+        status = getattr(response, "status_code", None)
+        location = (getattr(response, "headers", None) or {}).get("Location")
+        if status is None or not (300 <= status < 400) or not location:
+            return response
+
+        # Résolue relativement à la précédente, jamais inscrite au registre.
+        from urllib.parse import urljoin
+
+        current = urljoin(current, location)
+
+    raise NetworkRefused(
+        f"{source} : plus de {MAX_REDIRECTS} redirections — la chaîne ne "
+        "converge pas, et la suivre indéfiniment consommerait le budget sans "
+        "jamais aboutir"
+    )
+
+
 def get(source: str, stage: Stage, url: str, **kwargs):  # noqa: ANN201
     """`GET` inscrit. Le seul chemin autorisé vers `requests.get`.
 
@@ -347,12 +417,10 @@ def get(source: str, stage: Stage, url: str, **kwargs):  # noqa: ANN201
     """
     import requests
 
-    page = kwargs.pop("page", 1)
-    digest = kwargs.pop("request_digest", None)
-    what = kwargs.pop("what", None)
-    return request(
-        source, stage, "GET", lambda: requests.get(url, **kwargs),
-        page=page, request_digest=digest, what=what,
+    return _follow(
+        source, stage, "GET", url, requests.get,
+        kwargs.pop("page", 1), kwargs.pop("request_digest", None),
+        kwargs.pop("what", None), kwargs,
     )
 
 
@@ -360,11 +428,9 @@ def head(source: str, stage: Stage, url: str, **kwargs):  # noqa: ANN201
     """`HEAD` inscrit. Aucun octet n'arrive : seule une longueur est annoncée."""
     import requests
 
-    digest = kwargs.pop("request_digest", None)
-    what = kwargs.pop("what", None)
-    return request(
-        source, stage, "HEAD", lambda: requests.head(url, **kwargs),
-        request_digest=digest, what=what,
+    return _follow(
+        source, stage, "HEAD", url, requests.head,
+        1, kwargs.pop("request_digest", None), kwargs.pop("what", None), kwargs,
     )
 
 

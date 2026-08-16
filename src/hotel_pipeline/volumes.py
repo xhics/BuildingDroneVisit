@@ -129,7 +129,10 @@ def content_length(request) -> int | None:  # noqa: ANN001
 
     response = transport.head(
         request.source, transport.Stage.VOLUME_PROBE, url,
-        timeout=30, allow_redirects=True,
+        # Les redirections sont suivies **par le transport**, saut par saut :
+        # les laisser à `requests` cachait plusieurs échanges derrière une
+        # seule opération inscrite.
+        timeout=30,
         request_digest=getattr(request, "digest", None),
         what="mesure de volume",
     )
