@@ -1,5 +1,11 @@
 # Plan général directeur — WelcomINNS Boucherville
 
+> **Nature du document : destination de la Phase 1.** Ce plan reste normatif
+> pour le périmètre et la définition de DONE, mais il ne décrit plus à lui seul
+> le logiciel courant. Voir `ARCHITECTURE_ACTUELLE.md` pour les contrats
+> réellement implémentés, `ETAT_IMPLEMENTATION.md` pour les Gates courants et
+> `DECISIONS_ARCHITECTURE.md` pour les choix apparus pendant l'implémentation.
+
 ## Phase 1 — Reconstruction d’un environnement 3D inspectable
 
 **Version recadrée selon le document d’accompagnement V3.2**  

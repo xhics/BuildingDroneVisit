@@ -1,5 +1,11 @@
 # Complément d'implémentation — Phase 1 WelcomINNS
 
+> **Nature du document : contraintes d'exécution prévues.** Les commandes,
+> contrats et artefacts courants sont documentés dans
+> `ARCHITECTURE_ACTUELLE.md`. La matrice livré/partiel/absent se trouve dans
+> `ETAT_IMPLEMENTATION.md`. Les exemples historiques ci-dessous ne constituent
+> pas une preuve qu'une étape est aujourd'hui raccordée.
+
 Document **complémentaire** à `PLAN_DIRECTEUR_WELCOMINNS.md` (V3.2, 24 sections). Le plan directeur fait foi sur tout ce qu'il traite : périmètre, architecture fonctionnelle, Gates G0–G5, Router, arborescence `work/<hotel>/`, CLI `hotel-pipeline`, Lots 0–8, définition de DONE.
 
 Ce document ne couvre **que ce que le plan directeur ne traite pas** : contraintes matérielles constatées, exécution concrète sur VM GPU louée, sources géospatiales québécoises précises, qualité de reconstruction, et seuils économiques. En cas de recouvrement, le plan directeur l'emporte sans discussion.

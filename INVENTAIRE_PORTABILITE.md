@@ -1,5 +1,14 @@
 # Inventaire de portabilité — hypothèses à extraire avant le second site
 
+> **Archive de diagnostic.** Ce document décrit l'état du commit `75507d6` et
+> conserve la preuve des hypothèses qui ont motivé les correctifs. Il ne décrit
+> plus l'état courant : territoire et CRS dynamiques, transformations verticales,
+> profils stricts, politique matérialisée et smoke test second site ont depuis
+> été implémentés. Voir `ARCHITECTURE_ACTUELLE.md` et
+> `ETAT_IMPLEMENTATION.md`. Les formulations « repli actuel » ci-dessous doivent
+> donc être lues comme des constats historiques, non comme des défauts encore
+> présents.
+
 Établi en lecture seule sur `75507d6`. Aucune écriture hors ce fichier, aucun appel réseau.
 
 L'objet n'est pas la liste des noms codés en dur : elle est courte et la plupart des occurrences de « WelcomINNS » sont des justifications en commentaire, légitimes. L'objet est la liste des **hypothèses comportementales** — ce que le code tient pour acquis sans le demander, et ce qu'il fait quand la réponse manque.

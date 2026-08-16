@@ -1,5 +1,10 @@
 # Lot 1B — Couverture étendue et vérité visuelle WelcomINNS
 
+> **Nature du document : cible et critères d'acceptation du Lot 1B.** Il ne
+> constitue pas un état d'avancement. Le pipeline réellement implémenté est
+> décrit dans `ARCHITECTURE_ACTUELLE.md`; l'avancement de chacune des huit étapes
+> et les livrables manquants sont tenus dans `ETAT_IMPLEMENTATION.md`.
+
 Document d'exécution consolidé, sans duplication, de tout le travail restant avant le Lot 2.
 
 Il complète `PLAN_DIRECTEUR_WELCOMINNS.md`, qui demeure la référence d'architecture. Le Lot 1B ne lance ni hloc, ni LightGlue, ni pycolmap, ni Brush. Il doit d'abord produire un corpus réellement diversifié, un paquet géospatial déterministe et des limites visibles qui empêchent toute invention ultérieure.
