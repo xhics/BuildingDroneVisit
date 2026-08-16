@@ -228,6 +228,10 @@ def run(
             computed_heading_deg=candidate.computed_heading_deg,
             requested_heading_deg=candidate.requested_heading_deg,
             requested_fov_deg=candidate.requested_fov_deg,
+            # Ce que l'optique **vaut**, à côté de ce qui a servi au cadrage :
+            # un fichier acquis d'un ultra-grand-angle doit le dire.
+            observed_horizontal_fov_deg=candidate.observed_horizontal_fov_deg,
+            projection_support=candidate.projection_support,
             requested_pitch_deg=candidate.requested_pitch_deg,
             sequence_id=candidate.sequence_id,
             panorama_id=candidate.panorama_id,

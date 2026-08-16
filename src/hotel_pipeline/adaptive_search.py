@@ -165,6 +165,12 @@ class CandidateMeasure:
 
     heading_is_measured: bool = False
 
+    #: Ce que le modèle de projection sait faire de cette optique, et pourquoi.
+    #: Une vue dont on **connaît** le champ mais qu'on ne sait pas projeter ne
+    #: se corrige pas comme une vue sans métadonnées.
+    projection_support: str | None = None
+    projection_note: str = ""
+
     #: Hors de la portée de **recommandation automatique**, ce qui n'est pas un
     #: rejet : le candidat reste au manifeste et redevient examinable si rien
     #: de plus proche n'existe.
@@ -215,6 +221,10 @@ class CandidateMeasure:
                 "outside": self.outside_automatic_range,
                 "reason": self.preview_only_reason,
                 "recommended_by_fallback": self.recommended_by_fallback,
+            },
+            "projection": {
+                "support": self.projection_support,
+                "note": self.projection_note,
             },
             "camera_orientation": {
                 "targets_object": self.heading_targets_object,
@@ -438,12 +448,15 @@ def measure_candidate(
     """
     from .visibility import bearing_deg, haversine_m
 
+    support = getattr(candidate, "projection_support", None)
     measure = CandidateMeasure(
         candidate_id=candidate.candidate_id,
         demand_id=demand.demand_id,
         coverage_gap_priority=priority,
         sector_novelty=not anchors,
         heading_is_measured=candidate.heading_is_measured,
+        projection_support=getattr(support, "value", support),
+        projection_note=getattr(candidate, "projection_note", "") or "",
     )
 
     if candidate.camera_lat is None or candidate.camera_lon is None:
@@ -870,6 +883,14 @@ def _unmeasured_requirements(measure, demand) -> list[str]:  # noqa: ANN001
         return []
 
     missing: list[str] = []
+
+    # Le cadrage ne se calcule pas de la même façon selon ce qu'on ignore. Dire
+    # « taille projetée » quand on connaît le champ à 134,2° cacherait la vraie
+    # cause : le modèle, non la donnée.
+    if measure.projection_support in ("unsupported_fov",
+                                      "panoramic_requires_extraction"):
+        return [measure.projection_note or "projection non supportée"]
+
     if getattr(demand, "min_projected_width_fraction", 0.0) > 0:
         missing.append("taille projetée")
     if getattr(demand, "min_visible_fraction", 0.0) > 0:

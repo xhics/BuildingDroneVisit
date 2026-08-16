@@ -474,6 +474,30 @@ def bind_plan(
 # --- candidats ---------------------------------------------------------------
 
 
+class ProjectionSupport(StrEnum):
+    """Ce que le modèle de projection sait faire de cette optique.
+
+    « Inconnu » et « connu mais non supporté » ne se corrigent pas de la même
+    façon : le premier appelle une source de métadonnées, le second une
+    validation du modèle. Les confondre — en mettant `None` partout — perdait
+    l'information la plus utile : on **sait** que ces vues font 134,2°.
+    """
+
+    #: Optique dans le domaine où le cadrage rectiligne a été validé.
+    SUPPORTED = "supported"
+
+    #: Champ observé au-delà de ce que le modèle sait projeter. La vue est
+    #: utilisable, son cadrage n'est pas calculable ainsi.
+    UNSUPPORTED_FOV = "unsupported_fov"
+
+    #: La source ne publie pas de quoi le déduire.
+    UNKNOWN_INTRINSICS = "unknown_intrinsics"
+
+    #: Sphérique : « cadrer » n'a pas de sens avant qu'un cap et une ouverture
+    #: soient choisis.
+    PANORAMIC_REQUIRES_EXTRACTION = "panoramic_requires_extraction"
+
+
 class CaptureCandidate(BaseModel):
     """Une prise de vue possible : métadonnées fournisseur et caméra, rien de plus.
 
@@ -506,7 +530,20 @@ class CaptureCandidate(BaseModel):
     #: Cadrage demandé pour une extraction panoramique : une vue Street View
     #: n'existe qu'au moment où on la cadre.
     requested_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    #: Cadrage **exploitable** : renseigné seulement quand le modèle sait le
+    #: projeter. Le plafond de 120° dit ce que le modèle a validé, non ce que
+    #: l'optique vaut.
     requested_fov_deg: float | None = Field(default=None, gt=0, le=120)
+
+    #: Champ horizontal **observé**, jusqu'à 360°. Une valeur hors du domaine
+    #: supporté reste une mesure : la taire ferait passer un ultra-grand-angle
+    #: pour une caméra sans métadonnées.
+    observed_horizontal_fov_deg: float | None = Field(default=None, gt=0, le=360)
+
+    projection_support: ProjectionSupport = ProjectionSupport.UNKNOWN_INTRINSICS
+
+    #: Pourquoi ce statut, en clair.
+    projection_note: str = ""
     requested_pitch_deg: float | None = Field(default=None, ge=-90, le=90)
 
     sequence_id: str | None = None
@@ -1130,7 +1167,20 @@ class AcquisitionProvenance(BaseModel):
     original_heading_deg: float | None = Field(default=None, ge=0, lt=360)
     computed_heading_deg: float | None = Field(default=None, ge=0, lt=360)
     requested_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    #: Cadrage **exploitable** : renseigné seulement quand le modèle sait le
+    #: projeter. Le plafond de 120° dit ce que le modèle a validé, non ce que
+    #: l'optique vaut.
     requested_fov_deg: float | None = Field(default=None, gt=0, le=120)
+
+    #: Champ horizontal **observé**, jusqu'à 360°. Une valeur hors du domaine
+    #: supporté reste une mesure : la taire ferait passer un ultra-grand-angle
+    #: pour une caméra sans métadonnées.
+    observed_horizontal_fov_deg: float | None = Field(default=None, gt=0, le=360)
+
+    projection_support: ProjectionSupport = ProjectionSupport.UNKNOWN_INTRINSICS
+
+    #: Pourquoi ce statut, en clair.
+    projection_note: str = ""
     requested_pitch_deg: float | None = Field(default=None, ge=-90, le=90)
 
     sequence_id: str | None = None
@@ -1140,6 +1190,10 @@ class AcquisitionProvenance(BaseModel):
     #: `640x640`. Distincte de ce que le plan demandait : inscrire le
     #: vocabulaire du plan décrirait un fichier qui n'est pas celui du disque.
     resolution: str | None = None
+
+    #: Champ horizontal observé de l'optique, et ce que le modèle en fait.
+    observed_horizontal_fov_deg: float | None = Field(default=None, gt=0, le=360)
+    projection_support: ProjectionSupport = ProjectionSupport.UNKNOWN_INTRINSICS
 
     #: Ce que le plan demandait, dans son propre vocabulaire.
     requested_resolution: str | None = None

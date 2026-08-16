@@ -139,8 +139,12 @@ def test_the_report_counts_what_the_candidates_really_carry() -> None:
         fields.update(overrides)
         return CaptureCandidate(**fields)
 
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
     coverage = _contract_coverage([
         candidate("complet", sequence_id="s1", requested_fov_deg=60.9,
+                  observed_horizontal_fov_deg=60.9,
+                  projection_support=ProjectionSupport.SUPPORTED,
                   advertised_width=4000, advertised_height=3000,
                   camera_type="perspective"),
         candidate("nu"),
@@ -150,7 +154,9 @@ def test_the_report_counts_what_the_candidates_really_carry() -> None:
     row = coverage["mapillary"]
     assert row["candidates"] == 3
     assert row["with_sequence"] == 2
-    assert row["with_fov"] == 1
+    assert row["observed_fov"] == 1
+    assert row["projection_supported"] == 1
+    assert row["fov_unknown"] == 2
     assert row["with_dimensions"] == 1
     assert row["with_camera_type"] == 1
 
@@ -185,3 +191,94 @@ def test_a_partial_corpus_does_not_become_the_current_manifest(
     assert latest.name == "candidates_20260101T000000Z.json", (
         "le corpus partiel ne remplace pas le complet, même plus récent"
     )
+
+
+# --- « inconnu » n'est pas « connu mais non supporté » -------------------------
+
+
+def _image(**overrides):
+    from hotel_pipeline.collectors.base import CollectedImage
+
+    fields = dict(
+        source="mapillary", source_id="1", url="http://exemple",
+        lat=45.0, lon=-73.0,
+    )
+    fields.update(overrides)
+    return CollectedImage(**fields)
+
+
+def test_a_wide_angle_keeps_its_measured_field_of_view() -> None:
+    """Les 18 vues du pilote font 134,2° : c'est une mesure, pas une absence.
+
+    Les encoder `None` faisait passer un ultra-grand-angle pour une caméra sans
+    métadonnées — deux situations qui n'appellent pas la même correction.
+    """
+    from hotel_pipeline.discover import candidates_from
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    built = candidates_from("mapillary", [_image(fov_deg=134.24)])[0]
+
+    assert built.observed_horizontal_fov_deg == 134.24, "la mesure est conservée"
+    assert built.requested_fov_deg is None, (
+        "elle ne sert pas au cadrage : le modèle n'est pas validé là"
+    )
+    assert built.projection_support is ProjectionSupport.UNSUPPORTED_FOV
+    assert "134.2" in built.projection_note
+    assert "non validé au-delà de 120" in built.projection_note
+
+
+def test_an_absent_field_of_view_stays_unknown() -> None:
+    """La source ne publie rien : c'est une autre correction qu'appelle ce cas."""
+    from hotel_pipeline.discover import candidates_from
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    built = candidates_from("mapillary", [_image()])[0]
+
+    assert built.observed_horizontal_fov_deg is None
+    assert built.projection_support is ProjectionSupport.UNKNOWN_INTRINSICS
+    assert "ne publie pas" in built.projection_note
+
+
+def test_a_panorama_declares_what_it_needs() -> None:
+    """360° est vrai et inexploitable comme cadrage."""
+    from hotel_pipeline.discover import candidates_from
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    built = candidates_from("mapillary", [_image(fov_deg=360.0)])[0]
+
+    assert built.observed_horizontal_fov_deg == 360.0
+    assert built.requested_fov_deg is None
+    assert built.projection_support is ProjectionSupport.PANORAMIC_REQUIRES_EXTRACTION
+
+
+def test_a_supported_optic_carries_both_values() -> None:
+    from hotel_pipeline.discover import candidates_from
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    built = candidates_from("mapillary", [_image(fov_deg=60.93)])[0]
+
+    assert built.requested_fov_deg == 60.93
+    assert built.observed_horizontal_fov_deg == 60.93
+    assert built.projection_support is ProjectionSupport.SUPPORTED
+
+
+def test_the_coverage_separates_observed_from_supported() -> None:
+    """Le format exigé : quatre comptes, non un seul.
+
+    « FOV observé 195, supporté 177, non supporté 18, inconnu 0 » se lit d'un
+    coup d'œil ; « with_fov 177 » laissait croire à 18 vues sans métadonnées.
+    """
+    from hotel_pipeline.discover import _contract_coverage, candidates_from
+
+    corpus = candidates_from("mapillary", [
+        *[_image(source_id=f"s{i}", fov_deg=60.9) for i in range(3)],
+        *[_image(source_id=f"w{i}", fov_deg=134.24) for i in range(2)],
+        _image(source_id="nu"),
+    ])
+
+    row = _contract_coverage(corpus)["mapillary"]
+
+    assert row["observed_fov"] == 5, "les 134° comptent comme observés"
+    assert row["projection_supported"] == 3
+    assert row["projection_unsupported"] == 2
+    assert row["fov_unknown"] == 1

@@ -681,3 +681,55 @@ def test_a_demand_without_extra_requirements_can_be_fully_eligible() -> None:
 
     assert measure.unmeasured_requirements == []
     assert measure.recommendation_level is RecommendationLevel.FULL_ACQUISITION
+
+
+def test_an_unsupported_optic_is_preview_for_the_right_reason() -> None:
+    """« FOV observé 134,2°, modèle non validé » et non « FOV absent ».
+
+    Les deux mènent à la preview, mais l'un dit qu'il manque une donnée et
+    l'autre qu'il manque un modèle : la correction n'est pas la même.
+    """
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    need = demand("obligation:front", "front", min_projected_width_fraction=0.25)
+    wide = candidate(
+        "c-grand-angle", *at_bearing(0.0), original_heading_deg=180.0,
+        observed_horizontal_fov_deg=134.24,
+        projection_support=ProjectionSupport.UNSUPPORTED_FOV,
+        projection_note="FOV observé 134.2°, modèle non validé au-delà de 120°",
+    )
+    context = sector_context(need.demand_id, 0.0)
+
+    measure = measure_candidate(
+        wide, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=context,
+    )
+    _select([measure], {wide.candidate_id: wide}, need)
+
+    assert measure.recommendation_level is RecommendationLevel.PREVIEW
+    assert measure.unmeasured_requirements == [
+        "FOV observé 134.2°, modèle non validé au-delà de 120°"
+    ]
+    assert "taille projetée" not in measure.recommendation_reason, (
+        "la cause est le modèle, non la donnée manquante"
+    )
+
+
+def test_a_supported_optic_keeps_the_ordinary_requirements() -> None:
+    """Sans quoi la distinction masquerait les exigences réelles du besoin."""
+    from hotel_pipeline.schemas.acquisition import ProjectionSupport
+
+    need = demand("obligation:front", "front", min_projected_width_fraction=0.25)
+    ordinary = candidate(
+        "c-normal", *at_bearing(0.0), original_heading_deg=180.0,
+        requested_fov_deg=60.9, observed_horizontal_fov_deg=60.9,
+        projection_support=ProjectionSupport.SUPPORTED,
+    )
+
+    measure = measure_candidate(
+        ordinary, need, [], 3, target_lat=0.0, target_lon=0.0,
+        policy=SEARCH, sector=sector_context(need.demand_id, 0.0),
+    )
+    _select([measure], {ordinary.candidate_id: ordinary}, need)
+
+    assert measure.unmeasured_requirements == ["taille projetée"]

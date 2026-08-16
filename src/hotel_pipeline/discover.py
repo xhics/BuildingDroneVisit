@@ -159,7 +159,7 @@ def candidates_from(source: str, images: list) -> list[CaptureCandidate]:
                 # Ce que la caméra déclare. Le cadrage exige un cap, un champ
                 # de vision et une largeur : il en manquait deux sur trois.
                 camera_type=getattr(image, "camera_type", None),
-                requested_fov_deg=_declared_fov(image),
+                **_projection_fields(image),
                 advertised_width=getattr(image, "width_px", None),
                 advertised_height=getattr(image, "height_px", None),
                 # Le nécessaire à la reconstruction de l'adresse, et rien qui
@@ -620,24 +620,64 @@ def _declare_stages(published, search, sequences: dict) -> None:  # noqa: ANN001
         )
 
 
-#: Plafond du champ de vision qu'un candidat peut déclarer. Une image
-#: sphérique voit à 360°, ce que le schéma refuse — et à juste titre : « cadrer »
-#: n'a pas de sens avant qu'un cap et une ouverture soient choisis. La vue
-#: reste au manifeste, son cadrage attend l'extraction.
+#: Domaine où le modèle de projection rectiligne a été **validé**. Au-delà, la
+#: vue reste utilisable et son champ reste connu : c'est le cadrage qui n'est
+#: pas calculable ainsi.
 MAX_DECLARABLE_FOV_DEG = 120.0
 
+#: Champ d'une sphérique. Elle voit tout autour, ce qui est vrai et
+#: inexploitable comme cadrage tant qu'aucune vue n'en est extraite.
+PANORAMIC_FOV_DEG = 360.0
 
-def _declared_fov(image) -> float | None:  # noqa: ANN001
-    """Champ de vision utilisable pour juger un cadrage, ou `None`.
 
-    Un panorama complet n'a pas de cadrage tant qu'on n'en a pas extrait une
-    vue : rendre 360° ferait croire à une mesure là où il n'y a qu'une
-    promesse.
+def _projection_fields(image) -> dict:  # noqa: ANN001
+    """Ce que l'optique vaut, et ce que le modèle sait en faire.
+
+    Deux questions distinctes. Mettre `None` partout confondait « la source ne
+    publie rien » et « on sait que cette vue fait 134,2° » : la première appelle
+    une autre source de métadonnées, la seconde une validation du modèle.
     """
+    from .schemas.acquisition import ProjectionSupport
+
     fov = getattr(image, "fov_deg", None)
-    if fov is None or fov <= 0 or fov > MAX_DECLARABLE_FOV_DEG:
-        return None
-    return fov
+
+    if fov is None or fov <= 0:
+        return {
+            "projection_support": ProjectionSupport.UNKNOWN_INTRINSICS,
+            "projection_note": (
+                "la source ne publie pas de quoi déduire le champ de vision"
+            ),
+        }
+
+    if fov >= PANORAMIC_FOV_DEG:
+        return {
+            "observed_horizontal_fov_deg": fov,
+            "projection_support": ProjectionSupport.PANORAMIC_REQUIRES_EXTRACTION,
+            "projection_note": (
+                "vue sphérique : « cadrer » n'a pas de sens avant qu'un cap et "
+                "une ouverture soient choisis"
+            ),
+        }
+
+    if fov > MAX_DECLARABLE_FOV_DEG:
+        # La valeur est **connue** : elle reste publiée, hors du champ qui sert
+        # au cadrage. Le plafond dit ce que le modèle a validé, non ce que
+        # l'optique vaut.
+        return {
+            "observed_horizontal_fov_deg": fov,
+            "projection_support": ProjectionSupport.UNSUPPORTED_FOV,
+            "projection_note": (
+                f"FOV observé {fov:.1f}°, modèle non validé au-delà de "
+                f"{MAX_DECLARABLE_FOV_DEG:.0f}°"
+            ),
+        }
+
+    return {
+        "requested_fov_deg": fov,
+        "observed_horizontal_fov_deg": fov,
+        "projection_support": ProjectionSupport.SUPPORTED,
+        "projection_note": "",
+    }
 
 
 def _contract_coverage(candidates: list) -> dict:
@@ -651,14 +691,35 @@ def _contract_coverage(candidates: list) -> dict:
     for candidate in candidates:
         row = coverage.setdefault(
             candidate.source,
-            {"candidates": 0, "with_sequence": 0, "with_fov": 0,
-             "with_dimensions": 0, "with_camera_type": 0},
+            {
+                "candidates": 0, "with_sequence": 0,
+                # Le champ observé et ce que le modèle en fait sont deux
+                # comptes : les fondre ferait passer un ultra-grand-angle pour
+                # une caméra sans métadonnées.
+                "observed_fov": 0,
+                "projection_supported": 0,
+                "projection_unsupported": 0,
+                "fov_unknown": 0,
+                "panoramic_requires_extraction": 0,
+                "with_dimensions": 0, "with_camera_type": 0,
+            },
         )
         row["candidates"] += 1
         if candidate.sequence_id:
             row["with_sequence"] += 1
-        if candidate.requested_fov_deg:
-            row["with_fov"] += 1
+        if candidate.observed_horizontal_fov_deg:
+            row["observed_fov"] += 1
+
+        support = getattr(candidate, "projection_support", None)
+        support_value = getattr(support, "value", support)
+        if support_value == "supported":
+            row["projection_supported"] += 1
+        elif support_value == "unsupported_fov":
+            row["projection_unsupported"] += 1
+        elif support_value == "panoramic_requires_extraction":
+            row["panoramic_requires_extraction"] += 1
+        else:
+            row["fov_unknown"] += 1
         if candidate.advertised_width and candidate.advertised_height:
             row["with_dimensions"] += 1
         if candidate.camera_type:
