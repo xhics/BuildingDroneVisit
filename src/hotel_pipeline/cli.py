@@ -6667,6 +6667,38 @@ def sources_unavailable(
     typer.echo("  relancez : hotel-pipeline sources registry " + hotel_id)
 
 
+@sources_app.command("queried")
+def sources_queried(
+    hotel_id: str = typer.Argument(...),
+    family_id: str = typer.Argument(..., help="Famille interrogée."),
+    query: str = typer.Option(..., "--query", help="Requête réellement lancée."),
+    returned: int = typer.Option(..., "--returned", help="Nombre de résultats rendus."),
+    evidence: str = typer.Option(..., "--evidence", help="Trace de l'interrogation."),
+    by: str = typer.Option(..., "--by", help="Auteur de la campagne."),
+) -> None:
+    """Consigne qu'une famille a été interrogée hors découverte ciblée.
+
+    Le registre ne lisait que les manifestes de candidats, or seule la
+    découverte ciblée en produit. Un collecteur exécuté directement — Places,
+    site officiel, Commons — ne laissait donc aucune trace, et sa famille
+    restait ouverte alors même qu'elle avait répondu.
+
+    `--returned 0` est admis : une source interrogée qui ne rend rien est close
+    tout de même. C'est l'interrogation qui ferme la campagne, pas la moisson.
+    """
+    from .source_registry import record_campaign
+
+    workspace = Workspace(hotel_id)
+    try:
+        path = record_campaign(workspace, family_id, query, returned, evidence, by)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{OK} campagne consignée : {path}", fg=typer.colors.GREEN)
+    typer.echo(f"  {family_id} — {returned} résultat(s)")
+    typer.echo("  relancez : hotel-pipeline sources registry " + hotel_id)
+
+
 @sources_app.command("reopen")
 def sources_reopen(
     hotel_id: str = typer.Argument(...),

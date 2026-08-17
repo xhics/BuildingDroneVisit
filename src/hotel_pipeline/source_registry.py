@@ -140,11 +140,68 @@ class UnavailabilityReceipt(BaseModel):
         return self
 
 
+#: Reçus de campagne : une famille réellement interrogée hors découverte
+#: ciblée. Le registre ne lisait que les manifestes de candidats, or seule la
+#: découverte ciblée en produit — un collecteur exécuté directement ne laissait
+#: donc aucune trace, et sa famille restait indéfiniment ouverte.
+CAMPAIGN_RECEIPTS = "00_manifest/source_campaigns.json"
+
+
+class CampaignReceipt(BaseModel):
+    """Constat qu'une famille a été interrogée, et ce qu'elle a rendu.
+
+    `returned` peut valoir zéro : une source interrogée qui ne rend rien est
+    close tout de même. C'est l'interrogation qui ferme la campagne, pas la
+    moisson — confondre les deux rouvrirait toute source pauvre.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    family_id: str
+    query: str = Field(min_length=1)
+    returned: int = Field(ge=0)
+    evidence: str = Field(min_length=1)
+    recorded_by: str = Field(min_length=1)
+    recorded_at: str
+
+    @model_validator(mode="after")
+    def _family_is_known(self) -> "CampaignReceipt":
+        if self.family_id not in _FAMILY_IDS:
+            raise ValueError(f"famille inconnue : {self.family_id}")
+        return self
+
+
 def _receipts(workspace) -> list[UnavailabilityReceipt]:  # noqa: ANN001
     raw = workspace.read_json(UNAVAILABILITY_RECEIPTS)
     if raw is None:
         return []
     return [UnavailabilityReceipt.model_validate(row) for row in raw]
+
+
+def _campaigns(workspace) -> list[CampaignReceipt]:  # noqa: ANN001
+    raw = workspace.read_json(CAMPAIGN_RECEIPTS)
+    if raw is None:
+        return []
+    return [CampaignReceipt.model_validate(row) for row in raw]
+
+
+def record_campaign(  # noqa: ANN001
+    workspace, family_id: str, query: str, returned: int, evidence: str, by: str
+) -> Path:
+    """Consigne qu'une famille a été interrogée, sans réécrire les précédents."""
+    receipt = CampaignReceipt(
+        family_id=family_id,
+        query=query,
+        returned=returned,
+        evidence=evidence,
+        recorded_by=by,
+        recorded_at=datetime.now(timezone.utc).isoformat(),
+    )
+    history = _campaigns(workspace)
+    history.append(receipt)
+    return workspace.write_json(
+        CAMPAIGN_RECEIPTS, [row.model_dump(mode="json") for row in history]
+    )
 
 
 def record_unavailable(workspace, family_id: str, reason: str, by: str) -> Path:  # noqa: ANN001
@@ -222,6 +279,8 @@ def build(workspace) -> Path:  # noqa: ANN001
         source for source, count in candidate_counts.items() if count > 0
     }
 
+    campaigns = {row.family_id: row for row in _campaigns(workspace)}
+
     documented = {
         row.family_id for row in _receipts(workspace) if not row.withdrawn
     }
@@ -239,6 +298,16 @@ def build(workspace) -> Path:  # noqa: ANN001
             state = SourceFamilyState.QUERIED_CURRENT
             evidence = [f"01_sources/{candidates_path.name}"]
             reason = "candidats présents dans le manifeste canonique courant"
+        elif family_id in campaigns:
+            # Une interrogation réelle vaut celle de la découverte ciblée : la
+            # trace diffère, le fait est le même.
+            receipt = campaigns[family_id]
+            state = SourceFamilyState.QUERIED_CURRENT
+            evidence = [CAMPAIGN_RECEIPTS, receipt.evidence]
+            reason = (
+                f"famille interrogée : {receipt.returned} résultat(s) pour "
+                f"{receipt.query!r}"
+            )
         elif family_id in documented:
             # Après l'interrogation courante : une famille réellement interrogée
             # ne doit jamais être déclarée indisponible par un reçu périmé.

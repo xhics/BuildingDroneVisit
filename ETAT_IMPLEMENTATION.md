@@ -28,7 +28,7 @@ Statuts :
 | Preuve tirée du corpus | livré | constat, lecture et résolution raccordés ; 0 octet téléchargé |
 | Revue et qualification | livré | décisions et protocoles append-only |
 | Collecte ciblée V2 | partiel | boucle réelle jusqu'à l'aperçu ; expansion Mapillary non raccordée |
-| Registre des sources | livré, campagne incomplète | 2 familles requises sur 15 closes ; aucune absence masquée |
+| Registre des sources | livré, campagne quasi close | 14 familles requises sur 15 ; seule la demande à l'hôtel reste |
 | LiDAR, terrain, toiture | livré | dérivations qualifiées comme inférences |
 | Orthophoto et cadastre | partiel | état de couverture publié ; orthophoto non acquise, cadastre manuel |
 | Orientation des façades | livré | décision à 227,89° propagée et vérifiée indépendamment |
@@ -204,6 +204,62 @@ demeure inconnu.
 ---
 
 ## 5. Blocages prioritaires
+
+### P1 — Campagne de sources : 2/15 → 14/15
+
+Trois voies ont été essayées, et le registre distingue désormais ce qui est
+interrogé, ce qui est indisponible et ce qui attend une décision humaine.
+
+**Ce qui a été interrogé.** Trois collecteurs existaient sans avoir jamais
+tourné. Wikimedia Commons ne demande aucune clé : la géorecherche rend
+**3 images CC BY-SA 4.0** dans un rayon de 500 m — deux du Terminus de
+Mortagne, une de la rue Nobel. Ce sont les premières images du corpus à porter
+une licence explicitement réutilisable, contre 146 assets `public_uncleared`.
+Places et le site officiel ont été rejoués : 10 et 12 résultats, identiques au
+corpus — la campagne est donc complète, non lacunaire.
+
+**Ce qui est indisponible, et pourquoi.** Onze reçus documentent une
+indisponibilité **observée**, jamais un renoncement : TripAdvisor et Flickr ont
+un collecteur mais aucune clé (`provider-check` le confirme) ; Booking, Expedia,
+ICE Portal, Foursquare, Yelp/Apple/Bing, les annuaires, KartaView, Panoramax et
+les réseaux sociaux officiels n'ont ni collecteur ni accès public — pour
+plusieurs, l'accès suppose un contrat commercial ou l'accord de l'exploitant.
+
+**Ce qui reste.** `hotel_project_team` seulement : une demande directe à
+l'hôtel, au dossier municipal ou aux intervenants. Aucun mécanisme ne peut s'y
+substituer, et rien n'a été inventé pour la clore.
+
+Un verrou de registre a dû être levé au passage. Le registre ne lisait que les
+manifestes de candidats comme preuve d'interrogation, or **seule la découverte
+ciblée en produit** : un collecteur exécuté directement ne laissait aucune
+trace, et sa famille restait ouverte alors qu'elle avait répondu.
+`sources queried` consigne cette interrogation, avec sa requête, son nombre de
+résultats et sa trace. `--returned 0` est admis : c'est l'interrogation qui
+ferme la campagne, pas la moisson — confondre les deux rouvrirait toute source
+pauvre. Un manifeste courant continue de primer sur un reçu de campagne.
+
+### P1 — Orthophoto et cadastre : les pistes automatiques sont épuisées
+
+Plutôt que de répéter « acquisition manuelle », les routes plausibles ont été
+sondées. Le résultat est négatif et désormais mesuré :
+
+- **GéoMont 2023**, 20 cm, couvre la Montérégie mais **exclut explicitement le
+  territoire de la CMM** — et Boucherville en relève. Exclusion déjà inscrite au
+  catalogue, vérifiée ;
+- le **portail géospatial du gouvernement** (`geoegl.msp.gouv.qc.ca`) expose
+  140 couches WFS et 6 716 couches WMS : **aucune couche cadastrale**. Les
+  couches `images2024/2025/2026` sont des images **satellitaires** dont
+  l'emprise (-75,09 à -74,02) ne contient pas le site (-73,44) ;
+- **Données Québec** ne publie pas le cadastre : les « unités d'évaluation
+  foncière » existent en GeoJSON, mais par municipalité — Montréal, Rimouski,
+  Rouyn-Noranda. Rien pour Boucherville ;
+- les services **WFS du MERN** hébergeant l'index LiDAR n'exposent aucun index
+  d'imagerie ou d'orthophoto (404 sur les points d'entrée attendus) ;
+- les hôtes **CMM** testés ne résolvent pas ou refusent (403).
+
+Conclusion : `manual_acquisition_required` est exact pour le cadastre, et
+l'orthophoto CMM à 5 m reste la seule couverture déclarée. Ce n'est plus une
+hypothèse du catalogue, c'est un constat.
 
 ### P1 fermé — Gates réseau exécutés, `ACCESS_ROAD_MAIN` toujours ouvert
 

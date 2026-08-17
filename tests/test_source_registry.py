@@ -191,3 +191,71 @@ def test_withdrawing_a_receipt_reopens_the_campaign(tmp_path) -> None:
 
     assert not _family(reopened, "booking").campaign_closed
     assert reopened.closed_families == closed.closed_families - 1
+
+
+# --- reçus de campagne ------------------------------------------------------
+
+
+def test_a_campaign_receipt_closes_a_family_queried_outside_discovery(
+    tmp_path,
+) -> None:
+    """Un collecteur exécuté directement laisse enfin une trace lisible."""
+    from hotel_pipeline.source_registry import build, record_campaign
+
+    workspace = _registry_workspace(tmp_path)
+    before = SourceRegistry.model_validate_json(build(workspace).read_text("utf-8"))
+    assert not _family(before, "wikimedia_commons").campaign_closed
+
+    record_campaign(
+        workspace, "wikimedia_commons",
+        query="geosearch 45.57,-73.44", returned=3,
+        evidence="3 images CC BY-SA", by="op",
+    )
+    after = SourceRegistry.model_validate_json(build(workspace).read_text("utf-8"))
+
+    commons = _family(after, "wikimedia_commons")
+    assert commons.state is SourceFamilyState.QUERIED_CURRENT
+    assert commons.campaign_closed
+    assert "3 résultat(s)" in commons.reason
+
+
+def test_an_empty_campaign_still_closes_the_family(tmp_path) -> None:
+    """C'est l'interrogation qui ferme, pas la moisson."""
+    from hotel_pipeline.source_registry import build, record_campaign
+
+    workspace = _registry_workspace(tmp_path)
+    record_campaign(
+        workspace, "flickr", query="CC autour du site", returned=0,
+        evidence="aucune image sous licence CC dans le rayon", by="op",
+    )
+    registry = SourceRegistry.model_validate_json(build(workspace).read_text("utf-8"))
+
+    flickr = _family(registry, "flickr")
+    assert flickr.campaign_closed
+    assert "0 résultat(s)" in flickr.reason
+
+
+def test_a_campaign_receipt_refuses_an_unknown_family(tmp_path) -> None:
+    from hotel_pipeline.source_registry import record_campaign
+
+    with pytest.raises(ValueError, match="famille inconnue"):
+        record_campaign(
+            _workspace(tmp_path), "source_imaginaire",
+            query="q", returned=1, evidence="e", by="op",
+        )
+
+
+def test_a_current_discovery_outranks_a_campaign_receipt(tmp_path) -> None:
+    """Le manifeste courant reste la preuve la plus forte."""
+    from hotel_pipeline.source_registry import build, record_campaign
+
+    workspace = _registry_workspace(tmp_path)
+    record_campaign(
+        workspace, "mapillary", query="ancienne campagne", returned=1,
+        evidence="trace plus ancienne", by="op",
+    )
+    registry = SourceRegistry.model_validate_json(build(workspace).read_text("utf-8"))
+
+    mapillary = _family(registry, "mapillary")
+    assert mapillary.state is SourceFamilyState.QUERIED_CURRENT
+    assert "manifeste canonique courant" in mapillary.reason

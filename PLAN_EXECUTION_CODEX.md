@@ -94,39 +94,26 @@ une reconstruction photoréaliste.
 
 ### E4 — Fermer la boucle ciblée `ACCESS_ROAD_MAIN`
 
-**État : en cours, brouillon ciblé produit.**
+**État : terminé. Résultat négatif, et c'en est un.**
 
-Travail local déjà effectué :
+Les trois Gates ont été franchis le 17 août 2026, chacun avec son consentement
+propre. Le brouillon `20260817T031056701995Z` a été écarté **sans être mesuré** :
+son `corpus_digest` ne correspondait plus aux entrées courantes.
 
-- découverte ciblée exacte sur un seul besoin ;
-- cache-only, zéro appel réseau ;
-- 17 positions Street View pertinentes au lieu de 1 215 ;
-- un candidat Mapillary recommandé en aperçu, mais distant de 345 m ;
-- aucun candidat sous le seuil automatique de 250 m ;
-- plan brouillon courant `20260817T031056701995Z`, limité au couple
-  `mapillary-817552220025789 / obligation:ACCESS_ROAD_MAIN` ;
-- résolution `thumb_256`, niveau `recommended_for_preview`, volume encore
-  inconnu ; aucun HEAD, GET ou consentement exécuté ;
-- filiation explicite vers
-  `01_sources/targeted/20260817T031050597389Z/candidates_20260817T031050597389Z.json` ;
-  les brouillons antérieurs sont invalidés append-only et leurs fichiers
-  restent intacts. Le plus récent a été retiré pour `stale_corpus` après
-  l'ajout des signatures robustes.
+| Gate | Coût réel | Résultat |
+|---|---|---|
+| G1 redécouverte | **0 appel réseau** — 18 hits de cache | 195 candidats, 40 éligibles, **0 sous 250 m** |
+| G2 mesure | 7 opérations logiques, aucun corps d'image | 134 405 octets, statut `exact` |
+| G3 acquisition | 134 394 octets sur 134 405 consentis | 5/5 fichiers, atomique |
 
-Travail immédiat :
+La vue `ACCESS_ROAD_MAIN` à 640 px montre une voie asphaltée réelle — cases
+numérotées, clôture, lampadaires — mais **le bâtiment cible n'apparaît pas dans
+le cadre**. Panorama contributeur dont l'orientation diffère du cap demandé.
+Verdict **indécis**, deux inconnues nommées. Les quatre vignettes 256 px sont
+réfutées : nuit en mouvement, autoroute, pavillons, hall de concessionnaire.
 
-1. obtenir le Gate pour mesurer le brouillon : deux opérations logiques
-   Mapillary au maximum (résolution de l'URL puis mesure du volume), aucun corps
-   d'image ;
-2. publier le plan mesuré sans reconstruire la sélection ;
-3. soumettre séparément le nombre exact d'octets au consentement ;
-4. acquérir atomiquement l'aperçu seulement après ce consentement ;
-5. soumettre l'aperçu à `PreviewAssessment` ;
-6. republier besoins, couverture et Router seulement si une preuve est établie.
-
-Gate réseau prévisible si le cache ne suffit pas : au plus 17 opérations de
-métadonnées Street View pour ce seul besoin, puis un budget d'image séparé et
-mesuré. Le consentement à l'un ne vaut pas consentement à l'autre.
+Le besoin reste ouvert. Élargir au-delà du corridor résolu serait un **nouveau**
+Gate, à demander explicitement.
 
 ### E5 — Fermer les prérequis non photographiques du Lot 1B
 
@@ -139,12 +126,12 @@ seul besoin porté par le Router :
    territoriale CMM à 5 m ne vaut pas acquisition ;
 2. acquérir manuellement l'extrait cadastral ou conserver explicitement
    `PROPERTY_PARCEL` non résolu avec le Gate externe correspondant ;
-3. terminer ou motiver l'indisponibilité des familles de sources prioritaires ;
-   le registre canonique est publié et établit actuellement que 2 familles
-   requises sur 15 seulement sont closes. Le **mécanisme** de reçu est
-   désormais livré (`sources unavailable` / `sources reopen`, append-only) :
-   ce qui manque n'est plus du code, mais le constat humain famille par
-   famille ;
+3. **quasi fermé** — 14 familles requises sur 15 sont closes. Trois ont été
+   réellement interrogées (Wikimedia Commons sans clé, Places, site officiel),
+   onze portent un reçu d'indisponibilité observée. `sources queried` a dû être
+   ajouté : le registre ne lisait que les manifestes de candidats, et un
+   collecteur exécuté directement ne laissait aucune trace. Reste
+   `hotel_project_team`, qui demande une réponse humaine ;
 4. **fermé** — la déduplication robuste est appliquée aux 335 assets : 30 891
    couples plausibles examinés, aucune fusion robuste sur le corpus réel, et
    régressions recadrage, filigrane et image distincte exécutées par la
@@ -207,7 +194,7 @@ et reprend à la première action locale ou autorisée suivante.
 
 | Exigence normative | État courant | Preuve ou manque |
 |---|---|---|
-| Familles prioritaires interrogées ou indisponibilité motivée | échec mesuré | `source_registry.json` : 2/15 familles requises closes |
+| Familles prioritaires interrogées ou indisponibilité motivée | 14/15 | Commons, Places et site officiel interrogés ; 11 indisponibilités documentées ; reste la demande à l'hôtel |
 | Republications neutralisées | livré | 335/335 ; pHash et hash robuste, 30 891 couples plausibles, trois régressions de production, G1 `passed` |
 | Points de vue indépendants par secteur | livré | 3 points de vue ; besoins et Router les comptent, pas les fichiers |
 | Objets critiques établis sur preuve | livré sauf parcelle | 4 confirmés, 9 inférés, 1 non résolu ; 0 octet téléchargé |
