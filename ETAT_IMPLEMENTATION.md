@@ -52,8 +52,8 @@ l'accès et la campagne de sources — dont aucun n'est un défaut de code.
 
 | Mesure | Valeur |
 |---|---:|
-| Assets | 335 |
-| `context_lock` | 298 |
+| Assets | 338 |
+| `context_lock` | 301 |
 | `photo_geometry` | 15 |
 | `reference_only` | 16 |
 | `identity_evidence` | 5 |
@@ -62,7 +62,7 @@ l'accès et la campagne de sources — dont aucun n'est un défaut de code.
 | Droits `public_uncleared` | 134 |
 | Droits `unknown` | 12 |
 | Assets positionnés | 313 |
-| Fichiers sur disque | 604, pour 123 Mo |
+| Fichiers sur disque | 609, pour 123 Mo |
 | Images ≥ 640 px | 596 |
 | Images ≥ 1920 px | 449 |
 
@@ -103,16 +103,20 @@ savait convertir en preuve. Voir §5, « Preuve tirée du corpus ».
 | Besoins ouverts | 4 |
 | Besoins partiellement couverts | 3 |
 | Constats d'aperçu établis | 9 |
-| Constats réfutés | 9 |
-| Constats indécis | 0 |
+| Constats réfutés | 12 |
+| Constats indécis | 1 |
 | Points de vue indépendants | 3 |
 
 `refuted` qualifie l'élément de preuve, pas le besoin. Un besoin dont tous les
 aperçus sont réfutés reste ouvert.
 
-Les neuf constats réfutés portaient tous sur des vignettes de 256 px : c'est la
-résolution, non le site, qui empêchait de conclure. Les neuf constats établis
+Les douze constats réfutés portent tous sur des vignettes de 256 px : c'est la
+résolution, non le site, qui empêche de conclure. Les neuf constats établis
 portent sur des images de 640 à 2048 px déjà présentes au corpus.
+
+Le constat indécis est la vue `ACCESS_ROAD_MAIN` acquise au Gate G3 : 640 px,
+voie réelle, mais bâtiment cible absent du cadre. Indécis n'est pas réfuté —
+la vue montre quelque chose, sans qu'on puisse le rattacher à l'empreinte.
 
 `ENTRANCE_MAIN_CURRENT`, `PROPERTY_SIGN` et `FACADE_PRIMARY` atteignent
 désormais les deux points de vue exigés. Leur seul manque restant est la
@@ -200,6 +204,46 @@ demeure inconnu.
 ---
 
 ## 5. Blocages prioritaires
+
+### P1 fermé — Gates réseau exécutés, `ACCESS_ROAD_MAIN` toujours ouvert
+
+Les trois Gates ont été franchis dans l'ordre, chacun avec son propre
+consentement. Le résultat est négatif, et c'est un résultat.
+
+| Gate | Coût réel | Résultat |
+|---|---|---|
+| G1 découverte ciblée | **0 appel réseau** — 1 hit cache Mapillary, 17 hits Street View | 195 candidats, 40 éligibles, **0 sous 250 m** |
+| G2 mesure des volumes | 7 opérations logiques, aucun corps d'image | 134 405 octets, statut `exact` |
+| G3 acquisition | 134 394 octets sur 134 405 consentis | 5/5 fichiers, atomique |
+
+G1 n'a rien coûté : le plafond de 25 opérations était planifié, le cache a tout
+servi. Le mode hors ligne strict l'avait refusé plus tôt, mais c'était le mode,
+non l'absence de données.
+
+Le brouillon `20260817T031056701995Z` prévu au plan a été écarté avant toute
+mesure : son `corpus_digest` valait `fbfcfbde8…` quand le corpus courant vaut
+`a3ad184b…`. Le mesurer aurait dépensé des appels sur une sélection faite
+contre un corpus disparu.
+
+**Ce que les cinq fichiers acquis montrent :**
+
+- la vue `ACCESS_ROAD_MAIN` à 640 px — 67 % du volume — montre bien une voie
+  asphaltée à cases numérotées, clôture et lampadaires, mais **le bâtiment
+  cible n'y apparaît pas**. La géométrie annonçait 31,6 % de cible dans le
+  cadre à 30,2 m ; l'image ne le confirme pas. Il s'agit d'un panorama
+  contributeur (© Marc Durand - Panosphere360), dont l'orientation réelle
+  diffère du cap demandé de 133,2°. Verdict : **indécis**, avec deux inconnues
+  nommées — le raccord à l'empreinte, et l'identité de la voie ;
+- les quatre vignettes 256 px sont **réfutées** : une prise de nuit depuis un
+  véhicule en mouvement, une autoroute, des pavillons unifamiliaux, et un hall
+  de concessionnaire automobile.
+
+`ACCESS_ROAD_MAIN` reste donc ouvert, et le Router maintient
+`path_d_hybrid / capture_required`. La demande de capture ne repose plus sur
+une absence de recherche : elle repose sur une recherche menée, mesurée et
+jugée.
+
+Coût cumulé des trois Gates : **0,13 Mo**, contre 123 Mo déjà présents.
 
 ### P0 fermé — Preuve tirée du corpus déjà collecté
 

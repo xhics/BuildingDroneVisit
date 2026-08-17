@@ -227,12 +227,30 @@ définition de DONE. La fermeture ne sera déclarée qu'après résolution des
 
 ## 6. Point de reprise courant
 
-**Reprendre au Gate E4.1 :** mesurer le brouillon ciblé
-`20260817T031056701995Z` si l'opérateur autorise au plus deux opérations
-logiques Mapillary. Cette mesure ne télécharge aucun corps d'image.
+**E4 est terminé.** Les trois Gates ont été franchis le 17 août 2026, chacun
+avec son consentement propre :
 
-Après la mesure, arrêter de nouveau avant le GET et demander un consentement
-portant sur le nombre exact d'octets et sur l'empreinte de la requête. Si
-l'aperçu est ensuite réfuté ou indécis, le besoin reste ouvert et l'étape
-suivante devient le Gate distinct des 17 requêtes de métadonnées Street View ;
-la recherche ne s'élargit jamais implicitement.
+1. **G1** — redécouverte ciblée sur le corpus courant. Le brouillon
+   `20260817T031056701995Z` a été écarté sans être mesuré : son `corpus_digest`
+   ne correspondait plus. Coût réel : **0 appel réseau**, le cache ayant servi
+   les 18 opérations planifiées. Résultat : 195 candidats, 40 éligibles,
+   **0 sous 250 m** — le plus proche à 345 m.
+2. **G2** — mesure des volumes : 7 opérations logiques, aucun corps d'image,
+   **134 405 octets** en statut `exact`.
+3. **G3** — acquisition atomique après consentement au total exact :
+   **134 394 octets sur 134 405**, 5/5 fichiers.
+
+**Résultat : `ACCESS_ROAD_MAIN` reste ouvert.** La vue à 640 px montre une voie
+asphaltée réelle, mais sans le bâtiment cible dans le cadre — verdict
+**indécis**, avec deux inconnues nommées. Les quatre vignettes 256 px sont
+réfutées : nuit en mouvement, autoroute, pavillons, hall de concessionnaire.
+
+Le Router maintient `path_d_hybrid / capture_required`. La demande de capture
+ne repose plus sur une absence de recherche, mais sur une recherche menée,
+mesurée et jugée.
+
+**Point de reprise courant :** aucun Gate réseau ne reste utile pour ce besoin.
+Élargir la recherche au-delà du corridor résolu serait un nouveau Gate, à
+demander explicitement — la recherche ne s'élargit jamais implicitement. Les
+prochains blocages sont non photographiques : orthophoto, cadastre, et la
+campagne de sources.

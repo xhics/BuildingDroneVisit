@@ -11,8 +11,8 @@ exploitables comme proxies qualifiés ; leur apparence ne l'est pas.
 
 ## Couverture
 
-- 335 assets, dont 15 porteurs de géométrie ;
-- 269 photographies uniques et 209 points de vue au rapport de déduplication courant ;
+- 338 assets, dont 15 porteurs de géométrie ;
+- 272 photographies uniques et 210 points de vue au rapport de déduplication courant ;
 - 3 points de vue indépendants ;
 - besoins satisfaits : 0, partiels : 3, ouverts : 4 ;
 - capture complémentaire : `obligation:ACCESS_ROAD_MAIN` seulement, depuis son corridor résolu et avec aperçu préalable ;
