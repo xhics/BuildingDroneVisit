@@ -87,6 +87,25 @@ filigrane et image distincte avec l'algorithme de production. G1 est `passed`.
 Les 146 droits non clarifiés bornent l'usage des images mais ne sont pas
 présentés comme la cause du manque de couverture.
 
+## Champs visuels morts
+
+La caméra doit éviter ce qui n'a jamais été photographié. Le paquet distingue
+donc deux interdits que l'ancienne contrainte unique confondait :
+
+- `do_not_show_as_fact` → **PROPERTY_PARCEL** seulement : existence non établie,
+  rien n'en est affirmé ;
+- `avoid_framing_no_observed_appearance` → **DRIVEWAY_MAIN,
+  ENTRANCE_MAIN_CURRENT, PARKING_HOTEL, PARK_AND_RIDE, PROPERTY_SIGN** : objets
+  réels, établis sur preuve, mais dont aucune apparence n'a été mesurée.
+
+Chaque pose de l'orbite virtuelle déclare la façade qu'elle cadre, déduite du
+cap `227,89°`, et un drapeau `blind_field`. **9 poses sur 12 tombent sur un
+champ visuel mort** : seul l'arc 210°–270°, face à `FACADE_PRIMARY`, s'appuie
+sur une apparence observée.
+
+Les poses aveugles restent dans le chemin : les retirer masquerait la lacune au
+lieu de la déclarer.
+
 ## Export hybride post-Router
 
 Un paquet provider-agnostic est publié sous `08_composite/` : volume OBJ proxy,

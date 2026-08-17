@@ -51,6 +51,33 @@ def _json(path: Path) -> dict:
     return json.loads(path.read_text("utf-8"))
 
 
+def _zones_of(constraints: dict, rule: str) -> list[str]:
+    """Objets nommés par une règle de contrainte caméra."""
+    zones: set[str] = set()
+    for row in constraints.get("constraints", []):
+        if row.get("rule") != rule:
+            continue
+        zones.update(
+            part for part in str(row.get("zone_ref", "")).split(",") if part
+        )
+    return sorted(zones)
+
+
+def _forbidden_claims(constraints: dict) -> list[str]:
+    """Ce dont rien ne peut être affirmé : l'existence même manque."""
+    return _zones_of(constraints, "do_not_show_as_fact")
+
+
+def _blind_visual_fields(constraints: dict) -> list[str]:
+    """Objets réels que rien n'a photographiés — la caméra les contourne.
+
+    Distincts des revendications interdites : ils existent, et les taire
+    reviendrait à nier une preuve. C'est leur **apparence** qui manque, donc
+    leur cadrage qui doit être évité.
+    """
+    return _zones_of(constraints, "avoid_framing_no_observed_appearance")
+
+
 def _active_artifact(site, role: str):  # noqa: ANN001, ANN201
     found = [row for row in site.artifacts if row.is_active and row.role == role]
     if len(found) != 1:
@@ -151,8 +178,40 @@ def _extruded_obj(polygon: Polygon, ground_z: float, roof_z: float) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _camera_path(polygon: Polygon, height_m: float, fov_deg: float) -> VirtualCameraPath:
-    """Orbite virtuelle de cadrage, jamais une trajectoire de capture terrain."""
+#: Façade regardée depuis une position, selon son écart au cap de façade.
+#: L'observateur au sud-ouest d'un bâtiment orienté 227,89° voit la façade
+#: principale ; à l'opposé, l'arrière.
+_FACADE_BY_OFFSET = (
+    (45.0, "FACADE_PRIMARY"),
+    (135.0, "FACADE_LEFT"),
+    (225.0, "FACADE_REAR"),
+    (315.0, "FACADE_RIGHT"),
+)
+
+
+def _facade_faced(azimuth_deg: float, front_azimuth_deg: float) -> str:
+    """Façade cadrée par une pose placée à cet azimut autour de l'emprise."""
+    offset = (azimuth_deg - front_azimuth_deg) % 360.0
+    for limit, kind in _FACADE_BY_OFFSET:
+        if offset < limit:
+            return kind
+    return "FACADE_PRIMARY"
+
+
+def _camera_path(  # noqa: PLR0913
+    polygon: Polygon,
+    height_m: float,
+    fov_deg: float,
+    front_azimuth_deg: float | None = None,
+    observed_appearance: frozenset[str] = frozenset(),
+) -> VirtualCameraPath:
+    """Orbite virtuelle de cadrage, jamais une trajectoire de capture terrain.
+
+    Chaque pose déclare la façade qu'elle regarde et si cette surface est un
+    **champ visuel mort** — une géométrie dont aucune apparence n'a été
+    observée. Les poses aveugles restent dans le chemin : les retirer
+    masquerait la lacune au lieu de la déclarer.
+    """
     radius_xy = max(
         math.hypot(x - polygon.centroid.x, y - polygon.centroid.y)
         for x, y in polygon.exterior.coords
@@ -164,8 +223,17 @@ def _camera_path(polygon: Polygon, height_m: float, fov_deg: float) -> VirtualCa
     elevation = 18.0
     camera_z = look_z + radius * math.tan(math.radians(elevation))
     poses = []
+    aveugles = 0
     for index, azimuth in enumerate(range(0, 360, 30)):
         angle = math.radians(azimuth)
+        faces = (
+            _facade_faced(float(azimuth), front_azimuth_deg)
+            if front_azimuth_deg is not None else None
+        )
+        # Sans orientation connue, aucune pose n'est déclarée aveugle : on ne
+        # sait pas ce qu'elle regarde, et l'affirmer serait une invention.
+        blind = bool(faces) and faces not in observed_appearance
+        aveugles += int(blind)
         poses.append(
             CameraPose(
                 frame=index * 60,
@@ -179,15 +247,23 @@ def _camera_path(polygon: Polygon, height_m: float, fov_deg: float) -> VirtualCa
                 elevation_deg=elevation,
                 distance_m=round(radius, 4),
                 fov_horizontal_deg=fov_deg,
+                faces=faces,
+                blind_field=blind,
             )
+        )
+    derivation = (
+        "12 poses à 30°, rayon = 1.2 × rayon d'emprise / tan(FOV/2); "
+        "orbite virtuelle uniquement, sans affirmation d'accès physique"
+    )
+    if front_azimuth_deg is not None:
+        derivation += (
+            f"; façade cadrée déduite du cap {front_azimuth_deg:.2f}°, "
+            f"{aveugles}/{len(poses)} pose(s) sur un champ visuel mort"
         )
     return VirtualCameraPath(
         path_id="virtual-context-orbit-v1",
         simulation_only=True,
-        derivation=(
-            "12 poses à 30°, rayon = 1.2 × rayon d'emprise / tan(FOV/2); "
-            "orbite virtuelle uniquement, sans affirmation d'accès physique"
-        ),
+        derivation=derivation,
         poses=poses,
     )
 
@@ -392,7 +468,20 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         json.dumps(constraints, indent=2, ensure_ascii=False) + "\n",
     )
 
-    path = _camera_path(polygon, float(height_m), float(context.policy.collection.image_fov_deg))
+    # Ce que la carte de confiance déclare réellement observé : une façade sans
+    # apparence mesurée reste une forme, et son cadrage un champ visuel mort.
+    observed = frozenset(
+        feature["properties"]["kind"]
+        for feature in confidence.get("features", [])
+        if feature.get("properties", {}).get("appearance_coverage") in ("partial", "full")
+    )
+    path = _camera_path(
+        polygon,
+        float(height_m),
+        float(context.policy.collection.image_fov_deg),
+        front_azimuth_deg=getattr(spatial, "front_azimuth_deg", None),
+        observed_appearance=observed,
+    )
     _write_atomic(
         folder / "camera_path.json",
         json.dumps(path.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n",
@@ -408,9 +497,25 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             "utiliser uniquement les trajectoires virtuelles marquées simulation_only",
         ],
         "negative_constraints": [
-            "ne pas inventer l'entrée actuelle, le stationnement, l'enseigne ou la parcelle",
+            # Deux interdits distincts : ce dont l'existence manque, et ce qui
+            # existe sans apparence observée. Les confondre ferait taire une
+            # preuve ou, à l'inverse, autoriser une texture inventée.
+            (
+                "ne rien affirmer de : "
+                + ", ".join(_forbidden_claims(constraints))
+                + " — existence non établie"
+            ),
+            (
+                "ne pas texturer ni cadrer en gros plan : "
+                + ", ".join(_blind_visual_fields(constraints))
+                + " — objets réels dont aucune apparence n'a été observée"
+            ),
             "ne pas produire de gros plan sur les façades proxy ou les lacunes de toiture",
+            "privilégier les poses dont blind_field vaut false dans camera_path.json",
             "ne pas présenter ce paquet comme un relevé ou une reconstruction photo-réaliste",
+        ],
+        "blind_field_poses": [
+            pose.frame for pose in path.poses if pose.blind_field
         ],
     }
     _write_atomic(
@@ -595,14 +700,11 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         files=files,
         camera_paths=[path],
         rights_summary={str(key): int(value) for key, value in rights.items()},
-        forbidden_claims=[
-            "ENTRANCE_MAIN_CURRENT",
-            "PARKING_HOTEL",
-            "PARK_AND_RIDE",
-            "PROPERTY_PARCEL",
-            "PROPERTY_SIGN",
-            "DRIVEWAY_MAIN",
-        ],
+        # Lus des contraintes publiées, jamais figés : une liste en dur
+        # continuait d'interdire des objets depuis établis, et taisait donc une
+        # preuve au lieu de protéger contre une invention.
+        forbidden_claims=_forbidden_claims(constraints),
+        blind_visual_fields=_blind_visual_fields(constraints),
         limitations=[
             "volume de façade proxy sans texture de production",
             "toiture LiDAR observée à 96.9 %, lacunes conservées dans le raster",

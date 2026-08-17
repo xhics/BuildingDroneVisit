@@ -205,6 +205,48 @@ demeure inconnu.
 
 ## 5. Blocages prioritaires
 
+### P0 fermé — Les champs visuels morts sont nommés, la caméra les évite
+
+Décision d'exploitation : on avance avec le corpus disponible, et la caméra
+contourne ce qui n'a jamais été photographié. Cela demandait une distinction
+que le paquet ne savait pas faire.
+
+`unresolved-claims` mêlait deux interdits opposés. Après les résolutions du
+jour, il interdisait encore d'affirmer `ENTRANCE_MAIN_CURRENT`,
+`PROPERTY_SIGN`, `DRIVEWAY_MAIN` et `PARK_AND_RIDE` — objets désormais
+**confirmés**. Interdire ce qui est prouvé ne protège de rien : cela tait une
+preuve. La cause était structurelle : la règle réunissait `unresolved` et
+`known_not_targetable`, or ce second état signifie « existe, sans contour
+utilisable », pas « n'existe pas ».
+
+Deux règles distinctes remplacent l'unique :
+
+| Règle | Objets | Sens |
+|---|---|---|
+| `do_not_show_as_fact` | `PROPERTY_PARCEL` | existence non établie — ne rien affirmer |
+| `avoid_framing_no_observed_appearance` | entrée, enseigne, allée, stationnements | objets **réels** dont aucune apparence n'a été observée |
+
+Le paquet de scène s'aligne. `forbidden_claims` était une liste **en dur** dans
+le code : elle est désormais lue des contraintes publiées, donc elle suit l'état
+réel du site. Un champ `blind_visual_fields` la complète.
+
+Surtout, l'orbite virtuelle n'était pas aveugle au sens propre : elle ignorait
+ce que chaque pose regardait. Chaque pose déclare maintenant la façade cadrée —
+déduite du cap de façade `227,89°` — et un drapeau `blind_field` quand cette
+surface n'a aucune apparence mesurée. Sur le pilote :
+
+**9 poses sur 12 tombent sur un champ visuel mort.** Seul l'arc 210°–270°,
+face à `FACADE_PRIMARY`, s'appuie sur une apparence observée.
+
+Les poses aveugles **restent dans le chemin**. Les retirer masquerait la lacune
+au lieu de la déclarer, et un consommateur ne saurait plus qu'un secteur entier
+n'a jamais été photographié. Le contrat de prompts nomme les frames concernées
+et demande de privilégier les poses `blind_field: false`.
+
+Ce résultat concorde avec le terrain : les secteurs arrière donnent sur une rue
+résidentielle d'où l'hôtel n'est pas visible, et `ACCESS_ROAD_MAIN` est une
+allée privée réservée aux clients.
+
 ### P1 fermé — OpenStreetMap comme source complémentaire
 
 Le corpus photographique n'était pas la seule source disponible. OSM porte des

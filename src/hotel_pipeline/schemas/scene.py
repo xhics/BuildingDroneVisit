@@ -91,6 +91,15 @@ class CameraPose(BaseModel):
     distance_m: float = Field(gt=0)
     fov_horizontal_deg: float = Field(gt=0, le=120)
 
+    #: Ce que la pose regarde, quand c'est connu — `FACADE_PRIMARY`…
+    faces: str | None = None
+
+    #: Vrai quand la pose cadre une surface dont **aucune apparence n'a été
+    #: observée**. La pose reste dans le chemin : la retirer masquerait la
+    #: lacune au lieu de la déclarer, et un consommateur ne saurait plus
+    #: qu'un secteur entier n'a jamais été photographié.
+    blind_field: bool = False
+
 
 class VirtualCameraPath(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -128,7 +137,14 @@ class ScenePackage(BaseModel):
     files: list[PackageFile] = Field(min_length=1)
     camera_paths: list[VirtualCameraPath] = Field(min_length=1)
     rights_summary: dict[str, int]
+    #: Objets dont l'existence même n'est pas établie : rien n'en est affirmé.
     forbidden_claims: list[str]
+
+    #: Champs visuels morts : objets réels que **rien n'a photographiés**. Les
+    #: taire nierait une preuve ; les cadrer montrerait une forme sans texture
+    #: observée. La caméra les contourne, le rapport les nomme.
+    blind_visual_fields: list[str] = Field(default_factory=list)
+
     limitations: list[str] = Field(min_length=1)
     video_generation: dict
 

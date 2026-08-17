@@ -216,3 +216,74 @@ def test_cli_expose_scene_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert result.exit_code == 0
     assert "paquet 3D hybride publié" in result.stdout
     assert "NEEDS_AUTHORIZED_CAPTURE" in result.stdout
+
+
+# --- champs visuels morts ---------------------------------------------------
+
+
+def test_a_pose_facing_an_unobserved_facade_is_declared_blind() -> None:
+    """Le cadrage d'une géométrie sans apparence mesurée est déclaré, non retiré."""
+    from shapely.geometry import Polygon as _P
+
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = _P([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(
+        square, height_m=10.0, fov_deg=80.0,
+        front_azimuth_deg=0.0,
+        observed_appearance=frozenset({"FACADE_PRIMARY"}),
+    )
+
+    faces = {pose.azimuth_deg: (pose.faces, pose.blind_field) for pose in path.poses}
+    # Au cap de façade, l'observateur voit la façade principale : elle est vue.
+    assert faces[0.0] == ("FACADE_PRIMARY", False)
+    # À l'opposé, l'arrière — jamais photographié ici.
+    assert faces[180.0] == ("FACADE_REAR", True)
+    # Aucune pose n'est supprimée : la lacune se déclare, elle ne se masque pas.
+    assert len(path.poses) == 12
+
+
+def test_without_a_known_orientation_no_pose_claims_a_facade() -> None:
+    """Ignorer ce qu'une pose regarde interdit d'affirmer qu'elle est aveugle."""
+    from shapely.geometry import Polygon as _P
+
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = _P([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(square, height_m=10.0, fov_deg=80.0)
+
+    assert all(pose.faces is None for pose in path.poses)
+    assert not any(pose.blind_field for pose in path.poses)
+
+
+def test_the_derivation_counts_the_blind_poses() -> None:
+    from shapely.geometry import Polygon as _P
+
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = _P([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(
+        square, height_m=10.0, fov_deg=80.0, front_azimuth_deg=227.89,
+        observed_appearance=frozenset({"FACADE_PRIMARY"}),
+    )
+
+    assert "champ visuel mort" in path.derivation
+    blind = sum(pose.blind_field for pose in path.poses)
+    assert f"{blind}/12" in path.derivation
+
+
+def test_forbidden_claims_and_blind_fields_come_from_the_constraints() -> None:
+    """Une liste en dur interdisait des objets depuis établis."""
+    from hotel_pipeline.scene_package import _blind_visual_fields, _forbidden_claims
+
+    constraints = {"constraints": [
+        {"rule": "do_not_show_as_fact", "zone_ref": "PROPERTY_PARCEL"},
+        {"rule": "avoid_framing_no_observed_appearance",
+         "zone_ref": "ENTRANCE_MAIN_CURRENT,PROPERTY_SIGN"},
+        {"rule": "avoid_close_up", "zone_ref": "BUILDING_MAIN"},
+    ]}
+
+    assert _forbidden_claims(constraints) == ["PROPERTY_PARCEL"]
+    assert _blind_visual_fields(constraints) == [
+        "ENTRANCE_MAIN_CURRENT", "PROPERTY_SIGN",
+    ]

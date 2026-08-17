@@ -13,6 +13,8 @@ from typer.testing import CliRunner
 from hotel_pipeline.cli import app
 from hotel_pipeline.geo.catalog import CoverageState, SOURCES
 from hotel_pipeline.lot1b_coverage import (
+    _blind_field_kinds,
+    _positionless_kinds,
     AcquisitionState,
     CameraConstraint,
     CameraConstraintsManifest,
@@ -86,7 +88,7 @@ def test_projected_facade_is_serialised_as_wgs84_not_metres() -> None:
     assert 45 < geographic.bounds[1] < 46
 
 
-def test_no_claims_exclude_qualified_proxies_and_resolved_capture_geometry() -> None:
+def _standing_fixture():
     router = {
         "site": {"by_standing": {
             "known_not_targetable": ["ACCESS_ROAD_MAIN", "PROPERTY_SIGN", "ROOFLINE_MAIN"],
@@ -100,8 +102,49 @@ def test_no_claims_exclude_qualified_proxies_and_resolved_capture_geometry() -> 
         feature_id="ACCESS_ROAD_MAIN",
         resolution_status=GeometryResolutionStatus.RESOLVED,
     )])
+    return router, geometry
 
-    assert _no_claim_kinds(router, geometry) == ["PROPERTY_PARCEL", "PROPERTY_SIGN"]
+
+def _site_with(states: dict):
+    from hotel_pipeline.schemas.enums import ObjectState
+
+    return SimpleNamespace(objects=[
+        SimpleNamespace(kind=kind, state=ObjectState(state))
+        for kind, state in states.items()
+    ])
+
+
+def test_positionless_kinds_exclude_qualified_proxies_and_resolved_geometry() -> None:
+    router, geometry = _standing_fixture()
+
+    assert _positionless_kinds(router, geometry) == ["PROPERTY_PARCEL", "PROPERTY_SIGN"]
+
+
+def test_no_claim_keeps_only_what_is_not_established() -> None:
+    """Un objet établi sans contour n'est pas un objet dont on ne peut rien dire."""
+    router, geometry = _standing_fixture()
+    site = _site_with({"PROPERTY_SIGN": "confirmed"})
+
+    assert _no_claim_kinds(router, geometry, site) == ["PROPERTY_PARCEL"]
+
+
+def test_a_blind_visual_field_is_established_but_never_photographed() -> None:
+    """L'enseigne existe et se contourne ; la parcelle ne s'affirme pas."""
+    router, geometry = _standing_fixture()
+    site = _site_with({"PROPERTY_SIGN": "confirmed"})
+
+    assert _blind_field_kinds(router, geometry, site) == ["PROPERTY_SIGN"]
+
+
+def test_an_unestablished_object_is_never_a_blind_field() -> None:
+    """On ne contourne pas ce dont l'existence même manque : on le tait."""
+    router, geometry = _standing_fixture()
+    site = _site_with({})
+
+    assert _blind_field_kinds(router, geometry, site) == []
+    assert _no_claim_kinds(router, geometry, site) == [
+        "PROPERTY_PARCEL", "PROPERTY_SIGN",
+    ]
 
 
 def test_camera_constraint_is_closed_and_carries_evidence() -> None:

@@ -346,7 +346,7 @@ def _rechecks(site) -> list[ObjectRecheck]:  # noqa: ANN001
     return rows
 
 
-def _no_claim_kinds(router: dict, geometry) -> list[str]:  # noqa: ANN001
+def _positionless_kinds(router: dict, geometry) -> list[str]:  # noqa: ANN001
     """Objets sans position utilisable, sans condamner les proxies mesurés."""
     known_without_site_wkt = set(
         router["site"]["by_standing"].get("known_not_targetable", [])
@@ -364,6 +364,35 @@ def _no_claim_kinds(router: dict, geometry) -> list[str]:  # noqa: ANN001
         if item.resolution_status is GeometryResolutionStatus.RESOLVED
     }
     return sorted((unresolved | known_without_site_wkt) - proxy_objects - resolved_features)
+
+
+def _no_claim_kinds(router: dict, geometry, site) -> list[str]:  # noqa: ANN001
+    """Objets dont **rien** ne peut être affirmé : l'existence même manque.
+
+    Distinct de `_blind_field_kinds` : un objet établi par la photographie mais
+    dépourvu de contour existe, et l'interdire d'affirmation reviendrait à taire
+    une preuve. Seul un objet non résolu tombe ici.
+    """
+    established = {
+        obj.kind for obj in site.objects
+        if obj.state in (ObjectState.CONFIRMED, ObjectState.INFERRED)
+    }
+    return sorted(set(_positionless_kinds(router, geometry)) - established)
+
+
+def _blind_field_kinds(router: dict, geometry, site) -> list[str]:  # noqa: ANN001
+    """Objets réels que **rien n'a photographiés** : les champs visuels morts.
+
+    Leur existence est établie, leur apparence ne l'est pas. Une caméra qui les
+    cadre montrerait une forme sans texture observée — ce qui se lit comme une
+    reconstruction alors que ce n'en est pas une. Ils se contournent, ils ne se
+    nient pas.
+    """
+    established = {
+        obj.kind for obj in site.objects
+        if obj.state in (ObjectState.CONFIRMED, ObjectState.INFERRED)
+    }
+    return sorted(set(_positionless_kinds(router, geometry)) & established)
 
 
 def _completion_findings(
@@ -560,7 +589,8 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         (set(demands["open"]) | set(demands["partial"]))
         - set(router.get("appearance_gaps") or [])
     )
-    no_claim_kinds = _no_claim_kinds(router, geometry)
+    no_claim_kinds = _no_claim_kinds(router, geometry, site)
+    blind_field_kinds = _blind_field_kinds(router, geometry, site)
 
     context_manifest = ContextManifest(
         hotel_id=workspace.hotel_id,
@@ -602,15 +632,34 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             rationale=roof_proxy.get("note") or "la toiture qualifiée conserve des lacunes",
             evidence_refs=[roof_proxy.get("qualification_report") or "06_geo/qualification_report"],
         ),
-        CameraConstraint(
+    ]
+    if no_claim_kinds:
+        constraints.append(CameraConstraint(
             constraint_id="unresolved-claims",
             zone_ref=",".join(no_claim_kinds),
             rule="do_not_show_as_fact",
             severity=ConstraintSeverity.HARD,
             rationale="existence, association, état courant ou géométrie non établis",
             evidence_refs=["00_manifest/site_manifest.json"],
-        ),
-    ]
+        ))
+    if blind_field_kinds:
+        # Champs visuels morts : l'objet existe et sa position est connue, mais
+        # aucune photographie n'en donne l'apparence. Le cadrer produirait une
+        # forme sans texture observée, qui se lirait comme une reconstruction.
+        constraints.append(CameraConstraint(
+            constraint_id="blind-visual-fields",
+            zone_ref=",".join(blind_field_kinds),
+            rule="avoid_framing_no_observed_appearance",
+            severity=ConstraintSeverity.HARD,
+            rationale=(
+                "existence établie, apparence jamais observée : cadrer ces "
+                "objets montrerait une forme sans texture mesurée"
+            ),
+            evidence_refs=[
+                "00_manifest/site_manifest.json",
+                "01_sources/preview_assessments.json",
+            ],
+        ))
     constraints.extend(
         CameraConstraint(
             constraint_id=f"capture-{demand_id.split(':', 1)[-1].lower()}",
