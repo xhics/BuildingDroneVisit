@@ -19,6 +19,7 @@ log = get_logger("steps")
 #: Ordre des étapes de la Phase 1 (plan directeur §18).
 STEP_ORDER: tuple[str, ...] = (
     "collect",
+    "lot1b",
     "preflight",
     "reconstruct",
     "align",
@@ -63,6 +64,11 @@ STEPS: dict[str, Step] = {
         "collect",
         "Lot 1 puis Lot 4",
         "Résolution de propriété, collecte, droits et manifeste d'assets.",
+    ),
+    "lot1b": Step(
+        "lot1b",
+        "Lot 1B",
+        "Registre des sources, couverture finale et paquet hybride.",
     ),
     "preflight": Step(
         "preflight", "Lot 2 puis Lot 4", "Cascade G0 à G5, du comptage au SfM sparse réel."
@@ -273,6 +279,74 @@ def _gather(workspace, project, spatial: SpatialManifest, context) -> None:  # n
     log.info("collecte : %s", summarise(manifest))
 
 
+def _lot1b(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
+    """Registre des sources, couverture finale et paquet hybride (Lot 1B).
+
+    Appelle les **mêmes** fonctions que `sources registry`, `coverage build` et
+    `scene build`. Aucune collecte et aucune péremption ne sont réécrites ici :
+    une troisième variante aurait divergé des deux existantes en silence, et le
+    Router aurait jugé un corpus que personne d'autre ne sait reproduire.
+
+    La décision du Router n'est pas rejouée : elle dépend de besoins arrêtés et
+    d'une évaluation humaine. L'étape s'arrête si elle manque, plutôt que de
+    publier une route sur des entrées qu'elle aurait fabriquées elle-même.
+    """
+    from .lot1b_coverage import build as build_coverage
+    from .scene_package import build as build_scene
+    from .source_registry import SourceRegistry
+    from .source_registry import build as build_registry
+
+    # Un prérequis absent est un arrêt propre, jamais une trace brute : la
+    # traversée doit nommer l'étape qui manque, pas échouer sur son absence.
+    try:
+        registry_path = build_registry(workspace)
+    except FileNotFoundError as exc:
+        raise StepBlocked(
+            "lot1b",
+            f"corpus incomplet pour le registre des sources : {exc}",
+            "hotel-pipeline collect <hotel>, puis les découvertes ciblées",
+        ) from exc
+    registry = SourceRegistry.model_validate_json(registry_path.read_text("utf-8"))
+    log.info(
+        "registre des sources : %d/%d famille(s) requise(s) close(s)",
+        registry.closed_families,
+        registry.required_families,
+    )
+
+    # Le Router lit une décision arrêtée ; sans elle, la couverture ne peut pas
+    # citer de route et le paquet n'aurait pas de verdict à porter.
+    if not list(workspace.path("10_validation").glob("router_decision_*.json")):
+        raise StepBlocked(
+            "lot1b",
+            "aucune décision de Router publiée — la couverture citerait une "
+            "route inexistante",
+            "hotel-pipeline router decide <hotel>",
+        )
+
+    try:
+        outputs = build_coverage(workspace)
+        log.info("couverture Lot 1B publiée : %s", ", ".join(sorted(outputs)))
+        scene = build_scene(workspace)
+        log.info("paquet hybride publié : %s", ", ".join(sorted(scene)))
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        raise StepBlocked(
+            "lot1b",
+            f"livrables Lot 1B non productibles : {exc}",
+            "compléter les vérités amont : geo resolve, visibility apply, "
+            "demands assess, router decide",
+        ) from exc
+
+    if not registry.closure_complete:
+        raise StepBlocked(
+            "lot1b",
+            f"campagne de sources incomplète — {registry.closed_families}/"
+            f"{registry.required_families} famille(s) requise(s) close(s)",
+            "interroger la famille, ou publier un reçu d'indisponibilité : "
+            "hotel-pipeline sources unavailable <hotel> <famille> --reason <motif> "
+            "--by <auteur>",
+        )
+
+
 def _fetch_elements(spatial: SpatialManifest) -> list[dict]:
     """Réinterroge Overpass pour conserver les éléments bruts.
 
@@ -291,6 +365,10 @@ def run_step(name: str, workspace) -> None:  # noqa: ANN001
     """Exécute une étape."""
     if name == "collect":
         _collect(workspace)
+        return
+
+    if name == "lot1b":
+        _lot1b(workspace)
         return
 
     step = STEPS[name]

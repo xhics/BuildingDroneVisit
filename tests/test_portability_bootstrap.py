@@ -92,6 +92,10 @@ PILOT_POLICY_DIGESTS = {
         "avec hard_max_distance_m — une contrainte qu'un repli contourne n'en "
         "est pas une : le repli proposait une vue à 1,7 km"
     ),
+    "b22753407fec0eb7": (
+        "politique 1.4.0 — hash robuste aux recadrages activé, cinq régions "
+        "concordantes et comparaison limitée aux republications plausibles"
+    ),
 }
 
 

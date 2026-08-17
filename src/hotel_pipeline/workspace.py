@@ -33,6 +33,7 @@ SUBDIRS: tuple[str, ...] = (
     "08_composite",
     "09_confidence",
     "10_validation",
+    "coverage",
 )
 
 MANIFEST_NAME = "project_manifest.json"
@@ -107,6 +108,13 @@ class Workspace:
         target = self.root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         _atomic_write(target, json.dumps(payload, indent=2, ensure_ascii=False))
+        return target
+
+    def write_text(self, relative: str, text: str) -> Path:
+        """Publie un texte par le même passage atomique que les manifestes."""
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(target, text.rstrip("\n"))
         return target
 
     def write_report(

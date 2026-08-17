@@ -444,6 +444,10 @@ class Asset(BaseModel):
     acquisition: "AcquisitionProvenance | None" = None
 
     phash: str | None = None
+    #: Signature multi-segments utilisée uniquement pour comparer des
+    #: republications plausibles. Elle résiste à un recadrage ou un filigrane,
+    #: mais ne doit jamais rapprocher toutes les vues consécutives d'une rue.
+    crop_resistant_hash: str | None = None
     quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @property

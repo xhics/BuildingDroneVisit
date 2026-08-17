@@ -60,6 +60,11 @@ class InvalidationReason(StrEnum):
     #: pose plus.
     STALE_DEMANDS = "stale_demands"
 
+    #: Le corpus d'assets a changé depuis la sélection. Même si les besoins
+    #: sont identiques, les doublons, points de vue ou preuves disponibles ne
+    #: sont plus ceux que le plan a jugés.
+    STALE_CORPUS = "stale_corpus"
+
     #: Décision humaine, motivée dans le champ libre qui l'accompagne.
     OPERATOR_DECISION = "operator_decision"
 

@@ -179,6 +179,91 @@ def test_only_the_planned_acquisitions_are_probed(tmp_path, monkeypatch) -> None
     assert len(probed) == 2, f"22 candidats au manifeste, 2 mesurés — obtenu {probed}"
 
 
+def test_a_targeted_plan_reloads_its_exact_candidate_manifest(
+    tmp_path, monkeypatch
+) -> None:
+    """Une découverte ciblée ne vit pas dans le glob du manifeste global.
+
+    Relire ``_latest_candidates`` ici confronterait le plan au mauvais corpus
+    juste avant la dépense. La référence persistée doit gagner.
+    """
+    runner, workspace = _project(tmp_path, monkeypatch)
+    path = _write_plan(workspace, [_candidate("targeted")])
+
+    global_path = workspace.path("01_sources/candidates_20260101T000000Z.json")
+    targeted_path = workspace.path(
+        "01_sources/targeted/20260101T010000Z/candidates_20260101T010000Z.json"
+    )
+    targeted_path.parent.mkdir(parents=True)
+    global_path.replace(targeted_path)
+
+    from hotel_pipeline.provenance import digest_of
+    from hotel_pipeline.schemas.acquisition import CandidateManifest
+
+    targeted_payload = json.loads(targeted_path.read_text("utf-8"))
+    plan_payload = json.loads(path.read_text("utf-8"))
+    plan_payload["candidate_manifest_ref"] = str(
+        targeted_path.relative_to(workspace.root)
+    )
+    plan_payload["candidate_manifest_digest"] = digest_of(targeted_payload)
+    path.write_text(json.dumps(plan_payload), encoding="utf-8")
+
+    # Le manifeste global courant parle volontairement d'un autre candidat.
+    workspace.write_json(
+        "01_sources/candidates_20260102T000000Z.json",
+        json.loads(
+            CandidateManifest(hotel_id="essai", candidates=[_candidate("wrong")])
+            .model_dump_json()
+        ),
+    )
+
+    probed: list[str] = []
+    monkeypatch.setattr(
+        "hotel_pipeline.volumes.content_length",
+        lambda request: probed.append(request.candidate_id) or 1024,
+    )
+    result = runner.invoke(
+        app, ["assets", "measure-plan", "essai", "--plan", str(path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert probed == ["targeted"]
+
+
+def test_a_changed_targeted_manifest_is_refused_before_measurement(
+    tmp_path, monkeypatch
+) -> None:
+    runner, workspace = _project(tmp_path, monkeypatch)
+    path = _write_plan(workspace, [_candidate("targeted")])
+    candidate_path = workspace.path("01_sources/candidates_20260101T000000Z.json")
+
+    from hotel_pipeline.provenance import digest_of
+
+    original = json.loads(candidate_path.read_text("utf-8"))
+    plan_payload = json.loads(path.read_text("utf-8"))
+    plan_payload["candidate_manifest_ref"] = str(
+        candidate_path.relative_to(workspace.root)
+    )
+    plan_payload["candidate_manifest_digest"] = digest_of(original)
+    path.write_text(json.dumps(plan_payload), encoding="utf-8")
+
+    original["candidates"][0]["provider_id"] = "changed-after-plan"
+    candidate_path.write_text(json.dumps(original), encoding="utf-8")
+    probed: list[str] = []
+    monkeypatch.setattr(
+        "hotel_pipeline.volumes.content_length",
+        lambda request: probed.append(request.candidate_id) or 1024,
+    )
+
+    result = runner.invoke(
+        app, ["assets", "measure-plan", "essai", "--plan", str(path)]
+    )
+
+    assert result.exit_code == 2
+    assert "empreinte du manifeste de candidats divergente" in result.output
+    assert probed == []
+
+
 # --- ce qui est refusé avant tout appel ---------------------------------------
 
 

@@ -180,13 +180,24 @@ class TestMediaLocks:
         assert asset.temporal_decisions[0].scope == "entrance"
         assert asset.temporal_by_scope["entrance"].value == "current_confirmed"
 
-    def test_phase1_then_stops_on_preflight(self, confirmed, tmp_path):
-        """Une fois collect franchi, l'arrêt suivant est l'étape non construite."""
+    def test_phase1_then_stops_on_lot1b(self, confirmed, tmp_path):
+        """Une fois collect franchi, l'arrêt suivant est le Lot 1B.
+
+        Sur un corpus minimal, le registre des sources n'a aucun manifeste
+        canonique de candidats à lire : c'est un arrêt documenté, pas une
+        trace brute, et il précède l'étape non construite.
+        """
         path = csv_at(tmp_path, "img-1,hotel,owned,facade,exterior,after_renovation\n")
         runner.invoke(app, ["assets", "import", confirmed, path])
         runner.invoke(app, ["assets", "promote", confirmed, "img-1"])
 
         result = runner.invoke(app, ["run-phase1", confirmed])
+        assert result.exit_code == EXIT_BLOCKED
+        assert "corpus incomplet" in result.stdout
+
+    def test_preflight_remains_the_unbuilt_boundary(self, confirmed):
+        """L'étape non construite reste `preflight`, au Lot 2."""
+        result = runner.invoke(app, ["preflight", confirmed])
         assert result.exit_code == EXIT_NOT_IMPLEMENTED
         assert "preflight" in result.stdout
         assert "Lot 2" in result.stdout

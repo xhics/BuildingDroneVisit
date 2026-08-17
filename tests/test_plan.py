@@ -469,13 +469,28 @@ def test_consenting_to_an_unknown_volume_is_refused(project) -> None:
     assert "n'a pas été montré" in result.output
 
 
-def test_a_draft_names_the_exact_command_that_would_execute_it(project) -> None:
+def test_candidate_manifest_reference_cannot_escape_the_workspace() -> None:
+    from pydantic import ValidationError
+
+    from hotel_pipeline.schemas.acquisition import AcquisitionPlan
+
+    with pytest.raises(ValidationError, match="confiné sous 01_sources"):
+        AcquisitionPlan(
+            plan_id="p",
+            hotel_id="hotel-test",
+            candidate_manifest_ref="01_sources/../outside/candidates_x.json",
+        )
+
+
+def test_a_draft_names_the_exact_command_that_would_measure_it(project) -> None:
     from hotel_pipeline.cli import app
 
     runner, _, _ = project
     result = runner.invoke(app, ["assets", "plan", "hotel-test"])
 
-    assert "--consent-bytes" in result.output
+    assert "assets measure-plan hotel-test" in result.output
+    assert "--plan" in result.output
+    assert "--consent-bytes" not in result.output
 
 
 # --- le raccord CLI : la nouvelle logique s'exécute réellement ----------------

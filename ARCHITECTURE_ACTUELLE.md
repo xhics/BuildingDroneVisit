@@ -2,7 +2,7 @@
 
 **État vérifié :** 16 août 2026  
 **Périmètre :** pipeline générique et pilote WelcomINNS Boucherville  
-**Jalon stable observé :** `2977969`
+**Jalon stable observé :** `49b5f0f` + livrables de couverture en cours de validation
 
 Ce document décrit le système réellement implémenté. Il complète les documents
 de destination suivants sans les remplacer :
@@ -183,13 +183,18 @@ CRS, empreinte et statut.
 La chaîne distingue :
 
 1. fichier exact par checksum ;
-2. photographie republiée par pHash ;
+2. photographie republiée par pHash et hash robuste aux recadrages ;
 3. point de vue par position, panorama ou séquence ;
 4. recouvrement utile au sein d'une grappe.
 
 Les membres ne sont pas supprimés. Un canonique est choisi et les autres
-restent auditables. L'embedding robuste aux recadrages et filigranes n'est pas
-encore implémenté.
+restent auditables. Le détecteur robuste compare uniquement des republications
+plausibles — familles différentes, ou médias sans position — afin de ne pas
+fusionner deux frames voisines d'une même séquence routière. La politique 1.4.0
+fixe un minimum de cinq régions concordantes. La commande de production exécute
+trois régressions : recadrage reconnu, filigrane reconnu et image distincte
+rejetée. Sa preuve porte une empreinte fermée des seules entrées de
+déduplication : une application de visibilité ne la périme donc pas.
 
 ### 6.2 Trois questions indépendantes
 
@@ -301,6 +306,36 @@ acquisition multiple publie tous ses fichiers ou aucun.
 
 Un aperçu réfuté ne ferme pas le besoin et ne doit pas être racheté pour le
 même couple lors de la recherche suivante.
+
+### 7.5 Découverte bornée à un besoin
+
+`assets discover --demand <demand_id>` réutilise la chaîne de découverte
+canonique avec un `DiscoveryScope` explicite ; ce n'est pas un second pipeline.
+Le besoin est validé avant interrogation, seuls ses couples sont évalués et la
+sortie vit sous `01_sources/targeted/<run_id>/`, hors du manifeste global
+choisi par `_latest_candidates`. Un plan ciblé doit nommer cet artefact exact et
+ne peut pas mélanger plusieurs portées.
+
+Pour `ACCESS_ROAD_MAIN`, la portée cite aussi le corridor résolu. Le passage
+`cache_only` courant relit 195 candidats Mapillary, ne trouve aucun panorama
+Street View dans le cache pour les 17 positions du corridor, et recommande un
+seul aperçu Mapillary à 345 m. Le plan exact reste un brouillon : une conclusion
+métier exige d'abord la mesure bornée de cet aperçu, puis son examen humain.
+
+### 7.6 Registre des familles de sources
+
+`hotel-pipeline sources registry <hotel_id>` ne collecte rien. Il confronte le
+catalogue normatif des familles du Lot 1B aux assets et au manifeste de
+candidats courants. Chaque famille est `queried_current`,
+`evidence_present`, `unavailable_documented`, `pending_manual`,
+`not_implemented` ou `not_evidenced`. Seules une interrogation courante ou une
+indisponibilité documentée ferment une famille requise ; la simple présence
+d'anciens assets ne suffit pas.
+
+Le registre est publié sous `00_manifest/source_registry.json` et son empreinte
+entre dans la couverture canonique. Sur le pilote, il mesure 2 familles
+requises closes sur 15. Ce nombre est un constat d'incomplétude, jamais une
+invitation à lancer implicitement les treize autres sources.
 
 ---
 
@@ -455,6 +490,64 @@ appellent une résolution, non une caméra.
 
 Les étapes SfM, reconstruction, alignement, composite et validation finale
 restent hors de l'état courant.
+
+### 10.1 Rapport de couverture et contexte
+
+Le Router choisit une route ; il ne remplace pas la carte qui borne le rendu.
+La commande suivante consomme la décision courante et les manifestes qui la
+fondent, sans muter le site ni les assets :
+
+```bash
+hotel-pipeline coverage build <hotel_id>
+```
+
+Elle publie sous `work/<hotel_id>/coverage/` :
+
+- `context_manifest.json` : ancres de contexte, sources géospatiales et
+  réexamen des objets indéterminés ;
+- `camera_constraints.json` : plans rapprochés interdits, zones sans fait
+  établi et besoins autorisés à la capture ;
+- `coverage_report.json` : synthèse canonique des besoins, droits, visibilité,
+  proxies, sources et blocages ;
+- `zone_confidence.geojson` : géométries WGS84 et niveaux de confiance, avec
+  `geometry: null` pour les objets indéterminés plutôt qu'une forme inventée ;
+- `capture_brief.md` : produit seulement comme consigne de capture bornée par
+  la décision courante.
+
+Couverture et acquisition restent deux axes. Pour le pilote, l'orthophoto CMM
+2023 est couverte par déclaration territoriale du diffuseur, mais non acquise
+et limitée au contexte à 5 m. Le cadastre est
+`manual_acquisition_required` : Infolot est une consultation/extraction, pas
+une géométrie déjà acquise par le pipeline. Aucun de ces deux états ne promeut
+`PROPERTY_PARCEL`.
+
+Les droits sont publiés séparément : les neuf porteurs de géométrie ont des
+droits de production, tandis que les 146 assets `public_uncleared` ou `unknown`
+ne peuvent pas devenir textures de production par simple présence au corpus.
+
+### 10.2 Paquet 3D provider-agnostic
+
+`hotel-pipeline scene build <hotel_id>` consomme uniquement la décision Router,
+les manifestes courants et les artefacts géospatiaux actifs. La commande ne
+lance ni SfM ni fournisseur vidéo. Elle publie un paquet adressé par contenu
+sous `08_composite/scene_package_<digest>/` et un pointeur canonique
+`scene_package_current.json`.
+
+Le paquet sépare trois classes de preuve : `measured`, `inferred` et `proxy`.
+Pour le pilote, la surface de toiture LiDAR est mesurée, le terrain et le nDSM
+sont des inférences qualifiées, et le volume de façade est un proxy extrudé.
+Les rasters sont copiés avec leurs empreintes, CRS horizontal et datum vertical.
+
+La trajectoire est une caméra **virtuelle de simulation**. Son rayon est dérivé
+de l'emprise et du FOV matérialisé dans la politique ; elle ne constitue jamais
+une autorisation de capturer depuis ces positions. Les contraintes du Lot 1B et
+les zones sans claim établi voyagent dans le même paquet que le mesh.
+
+Le verdict Phase 1 est un contrat distinct. Il refuse structurellement
+`ENVIRONMENT_3D_READY` si un gate est échoué ou non vérifié, si une raison de
+blocage subsiste ou si l'approbation humaine manque. Le verdict courant est
+`NEEDS_AUTHORIZED_CAPTURE` : produire un OBJ lisible ne remplace ni une
+reconstruction SfM ni la vérité sur l'entrée et le stationnement.
 
 ---
 

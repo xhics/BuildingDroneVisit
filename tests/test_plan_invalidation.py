@@ -19,6 +19,10 @@ from hotel_pipeline.plan_invalidation import (
 )
 
 MOTIF = InvalidationReason.PRE_RESOLVED_ACQUISITION_REQUEST_CONTRACT
+
+
+def test_le_motif_corpus_perime_est_structure() -> None:
+    assert InvalidationReason("stale_corpus") is InvalidationReason.STALE_CORPUS
 POURQUOI = "produit avant que la résolution planifiée n'atteigne la requête"
 
 

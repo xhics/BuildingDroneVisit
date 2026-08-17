@@ -1,7 +1,7 @@
 # État d'implémentation — BuildingDroneVisit
 
-**Photographie vérifiée :** 16 août 2026  
-**Jalon stable observé :** `2977969`
+**Photographie vérifiée :** 17 août 2026
+**Jalon stable observé :** `49b5f0f` + livrables locaux non commités en validation
 **Pilote :** WelcomINNS Boucherville
 
 Ce document répond à la question « qu'est-ce qui fonctionne réellement
@@ -27,17 +27,19 @@ Statuts :
 | Vérité du site | partiel | structure solide, cinq objets encore non résolus |
 | Revue et qualification | livré | décisions et protocoles append-only |
 | Collecte ciblée V2 | partiel | boucle réelle jusqu'à l'aperçu ; expansion Mapillary non raccordée |
+| Registre des sources | livré, campagne incomplète | 2 familles requises sur 15 closes ; aucune absence masquée |
 | LiDAR, terrain, toiture | livré | dérivations qualifiées comme inférences |
-| Orthophoto et cadastre | partiel | catalogue présent, acquisition absente |
+| Orthophoto et cadastre | partiel | état de couverture publié ; orthophoto non acquise, cadastre manuel |
 | Orientation des façades | livré | décision à 227,89° propagée et vérifiée indépendamment |
-| Contexte et contraintes caméra | absent | livrables finaux Lot 1B non produits |
-| Router | absent | enum seulement, aucune décision exécutable |
+| Contexte et contraintes caméra | livré | manifestes canoniques produits sous `coverage/` |
+| Router | livré pour B/D | décision Path D publiée ; Path A/C restent hors contrat |
+| Paquet 3D provider-agnostic | livré comme proxy | OBJ, rasters, orbite virtuelle, prompts et verdict Phase 1 |
 | SfM et reconstruction | hors lot courant | Lot 2 non commencé |
-| Orchestrateur Phase 1 | partiel | seules les sous-commandes modernes sont réelles |
+| Orchestrateur Phase 1 | livré pour le Lot 1B | étape `lot1b` déléguant aux contrats modernes |
 
 **Conclusion :** les mécanismes du Lot 1B sont avancés, mais sa définition de
 DONE n'est pas atteinte. Les tests verts ne compensent pas l'absence de vérité
-sur l'entrée, le stationnement, la parcelle et la couverture finale.
+sur l'entrée, le stationnement et la parcelle, ni la preuve photo de l'accès.
 
 ---
 
@@ -48,10 +50,11 @@ sur l'entrée, le stationnement, la parcelle et la couverture finale.
 | Mesure | Valeur |
 |---|---:|
 | Assets | 335 |
-| `context_lock` | 295 |
+| `context_lock` | 304 |
 | `photo_geometry` | 9 |
-| `reference_only` | 28 |
-| `identity_evidence` | 3 |
+| `reference_only` | 16 |
+| `identity_evidence` | 5 |
+| `reject` | 1 |
 | Droits `open_data` | 189 |
 | Droits `public_uncleared` | 134 |
 | Droits `unknown` | 12 |
@@ -103,15 +106,14 @@ aperçus sont réfutés reste ouvert.
 | nDSM | environ 96,9 % valide |
 | Hauteur médiane | environ 10,26 m |
 | Qualification | `inferred`, confiance moyenne, provisoire |
-| Dernier run historique | 307 assets, désormais périmé |
-| Productions de visibilité périmées | 20 rapports, runs et applications |
-| Run courant après orientation | à recalculer |
+| Run courant | 313 assets évalués, appliqué et empreint |
+| Visibilité | 219 clear, 50 partial, 44 at_risk, 0 blocked |
+| Corridors | 129, dont 100 utiles et 29 inconnus |
 
-Les anciens nombres de visibilité restent auditables, mais ne sont plus un état
-courant : leurs secteurs dépendaient de l'azimut rétracté. Lors du prochain
-run, « dégagé » signifiera seulement qu'une direction vers l'empreinte n'est
-pas masquée en plan ; cela n'établira toujours ni l'identité, ni le cadrage, ni
-l'utilité géométrique.
+Les anciens nombres de visibilité restent auditables, mais le run appliqué
+ci-dessus est le seul courant. « Dégagé » signifie seulement qu'une direction
+vers l'empreinte n'est pas masquée en plan ; cela n'établit ni l'identité, ni le
+cadrage, ni l'utilité géométrique.
 
 ---
 
@@ -137,23 +139,24 @@ stationnement soient confirmés par des preuves enregistrées.
 | Étape du plan | État | Ce qui manque pour fermer |
 |---|---|---|
 | 1. Structure de vérité | livré | aucun raccord critique connu |
-| 2. Déduplication | partiel | embedding recadrage/filigrane |
+| 2. Déduplication | livré | 335/335 courants, 269 photos, 209 points de vue ; hash robuste appliqué et régressions recadrage/filigrane/distincte passées |
 | 3. Catégorisation | livré | élargir la validation à plusieurs sites |
-| 4. Street View multi-position | livré | requalifier après nouvelle orientation |
-| 5. Sources photographiques | partiel | expansion Mapillary et familles prioritaires non raccordées |
-| 6. LiDAR/orthophoto | partiel | orthophoto et cadastre absents |
-| 7. Contexte et couverture | partiel | manifeste de contexte et contraintes caméra |
-| 8. Capture complémentaire | absent | dépend du Router et du rapport de couverture |
+| 4. Street View multi-position | livré | visibilité recalculée et appliquée après orientation |
+| 5. Sources photographiques | partiel | registre canonique : 2/15 familles requises closes |
+| 6. LiDAR/orthophoto | partiel | orthophoto CMM couverte mais non acquise ; cadastre manuel |
+| 7. Contexte et couverture | livré | rapports canoniques produits, cinq objets restent non résolus |
+| 8. Capture complémentaire | en cours | besoin ACCESS_ROAD_MAIN ciblé ; brouillon `20260817T031056701995Z`, passage réseau non engagé |
 
-### Livrables finaux encore absents
+### Livrables finaux produits
 
 - `coverage/coverage_report.json` canonique ;
 - `coverage/zone_confidence.geojson` ;
 - `coverage/camera_constraints.json` ;
 - `coverage/context_manifest.json` ;
 - `coverage/capture_brief.md`, si nécessaire ;
-- `LOT_1B_REPORT.md` ;
-- `router_decision.json`.
+- `work/<hotel>/LOT_1B_REPORT.md` et la synthèse pilote `LOT_1B_REPORT.md` ;
+- décision Router versionnée sous `10_validation/`.
+- `00_manifest/source_registry.json`, avec état, preuve et motif par famille.
 
 ---
 
@@ -181,7 +184,7 @@ Le raccord est livré dans les derniers commits : un couple asset/besoin réfut�
 est retiré avant la mesure et ne consomme plus le budget. La découverte courante
 à 916 candidats confirme qu'aucun des neuf couples réfutés n'a été reproposé.
 
-### P1 — Implémenter le Router
+### P1 fermé — Router
 
 Entrées minimales :
 
@@ -192,40 +195,96 @@ Entrées minimales :
 - droits ;
 - possibilité de capture complémentaire.
 
-Sortie : une décision versionnée et motivée, jamais une conclusion reconstruite
-à la main depuis plusieurs rapports.
+Sortie courante : `PATH_D_HYBRID / CAPTURE_REQUIRED`. Les façades sont couvertes
+par les proxies qualifiés ; `ACCESS_ROAD_MAIN`, ciblable mais sans preuve photo
+ni proxy routier, porte seul la demande de capture.
 
-### P1 — Fermer contexte, orthophoto et cadastre
+### P1 partiel — Contexte, orthophoto et cadastre
 
-Sans ces éléments, le système sait mesurer le volume mais pas encore verrouiller
-proprement la parcelle et tout l'environnement visible.
+Le contexte et les contraintes caméra sont publiés. L'orthophoto CMM 2023 est
+déclarée couverte pour le territoire à 5 m et reste non acquise : elle verrouille
+le contexte, jamais le toit ou la parcelle. Infolot demande une acquisition
+manuelle ; `PROPERTY_PARCEL` reste donc `unresolved`.
 
-### P2 — Remplacer l'orchestrateur historique
+### P2 fermé — Orchestrateur raccordé aux contrats modernes
 
-`run-phase1` doit appeler les mêmes contrats que les sous-commandes modernes.
-Il ne doit pas créer une troisième variante de collecte ou de péremption.
+`run-phase1` traverse désormais une étape `lot1b`, placée entre `collect` et
+`preflight`. Elle appelle les **mêmes** fonctions que `sources registry`,
+`coverage build` et `scene build` : aucune collecte ni péremption n'est
+réécrite, et aucune troisième variante n'a été introduite.
+
+La décision du Router n'est jamais rejouée par l'étape : elle est lue. Sans
+décision publiée, la traversée s'arrête plutôt que de citer une route
+inexistante. Un prérequis absent produit un arrêt documenté, pas une trace
+brute.
+
+Sur le corpus pilote, la traversée republie les livrables canoniques puis
+s'arrête sur le gate réel : campagne de sources incomplète, 2/15 familles
+requises closes. Le verdict et la route restent inchangés.
+
+### P2 bis — Reçus d'indisponibilité de sources
+
+L'état `unavailable_documented` existait au contrat sans qu'aucun chemin ne
+puisse le produire : une famille sans collecteur restait indéfiniment ouverte.
+Deux commandes append-only comblent ce vide :
+
+```bash
+hotel-pipeline sources unavailable <hotel> <famille> --reason <motif> --by <auteur>
+hotel-pipeline sources reopen <hotel> <famille> --reason <motif> --by <auteur>
+```
+
+Un reçu documente une indisponibilité **observée**. Une interrogation courante
+prime toujours sur un reçu périmé, afin qu'un constat ancien ne masque jamais
+une preuve réelle. Le retrait conserve l'historique.
+
+Émettre les reçus reste une décision humaine : le mécanisme est livré, la
+campagne n'est pas close pour autant.
 
 ---
 
-## 6. Phase 1 après le Lot 1B
+## 6. Verdict Phase 1 et paquet hybride
 
-Les éléments suivants restent volontairement hors du lot courant :
+La commande locale suivante produit un paquet adressé par les empreintes de
+ses entrées :
+
+```bash
+hotel-pipeline scene build welcominns-boucherville
+```
+
+Le pointeur canonique est
+`08_composite/scene_package_current.json`. Le paquet courant contient :
+
+- un volume OBJ extrudé depuis l'empreinte confirmée, classé `proxy` ;
+- les rasters actifs DTM, DSM de toiture et nDSM, relus par SHA-256 ;
+- 12 poses d'une orbite **virtuelle** dérivée du FOV de la politique ;
+- les contraintes caméra, la carte de confiance et les claims interdits ;
+- un contrat de prompts sans appel à un fournisseur vidéo réel ;
+- un script d'import Blender et un verdict Phase 1 typé.
+
+Ce résultat ne vaut pas reconstruction photo-réaliste. Le verdict courant est
+`NEEDS_AUTHORIZED_CAPTURE`, pour quatre raisons prouvées : entrée et
+stationnement non établis, un seul point de vue indépendant, aucune mesure SfM
+et aucune approbation humaine finale.
+
+## 7. Phase 1 restant à exécuter
+
+Les éléments suivants restent non exécutés :
 
 - hloc et LightGlue ;
 - pycolmap et rapport G5 ;
 - reconstruction photo-first ou hybride ;
 - Brush ou autre représentation 3D ;
-- alignement et composite ;
+- alignement SfM et composite photoréaliste ;
 - carte de confiance finale ;
 - validation `ENVIRONMENT_3D_READY`.
 
-Les répertoires `03_preflight`, `04_masks`, `05_colmap`, `07_reconstruction`,
-`08_composite`, `09_confidence` et `10_validation` ne contiennent encore aucun
-livrable de production.
+`08_composite` contient désormais un paquet hybride/proxy inspectable. Les
+répertoires `05_colmap` et `07_reconstruction` ne portent toujours aucun
+résultat SfM ou Brush ; cette absence est un gate, pas un détail d'affichage.
 
 ---
 
-## 7. Dette documentaire fermée par les documents actuels
+## 8. Dette documentaire fermée par les documents actuels
 
 Avant cette photographie, les plans ne décrivaient pas les mécanismes pourtant
 implémentés suivants :
@@ -247,7 +306,7 @@ Ils sont désormais décrits dans `ARCHITECTURE_ACTUELLE.md` et justifiés dans
 
 ---
 
-## 8. Vérification standard
+## 9. Vérification standard
 
 La validation technique à rejouer avant de déplacer un Gate :
 

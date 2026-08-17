@@ -27,6 +27,15 @@ def phash(image_path: Path) -> str:
         return str(imagehash.phash(image.convert("RGB")))
 
 
+def crop_resistant_hash(image_path: Path) -> str:
+    """Signature multi-segments résistante aux recadrages et filigranes."""
+    import imagehash
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        return str(imagehash.crop_resistant_hash(image.convert("RGB")))
+
+
 def group_duplicates(hashes: dict[str, str], threshold: int = HAMMING_THRESHOLD) -> dict[str, str]:
     """Associe chaque identifiant d'asset à un identifiant de groupe.
 

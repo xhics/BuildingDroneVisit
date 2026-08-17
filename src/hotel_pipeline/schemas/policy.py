@@ -175,6 +175,14 @@ class DedupPolicy(BaseModel):
     position_tolerance_m: float = Field(default=10.0, gt=0)
     bearing_tolerance_deg: float = Field(default=25.0, gt=0, le=180)
     max_overlap_per_cluster: int = Field(default=2, ge=0)
+    robust_crop_hash_enabled: bool = True
+    #: Au moins cinq régions doivent concorder. Un ou deux segments fusionnent
+    #: abusivement les routes, arbres et ciels répétés du corpus pilote.
+    robust_region_cutoff: int = Field(default=5, ge=1, le=64)
+    #: Le hash robuste ne compare que des republications plausibles : familles
+    #: différentes, ou médias non positionnés. Les séquences routières restent
+    #: des points de vue voisins, jamais une seule photographie.
+    robust_plausible_pairs_only: bool = True
 
 
 class CollectionPolicy(BaseModel):

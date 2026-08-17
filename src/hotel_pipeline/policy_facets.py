@@ -137,6 +137,9 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "dedup.position_tolerance_m",
         "dedup.bearing_tolerance_deg",
         "dedup.max_overlap_per_cluster",
+        "dedup.robust_crop_hash_enabled",
+        "dedup.robust_region_cutoff",
+        "dedup.robust_plausible_pairs_only",
     ),
     Facet.CLASSIFICATION_MODEL: (
         "model.model_name",

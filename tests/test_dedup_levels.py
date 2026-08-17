@@ -12,6 +12,8 @@ import pytest
 from hotel_pipeline.dedup_levels import (
     assign_roles,
     exact_groups,
+    robust_pairs,
+    robust_regression,
     run,
     viewpoint_groups,
 )
@@ -97,6 +99,48 @@ class TestLevel3Viewpoints:
             BUILDING_LON,
         )
         assert clusters["expedia"] == clusters["kayak"] != clusters["autre"]
+
+
+class TestRobustRepublications:
+    _SIGNATURE = ",".join(["a2a2a2a2a2a2a2a2"] * 5)
+
+    def test_crop_watermark_and_distinct_regressions_are_discriminating(self):
+        result = robust_regression(region_cutoff=5)
+        assert result == {
+            "crop": True,
+            "watermark": True,
+            "distinct_rejected": True,
+        }
+
+    def test_identical_street_signatures_are_not_merged_as_photographs(self):
+        road = [
+            make(
+                "frame-a", source_family="mapillary",
+                crop_resistant_hash=self._SIGNATURE,
+                camera_lat=45.57, camera_lon=-73.44,
+            ),
+            make(
+                "frame-b", source_family="mapillary",
+                crop_resistant_hash=self._SIGNATURE,
+                camera_lat=45.571, camera_lon=-73.441,
+            ),
+        ]
+        assert robust_pairs(road, region_cutoff=5, plausible_only=True) == []
+
+    def test_unpositioned_republication_is_a_plausible_pair(self):
+        media = [
+            make(
+                "catalogue", source_family="expedia_media",
+                crop_resistant_hash=self._SIGNATURE,
+            ),
+            make(
+                "site", source_family="hotel_website",
+                crop_resistant_hash=self._SIGNATURE,
+            ),
+        ]
+        assert robust_pairs(media, region_cutoff=5, plausible_only=True) == [
+            ("site", "catalogue")
+        ]
 
 
 class TestLevel4UsefulOverlap:

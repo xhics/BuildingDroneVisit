@@ -48,6 +48,12 @@ class TestManifest:
         workspace.write_manifest(ProjectManifest(hotel_id="h", address="a"))
         assert list(workspace.path("00_manifest").glob("*.tmp")) == []
 
+    def test_text_reports_use_the_same_atomic_writer(self, workspace):
+        path = workspace.write_text("coverage/report.md", "preuve\n")
+
+        assert path.read_text() == "preuve\n"
+        assert list(path.parent.glob("*.tmp")) == []
+
 
 class TestStepRecording:
     def test_completed_steps_tracked(self):

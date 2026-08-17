@@ -39,6 +39,15 @@ class CoverageState(StrEnum):
     COVERED = "covered"
     NOT_COVERED = "not_covered"
     DISCOVERY_ERROR = "discovery_error"
+    MANUAL_ACQUISITION_REQUIRED = "manual_acquisition_required"
+
+
+class CoverageBasis(StrEnum):
+    """Comment la couverture peut être établie sans confondre les preuves."""
+
+    INDEX_INTERSECTION = "index_intersection"
+    PUBLISHER_DECLARED_TERRITORY = "publisher_declared_territory"
+    MANUAL_SERVICE = "manual_service"
 
 
 @dataclass(frozen=True)
@@ -71,6 +80,13 @@ class GeoSource:
     #: télécharge pas encore ici.
     acquisition_automated: bool = True
 
+    #: Méthode admise pour décider de la couverture. Une déclaration de
+    #: territoire convient à un verrou de contexte ; elle ne remplace jamais
+    #: l'intersection d'une tuile lorsqu'une géométrie doit être dérivée.
+    coverage_basis: CoverageBasis = CoverageBasis.INDEX_INTERSECTION
+    index_url: str | None = None
+    vintage: str | None = None
+
     def __post_init__(self) -> None:
         unknown = (set(self.establishes) | set(self.cannot_establish)) - KNOWN_KINDS
         if unknown:
@@ -95,6 +111,7 @@ SOURCES: tuple[GeoSource, ...] = (
         establishes=("TERRAIN_MAIN", "ROOFLINE_MAIN"),
         cannot_establish=("PROPERTY_PARCEL",),
         licence="Licence ouverte du gouvernement du Québec",
+        coverage_basis=CoverageBasis.INDEX_INTERSECTION,
         notes=(
             "Nuage LAZ classifié. MNT et MNS s'en dérivent ; la hauteur des "
             "façades aussi, mais jamais leur apparence."
@@ -111,6 +128,7 @@ SOURCES: tuple[GeoSource, ...] = (
         establishes=(),
         cannot_establish=("PROPERTY_PARCEL",),
         licence="Licence ouverte",
+        coverage_basis=CoverageBasis.INDEX_INTERSECTION,
         notes="20 cm, mais le territoire de la CMM est hors emprise.",
     ),
     GeoSource(
@@ -122,6 +140,12 @@ SOURCES: tuple[GeoSource, ...] = (
         establishes=(),
         cannot_establish=("PROPERTY_PARCEL", "ROOFLINE_MAIN"),
         licence="Licence ouverte",
+        coverage_basis=CoverageBasis.PUBLISHER_DECLARED_TERRITORY,
+        index_url=(
+            "https://observatoire.cmm.qc.ca/produits/"
+            "donnees-georeferencees/"
+        ),
+        vintage="2023-08",
         notes=(
             "Mosaïques à 5 m : utiles comme verrou de contexte, insuffisantes "
             "pour découper un toit ou une parcelle."
@@ -135,10 +159,12 @@ SOURCES: tuple[GeoSource, ...] = (
         establishes=("PROPERTY_PARCEL",),
         licence="consultation ; acquisition à formaliser",
         acquisition_automated=False,
+        coverage_basis=CoverageBasis.MANUAL_SERVICE,
+        index_url="https://appli.foncier.gouv.qc.ca/Infolot/",
         notes=(
-            "Seule source juridique de la limite de propriété. Le Référentiel "
-            "québécois des adresses peut donner un numéro de lot, jamais la "
-            "géométrie officielle."
+            "Source officielle de la représentation cadastrale. Elle permet "
+            "d'instancier PROPERTY_PARCEL une fois l'extrait acquis et vérifié, "
+            "mais ne vaut ni arpentage ni titre de propriété."
         ),
     ),
 )

@@ -285,6 +285,44 @@ def test_a_plan_on_the_very_demand_it_targeted_is_accepted() -> None:
     assert not any("n'ont pas été cherchés" in p for p in problems)
 
 
+def test_assets_plan_restreint_les_besoins_au_scope_canonique() -> None:
+    """Le fichier ciblé doit être réellement planifiable depuis les sept besoins."""
+    from hotel_pipeline import cli
+
+    canonical_count = len(LES_SEPT.demands)
+    ciblé = CandidateManifest(
+        hotel_id="essai",
+        scope=DiscoveryScope(
+            mode=DiscoveryMode.TARGETED,
+            demand_ids=("obligation:ACCESS_ROAD_MAIN",),
+            demand_manifest_digest="d" * 16,
+        ),
+    )
+    restreint = cli._plan_demands_for_scope(ciblé, LES_SEPT)
+
+    assert [row.demand_id for row in restreint.demands] == [
+        "obligation:ACCESS_ROAD_MAIN"
+    ]
+    assert len(LES_SEPT.demands) == canonical_count, (
+        "le manifeste canonique reste intact"
+    )
+
+
+def test_assets_plan_refuse_un_scope_vers_un_besoin_absent() -> None:
+    from hotel_pipeline import cli
+
+    ciblé = CandidateManifest(
+        hotel_id="essai",
+        scope=DiscoveryScope(
+            mode=DiscoveryMode.TARGETED,
+            demand_ids=("obligation:INCONNU",),
+            demand_manifest_digest="d" * 16,
+        ),
+    )
+    with pytest.raises(ValueError, match="besoins absents"):
+        cli._plan_demands_for_scope(ciblé, LES_SEPT)
+
+
 def test_a_full_manifest_still_plans_on_every_demand() -> None:
     """La règle ne doit pas gêner le chemin ordinaire."""
     from hotel_pipeline import cli

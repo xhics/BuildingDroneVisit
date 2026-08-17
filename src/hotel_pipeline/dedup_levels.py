@@ -55,6 +55,8 @@ class DedupReport:
     overlap: int = 0
     inactive: int = 0
     by_source_family: dict[str, dict[str, int]] = field(default_factory=dict)
+    robust_candidate_pairs: int = 0
+    robust_matched_pairs: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -101,6 +103,150 @@ def perceptual_groups(assets: list[Asset], threshold: int = 6) -> dict[str, str]
 
     hashes = {a.id: a.phash for a in assets if a.phash}
     return group_duplicates(hashes, threshold=threshold)
+
+
+def _plausible_republication_pair(first: Asset, second: Asset) -> bool:
+    """Écarte les séquences de rue qui partagent légitimement leur contenu."""
+    first_family = first.source_family or first.source
+    second_family = second.source_family or second.source
+    if first_family != second_family:
+        return True
+    return (
+        first.camera_lat is None and first.camera_lon is None
+        and second.camera_lat is None and second.camera_lon is None
+    )
+
+
+def robust_pairs(
+    assets: list[Asset], *, region_cutoff: int, plausible_only: bool = True,
+) -> list[tuple[str, str]]:
+    """Détecte les recadrages sans confondre deux frames d'une même route."""
+    import imagehash
+
+    available = [asset for asset in assets if asset.crop_resistant_hash]
+    parsed = {
+        asset.id: imagehash.hex_to_multihash(asset.crop_resistant_hash)
+        for asset in available
+    }
+    pairs: list[tuple[str, str]] = []
+    for index, first in enumerate(sorted(available, key=lambda row: row.id)):
+        for second in sorted(available, key=lambda row: row.id)[:index]:
+            if plausible_only and not _plausible_republication_pair(first, second):
+                continue
+            if parsed[first.id].matches(
+                parsed[second.id], region_cutoff=region_cutoff
+            ):
+                pairs.append((first.id, second.id))
+    return pairs
+
+
+def plausible_pair_count(assets: list[Asset], *, plausible_only: bool) -> int:
+    available = [asset for asset in assets if asset.crop_resistant_hash]
+    return sum(
+        1
+        for index, first in enumerate(available)
+        for second in available[:index]
+        if not plausible_only or _plausible_republication_pair(first, second)
+    )
+
+
+def robust_input_digest(assets: list[Asset]) -> str:
+    """Empreinte fermée des seules données lues par le détecteur robuste.
+
+    Une application de visibilité, une revue humaine ou un changement de rôle
+    ne modifie pas ce que le détecteur de republications a comparé. Lier sa
+    preuve au JSON complet du manifeste la périmait donc à chaque projection
+    aval, bien que les fichiers et les signatures soient inchangés.
+
+    Le contenu, la famille de source et la présence d'une position sont les
+    seules entrées du filtrage robuste. Les coordonnées exactes sont conservées
+    plutôt qu'un booléen afin qu'une correction de provenance spatiale déplace
+    bien l'empreinte.
+    """
+    from .provenance import digest_of
+
+    return digest_of([
+        {
+            "asset_id": asset.id,
+            "checksum": asset.checksum,
+            "crop_resistant_hash": asset.crop_resistant_hash,
+            "source": asset.source,
+            "source_family": asset.source_family,
+            "camera_lat": asset.camera_lat,
+            "camera_lon": asset.camera_lon,
+        }
+        for asset in sorted(assets, key=lambda row: row.id)
+    ])
+
+
+def robust_regression(region_cutoff: int) -> dict[str, bool]:
+    """Régression exécutée par la commande, pas seulement par pytest."""
+    import imagehash
+    from PIL import Image, ImageDraw
+
+    base = Image.new("RGB", (512, 384), "#d9d0c4")
+    draw = ImageDraw.Draw(base)
+    draw.rectangle((35, 85, 480, 340), fill="#8b3d2e")
+    draw.rectangle((70, 120, 170, 280), fill="#4c708f")
+    draw.polygon([(30, 90), (255, 20), (490, 90)], fill="#252525")
+    for x in range(190, 450, 55):
+        draw.rectangle((x, 140, x + 30, 210), fill="#e2e8ed")
+    draw.text((170, 250), "HOTEL TEST", fill="white")
+    cropped = base.crop((45, 25, 485, 365)).resize(base.size)
+    watermarked = base.copy()
+    overlay = ImageDraw.Draw(watermarked, "RGBA")
+    overlay.rectangle((0, 315, 512, 384), fill=(255, 255, 255, 150))
+    overlay.text((320, 335), "EXAMPLE.COM", fill=(0, 0, 0, 210))
+    distinct = Image.new("RGB", base.size, "#224466")
+    ImageDraw.Draw(distinct).ellipse((80, 40, 420, 360), fill="#ddcc22")
+
+    hashes = {
+        name: imagehash.crop_resistant_hash(image)
+        for name, image in {
+            "base": base, "crop": cropped, "watermark": watermarked,
+            "distinct": distinct,
+        }.items()
+    }
+    return {
+        "crop": hashes["base"].matches(
+            hashes["crop"], region_cutoff=region_cutoff
+        ),
+        "watermark": hashes["base"].matches(
+            hashes["watermark"], region_cutoff=region_cutoff
+        ),
+        "distinct_rejected": not hashes["base"].matches(
+            hashes["distinct"], region_cutoff=region_cutoff
+        ),
+    }
+
+
+def _merge_photo_groups(
+    assets: list[Asset], phash_groups: dict[str, str], pairs: list[tuple[str, str]],
+) -> dict[str, str]:
+    """Union transitive des groupes pHash et des preuves robustes."""
+    ids = sorted(asset.id for asset in assets)
+    parent = {asset_id: asset_id for asset_id in ids}
+
+    def find(asset_id: str) -> str:
+        while parent[asset_id] != asset_id:
+            parent[asset_id] = parent[parent[asset_id]]
+            asset_id = parent[asset_id]
+        return asset_id
+
+    def union(first: str, second: str) -> None:
+        a, b = find(first), find(second)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    by_phash: dict[str, list[str]] = {}
+    for asset_id, group_id in phash_groups.items():
+        by_phash.setdefault(group_id, []).append(asset_id)
+    for members in by_phash.values():
+        for asset_id in members[1:]:
+            union(members[0], asset_id)
+    for first, second in pairs:
+        union(first, second)
+    return {asset_id: find(asset_id) for asset_id in ids}
 
 
 # --- niveau 3 : même point de vue ----------------------------------------
@@ -264,6 +410,33 @@ def measure_files(assets: list[Asset]) -> int:
     return measured
 
 
+def measure_hashes(assets: list[Asset], *, robust: bool) -> tuple[int, int]:
+    """Calcule les signatures absentes depuis le contenu local vérifié."""
+    from .triage.dedup import crop_resistant_hash, phash
+
+    phash_count = robust_count = 0
+    for index, asset in enumerate(assets):
+        if not asset.local_path:
+            continue
+        path = Path(asset.local_path)
+        if not path.is_file():
+            continue
+        updates = {}
+        try:
+            if not asset.phash:
+                updates["phash"] = phash(path)
+                phash_count += 1
+            if robust and not asset.crop_resistant_hash:
+                updates["crop_resistant_hash"] = crop_resistant_hash(path)
+                robust_count += 1
+        except OSError as exc:
+            log.warning("hash illisible pour %s : %s", asset.id, exc)
+            continue
+        if updates:
+            assets[index] = asset.model_copy(update=updates)
+    return phash_count, robust_count
+
+
 def run(
     assets: list[Asset],
     building_lat: float,
@@ -272,9 +445,21 @@ def run(
 ) -> DedupReport:
     """Applique les quatre niveaux et produit le rapport du §5."""
     measure_files(assets)
+    measure_hashes(assets, robust=policy.dedup.robust_crop_hash_enabled)
 
     exact = exact_groups(assets)
-    perceptual = perceptual_groups(assets, threshold=policy.dedup.phash_hamming_threshold)
+    phash_only = perceptual_groups(
+        assets, threshold=policy.dedup.phash_hamming_threshold
+    )
+    crop_pairs = (
+        robust_pairs(
+            assets,
+            region_cutoff=policy.dedup.robust_region_cutoff,
+            plausible_only=policy.dedup.robust_plausible_pairs_only,
+        )
+        if policy.dedup.robust_crop_hash_enabled else []
+    )
+    perceptual = _merge_photo_groups(assets, phash_only, crop_pairs)
 
     for index, asset in enumerate(assets):
         assets[index] = asset.model_copy(
@@ -309,6 +494,11 @@ def run(
         canonical=len([a for a in assets if a.cluster_role is ClusterRole.CANONICAL]),
         overlap=len([a for a in assets if a.cluster_role is ClusterRole.OVERLAP]),
         inactive=len([a for a in assets if a.cluster_role is ClusterRole.INACTIVE]),
+        robust_candidate_pairs=plausible_pair_count(
+            assets,
+            plausible_only=policy.dedup.robust_plausible_pairs_only,
+        ),
+        robust_matched_pairs=len(crop_pairs),
     )
 
     for asset in assets:

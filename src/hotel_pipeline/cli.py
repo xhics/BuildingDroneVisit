@@ -729,9 +729,21 @@ def assets_discover(
     # Ce qu'on s'attend à émettre **au plus**. La pagination interdit un compte
     # exact d'avance ; annoncer un plafond vaut mieux que se taire, et le
     # comparer à l'effectif dit si l'estimation valait.
-    registre.planned_max_requests.update(_planned_calls(context, radius))
+    # Depuis les points **réels** du corridor quand la portée en nomme un :
+    # la formule globale annoncerait un plafond sans rapport avec ce qu'on
+    # s'autorise.
+    points_ciblés = _scoped_corridor_points(workspace, context, scope)
+    registre.planned_max_requests.update(
+        _planned_calls(context, radius, points_ciblés)
+    )
+    if points_ciblés is not None:
+        typer.echo(
+            f"  plafond     {points_ciblés} appel(s) Street View au plus, "
+            "comptés sur la géométrie du corridor"
+        )
     queries = _query_sources(
-        profile, context, workspace, radius, search.outstanding or demands.demands
+        profile, context, workspace, radius,
+        search.outstanding or demands.demands, scope,
     )
     search.requests_by_source = _requests_by_source(ledger().by_source())
 
@@ -1152,7 +1164,7 @@ def _targeted_manifest(workspace, manifest, scope):  # noqa: ANN001, ANN201
     })
 
 
-def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:  # noqa: ANN001
+def _query_sources(profile, context, workspace, radius_m: int, demands, scope=None) -> dict:  # noqa: ANN001
     """Interroge les index disponibles, et dit pourquoi les autres ne le sont pas.
 
     Une source non configurée n'est pas une source vide : le motif remonte au
@@ -1178,12 +1190,12 @@ def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:
         queries["mapillary"] = candidates_from("mapillary", images)
 
     queries["street_view"] = _street_view_candidates(
-        context, workspace, radius_m, demands
+        context, workspace, radius_m, demands, scope
     )
     return queries
 
 
-def _street_view_candidates(context, workspace, radius_m: int, demands):  # noqa: ANN001, ANN201
+def _street_view_candidates(context, workspace, radius_m: int, demands, scope=None):  # noqa: ANN001, ANN201
     """Panoramas des corridors proches, cadrés vers ce que les besoins demandent.
 
     Le cap est **dirigé**, jamais balayé : tourner l'horizon produirait des
@@ -1209,9 +1221,25 @@ def _street_view_candidates(context, workspace, radius_m: int, demands):  # noqa
     except LegacyManifestRefused as exc:
         return f"géométrie illisible : {exc}"
 
-    corridors = _corridor_elements(manifest)
+    # La portée restreint l'**espace** interrogé, non seulement le besoin :
+    # sans cela, une découverte ciblée échantillonnait les 129 corridors du
+    # secteur pour un besoin qui n'en concerne qu'un.
+    corridor_ref = getattr(scope, "corridor_ref", "") if scope else ""
+    try:
+        corridors = _corridor_elements(manifest, corridor_ref)
+    except CorridorScopeRefused as exc:
+        # Refusé **avant** le réseau : émettre des requêtes dont le domaine est
+        # inconnu coûterait un quota sans qu'on sache ce qui a été interrogé.
+        return f"portée de corridor refusée : {exc}"
     if not corridors:
         return "aucun corridor résolu autour du site"
+
+    if corridor_ref:
+        typer.secho(
+            f"    street_view · échantillonnage borné au corridor "
+            f"{corridor_ref}",
+            fg=typer.colors.CYAN,
+        )
 
     spatial = _safe_read(workspace.read_spatial)
     front = getattr(spatial, "front_azimuth_deg", None) if spatial else None
@@ -1250,26 +1278,66 @@ def _street_view_candidates(context, workspace, radius_m: int, demands):  # noqa
     ]
 
 
-def _corridor_elements(manifest) -> list[dict]:  # noqa: ANN001
-    """Corridors résolus, au format qu'attend l'échantillonnage de voirie."""
+class CorridorScopeRefused(RuntimeError):
+    """La référence de corridor ne désigne pas exactement une géométrie.
+
+    Absente, elle ferait balayer le réseau entier ; ambiguë, on ne saurait pas
+    laquelle des deux a été échantillonnée. Dans les deux cas, refuser **avant**
+    le réseau vaut mieux qu'émettre des requêtes dont le domaine est inconnu.
+    """
+
+
+def _corridor_elements(manifest, corridor_ref: str = "") -> list[dict]:  # noqa: ANN001
+    """Corridors résolus, au format qu'attend l'échantillonnage de voirie.
+
+    `corridor_ref` restreint à **une** géométrie nommée. Sans lui, une
+    découverte ciblée sur un besoin interrogeait quand même les 129 corridors
+    du secteur : le besoin était filtré, l'espace ne l'était pas — 1 215 points
+    d'échantillon au lieu de 17.
+    """
     from shapely import wkt as shapely_wkt
 
     from .schemas.geometry import GeometryResolutionStatus, GeometryRole
 
-    elements = []
+    retenues = []
     for geometry in manifest.geometries:
         if geometry.role not in (GeometryRole.ROAD_CANDIDATE, GeometryRole.ACCESS_ROAD):
             continue
         if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
             continue
+        retenues.append(geometry)
+
+    if corridor_ref:
+        # Correspondance **exacte** sur le `feature_id`. Une correspondance
+        # partielle ferait retenir `ACCESS_ROAD_MAIN_2` pour `ACCESS_ROAD_MAIN`,
+        # et l'échantillonnage porterait sur une voie qu'on n'a pas nommée.
+        nommées = [g for g in retenues if g.feature_id == corridor_ref]
+        if not nommées:
+            raise CorridorScopeRefused(
+                f"corridor {corridor_ref!r} absent des géométries résolues : "
+                "interroger le réseau entier reviendrait à ignorer la portée "
+                "demandée"
+            )
+        if len(nommées) > 1:
+            raise CorridorScopeRefused(
+                f"corridor {corridor_ref!r} désigne {len(nommées)} géométries : "
+                "on ne saurait pas laquelle a été échantillonnée"
+            )
+        retenues = nommées
+
+    elements = []
+    for geometry in retenues:
         shape = shapely_wkt.loads(geometry.wgs84_wkt)
         coords = (
             list(shape.coords) if shape.geom_type == "LineString"
             else [point for part in shape.geoms for point in part.coords]
         )
-        elements.append(
-            {"geometry": [{"lat": lat, "lon": lon} for lon, lat in coords]}
-        )
+        elements.append({
+            # Le `feature_id` voyage avec la géométrie : sans lui, rien ne
+            # permet de vérifier après coup **quelle** voie a été interrogée.
+            "feature_id": geometry.feature_id,
+            "geometry": [{"lat": lat, "lon": lon} for lon, lat in coords],
+        })
     return elements
 
 
@@ -1297,7 +1365,8 @@ def assets_plan(
     from .plan import PlanRefused, build, consent
     from .provenance import digest_of
     from .schemas.acquisition import (
-        CandidateManifest, CaptureDemandManifest, PlanStatus, VolumeStatus,
+        AcquisitionPlan, CandidateManifest, CaptureDemandManifest, PlanStatus,
+        VolumeStatus,
     )
 
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
@@ -1322,9 +1391,20 @@ def assets_plan(
         )
         raise typer.Exit(code=1)
 
+    try:
+        candidate_manifest_ref = _candidate_manifest_reference(workspace, Path(path))
+    except ValueError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
     candidates_payload = json.loads(Path(path).read_text("utf-8"))
     candidates = CandidateManifest.model_validate(candidates_payload)
-    demands = CaptureDemandManifest.model_validate(demands_payload)
+    canonical_demands = CaptureDemandManifest.model_validate(demands_payload)
+    try:
+        demands = _plan_demands_for_scope(candidates, canonical_demands)
+    except ValueError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
 
     # Liaison des deux manifestes. `--candidates` permet de désigner un fichier
     # arbitraire : sans ces contrôles, un manifeste d'un autre établissement ou
@@ -1390,20 +1470,23 @@ def assets_plan(
     )
     # Chaque acquisition porte désormais ce qui sera demandé pour elle : le
     # consentement verrouille l'empreinte, non le seul candidat.
-    plan = plan.model_copy(update={"acquisitions": [
-        a.model_copy(update={
-            "provider_resolution": (
-                acquisition_requests[a.candidate_id].provider_resolution
-                if a.candidate_id in acquisition_requests else None
-            ),
-            "request_digest": (
-                acquisition_requests[a.candidate_id].digest
-                if a.candidate_id in acquisition_requests else None
-            ),
-            **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
-        })
-        for a in plan.acquisitions
-    ]})
+    plan = AcquisitionPlan.model_validate(plan.model_copy(update={
+        "candidate_manifest_ref": candidate_manifest_ref,
+        "acquisitions": [
+            a.model_copy(update={
+                "provider_resolution": (
+                    acquisition_requests[a.candidate_id].provider_resolution
+                    if a.candidate_id in acquisition_requests else None
+                ),
+                "request_digest": (
+                    acquisition_requests[a.candidate_id].digest
+                    if a.candidate_id in acquisition_requests else None
+                ),
+                **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
+            })
+            for a in plan.acquisitions
+        ],
+    }).model_dump())
 
     # Un brouillon irréalisable est un brouillon faux. `bind_plan` existait,
     # était testé, et n'était appelé nulle part : la contradiction entre ce que
@@ -1518,8 +1601,9 @@ def assets_plan(
             typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
 
+    plan_relative_path = f"01_sources/acquisition_plan_{plan.plan_id}.json"
     workspace.write_json(
-        f"01_sources/acquisition_plan_{plan.plan_id}.json",
+        plan_relative_path,
         json.loads(plan.model_dump_json()),
     )
     report.transport = plan_ledger().as_dict()
@@ -1554,10 +1638,17 @@ def assets_plan(
         typer.echo("    prochaine étape : assets acquire")
     else:
         typer.echo(f"{OK} plan {plan.plan_id} — brouillon, rien ne sera téléchargé")
-        typer.echo(
-            f"    pour l'exécuter : assets plan {hotel_id} "
-            f"--consent-bytes {plan.known_bytes}"
-        )
+        plan_path = workspace.path(plan_relative_path)
+        if plan.unknown_size_items:
+            typer.echo(
+                f"    prochaine étape : assets measure-plan {hotel_id} "
+                f"--plan {plan_path}"
+            )
+        else:
+            typer.echo(
+                f"    prochaine étape : assets consent-plan {hotel_id} "
+                f"--plan {plan_path} --consent-bytes {plan.known_bytes}"
+            )
 
 
 def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN001, ANN201
@@ -1700,6 +1791,61 @@ def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
     return found[-1] if found else None
 
 
+def _candidate_manifest_reference(workspace, path: Path) -> str:  # noqa: ANN001
+    """Référence portable et confinée du manifeste réellement planifié."""
+    resolved = Path(path).resolve()
+    try:
+        relative = resolved.relative_to(workspace.root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            "le manifeste de candidats doit vivre dans le workspace pour être "
+            "rejouable ; copiez-le sous 01_sources/ avant de planifier"
+        ) from exc
+    reference = relative.as_posix()
+    # Le schéma porte la règle de confinement ; revalider ici évite qu'un
+    # simple helper reconstruise un contrat parallèle.
+    from .schemas.acquisition import AcquisitionPlan
+
+    probe = AcquisitionPlan(
+        plan_id="candidate-reference-check",
+        hotel_id=workspace.hotel_id,
+        candidate_manifest_ref=reference,
+    )
+    return str(probe.candidate_manifest_ref)
+
+
+def _candidate_manifest_for_plan(workspace, plan):  # noqa: ANN001, ANN201
+    """Relit le manifeste exact d'un plan et confronte son empreinte.
+
+    Les plans antérieurs au champ ``candidate_manifest_ref`` conservent leur
+    chemin historique vers le manifeste global. Ils ne peuvent toutefois plus
+    franchir silencieusement une divergence d'empreinte.
+    """
+    from .provenance import digest_of
+
+    if plan.candidate_manifest_ref:
+        path = (workspace.root / plan.candidate_manifest_ref).resolve()
+        try:
+            path.relative_to(workspace.root.resolve())
+        except ValueError as exc:  # défense redondante contre un modèle forgé
+            raise ValueError("référence de candidats hors workspace") from exc
+    else:
+        path = _latest_candidates(workspace)
+        if path is None:
+            raise FileNotFoundError("aucun manifeste de candidats")
+
+    if not path.is_file():
+        raise FileNotFoundError(f"manifeste de candidats du plan absent : {path}")
+    payload = json.loads(path.read_text("utf-8"))
+    actual = digest_of(payload)
+    if plan.candidate_manifest_digest and actual != plan.candidate_manifest_digest:
+        raise ValueError(
+            "empreinte du manifeste de candidats divergente : "
+            f"{actual} != {plan.candidate_manifest_digest} — aucun appel émis"
+        )
+    return path, payload
+
+
 def _plan_digests(workspace, context, candidates_payload, demands_payload) -> dict:  # noqa: ANN001
     """Toutes les empreintes qu'un plan exécutable doit porter.
 
@@ -1778,11 +1924,13 @@ def assets_acquire(
     plan_payload = json.loads(Path(path).read_text("utf-8"))
     plan = AcquisitionPlan.model_validate(plan_payload)
 
-    candidates_path = _latest_candidates(workspace)
-    if candidates_path is None:
-        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-    candidates_payload = json.loads(candidates_path.read_text("utf-8"))
+    try:
+        candidates_path, candidates_payload = _candidate_manifest_for_plan(
+            workspace, plan
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
     candidates = {
         c.candidate_id: c
         for c in CandidateManifest.model_validate(candidates_payload).candidates
@@ -2381,6 +2529,29 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     roles = assign(manifest.assets, context.policy)
     workspace.write_assets(manifest)
     workspace.write_report("01_sources/duplicate_report.json", report, context, production="DuplicateReport")
+    from .lot1b_coverage import DedupRobustnessEvidence, _sha256
+    from .policy_facets import Facet, facet_digest
+
+    regression = dedup_levels.robust_regression(
+        context.policy.dedup.robust_region_cutoff
+    )
+    robustness = DedupRobustnessEvidence(
+        asset_manifest_sha256=_sha256(workspace.assets_path),
+        robust_input_digest=dedup_levels.robust_input_digest(manifest.assets),
+        algorithm="imagehash-crop-resistant-v1",
+        policy_digest=context.provenance["policy_digest"],
+        dedup_policy_digest=facet_digest(context.policy, Facet.DEDUPLICATION),
+        production_used=context.policy.dedup.robust_crop_hash_enabled,
+        candidate_pairs=report.robust_candidate_pairs,
+        matched_pairs=report.robust_matched_pairs,
+        crop_regression_passed=regression["crop"],
+        watermark_regression_passed=regression["watermark"],
+        distinct_regression_passed=regression["distinct_rejected"],
+    )
+    workspace.write_json(
+        "01_sources/dedup_robustness_report.json",
+        robustness.model_dump(mode="json"),
+    )
     workspace.write_report("01_sources/roles_report.json", roles, context)
 
     typer.echo(f"  fichiers                  {report.files}")
@@ -4720,6 +4891,29 @@ def _validate_manifest_pairing(hotel_id, candidates, demands, demands_payload): 
     return problems
 
 
+def _plan_demands_for_scope(candidates, demands):  # noqa: ANN001, ANN201
+    """Applique au plan la portée déjà validée par la découverte.
+
+    Le manifeste canonique complet reste l'autorité et son empreinte reste au
+    plan. Seule la vue transmise au sélecteur est restreinte : reconstruire un
+    nouveau manifeste indépendant ferait perdre la filiation au corpus global.
+    """
+    scope = getattr(candidates, "scope", None)
+    demand_ids = tuple(getattr(scope, "demand_ids", ()) or ())
+    if not demand_ids:
+        return demands
+
+    by_id = {row.demand_id: row for row in demands.demands}
+    unknown = sorted(set(demand_ids) - set(by_id))
+    if unknown:
+        raise ValueError(
+            "portée de candidats vers des besoins absents du manifeste canonique : "
+            + ", ".join(unknown)
+        )
+    selected = [by_id[demand_id] for demand_id in demand_ids]
+    return demands.model_copy(update={"demands": selected})
+
+
 def _readable_evaluations(evaluations, candidates, separation_m):  # noqa: ANN001, ANN201
     """Le cadrage à côté du verdict, pour que deux lignes se distinguent.
 
@@ -4793,7 +4987,37 @@ def _requests_by_source(by_source: dict) -> dict:
     }
 
 
-def _planned_calls(context, radius_m: int) -> dict:  # noqa: ANN001
+def _scoped_corridor_points(workspace, context, scope) -> int | None:  # noqa: ANN001
+    """Nombre **réel** de points d'échantillon du corridor visé.
+
+    La formule globale annonce un ordre de grandeur pour un réseau entier — 529
+    ici — alors qu'un corridor nommé en compte 17. Annoncer un plafond deux
+    fois plus grand que ce qu'on s'autorise vide le plafond de son sens.
+
+    `None` quand la portée ne nomme aucun corridor : la formule reste alors la
+    seule estimation disponible, et l'inventer ici serait pire.
+    """
+    corridor_ref = getattr(scope, "corridor_ref", "") if scope else ""
+    if not corridor_ref:
+        return None
+
+    from .collectors.streetview import sample_road_network
+
+    manifest = _capture_geometry_if_any(workspace, context)
+    if manifest is None:
+        return None
+    try:
+        corridors = _corridor_elements(manifest, corridor_ref)
+    except CorridorScopeRefused:
+        # Le refus se prononce à l'interrogation, avec son motif. Ici, on ne
+        # sait simplement pas compter.
+        return None
+    return len(sample_road_network(
+        corridors, spacing_m=context.policy.collection.sample_spacing_m
+    ))
+
+
+def _planned_calls(context, radius_m: int, corridor_points: int | None = None) -> dict:  # noqa: ANN001
     """Plafond d'appels annoncé **avant** d'interroger.
 
     Mapillary pagine : on ne sait pas d'avance combien de pages viendront, mais
@@ -4807,9 +5031,11 @@ def _planned_calls(context, radius_m: int) -> dict:  # noqa: ANN001
 
     collection = context.policy.collection
     spacing = max(collection.sample_spacing_m, 1.0)
-    # Deux fois le rayon divisé par l'espacement : ordre de grandeur du nombre
-    # de points d'un réseau routier couvrant la zone.
-    corridor_points = int((2 * collection.road_radius_m) / spacing) ** 2 // 4
+    if corridor_points is None:
+        # Deux fois le rayon divisé par l'espacement : ordre de grandeur du
+        # nombre de points d'un réseau routier couvrant la zone. Employé
+        # seulement faute de corridor nommé — sinon on compte les vrais points.
+        corridor_points = int((2 * collection.road_radius_m) / spacing) ** 2 // 4
 
     # Les clés sont celles du **registre** — `streetview-meta`, non
     # `street_view` : un plafond annoncé sous un autre nom que l'effectif ne se
@@ -5057,14 +5283,17 @@ def assets_measure_plan(
             typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
-    candidates_path = _latest_candidates(workspace)
-    if candidates_path is None:
-        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+    try:
+        candidates_path, candidates_payload = _candidate_manifest_for_plan(
+            workspace, plan
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
     candidates = {
         c.candidate_id: c
         for c in CandidateManifest.model_validate(
-            json.loads(candidates_path.read_text("utf-8"))
+            candidates_payload
         ).candidates
     }
 
@@ -5264,11 +5493,14 @@ def assets_consent_plan(
     # Les empreintes viennent des **mêmes** documents que ceux du plan : les
     # laisser nulles rendrait le plan inexécutable, et les inventer le
     # rattacherait à un état qu'il n'a pas connu.
-    candidates_path = _latest_candidates(workspace)
     demands_payload = workspace.read_json("01_sources/capture_demands.json")
-    candidates_payload = (
-        json.loads(candidates_path.read_text("utf-8")) if candidates_path else None
-    )
+    try:
+        _candidates_path, candidates_payload = _candidate_manifest_for_plan(
+            workspace, plan
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
 
     try:
         accepted = consent(
@@ -6156,6 +6388,132 @@ def router_decide(
     typer.echo(f"  {decision.rationale}")
     for action in decision.next_actions:
         typer.echo(f"    → {action}")
+
+
+# --- livrables canoniques du Lot 1B ------------------------------------------
+
+coverage_app = typer.Typer(
+    no_args_is_help=True,
+    help="Contexte, contraintes caméra et couverture finale du Lot 1B.",
+)
+app.add_typer(coverage_app, name="coverage")
+
+sources_app = typer.Typer(
+    no_args_is_help=True,
+    help="Registre factuel des familles de sources du Lot 1B.",
+)
+app.add_typer(sources_app, name="sources")
+
+
+@sources_app.command("registry")
+def sources_registry(hotel_id: str = typer.Argument(...)) -> None:
+    """Inventorie localement les familles interrogées, absentes ou en attente."""
+    from .source_registry import SourceRegistry, build
+
+    workspace = Workspace(hotel_id)
+    try:
+        path = build(workspace)
+        registry = SourceRegistry.model_validate_json(path.read_text("utf-8"))
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{OK} registre des sources publié : {path}", fg=typer.colors.GREEN)
+    typer.echo(
+        f"  familles requises {registry.closed_families}/{registry.required_families} closes"
+    )
+    if not registry.closure_complete:
+        typer.secho("  campagne incomplète", fg=typer.colors.YELLOW)
+
+
+@sources_app.command("unavailable")
+def sources_unavailable(
+    hotel_id: str = typer.Argument(...),
+    family_id: str = typer.Argument(..., help="Famille du §8 du plan Lot 1B."),
+    reason: str = typer.Option(..., "--reason", help="Indisponibilité observée."),
+    by: str = typer.Option(..., "--by", help="Auteur du constat."),
+) -> None:
+    """Consigne qu'une famille est indisponible, et pourquoi.
+
+    Le reçu documente une indisponibilité **observée**. Il ne dispense pas
+    d'interroger une famille simplement coûteuse ou lente.
+    """
+    from .source_registry import record_unavailable
+
+    workspace = Workspace(hotel_id)
+    try:
+        path = record_unavailable(workspace, family_id, reason, by)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{OK} reçu d'indisponibilité consigné : {path}", fg=typer.colors.GREEN)
+    typer.echo("  relancez : hotel-pipeline sources registry " + hotel_id)
+
+
+@sources_app.command("reopen")
+def sources_reopen(
+    hotel_id: str = typer.Argument(...),
+    family_id: str = typer.Argument(...),
+    reason: str = typer.Option(..., "--reason", help="Motif de la réouverture."),
+    by: str = typer.Option(..., "--by", help="Auteur du retrait."),
+) -> None:
+    """Retire un reçu devenu faux, sans effacer l'historique."""
+    from .source_registry import withdraw_unavailable
+
+    workspace = Workspace(hotel_id)
+    try:
+        path = withdraw_unavailable(workspace, family_id, by, reason)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{OK} famille rouverte : {path}", fg=typer.colors.GREEN)
+
+
+@coverage_app.command("build")
+def coverage_build(hotel_id: str = typer.Argument(...)) -> None:
+    """Produit les livrables finaux sans muter les vérités amont."""
+    from .lot1b_coverage import build
+
+    workspace = Workspace(hotel_id)
+    try:
+        outputs = build(workspace)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho(f"{OK} couverture Lot 1B publiée", fg=typer.colors.GREEN)
+    for name, path in outputs.items():
+        typer.echo(f"  {name:<20} {path}")
+
+
+# --- paquet hybride pour consommateurs vidéo -------------------------------
+
+scene_app = typer.Typer(
+    no_args_is_help=True,
+    help="Exporte une scène hybride/proxy sans appeler de fournisseur vidéo.",
+)
+app.add_typer(scene_app, name="scene")
+
+
+@scene_app.command("build")
+def scene_build(hotel_id: str = typer.Argument(...)) -> None:
+    """Produit le volume, les rasters, le verdict et le paquet de prompts."""
+    from .scene_package import build
+
+    workspace = Workspace(hotel_id)
+    try:
+        outputs = build(workspace)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.secho(f"{OK} paquet 3D hybride publié", fg=typer.colors.GREEN)
+    for name, path in outputs.items():
+        typer.echo(f"  {name:<12} {path}")
+    typer.secho(
+        "  verdict Phase 1 : NEEDS_AUTHORIZED_CAPTURE — ce paquet n'est pas "
+        "ENVIRONMENT_3D_READY",
+        fg=typer.colors.YELLOW,
+    )
 
 
 # En **fin** de fichier : placé au milieu, `app()` s'exécutait avant que les

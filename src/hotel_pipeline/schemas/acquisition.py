@@ -1156,6 +1156,11 @@ class AcquisitionPlan(BaseModel):
     planned_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     acquisitions: list[PlannedAcquisition] = Field(default_factory=list)
 
+    #: Fichier de candidats exact dont ce plan dérive, relatif au workspace.
+    #: L'empreinte seule ne suffit pas à retrouver une découverte ciblée,
+    #: rangée sous ``01_sources/targeted/`` et volontairement exclue de
+    #: ``_latest_candidates``.
+    candidate_manifest_ref: str | None = None
     candidate_manifest_digest: str | None = None
     demand_digest: str | None = None
     policy_digest: str | None = None
@@ -1197,6 +1202,26 @@ class AcquisitionPlan(BaseModel):
     #: Version du contrat de téléchargement en vigueur à l'accord. Ce que
     #: « télécharger » garantit fait partie de ce qui est consenti.
     consented_download_contract_version: int | None = Field(default=None, ge=1)
+
+    @field_validator("candidate_manifest_ref")
+    @classmethod
+    def _candidate_manifest_ref_is_confined(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            normalized.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] != "01_sources"
+            or not parts[-1].startswith("candidates_")
+            or not parts[-1].endswith(".json")
+        ):
+            raise ValueError(
+                "candidate_manifest_ref doit être un fichier candidates_*.json "
+                "confiné sous 01_sources/"
+            )
+        return normalized
 
     @property
     def known_bytes(self) -> int:
