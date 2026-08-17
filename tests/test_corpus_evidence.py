@@ -204,3 +204,53 @@ def test_a_resolution_leaves_an_append_only_trace(tmp_path, monkeypatch) -> None
     payload = json.loads(traces[0].read_text("utf-8"))
     assert payload["state"] == "inferred"
     assert payload["decided_by"] == "op"
+
+
+def test_evidence_can_be_added_without_changing_the_state(tmp_path, monkeypatch) -> None:
+    """Un objet déjà résolu accepte une preuve nouvelle.
+
+    Refuser l'ajout obligerait à dé-résoudre l'objet pour l'enrichir, donc à
+    effacer une décision valide pour documenter ce qui la conforte.
+    """
+    from hotel_pipeline.schemas.enums import ObjectState
+
+    workspace = _workspace(tmp_path, monkeypatch)
+    _site(workspace, "PARK_AND_RIDE")
+    runner.invoke(app, [
+        "site", "resolve", "hotel-test", "--kind", "PARK_AND_RIDE",
+        "--state", "inferred", "--rationale", "terminus observé", "--by", "op",
+    ])
+
+    result = runner.invoke(app, [
+        "site", "resolve", "hotel-test", "--kind", "PARK_AND_RIDE",
+        "--state", "inferred", "--rationale", "tags OSM concordants",
+        "--by", "op", "--evidence", "OSM relation/12666172 park_ride=yes",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "preuve ajoutée" in result.output
+
+    obj = workspace.read_site().objects[0]
+    assert obj.state is ObjectState.INFERRED
+    assert "OSM relation/12666172 park_ride=yes" in obj.evidence
+    traces = list(
+        workspace.path("00_manifest").glob("site_evidence_PARK_AND_RIDE_*.json")
+    )
+    assert len(traces) == 1
+
+
+def test_a_repeated_resolution_without_new_evidence_does_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    workspace = _workspace(tmp_path, monkeypatch)
+    _site(workspace, "PARK_AND_RIDE")
+    runner.invoke(app, [
+        "site", "resolve", "hotel-test", "--kind", "PARK_AND_RIDE",
+        "--state", "inferred", "--rationale", "observé", "--by", "op",
+    ])
+
+    result = runner.invoke(app, [
+        "site", "resolve", "hotel-test", "--kind", "PARK_AND_RIDE",
+        "--state", "inferred", "--rationale", "redite", "--by", "op",
+    ])
+    assert result.exit_code == 0
+    assert "rien à faire" in result.output

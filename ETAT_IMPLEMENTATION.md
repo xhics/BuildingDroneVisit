@@ -24,7 +24,7 @@ Statuts :
 |---|---|---|
 | Socle reproductible | livré | CLI, schémas, profils, politique, workspace, smoke |
 | Portabilité second site | livré | territoire et CRS dynamiques, refus hors emprise |
-| Vérité du site | partiel | 4 confirmés, 9 inférés ; seule la parcelle reste non résolue |
+| Vérité du site | partiel | 5 confirmés, 8 inférés ; seule la parcelle reste non résolue |
 | Preuve tirée du corpus | livré | constat, lecture et résolution raccordés ; 0 octet téléchargé |
 | Revue et qualification | livré | décisions et protocoles append-only |
 | Collecte ciblée V2 | partiel | boucle réelle jusqu'à l'aperçu ; expansion Mapillary non raccordée |
@@ -81,15 +81,15 @@ aptes et arbitrées, sans qu'aucun fichier ne soit téléchargé.
 | `ENTRANCE_MAIN_CURRENT` | confirmed | porte-cochère établie sur deux points de vue, corroborée 2024 → courant |
 | `PROPERTY_SIGN` | confirmed | enseigne HÔTEL WELCOMINNS lisible sur deux points de vue |
 | `DRIVEWAY_MAIN` | confirmed | allée marquée reliant la voie publique à la porte-cochère |
-| `ACCESS_ROAD_MAIN` | inferred | accès conditionnel, géométrie disponible |
+| `ACCESS_ROAD_MAIN` | inferred | `service=parking_aisle`, `access=customers` : voie privée, non photographiable depuis la rue |
 | `ROOFLINE_MAIN` | inferred | toiture LiDAR qualifiée |
 | `TERRAIN_MAIN` | inferred | terrain interpolé et qualifié |
 | `PARKING_HOTEL` | inferred | existence observée ; association cadastrale toujours réfutée |
-| `PARK_AND_RIDE` | inferred | terminus de transport observé, distinct du stationnement hôtelier |
+| `PARK_AND_RIDE` | confirmed | RTL, `park_ride=yes`, 459 places — donnée ouverte et photo concordantes |
 | `FACADE_PRIMARY/LEFT/RIGHT/REAR` | inferred | segments d'empreinte réinstanciés depuis l'orientation |
 | `PROPERTY_PARCEL` | unresolved | cadastre non acquis |
 
-Total : 14 objets, dont 4 confirmés, 9 inférés et 1 non résolu.
+Total : 14 objets, dont 5 confirmés, 8 inférés et 1 non résolu.
 
 Ces résolutions ne viennent d'aucune acquisition nouvelle : elles sortent des
 596 images en pleine résolution déjà présentes au corpus, qu'aucun mécanisme ne
@@ -204,6 +204,45 @@ demeure inconnu.
 ---
 
 ## 5. Blocages prioritaires
+
+### P1 fermé — OpenStreetMap comme source complémentaire
+
+Le corpus photographique n'était pas la seule source disponible. OSM porte des
+attributs que ni une image ni le LiDAR ne donnent, et qui tranchent trois
+questions restées ouvertes. Coût : quelques requêtes sur l'API publique.
+
+**`PARK_AND_RIDE` → confirmed.** `relation/12666172` se nomme « Stationnement
+incitatif de Mortagne » et porte `amenity=parking`, `park_ride=yes`,
+`operator=RTL`, `operator:type=public`, `capacity=459`, `capacity:disabled=5`,
+`surface=asphalt` ; `way/1203935424` la complète en `bus_station`,
+`network=RTL`. La distinction que le plan directeur attendait entre le
+stationnement hôtelier et le parc-o-bus se fait donc sur attribut, non par
+défaut — et elle concorde avec les deux vues Mapillary 2024 déjà examinées.
+
+**`ACCESS_ROAD_MAIN` : la cause de la rareté est nommée.** `way/938806358`
+porte `highway=service`, `service=parking_aisle` et **`access=customers`**. Ce
+n'est pas une voie publique mais une allée de stationnement réservée aux
+clients. Ni Street View ni les séquences Mapillary n'y circulent : la demande de
+capture du Router porte sur un objet que la donnée ouverte décrit comme non
+photographiable depuis la voie publique. L'objet reste `inferred` — sa
+géométrie existe, aucune preuve photographique ne l'établit — mais son blocage
+cesse d'être inexpliqué.
+
+**Ce qu'OSM ne donne pas, et qu'il ne faut pas lui faire dire.** L'empreinte
+confirmée `way/54581348` ne porte que `building=commercial`, sans nom, sans
+hauteur, sans niveaux, dernière modification en 2019 : elle ne corrobore donc
+pas la toiture LiDAR. Les nœuds d'adresse « 1195 » et « 1205 Rue Ampère »
+existent, mais issus de CanVec, distants de 9,9 m l'un de l'autre et situés à
+122–132 m au sud-sud-est du centroïde du bâtiment : ils ne désignent aucun
+polygone et ne confirment pas l'identité. Enfin, aucune entité Wikidata ne
+décrit cet établissement, et les données ouvertes de Longueuil couvrent
+Longueuil, non Boucherville.
+
+Un verrou a dû être levé au passage : `site resolve` ignorait un objet déjà
+dans l'état visé, donc une preuve nouvelle ne pouvait plus l'atteindre.
+L'enrichir obligeait à le dé-résoudre — effacer une décision valide pour
+documenter ce qui la conforte. La commande accepte désormais l'ajout de preuve
+à état constant, avec sa propre trace `site_evidence_*`.
 
 ### P1 — Campagne de sources : 2/15 → 14/15
 

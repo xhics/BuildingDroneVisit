@@ -46,8 +46,11 @@ déjà présentes au corpus et sans acquisition nouvelle :
   lisible depuis deux points de vue indépendants ;
 - `DRIVEWAY_MAIN` → **confirmed** : chaussée marquée reliant la voie publique à
   la porte-cochère, sur deux points de vue ;
-- `PARK_AND_RIDE` → **inferred** : terminus de transport collectif observé —
-  abribus, quais, signalisation — nettement distinct du stationnement hôtelier ;
+- `PARK_AND_RIDE` → **confirmed** : OSM `relation/12666172` « Stationnement
+  incitatif de Mortagne » porte `park_ride=yes`, `operator=RTL`, `capacity=459` ;
+  `way/1203935424` la complète en `bus_station`. Deux vues Mapillary 2024
+  concordent — abribus, quais, signalisation. La distinction d'avec le
+  stationnement hôtelier se fait sur attribut, non par défaut ;
 - `PARKING_HOTEL` → **inferred** : existence observée sur deux points de vue.
   L'objet n'est **pas** confirmé : l'association `way/1467386732` reste réfutée,
   ce polygone couvrant le 1205 et non le 1195. Son `source_ref` a été retiré
@@ -55,6 +58,11 @@ déjà présentes au corpus et sans acquisition nouvelle :
 
 `PROPERTY_PARCEL` demeure `unresolved` : le cadastre n'est pas acquis, et rien
 d'observable sur une photographie ne tient lieu d'emprise cadastrale.
+
+`ACCESS_ROAD_MAIN` reste `inferred`, mais sa rareté photographique est
+désormais expliquée : OSM `way/938806358` porte `service=parking_aisle` et
+`access=customers`. C'est une allée privée réservée aux clients, où ni Street
+View ni Mapillary ne circulent.
 
 ## Condition de fermeture
 

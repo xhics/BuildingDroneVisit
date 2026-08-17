@@ -5839,20 +5839,49 @@ def site_resolve(
     stamp = datetime.now(timezone.utc).isoformat()
     pièces = list(evidence or []) + [f"preview:{a}" for a in établis]
     touchés: list[str] = []
+    enrichis: list[str] = []
     for obj in cible:
-        if obj.state is voulu:
+        déjà = obj.state is voulu
+        nouvelles = sorted(set(pièces) - set(obj.evidence))
+        if déjà and not nouvelles:
+            continue
+        obj.evidence = sorted({*obj.evidence, *pièces})
+        if déjà:
+            # Un objet déjà dans l'état visé peut recevoir une preuve nouvelle :
+            # refuser l'ajout obligerait à le dé-résoudre pour l'enrichir, donc
+            # à effacer une décision valide pour documenter ce qui la conforte.
+            enrichis.append(obj.object_id)
             continue
         obj.state = voulu
         obj.unresolved_reason = None
-        obj.evidence = sorted({*obj.evidence, *pièces})
         if voulu is ObjectState.CONFIRMED:
             obj.confirmed_by = decided_by
             obj.confirmed_at = datetime.now(timezone.utc)
             obj.confirmation_rationale = rationale
         touchés.append(obj.object_id)
 
-    if not touchés:
+    if not touchés and not enrichis:
         typer.echo(f"{OK} {kind} déjà {voulu.value} — rien à faire")
+        return
+
+    if enrichis and not touchés:
+        workspace.write_site(site)
+        workspace.write_json(
+            f"00_manifest/site_evidence_{kind}_{_new_run_id()}.json",
+            {
+                "kind": kind,
+                "objects": enrichis,
+                "state": voulu.value,
+                "evidence_added": pièces,
+                "rationale": rationale,
+                "decided_by": decided_by,
+                "decided_at": stamp,
+                "note": "preuve ajoutée sans changement d'état",
+            },
+        )
+        typer.secho(f"{OK} {kind} : preuve ajoutée, état inchangé", fg=typer.colors.GREEN)
+        for identifiant in enrichis:
+            typer.echo(f"    {identifiant}")
         return
 
     workspace.write_site(site)
