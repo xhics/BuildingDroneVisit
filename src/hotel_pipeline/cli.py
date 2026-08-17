@@ -2425,6 +2425,10 @@ def demands_assess(hotel_id: str = typer.Argument(...)) -> None:
         corpus_digest=digest_of(corpus),
         viewpoints=viewpoints,
         demand_digest=digest_of(payload),
+        # Sans ce raccord, un aperçu examiné puis **établi** ne changeait rien :
+        # `assess` recevait `None` et retombait sur les seuls champs plats de
+        # l'inventaire, qui ne portent pas ce qu'un relecteur a vu.
+        previews=workspace.read_previews(),
     )
 
     workspace.write_json(
@@ -5662,6 +5666,220 @@ def preview_assess(
     if assessment.unmeasured:
         typer.echo(f"    inconnu  {', '.join(assessment.unmeasured)}")
     typer.echo("    ce constat ne promeut rien : demands assess le lira")
+
+
+@preview_app.command("assess-corpus")
+def preview_assess_corpus(
+    hotel_id: str = typer.Argument(...),
+    asset_id: str = typer.Option(..., "--asset", help="Asset du corpus examiné."),
+    demand_id: str = typer.Option(..., "--demand", help="Besoin **précis** jugé."),
+    verdict: str = typer.Option(
+        ..., "--verdict", help="established | refuted | inconclusive",
+    ),
+    rationale: str = typer.Option(
+        ..., "--rationale", help="Ce qu'un relecteur doit comprendre.",
+    ),
+    assessed_by: str = typer.Option(..., "--by", help="Qui prononce ce constat."),
+    in_frame: float | None = typer.Option(None, "--in-frame"),
+    projected_width: float | None = typer.Option(None, "--projected-width"),
+    visible: float | None = typer.Option(None, "--visible"),
+    unmeasured: list[str] = typer.Option(None, "--unmeasured"),
+    evidence: list[str] = typer.Option(None, "--evidence"),
+) -> None:
+    """Inscrit un constat sur un asset **déjà présent au corpus**.
+
+    `preview assess` exige qu'un fichier ait été acquis *pour* le besoin jugé :
+    une mesure prise pour autre chose ne doit pas créditer un besoin qu'elle
+    n'a jamais visé. Cette règle laissait toutefois inexploitables les assets
+    collectés sans plan ciblé — sur le pilote, 327 fichiers en pleine
+    résolution contre 6 vignettes.
+
+    Le constat porte donc une filiation explicite `corpus:<source>` au lieu
+    d'un `plan_id` inventé : un relecteur voit immédiatement que la vue n'a pas
+    été commandée pour ce besoin, et peut la contester sur ce motif.
+
+    Un fichier acquis par un plan ciblé reste du ressort de `preview assess` :
+    l'y renvoyer évite deux filiations concurrentes pour un même couple.
+    """
+    from .schemas.preview import PreviewAssessment, PreviewVerdict
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    asset = next(
+        (a for a in (manifest.assets if manifest else []) if a.id == asset_id), None
+    )
+    if asset is None:
+        typer.secho(f"{KO} asset {asset_id!r} absent du manifeste",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    if getattr(asset, "acquisition", None) is not None:
+        typer.secho(
+            f"{KO} {asset_id} vient d'un plan ciblé — utilisez « preview assess », "
+            "qui vérifie le besoin réellement servi",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if not asset.checksum:
+        # Sans empreinte, le constat ne désigne aucun fichier vérifiable.
+        typer.secho(
+            f"{KO} {asset_id} sans empreinte : le constat ne pourrait pas être "
+            "rattaché au fichier examiné",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        assessment = PreviewAssessment(
+            asset_id=asset_id,
+            demand_id=demand_id,
+            plan_id=f"corpus:{asset.source}",
+            request_digest=f"corpus:{asset.checksum[:16]}",
+            checksum=asset.checksum,
+            target_ref=demand_id.split(":", 1)[-1],
+            in_frame_fraction=in_frame,
+            projected_width_fraction=projected_width,
+            visible_fraction=visible,
+            verdict=PreviewVerdict(verdict),
+            unmeasured=list(unmeasured or []),
+            rationale=rationale,
+            assessed_by=assessed_by,
+            evidence=list(evidence or []),
+        )
+    except ValueError as exc:
+        typer.secho(f"{KO} {str(exc).split('Value error, ')[-1].split(' [type')[0]}",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    workspace.append_preview(assessment)
+    typer.echo(f"{OK} constat corpus inscrit : {asset_id[-22:]} / {demand_id}")
+    typer.echo(f"    verdict     {assessment.verdict.value}")
+    typer.echo(f"    filiation   {assessment.plan_id} (non commandé pour ce besoin)")
+    if assessment.unmeasured:
+        typer.echo(f"    inconnu     {', '.join(assessment.unmeasured)}")
+    typer.echo("    ce constat ne promeut rien : demands assess le lira")
+
+
+@site_app.command("resolve")
+def site_resolve(
+    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
+    kind: str = typer.Option(..., "--kind", help="Type d'objet à résoudre."),
+    state: str = typer.Option(
+        "confirmed", "--state", help="confirmed ou inferred.",
+    ),
+    demand_id: str = typer.Option(
+        None, "--demand",
+        help="Besoin dont les constats établis fondent la résolution.",
+    ),
+    rationale: str = typer.Option(..., "--rationale", help="Ce que la preuve établit."),
+    decided_by: str = typer.Option(..., "--by", help="Qui décide."),
+    evidence: list[str] = typer.Option(
+        None, "--evidence", help="Pièce à l'appui. Répétable.",
+    ),
+) -> None:
+    """Résout un objet de site quand une preuve l'établit.
+
+    Symétrique de `site unresolve`, qui manquait : le pilote savait démentir
+    une association, jamais en établir une. Un objet restait donc `unresolved`
+    même après qu'un relecteur ait vu la chose sur des images du corpus.
+
+    `confirmed` exige des constats d'aperçu **établis** sur le besoin
+    correspondant : sans eux, la commande refuse plutôt que de convertir une
+    conviction en fait. `inferred` s'en dispense — c'est précisément ce que le
+    mot dit — mais réclame la même justification écrite.
+
+    Aucune géométrie n'est inventée ici : l'objet change d'état et porte sa
+    preuve. Le tracé d'un contour reste le travail des sources géospatiales.
+    """
+    from datetime import datetime, timezone
+
+    from .schemas.enums import ObjectState
+
+    workspace = Workspace(hotel_id)
+    site = workspace.read_site()
+    if site is None:
+        typer.secho(f"{KO} aucun manifeste de site", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    cible = [obj for obj in site.objects if obj.kind == kind]
+    if not cible:
+        typer.secho(f"{KO} aucun objet de type {kind!r}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        voulu = ObjectState(state)
+    except ValueError as exc:
+        typer.secho(f"{KO} état {state!r} inconnu", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    if voulu not in (ObjectState.CONFIRMED, ObjectState.INFERRED):
+        typer.secho(
+            f"{KO} seuls 'confirmed' et 'inferred' se décident ici ; "
+            "'unresolved' relève de « site unresolve »",
+            fg=typer.colors.RED, err=True,
+        )
+        raise typer.Exit(code=2)
+
+    établis: list[str] = []
+    if voulu is ObjectState.CONFIRMED:
+        besoin = demand_id or f"obligation:{kind}"
+        log = workspace.read_previews()
+        établis = sorted(log.established_for(besoin)) if log else []
+        if not établis:
+            # Confirmer sans constat établi rendrait le mot « confirmé »
+            # indistinct de « supposé », et c'est cette distinction que le
+            # Gate du Lot 1 mesure.
+            typer.secho(
+                f"{KO} aucun constat établi sur {besoin} : « confirmé » sans "
+                "preuve d'aperçu serait une conviction, pas un fait",
+                fg=typer.colors.RED, err=True,
+            )
+            raise typer.Exit(code=2)
+
+    stamp = datetime.now(timezone.utc).isoformat()
+    pièces = list(evidence or []) + [f"preview:{a}" for a in établis]
+    touchés: list[str] = []
+    for obj in cible:
+        if obj.state is voulu:
+            continue
+        obj.state = voulu
+        obj.unresolved_reason = None
+        obj.evidence = sorted({*obj.evidence, *pièces})
+        if voulu is ObjectState.CONFIRMED:
+            obj.confirmed_by = decided_by
+            obj.confirmed_at = datetime.now(timezone.utc)
+            obj.confirmation_rationale = rationale
+        touchés.append(obj.object_id)
+
+    if not touchés:
+        typer.echo(f"{OK} {kind} déjà {voulu.value} — rien à faire")
+        return
+
+    workspace.write_site(site)
+    workspace.write_json(
+        f"00_manifest/site_resolve_{kind}_{_new_run_id()}.json",
+        {
+            "kind": kind,
+            "objects": touchés,
+            "state": voulu.value,
+            "established_previews": établis,
+            "evidence": pièces,
+            "rationale": rationale,
+            "decided_by": decided_by,
+            "decided_at": stamp,
+            "note": (
+                "résolution fondée sur des constats d'aperçu établis ; aucune "
+                "géométrie n'a été produite ici"
+            ),
+        },
+    )
+
+    typer.secho(f"{OK} {kind} → {voulu.value}", fg=typer.colors.GREEN)
+    for identifiant in touchés:
+        typer.echo(f"    {identifiant}")
+    if établis:
+        typer.echo(f"    fondé sur {len(établis)} constat(s) établi(s)")
+    typer.echo("    aucune géométrie produite : le contour reste le travail des sources")
 
 
 @site_app.command("unresolve")

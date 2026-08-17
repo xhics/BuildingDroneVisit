@@ -24,7 +24,8 @@ Statuts :
 |---|---|---|
 | Socle reproductible | livré | CLI, schémas, profils, politique, workspace, smoke |
 | Portabilité second site | livré | territoire et CRS dynamiques, refus hors emprise |
-| Vérité du site | partiel | structure solide, cinq objets encore non résolus |
+| Vérité du site | partiel | 4 confirmés, 9 inférés ; seule la parcelle reste non résolue |
+| Preuve tirée du corpus | livré | constat, lecture et résolution raccordés ; 0 octet téléchargé |
 | Revue et qualification | livré | décisions et protocoles append-only |
 | Collecte ciblée V2 | partiel | boucle réelle jusqu'à l'aperçu ; expansion Mapillary non raccordée |
 | Registre des sources | livré, campagne incomplète | 2 familles requises sur 15 closes ; aucune absence masquée |
@@ -38,8 +39,10 @@ Statuts :
 | Orchestrateur Phase 1 | livré pour le Lot 1B | étape `lot1b` déléguant aux contrats modernes |
 
 **Conclusion :** les mécanismes du Lot 1B sont avancés, mais sa définition de
-DONE n'est pas atteinte. Les tests verts ne compensent pas l'absence de vérité
-sur l'entrée, le stationnement et la parcelle, ni la preuve photo de l'accès.
+DONE n'est pas atteinte. Ce qui bloque a changé de nature : l'entrée, l'enseigne
+et l'allée sont désormais établies sur le corpus déjà collecté, sans acquisition
+nouvelle. Restent la parcelle cadastrale, l'orthophoto, la preuve photo de
+l'accès et la campagne de sources — dont aucun n'est un défaut de code.
 
 ---
 
@@ -50,8 +53,8 @@ sur l'entrée, le stationnement et la parcelle, ni la preuve photo de l'accès.
 | Mesure | Valeur |
 |---|---:|
 | Assets | 335 |
-| `context_lock` | 304 |
-| `photo_geometry` | 9 |
+| `context_lock` | 298 |
+| `photo_geometry` | 15 |
 | `reference_only` | 16 |
 | `identity_evidence` | 5 |
 | `reject` | 1 |
@@ -59,42 +62,62 @@ sur l'entrée, le stationnement et la parcelle, ni la preuve photo de l'accès.
 | Droits `public_uncleared` | 134 |
 | Droits `unknown` | 12 |
 | Assets positionnés | 313 |
+| Fichiers sur disque | 604, pour 123 Mo |
+| Images ≥ 640 px | 596 |
+| Images ≥ 1920 px | 449 |
 
 Les six acquisitions ciblées les plus récentes ont été publiées atomiquement,
 puis évaluées. Elles restent des références : aucune n'a été promue par le seul
 fait d'avoir été téléchargée.
+
+`photo_geometry` passe de 9 à 15 : six vues du corpus ont été examinées, jugées
+aptes et arbitrées, sans qu'aucun fichier ne soit téléchargé.
 
 ### 2.2 Objets du site
 
 | Objet | État courant | Lecture |
 |---|---|---|
 | `BUILDING_MAIN` | confirmed | empreinte OSM confirmée |
+| `ENTRANCE_MAIN_CURRENT` | confirmed | porte-cochère établie sur deux points de vue, corroborée 2024 → courant |
+| `PROPERTY_SIGN` | confirmed | enseigne HÔTEL WELCOMINNS lisible sur deux points de vue |
+| `DRIVEWAY_MAIN` | confirmed | allée marquée reliant la voie publique à la porte-cochère |
 | `ACCESS_ROAD_MAIN` | inferred | accès conditionnel, géométrie disponible |
 | `ROOFLINE_MAIN` | inferred | toiture LiDAR qualifiée |
 | `TERRAIN_MAIN` | inferred | terrain interpolé et qualifié |
-| `PROPERTY_SIGN` | inferred | existence plausible, géométrie non établie |
-| `PARKING_HOTEL` | unresolved | association précédente réfutée |
-| `ENTRANCE_MAIN_CURRENT` | unresolved | emplacement et état courant non établis |
-| `PROPERTY_PARCEL` | unresolved | cadastre non acquis |
+| `PARKING_HOTEL` | inferred | existence observée ; association cadastrale toujours réfutée |
+| `PARK_AND_RIDE` | inferred | terminus de transport observé, distinct du stationnement hôtelier |
 | `FACADE_PRIMARY/LEFT/RIGHT/REAR` | inferred | segments d'empreinte réinstanciés depuis l'orientation |
-| `DRIVEWAY_MAIN` | unresolved | existence non établie |
-| `PARK_AND_RIDE` | unresolved | distinction attendue, absence non vérifiée |
+| `PROPERTY_PARCEL` | unresolved | cadastre non acquis |
 
-Total : 14 objets, dont 1 confirmé, 8 inférés et 5 non résolus.
+Total : 14 objets, dont 4 confirmés, 9 inférés et 1 non résolu.
+
+Ces résolutions ne viennent d'aucune acquisition nouvelle : elles sortent des
+596 images en pleine résolution déjà présentes au corpus, qu'aucun mécanisme ne
+savait convertir en preuve. Voir §5, « Preuve tirée du corpus ».
 
 ### 2.3 Besoins et aperçus
 
 | Mesure | Valeur |
 |---|---:|
 | Besoins | 7 |
-| Besoins ouverts | 6 |
-| Besoins partiellement couverts | 1 |
-| Constats d'aperçu établis | 0 |
+| Besoins ouverts | 4 |
+| Besoins partiellement couverts | 3 |
+| Constats d'aperçu établis | 9 |
 | Constats réfutés | 9 |
 | Constats indécis | 0 |
+| Points de vue indépendants | 3 |
 
 `refuted` qualifie l'élément de preuve, pas le besoin. Un besoin dont tous les
 aperçus sont réfutés reste ouvert.
+
+Les neuf constats réfutés portaient tous sur des vignettes de 256 px : c'est la
+résolution, non le site, qui empêchait de conclure. Les neuf constats établis
+portent sur des images de 640 à 2048 px déjà présentes au corpus.
+
+`ENTRANCE_MAIN_CURRENT`, `PROPERTY_SIGN` et `FACADE_PRIMARY` atteignent
+désormais les deux points de vue exigés. Leur seul manque restant est la
+**continuité**, qui ne se mesure jamais sur un corpus existant : elle demande le
+recouvrement entre images, donc le Lot 2.
 
 ### 2.4 Géospatial et visibilité
 
@@ -125,12 +148,28 @@ stationnement soient confirmés par des preuves enregistrées.
 | Critère | État | Verdict |
 |---|---|---|
 | Bon bâtiment | `BUILDING_MAIN confirmed` | atteint |
-| Entrée actuelle | unresolved | échec |
-| Stationnement hôtel | unresolved | échec |
+| Entrée actuelle | `ENTRANCE_MAIN_CURRENT confirmed` | atteint |
+| Stationnement hôtel | `PARKING_HOTEL inferred` | partiel |
 | Corpus minimal autorisé | droits encore non clarifiés sur 146 assets | partiel |
-| Séparation temporelle de l'entrée | achèvement des travaux inconnu | échec |
+| Séparation temporelle de l'entrée | trois prises concordantes, dates exactes inconnues | partiel |
 
-**Lot 1 : non accepté.**
+**Lot 1 : non accepté, mais plus pour les mêmes raisons.**
+
+Deux critères en échec sont devenus l'un atteint, l'autre partiel. L'entrée
+actuelle est confirmée : la porte-cochère, ses portes vitrées et l'allée qui y
+mène sont identiques sur trois prises séparées — la vue Places portant le numéro
+civique 1195, une vue Mapillary de l'hiver 2024, et une vue Street View courante.
+Elle n'a donc été ni déplacée ni reconstruite dans cet intervalle.
+
+Le stationnement reste `inferred` et non `confirmed`, délibérément : son
+existence est observée sur deux points de vue, mais l'association cadastrale
+précédente — `way/1467386732`, qui couvre le 1205 et non le 1195 — demeure
+réfutée et n'a pas été rétablie. Une existence photographique ne vaut pas une
+emprise.
+
+La séparation temporelle reste partielle : les trois prises concordent, mais
+aucune ne porte de date exacte au manifeste, et l'achèvement des travaux
+demeure inconnu.
 
 ---
 
@@ -161,6 +200,59 @@ stationnement soient confirmés par des preuves enregistrées.
 ---
 
 ## 5. Blocages prioritaires
+
+### P0 fermé — Preuve tirée du corpus déjà collecté
+
+Le corpus contenait 604 fichiers pour 123 Mo, dont **596 images de 640 px ou
+plus** et 449 de 1920 px ou plus. Aucune ne pouvait servir de preuve : trois
+verrous indépendants s'y opposaient, et aucun n'était un manque de données.
+
+1. **`preview assess` exigeait une acquisition ciblée.** Un constat ne pouvait
+   porter que sur un fichier commandé *pour* le besoin jugé. La règle est juste
+   — une mesure prise pour autre chose ne doit pas créditer un besoin qu'elle
+   n'a jamais visé — mais elle rendait inexploitables 329 assets sur 335. Seules
+   6 vignettes de 256 px étaient éligibles, et c'est précisément leur résolution
+   qui a fait réfuter les neuf constats antérieurs.
+2. **`demands assess` ne lisait pas les constats.** Le CLI appelait `assess()`
+   sans lui passer `previews` : le paramètre retombait sur `None` et tout
+   verdict établi était ignoré en silence. Le mécanisme existait des deux côtés,
+   le fil manquait entre les deux.
+3. **Aucune commande ne savait résoudre un objet de site.** `site unresolve`
+   savait démentir une association ; rien ne savait en établir une. Un objet
+   restait `unresolved` même après qu'un relecteur eut vu la chose.
+
+Trois ajouts lèvent ces verrous sans affaiblir la règle qui les motivait :
+
+- `assets preview assess-corpus` constate sur un asset du corpus, avec une
+  filiation explicite `corpus:<source>` au lieu d'un `plan_id` inventé. Un
+  relecteur voit immédiatement que la vue n'a pas été commandée pour ce besoin
+  et peut la contester sur ce motif. Un fichier issu d'un plan ciblé est
+  refusé et renvoyé à `preview assess` ;
+- `demands assess` reçoit désormais le journal des constats ;
+- `site resolve` établit un objet. `confirmed` exige des constats établis sur
+  le besoin correspondant ; `inferred` s'en dispense mais réclame la même
+  justification écrite. Aucune géométrie n'est produite : le contour reste le
+  travail des sources géospatiales.
+
+Résultat, sans un octet téléchargé : objets non résolus **5 → 1**, points de
+vue indépendants **1 → 3**, constats établis **0 → 9**, revendications
+interdites par le Router **5 → 1**.
+
+### P0 fermé — Ce que le corpus ne montre pas
+
+Trois façades restent ouvertes, et l'examen direct des images explique pourquoi
+plutôt que de le supposer. Les vues des secteurs `rear`, `rear_left_corner` et
+`rear_right_corner` — pourtant à 65-70 m et en ligne de vue « dégagée » —
+montrent des **pavillons unifamiliaux d'une rue résidentielle située derrière
+la propriété**. L'hôtel n'y apparaît pas.
+
+Le secteur calculé décrit la position de la caméra par rapport à l'empreinte,
+non ce que l'image montre. Trois de ces vues sont désormais rejetées en revue
+avec ce motif, ce qui les retire des propositions futures.
+
+`FACADE_LEFT`, `FACADE_REAR` et `FACADE_RIGHT` ne sont donc pas couvrables par
+ce corpus. C'est un constat mesuré, et il fonde la demande de capture du Router
+au lieu de la laisser reposer sur un décompte.
 
 ### P0 fermé — Propager l'orientation
 

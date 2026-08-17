@@ -30,8 +30,8 @@ exécutées, aux artefacts produits et aux conditions de reprise.
   photographique ni proxy routier qualifié.
 - Corpus : 335 assets, 9 porteurs de géométrie, 1 point de vue indépendant.
 - Géospatial : terrain et toiture qualifiés comme inférences ; LiDAR acquis.
-- Objets encore non résolus : `PARKING_HOTEL`, `ENTRANCE_MAIN_CURRENT`,
-  `PROPERTY_PARCEL`, `DRIVEWAY_MAIN`, `PARK_AND_RIDE`.
+- Objets encore non résolus : `PROPERTY_PARCEL` seulement. Les quatre autres ont
+  été établis depuis le corpus déjà collecté, sans acquisition nouvelle.
 - Orthophoto CMM : couverture connue, non acquise, contexte seulement.
 - Cadastre : acquisition manuelle requise.
 - Lot 2 : non commencé et hors périmètre de ce goal.
@@ -149,7 +149,12 @@ seul besoin porté par le Router :
    couples plausibles examinés, aucune fusion robuste sur le corpus réel, et
    régressions recadrage, filigrane et image distincte exécutées par la
    commande de production. G1 est `passed` ;
-5. réexaminer les objets critiques seulement à partir de preuves nouvelles.
+5. **fermé pour quatre objets sur cinq** — le réexamen a bien porté sur des
+   preuves, mais elles étaient déjà au corpus : 596 images en pleine résolution
+   qu'aucun mécanisme ne savait convertir en constat. `ENTRANCE_MAIN_CURRENT`,
+   `PROPERTY_SIGN` et `DRIVEWAY_MAIN` sont confirmés ; `PARK_AND_RIDE` et
+   `PARKING_HOTEL` sont inférés. `PROPERTY_PARCEL` reste non résolu et le
+   restera tant que le cadastre n'est pas acquis.
 
 Ces actions ne sont pas remplacées par le paquet proxy. Toute opération réseau,
 manuelle ou susceptible d'engager un coût reçoit son propre Gate et son propre
@@ -204,7 +209,8 @@ et reprend à la première action locale ou autorisée suivante.
 |---|---|---|
 | Familles prioritaires interrogées ou indisponibilité motivée | échec mesuré | `source_registry.json` : 2/15 familles requises closes |
 | Republications neutralisées | livré | 335/335 ; pHash et hash robuste, 30 891 couples plausibles, trois régressions de production, G1 `passed` |
-| Points de vue indépendants par secteur | livré | besoins et Router comptent les points de vue, pas les fichiers |
+| Points de vue indépendants par secteur | livré | 3 points de vue ; besoins et Router les comptent, pas les fichiers |
+| Objets critiques établis sur preuve | livré sauf parcelle | 4 confirmés, 9 inférés, 1 non résolu ; 0 octet téléchargé |
 | `unknown` et preuves conservées | livré | revue et classification append-only |
 | Street View multi-position | livré | positions de corridor, panorama distinct du cadrage |
 | LiDAR, MNT et orthophoto acquis et qualifiés | échec | LiDAR/MNT présents ; orthophoto CMM non acquise |

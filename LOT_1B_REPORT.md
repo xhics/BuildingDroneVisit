@@ -11,10 +11,10 @@ exploitables comme proxies qualifiés ; leur apparence ne l'est pas.
 
 ## Couverture
 
-- 335 assets, dont 9 porteurs de géométrie ;
+- 335 assets, dont 15 porteurs de géométrie ;
 - 269 photographies uniques et 209 points de vue au rapport de déduplication courant ;
-- 1 point de vue indépendant ;
-- besoins satisfaits : 0, partiels : 1, ouverts : 4 ;
+- 3 points de vue indépendants ;
+- besoins satisfaits : 0, partiels : 3, ouverts : 4 ;
 - capture complémentaire : `obligation:ACCESS_ROAD_MAIN` seulement, depuis son corridor résolu et avec aperçu préalable ;
 - droits : 146 assets non clarifiés.
 
@@ -31,17 +31,41 @@ manuelles, non implémentées ou sans indisponibilité documentée.
 
 ## Objets réexaminés
 
-Les cinq objets demandés restent `unresolved` : PARKING_HOTEL,
-ENTRANCE_MAIN_CURRENT, PROPERTY_PARCEL, DRIVEWAY_MAIN et PARK_AND_RIDE. Cette
-relecture n'a apporté aucune preuve nouvelle et ne les promeut donc pas.
+Quatre des cinq objets sont sortis de `unresolved`, par examen direct des images
+déjà présentes au corpus et sans acquisition nouvelle :
+
+- `ENTRANCE_MAIN_CURRENT` → **confirmed** : porte-cochère, portes vitrées et
+  allée identiques sur trois prises séparées, dont une portant le numéro civique
+  1195 et une vue Street View courante ;
+- `PROPERTY_SIGN` → **confirmed** : enseigne sur pylône « HÔTEL WELCOMINNS »
+  lisible depuis deux points de vue indépendants ;
+- `DRIVEWAY_MAIN` → **confirmed** : chaussée marquée reliant la voie publique à
+  la porte-cochère, sur deux points de vue ;
+- `PARK_AND_RIDE` → **inferred** : terminus de transport collectif observé —
+  abribus, quais, signalisation — nettement distinct du stationnement hôtelier ;
+- `PARKING_HOTEL` → **inferred** : existence observée sur deux points de vue.
+  L'objet n'est **pas** confirmé : l'association `way/1467386732` reste réfutée,
+  ce polygone couvrant le 1205 et non le 1195. Son `source_ref` a été retiré
+  pour qu'aucun lecteur ne le prenne pour une preuve.
+
+`PROPERTY_PARCEL` demeure `unresolved` : le cadastre n'est pas acquis, et rien
+d'observable sur une photographie ne tient lieu d'emprise cadastrale.
 
 ## Condition de fermeture
 
 Obtenir et juger une vue de l'accès ; acquérir et qualifier l'orthophoto ;
-acquérir l'extrait cadastral ; établir l'entrée actuelle et l'association du
-stationnement ; et clôturer les 13 familles photographiques encore
-ouvertes par interrogation ou indisponibilité documentée. Régénérer ensuite ce
-rapport et republier le Router si ses entrées changent.
+acquérir l'extrait cadastral ; et clôturer les 13 familles photographiques
+encore ouvertes par interrogation ou indisponibilité documentée. Régénérer
+ensuite ce rapport et republier le Router si ses entrées changent.
+
+L'entrée actuelle n'y figure plus : elle est confirmée. L'association du
+stationnement reste attendue, mais elle demande une emprise cadastrale, non une
+photographie de plus.
+
+Trois façades — gauche, arrière, droite — ne sont **pas** couvrables par ce
+corpus, et c'est un constat mesuré : les vues des secteurs arrière montrent des
+pavillons unifamiliaux d'une rue résidentielle voisine, jamais l'hôtel. Le
+secteur calculé décrit la position de la caméra, non ce que l'image montre.
 
 La déduplication robuste n'est plus une réserve : elle couvre 335/335 assets,
 examine 30 891 couples plausibles et exécute les régressions recadrage,
