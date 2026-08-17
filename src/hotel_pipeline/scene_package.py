@@ -21,7 +21,7 @@ from shapely.ops import triangulate
 
 from .context import PipelineContext
 from .provenance import digest_of
-from .schemas.enums import ObjectState, ReconstructionRole, Rights
+from .schemas.enums import ObjectState, ReconstructionRole, Rights, ViewSector
 from .schemas.scene import (
     CameraPose,
     EvidenceClass,
@@ -178,24 +178,33 @@ def _extruded_obj(polygon: Polygon, ground_z: float, roof_z: float) -> str:
     return "\n".join(lines) + "\n"
 
 
-#: Façade regardée depuis une position, selon son écart au cap de façade.
-#: L'observateur au sud-ouest d'un bâtiment orienté 227,89° voit la façade
-#: principale ; à l'opposé, l'arrière.
-_FACADE_BY_OFFSET = (
-    (45.0, "FACADE_PRIMARY"),
-    (135.0, "FACADE_LEFT"),
-    (225.0, "FACADE_REAR"),
-    (315.0, "FACADE_RIGHT"),
-)
+#: Façade cadrée depuis chaque secteur canonique. Les quatre coins regardent
+#: deux murs à la fois ; on retient celui que le besoin nomme, et l'ambiguïté
+#: est déclarée par `_FACADE_AMBIGUOUS`.
+_FACADE_BY_SECTOR = {
+    ViewSector.FRONT: "FACADE_PRIMARY",
+    ViewSector.FRONT_LEFT_CORNER: "FACADE_PRIMARY",
+    ViewSector.LEFT: "FACADE_LEFT",
+    ViewSector.REAR_LEFT_CORNER: "FACADE_REAR",
+    ViewSector.REAR: "FACADE_REAR",
+    ViewSector.REAR_RIGHT_CORNER: "FACADE_REAR",
+    ViewSector.RIGHT: "FACADE_RIGHT",
+    ViewSector.FRONT_RIGHT_CORNER: "FACADE_PRIMARY",
+}
 
 
 def _facade_faced(azimuth_deg: float, front_azimuth_deg: float) -> str:
-    """Façade cadrée par une pose placée à cet azimut autour de l'emprise."""
-    offset = (azimuth_deg - front_azimuth_deg) % 360.0
-    for limit, kind in _FACADE_BY_OFFSET:
-        if offset < limit:
-            return kind
-    return "FACADE_PRIMARY"
+    """Façade cadrée par une pose placée à cet azimut autour de l'emprise.
+
+    Le secteur vient de `sectors.SECTOR_CENTRES`, la **même** table que celle
+    qui classe les assets réels. Une règle propre au paquet avait inversé
+    gauche et droite : elle plaçait `FACADE_RIGHT` là où le pipeline mesurait
+    `left`, et le rapport aurait déclaré aveugle un mur observé.
+    """
+    from .sectors import sector_for
+
+    sector = sector_for(azimuth_deg, front_azimuth_deg)
+    return _FACADE_BY_SECTOR.get(sector, "FACADE_PRIMARY")
 
 
 def _camera_path(  # noqa: PLR0913

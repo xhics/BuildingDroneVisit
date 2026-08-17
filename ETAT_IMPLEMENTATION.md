@@ -235,8 +235,18 @@ ce que chaque pose regardait. Chaque pose déclare maintenant la façade cadrée
 déduite du cap de façade `227,89°` — et un drapeau `blind_field` quand cette
 surface n'a aucune apparence mesurée. Sur le pilote :
 
-**9 poses sur 12 tombent sur un champ visuel mort.** Seul l'arc 210°–270°,
-face à `FACADE_PRIMARY`, s'appuie sur une apparence observée.
+**8 poses sur 12 tombent sur un champ visuel mort.** Seul l'arc 180°–270°,
+face à `FACADE_PRIMARY`, s'appuie sur une apparence observée — arc cohérent
+avec les 50 assets réels du secteur `front`, dont les azimuts s'étalent de
+205,8° à 250,2°.
+
+Une première version de cette règle **inversait gauche et droite**. Elle
+dérivait la façade d'une table propre au paquet, au lieu de
+`sectors.SECTOR_CENTRES` qui classe déjà les assets réels : elle plaçait
+`FACADE_RIGHT` là où le pipeline mesurait `left`, et aurait déclaré aveugle un
+mur observé. Le contrôle croisé sur les **313 assets positionnés** donne
+désormais zéro divergence, et deux tests de non-régression verrouillent la
+concordance.
 
 Les poses aveugles **restent dans le chemin**. Les retirer masquerait la lacune
 au lieu de la déclarer, et un consommateur ne saurait plus qu'un secteur entier

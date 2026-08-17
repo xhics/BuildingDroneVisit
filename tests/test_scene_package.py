@@ -287,3 +287,52 @@ def test_forbidden_claims_and_blind_fields_come_from_the_constraints() -> None:
     assert _blind_visual_fields(constraints) == [
         "ENTRANCE_MAIN_CURRENT", "PROPERTY_SIGN",
     ]
+
+
+def test_facade_faced_follows_the_canonical_sector_table() -> None:
+    """Une règle propre au paquet avait inversé gauche et droite.
+
+    `sectors.sector_for` classe les assets réels ; en déduire une façade par
+    une seconde table indépendante plaçait `FACADE_RIGHT` là où le pipeline
+    mesurait `left`, et le rapport aurait déclaré aveugle un mur observé.
+    """
+    from hotel_pipeline.scene_package import _facade_faced
+    from hotel_pipeline.schemas.enums import ViewSector
+    from hotel_pipeline.sectors import sector_for
+
+    attendu = {
+        ViewSector.FRONT: "FACADE_PRIMARY",
+        ViewSector.FRONT_LEFT_CORNER: "FACADE_PRIMARY",
+        ViewSector.FRONT_RIGHT_CORNER: "FACADE_PRIMARY",
+        ViewSector.LEFT: "FACADE_LEFT",
+        ViewSector.RIGHT: "FACADE_RIGHT",
+        ViewSector.REAR: "FACADE_REAR",
+        ViewSector.REAR_LEFT_CORNER: "FACADE_REAR",
+        ViewSector.REAR_RIGHT_CORNER: "FACADE_REAR",
+    }
+    front = 227.89
+    for bearing in range(0, 360, 5):
+        secteur = sector_for(float(bearing), front)
+        if secteur not in attendu:
+            continue
+        assert _facade_faced(float(bearing), front) == attendu[secteur], (
+            f"azimut {bearing}° : secteur {secteur.value}"
+        )
+
+
+def test_the_side_facades_are_not_mirrored() -> None:
+    """Contrôle direct de l'inversion : le côté gauche n'est pas le droit."""
+    from hotel_pipeline.scene_package import _facade_faced
+    from hotel_pipeline.sectors import sector_for
+    from hotel_pipeline.schemas.enums import ViewSector
+
+    front = 227.89
+    gauche = next(
+        b for b in range(360) if sector_for(float(b), front) is ViewSector.LEFT
+    )
+    droite = next(
+        b for b in range(360) if sector_for(float(b), front) is ViewSector.RIGHT
+    )
+
+    assert _facade_faced(float(gauche), front) == "FACADE_LEFT"
+    assert _facade_faced(float(droite), front) == "FACADE_RIGHT"

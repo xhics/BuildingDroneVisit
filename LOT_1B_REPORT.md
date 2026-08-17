@@ -99,9 +99,14 @@ donc deux interdits que l'ancienne contrainte unique confondait :
   réels, établis sur preuve, mais dont aucune apparence n'a été mesurée.
 
 Chaque pose de l'orbite virtuelle déclare la façade qu'elle cadre, déduite du
-cap `227,89°`, et un drapeau `blind_field`. **9 poses sur 12 tombent sur un
-champ visuel mort** : seul l'arc 210°–270°, face à `FACADE_PRIMARY`, s'appuie
-sur une apparence observée.
+cap `227,89°`, et un drapeau `blind_field`. **8 poses sur 12 tombent sur un
+champ visuel mort** : seul l'arc 180°–270°, face à `FACADE_PRIMARY`, s'appuie
+sur une apparence observée — cohérent avec les 50 assets réels du secteur
+`front` (azimuts 205,8° à 250,2°).
+
+La façade cadrée est déduite de `sectors.SECTOR_CENTRES`, la même table qui
+classe les assets : le contrôle croisé sur les 313 assets positionnés donne
+zéro divergence.
 
 Les poses aveugles restent dans le chemin : les retirer masquerait la lacune au
 lieu de la déclarer.
