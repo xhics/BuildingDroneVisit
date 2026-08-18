@@ -191,6 +191,8 @@ Ne pas éliminer les images successives qui créent une continuité spatiale exp
 - jusqu'à deux vues supplémentaires seulement si elles apportent un déplacement ou un recouvrement utile ;
 - les autres comme références inactives, sans les supprimer du registre.
 
+Le choix du canonique intègre désormais la fraîcheur temporelle et la qualité mesurée : une capture récente (`capture_year`) ou mieux notée (`quality_score`) prime pour la représentation du point de vue. Le regroupement glouton ordonne aussi les candidats par distance, puis par qualité décroissante et année décroissante, afin que le représentant de cluster soit le plus informé disponible.
+
 ### Validation requise
 
 - tests pour copie recompressée, recadrage, watermark et changement d'exposition ;
@@ -474,6 +476,7 @@ Ces seuils ne sont pas un concours de volume. Une zone n'est `trusted` que si le
 coverage_report.json
 zone_confidence.geojson
 camera_constraints.json
+video_prompts.json
 ```
 
 `camera_constraints.json` doit indiquer par zone :
@@ -484,6 +487,16 @@ camera_constraints.json
 - niveau de détail maximal ;
 - cause de la restriction ;
 - preuve nécessaire pour lever la restriction.
+
+`video_prompts.json` exporte le conditionnement pour la génération vidéo IA :
+
+- `facade_quality` : couverture pondérée par façade (`weighted_union_fraction`) ;
+- `pose_priorities` : priorité de chaque pose virtuelle (`high`/`medium`/`low`/`context`) ;
+- `style_hints` : consignes de style par façade (observée vs. proxy) ;
+- `temporal_sequence` : ordre de présentation suggéré ;
+- `blind_field_poses` : frames à éviter ou à déclarer explicitement.
+
+La trajectoire de caméra est désormais **pilotée par la demande** : le nombre de poses par façade dépend de la couverture mesurée, avec un minimum de 8 poses. Les façades non observées reçoivent 4 poses marquées `blind_field=True` ; les partiellement observées en reçoivent 3 ; les pleinement observées, 2. L'orbite fixe de 12 poses à 30° est remplacée par une répartition variable qui concentre les poses là où le besoin est maximal.
 
 ---
 
@@ -661,7 +674,7 @@ coverage/
   zone_confidence.geojson
   camera_constraints.json
   context_manifest.json
-  capture_brief.md          # seulement si nécessaire
+  video_prompts.json         # conditionnement IA pour génération vidéo
 
 LOT_1B_REPORT.md
 ```

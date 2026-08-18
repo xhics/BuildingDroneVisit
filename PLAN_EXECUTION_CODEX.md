@@ -48,7 +48,7 @@ Sorties :
 - `coverage/zone_confidence.geojson` ;
 - `coverage/camera_constraints.json` ;
 - `coverage/context_manifest.json` ;
-- `coverage/capture_brief.md` ;
+- `coverage/video_prompts.json` ;
 - `LOT_1B_REPORT.md` racine et copie sous le workspace.
 
 Critères de sortie :
@@ -84,7 +84,7 @@ Sorties sous `08_composite/` :
 - volume `environment.obj` et matériau ;
 - DTM, DSM toiture et nDSM actifs, copiés et vérifiés par SHA-256 ;
 - carte de confiance et contraintes caméra ;
-- orbite virtuelle de 12 poses, explicitement `simulation_only` ;
+- orbite virtuelle pilotée par la demande, explicitement `simulation_only` ;
 - contrat de prompts sans appel à un fournisseur réel ;
 - script d'import Blender ;
 - `phase1_verdict.json`, `scene.json` et pointeur canonique.

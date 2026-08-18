@@ -93,12 +93,12 @@ def test_un_gate_g1_franchi_ne_reapparait_pas_comme_blocage() -> None:
     assert "capture manquante" in reasons
 
 
-def test_orbite_est_virtuelle_et_compte_douze_poses() -> None:
+def test_orbite_est_virtuelle_et_compte_des_poses() -> None:
     polygon = Polygon([(0, 0), (20, 0), (20, 10), (0, 10)])
     path = _camera_path(polygon, height_m=10, fov_deg=80)
     assert path.simulation_only is True
-    assert len(path.poses) == 12
-    assert len({pose.frame for pose in path.poses}) == 12
+    assert len(path.poses) >= 8
+    assert len({pose.frame for pose in path.poses}) == len(path.poses)
     assert all(pose.distance_m > 0 for pose in path.poses)
 
 
@@ -234,13 +234,16 @@ def test_a_pose_facing_an_unobserved_facade_is_declared_blind() -> None:
         observed_appearance=frozenset({"FACADE_PRIMARY"}),
     )
 
-    faces = {pose.azimuth_deg: (pose.faces, pose.blind_field) for pose in path.poses}
-    # Au cap de façade, l'observateur voit la façade principale : elle est vue.
-    assert faces[0.0] == ("FACADE_PRIMARY", False)
-    # À l'opposé, l'arrière — jamais photographié ici.
-    assert faces[180.0] == ("FACADE_REAR", True)
+    rear_poses = [pose for pose in path.poses if pose.faces == "FACADE_REAR"]
+    primary_poses = [pose for pose in path.poses if pose.faces == "FACADE_PRIMARY"]
+    # Les poses de la façade arrière (non observée) sont déclarées aveugles.
+    assert rear_poses
+    assert all(pose.blind_field for pose in rear_poses)
+    # Les poses de la façade principale (observée) ne sont pas aveugles.
+    assert primary_poses
+    assert not any(pose.blind_field for pose in primary_poses)
     # Aucune pose n'est supprimée : la lacune se déclare, elle ne se masque pas.
-    assert len(path.poses) == 12
+    assert len(path.poses) >= 8
 
 
 def test_without_a_known_orientation_no_pose_claims_a_facade() -> None:
@@ -269,7 +272,7 @@ def test_the_derivation_counts_the_blind_poses() -> None:
 
     assert "champ visuel mort" in path.derivation
     blind = sum(pose.blind_field for pose in path.poses)
-    assert f"{blind}/12" in path.derivation
+    assert f"{blind}/{len(path.poses)}" in path.derivation
 
 
 def test_forbidden_claims_and_blind_fields_come_from_the_constraints() -> None:
@@ -336,3 +339,60 @@ def test_the_side_facades_are_not_mirrored() -> None:
 
     assert _facade_faced(float(gauche), front) == "FACADE_LEFT"
     assert _facade_faced(float(droite), front) == "FACADE_RIGHT"
+
+
+# --- orbite pilotée par la demande -----------------------------------------
+
+
+def test_demand_driven_path_generates_more_poses_for_unobserved_facades() -> None:
+    """Les façades sans apparence observée reçoivent plus de poses."""
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(
+        square, height_m=10.0, fov_deg=80.0,
+        front_azimuth_deg=0.0,
+        observed_appearance=frozenset(),
+        coverage_demands={"open": ["FACADE_REAR"], "partial": []},
+    )
+
+    rear_poses = [p for p in path.poses if p.faces == "FACADE_REAR"]
+    assert len(rear_poses) >= 4
+    assert all(p.blind_field for p in rear_poses)
+    assert len(path.poses) >= 8
+
+
+def test_demand_driven_path_has_demand_driven_derivation() -> None:
+    """La chaîne de dérivation mentionne la répartition par façade."""
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(
+        square, height_m=10.0, fov_deg=80.0,
+        front_azimuth_deg=0.0,
+        observed_appearance=frozenset({"FACADE_PRIMARY"}),
+        coverage_demands={"open": [], "partial": ["FACADE_LEFT"]},
+    )
+
+    assert "orbite pilotée par la demande" in path.derivation
+    assert "FACADE_PRIMARY" in path.derivation
+    assert "FACADE_LEFT" in path.derivation
+
+
+def test_demand_driven_path_assigns_blind_field_to_none_facades() -> None:
+    """Les poses ciblant des façades non observées sont marquées aveugles."""
+    from hotel_pipeline.scene_package import _camera_path
+
+    square = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    path = _camera_path(
+        square, height_m=10.0, fov_deg=80.0,
+        front_azimuth_deg=0.0,
+        observed_appearance=frozenset({"FACADE_PRIMARY", "FACADE_LEFT"}),
+        coverage_demands={"open": [], "partial": []},
+    )
+
+    for pose in path.poses:
+        if pose.faces in ("FACADE_PRIMARY", "FACADE_LEFT"):
+            assert not pose.blind_field
+        else:
+            assert pose.blind_field

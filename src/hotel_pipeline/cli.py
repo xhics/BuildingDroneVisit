@@ -7,7 +7,6 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -661,10 +660,6 @@ def assets_discover(
     radius_m: int | None = typer.Option(
         None, "--radius", help="Rayon d'interrogation ; défaut : politique de collecte."
     ),
-    demand: list[str] = typer.Option(
-        None, "--demand",
-        help="Restreint la découverte à ce besoin. Répétable.",
-    ),
 ) -> None:
     """Interroge les index des sources. **Aucune image n'est téléchargée.**
 
@@ -675,10 +670,7 @@ def assets_discover(
     """
     from .discover import DiscoveryRefused, discover
     from .provenance import digest_of
-    from .schemas.acquisition import (
-        CaptureDemandManifest,
-        DiscoveryMode,
-    )
+    from .schemas.acquisition import CaptureDemandManifest
 
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
     workspace = Workspace(hotel_id)
@@ -692,25 +684,9 @@ def assets_discover(
         )
         raise typer.Exit(code=1)
 
-    # Le manifeste **canonique complet** est chargé d'abord : un filtre qui
-    # lirait un sous-ensemble ne pourrait pas dire qu'un identifiant est
-    # inconnu — il le prendrait pour un besoin d'un autre manifeste.
     demands = CaptureDemandManifest.model_validate(payload)
     profile = context.profile
     radius = radius_m or context.policy.collection.radius_m
-
-    # --- la portée, arrêtée **avant** toute interrogation ---------------------
-    scope, demands = _discovery_scope(demands, demand or [], digest_of(payload))
-    if scope.mode is DiscoveryMode.TARGETED:
-        typer.secho(
-            f"  découverte ciblée sur {len(scope.demand_ids)} besoin(s) : "
-            f"{', '.join(scope.demand_ids)}",
-            fg=typer.colors.CYAN,
-        )
-        typer.echo(
-            "  le corpus obtenu ne dira rien des autres besoins : il ne "
-            "deviendra pas le manifeste courant"
-        )
 
     typer.echo(f"  besoins     {len(demands.demands)}")
     typer.echo(f"  position    {profile.lat:.6f}, {profile.lon:.6f}")
@@ -729,21 +705,9 @@ def assets_discover(
     # Ce qu'on s'attend à émettre **au plus**. La pagination interdit un compte
     # exact d'avance ; annoncer un plafond vaut mieux que se taire, et le
     # comparer à l'effectif dit si l'estimation valait.
-    # Depuis les points **réels** du corridor quand la portée en nomme un :
-    # la formule globale annoncerait un plafond sans rapport avec ce qu'on
-    # s'autorise.
-    points_ciblés = _scoped_corridor_points(workspace, context, scope)
-    registre.planned_max_requests.update(
-        _planned_calls(context, radius, points_ciblés)
-    )
-    if points_ciblés is not None:
-        typer.echo(
-            f"  plafond     {points_ciblés} appel(s) Street View au plus, "
-            "comptés sur la géométrie du corridor"
-        )
+    registre.planned_max_requests.update(_planned_calls(context, radius))
     queries = _query_sources(
-        profile, context, workspace, radius,
-        search.outstanding or demands.demands, scope,
+        profile, context, workspace, radius, search.outstanding or demands.demands
     )
     search.requests_by_source = _requests_by_source(ledger().by_source())
 
@@ -775,43 +739,21 @@ def assets_discover(
     failed = sorted(image_sources & set(report.sources_skipped))
     partial = bool(failed)
 
-    # Un rejeu figé n'est pas une découverte — mais un cache **complet et au
-    # contrat courant** en est une, servie sans appel. Les confondre condamnait
-    # toute reconstruction hors ligne à rester un replay, alors que le corpus
-    # obtenu est exactement celui qu'un appel rendrait.
-    replay = current_mode() is NetworkMode.CACHE_ONLY and (
-        partial or not manifest.candidates
-    )
-    # Une découverte ciblée vit **à part**, quoi qu'il arrive : son corpus ne
-    # dit rien des besoins qu'elle n'a pas cherchés, et le tri par date ne doit
-    # jamais aller l'y chercher comme manifeste courant.
-    if scope.mode is DiscoveryMode.TARGETED:
-        prefix = f"01_sources/targeted/{report.run_id}"
-    else:
-        prefix = "01_sources/replays" if (replay or partial) else "01_sources"
-    # Le message doit nommer **le dossier réellement employé** : annoncer
-    # `replays/` en écrivant sous `targeted/` enverrait chercher au mauvais
-    # endroit le fichier qu'un plan ciblé doit désigner explicitement.
+    replay = current_mode() is NetworkMode.CACHE_ONLY
+    prefix = "01_sources/replays" if (replay or partial) else "01_sources"
     if partial:
         typer.secho(
             f"  · corpus partiel — {', '.join(failed)} n'a pas répondu : écrit "
-            f"sous {prefix}/, il ne devient pas le manifeste courant. "
+            "sous 01_sources/replays/, il ne devient pas le manifeste courant. "
             "Planifier dessus prendrait une source absente pour une source vide.",
             fg=typer.colors.YELLOW,
         )
     if replay:
         typer.secho(
-            f"  · rejeu sur cache figé : écrit sous {prefix}/, il ne "
+            "  · rejeu sur cache figé : écrit sous 01_sources/replays/, il ne "
             "sera pas repris comme manifeste courant",
             fg=typer.colors.YELLOW,
         )
-
-    # La portée est inscrite **au manifeste** : sans elle, deux corpus de
-    # contenus incomparables se ressembleraient.
-    manifest = manifest.model_copy(update={"scope": scope})
-
-    if scope.mode is DiscoveryMode.TARGETED:
-        manifest = _targeted_manifest(workspace, manifest, scope)
 
     workspace.write_json(
         f"{prefix}/candidates_{report.run_id}.json",
@@ -1055,116 +997,7 @@ def _target_position(workspace):  # noqa: ANN001, ANN201
     return (building.centroid_lat, building.centroid_lon)
 
 
-def _discovery_scope(demands, selected: list[str], demand_digest: str):  # noqa: ANN001, ANN201
-    """Arrête ce que cette découverte couvrira, **avant** d'interroger quoi que ce soit.
-
-    Valider après un appel réseau aurait déjà émis la requête, dépensé le quota
-    et écrit une trace pour un besoin qui n'existe pas. Un identifiant inconnu
-    doit donc être refusé ici, sans cache ni réseau.
-
-    Le manifeste rendu ne porte que les besoins retenus : filtrer plus loin
-    laisserait les autres être interrogés « pour rien », et le rapport dirait
-    qu'on les a cherchés.
-    """
-    from .schemas.acquisition import (
-        DiscoveryMode,
-        DiscoveryScope,
-        TargetKind,
-    )
-
-    if not selected:
-        return DiscoveryScope(demand_manifest_digest=demand_digest), demands
-
-    connus = {d.demand_id for d in demands.demands}
-    inconnus = sorted(set(selected) - connus)
-    if inconnus:
-        typer.secho(
-            f"{KO} besoin(s) inconnu(s) du manifeste canonique : "
-            f"{', '.join(inconnus)}",
-            fg=typer.colors.RED, err=True,
-        )
-        typer.secho(
-            "  aucune source n'a été interrogée : chercher pour un besoin qui "
-            "n'existe pas dépenserait un quota et écrirait une trace que rien "
-            "ne justifie",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2)
-
-    retenus = [d for d in demands.demands if d.demand_id in set(selected)]
-    # Le corridor du besoin, quand il en désigne un : la recherche s'y cadre,
-    # au lieu de balayer le rayon entier.
-    corridors = sorted({
-        d.target_ref for d in retenus
-        if d.target_kind is TargetKind.CONTEXT_CORRIDOR
-    })
-
-    scope = DiscoveryScope(
-        mode=DiscoveryMode.TARGETED,
-        demand_ids=tuple(sorted(d.demand_id for d in retenus)),
-        demand_manifest_digest=demand_digest,
-        corridor_ref=corridors[0] if len(corridors) == 1 else "",
-    )
-    # Un manifeste restreint aux seuls besoins visés : les autres ne doivent
-    # être ni interrogés, ni évalués, ni comptés comme non satisfaits.
-    restreint = demands.model_copy(update={"demands": retenus})
-    return scope, restreint
-
-
-def _targeted_manifest(workspace, manifest, scope):  # noqa: ANN001, ANN201
-    """Écarte ce qu'un aperçu a déjà réfuté, et borne le reste à l'aperçu.
-
-    Deux règles, pour deux raisons distinctes :
-
-    - **un couple réfuté ne se repropose pas.** Un examen humain a constaté que
-      cette vue ne montre pas ce besoin ; la resservir ferait refaire le même
-      examen, et la réfutation n'aurait servi à rien.
-    - **rien n'entre en pleine résolution avant un aperçu établi.** Une
-      acquisition ciblée porte sur un besoin qu'aucune vue ne couvre encore :
-      engager la pleine résolution reviendrait à payer pour une image dont
-      personne n'a vérifié qu'elle montre ce qu'on cherche.
-    """
-    from .schemas.preview import PreviewAssessmentLog
-
-    payload = workspace.read_json("01_sources/preview_assessments.json") or {}
-    log = PreviewAssessmentLog.model_validate(payload) if payload else None
-
-    réfutés: set[str] = set()
-    if log is not None:
-        for demand_id in scope.demand_ids:
-            réfutés |= log.refuted_for(demand_id)
-
-    gardés = [c for c in manifest.candidates if c.candidate_id not in réfutés]
-    écartés = len(manifest.candidates) - len(gardés)
-    if écartés:
-        typer.secho(
-            f"  · {écartés} candidat(s) écarté(s) : un aperçu humain les a "
-            "déjà réfutés pour ce besoin",
-            fg=typer.colors.YELLOW,
-        )
-
-    restants = {c.candidate_id for c in gardés}
-    return manifest.model_copy(update={
-        "candidates": gardés,
-        "evaluations": [
-            e for e in manifest.evaluations if e.candidate_id in restants
-        ],
-        "recommendations": [
-            r for r in manifest.recommendations if r.candidate_id in restants
-        ],
-        "recommended_for_enrichment": [
-            c for c in manifest.recommended_for_enrichment if c in restants
-        ],
-        "recommended_for_preview": [
-            c for c in manifest.recommended_for_preview if c in restants
-        ],
-        # Aucune pleine résolution planifiable : l'aperçu et son examen humain
-        # sont le seul chemin vers l'acquisition complète d'une vue ciblée.
-        "eligible_for_full_acquisition": [],
-    })
-
-
-def _query_sources(profile, context, workspace, radius_m: int, demands, scope=None) -> dict:  # noqa: ANN001
+def _query_sources(profile, context, workspace, radius_m: int, demands) -> dict:  # noqa: ANN001
     """Interroge les index disponibles, et dit pourquoi les autres ne le sont pas.
 
     Une source non configurée n'est pas une source vide : le motif remonte au
@@ -1190,12 +1023,12 @@ def _query_sources(profile, context, workspace, radius_m: int, demands, scope=No
         queries["mapillary"] = candidates_from("mapillary", images)
 
     queries["street_view"] = _street_view_candidates(
-        context, workspace, radius_m, demands, scope
+        context, workspace, radius_m, demands
     )
     return queries
 
 
-def _street_view_candidates(context, workspace, radius_m: int, demands, scope=None):  # noqa: ANN001, ANN201
+def _street_view_candidates(context, workspace, radius_m: int, demands):  # noqa: ANN001, ANN201
     """Panoramas des corridors proches, cadrés vers ce que les besoins demandent.
 
     Le cap est **dirigé**, jamais balayé : tourner l'horizon produirait des
@@ -1221,25 +1054,9 @@ def _street_view_candidates(context, workspace, radius_m: int, demands, scope=No
     except LegacyManifestRefused as exc:
         return f"géométrie illisible : {exc}"
 
-    # La portée restreint l'**espace** interrogé, non seulement le besoin :
-    # sans cela, une découverte ciblée échantillonnait les 129 corridors du
-    # secteur pour un besoin qui n'en concerne qu'un.
-    corridor_ref = getattr(scope, "corridor_ref", "") if scope else ""
-    try:
-        corridors = _corridor_elements(manifest, corridor_ref)
-    except CorridorScopeRefused as exc:
-        # Refusé **avant** le réseau : émettre des requêtes dont le domaine est
-        # inconnu coûterait un quota sans qu'on sache ce qui a été interrogé.
-        return f"portée de corridor refusée : {exc}"
+    corridors = _corridor_elements(manifest)
     if not corridors:
         return "aucun corridor résolu autour du site"
-
-    if corridor_ref:
-        typer.secho(
-            f"    street_view · échantillonnage borné au corridor "
-            f"{corridor_ref}",
-            fg=typer.colors.CYAN,
-        )
 
     spatial = _safe_read(workspace.read_spatial)
     front = getattr(spatial, "front_azimuth_deg", None) if spatial else None
@@ -1278,66 +1095,26 @@ def _street_view_candidates(context, workspace, radius_m: int, demands, scope=No
     ]
 
 
-class CorridorScopeRefused(RuntimeError):
-    """La référence de corridor ne désigne pas exactement une géométrie.
-
-    Absente, elle ferait balayer le réseau entier ; ambiguë, on ne saurait pas
-    laquelle des deux a été échantillonnée. Dans les deux cas, refuser **avant**
-    le réseau vaut mieux qu'émettre des requêtes dont le domaine est inconnu.
-    """
-
-
-def _corridor_elements(manifest, corridor_ref: str = "") -> list[dict]:  # noqa: ANN001
-    """Corridors résolus, au format qu'attend l'échantillonnage de voirie.
-
-    `corridor_ref` restreint à **une** géométrie nommée. Sans lui, une
-    découverte ciblée sur un besoin interrogeait quand même les 129 corridors
-    du secteur : le besoin était filtré, l'espace ne l'était pas — 1 215 points
-    d'échantillon au lieu de 17.
-    """
+def _corridor_elements(manifest) -> list[dict]:  # noqa: ANN001
+    """Corridors résolus, au format qu'attend l'échantillonnage de voirie."""
     from shapely import wkt as shapely_wkt
 
     from .schemas.geometry import GeometryResolutionStatus, GeometryRole
 
-    retenues = []
+    elements = []
     for geometry in manifest.geometries:
         if geometry.role not in (GeometryRole.ROAD_CANDIDATE, GeometryRole.ACCESS_ROAD):
             continue
         if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
             continue
-        retenues.append(geometry)
-
-    if corridor_ref:
-        # Correspondance **exacte** sur le `feature_id`. Une correspondance
-        # partielle ferait retenir `ACCESS_ROAD_MAIN_2` pour `ACCESS_ROAD_MAIN`,
-        # et l'échantillonnage porterait sur une voie qu'on n'a pas nommée.
-        nommées = [g for g in retenues if g.feature_id == corridor_ref]
-        if not nommées:
-            raise CorridorScopeRefused(
-                f"corridor {corridor_ref!r} absent des géométries résolues : "
-                "interroger le réseau entier reviendrait à ignorer la portée "
-                "demandée"
-            )
-        if len(nommées) > 1:
-            raise CorridorScopeRefused(
-                f"corridor {corridor_ref!r} désigne {len(nommées)} géométries : "
-                "on ne saurait pas laquelle a été échantillonnée"
-            )
-        retenues = nommées
-
-    elements = []
-    for geometry in retenues:
         shape = shapely_wkt.loads(geometry.wgs84_wkt)
         coords = (
             list(shape.coords) if shape.geom_type == "LineString"
             else [point for part in shape.geoms for point in part.coords]
         )
-        elements.append({
-            # Le `feature_id` voyage avec la géométrie : sans lui, rien ne
-            # permet de vérifier après coup **quelle** voie a été interrogée.
-            "feature_id": geometry.feature_id,
-            "geometry": [{"lat": lat, "lon": lon} for lon, lat in coords],
-        })
+        elements.append(
+            {"geometry": [{"lat": lat, "lon": lon} for lon, lat in coords]}
+        )
     return elements
 
 
@@ -1365,8 +1142,7 @@ def assets_plan(
     from .plan import PlanRefused, build, consent
     from .provenance import digest_of
     from .schemas.acquisition import (
-        AcquisitionPlan, CandidateManifest, CaptureDemandManifest, PlanStatus,
-        VolumeStatus,
+        CandidateManifest, CaptureDemandManifest, PlanStatus, VolumeStatus,
     )
 
     context = _context(hotel_id, Capability.TARGETED_COLLECTION)
@@ -1391,20 +1167,9 @@ def assets_plan(
         )
         raise typer.Exit(code=1)
 
-    try:
-        candidate_manifest_ref = _candidate_manifest_reference(workspace, Path(path))
-    except ValueError as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-
     candidates_payload = json.loads(Path(path).read_text("utf-8"))
     candidates = CandidateManifest.model_validate(candidates_payload)
-    canonical_demands = CaptureDemandManifest.model_validate(demands_payload)
-    try:
-        demands = _plan_demands_for_scope(candidates, canonical_demands)
-    except ValueError as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
+    demands = CaptureDemandManifest.model_validate(demands_payload)
 
     # Liaison des deux manifestes. `--candidates` permet de désigner un fichier
     # arbitraire : sans ces contrôles, un manifeste d'un autre établissement ou
@@ -1470,23 +1235,20 @@ def assets_plan(
     )
     # Chaque acquisition porte désormais ce qui sera demandé pour elle : le
     # consentement verrouille l'empreinte, non le seul candidat.
-    plan = AcquisitionPlan.model_validate(plan.model_copy(update={
-        "candidate_manifest_ref": candidate_manifest_ref,
-        "acquisitions": [
-            a.model_copy(update={
-                "provider_resolution": (
-                    acquisition_requests[a.candidate_id].provider_resolution
-                    if a.candidate_id in acquisition_requests else None
-                ),
-                "request_digest": (
-                    acquisition_requests[a.candidate_id].digest
-                    if a.candidate_id in acquisition_requests else None
-                ),
-                **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
-            })
-            for a in plan.acquisitions
-        ],
-    }).model_dump())
+    plan = plan.model_copy(update={"acquisitions": [
+        a.model_copy(update={
+            "provider_resolution": (
+                acquisition_requests[a.candidate_id].provider_resolution
+                if a.candidate_id in acquisition_requests else None
+            ),
+            "request_digest": (
+                acquisition_requests[a.candidate_id].digest
+                if a.candidate_id in acquisition_requests else None
+            ),
+            **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
+        })
+        for a in plan.acquisitions
+    ]})
 
     # Un brouillon irréalisable est un brouillon faux. `bind_plan` existait,
     # était testé, et n'était appelé nulle part : la contradiction entre ce que
@@ -1601,9 +1363,8 @@ def assets_plan(
             typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2) from exc
 
-    plan_relative_path = f"01_sources/acquisition_plan_{plan.plan_id}.json"
     workspace.write_json(
-        plan_relative_path,
+        f"01_sources/acquisition_plan_{plan.plan_id}.json",
         json.loads(plan.model_dump_json()),
     )
     report.transport = plan_ledger().as_dict()
@@ -1638,17 +1399,10 @@ def assets_plan(
         typer.echo("    prochaine étape : assets acquire")
     else:
         typer.echo(f"{OK} plan {plan.plan_id} — brouillon, rien ne sera téléchargé")
-        plan_path = workspace.path(plan_relative_path)
-        if plan.unknown_size_items:
-            typer.echo(
-                f"    prochaine étape : assets measure-plan {hotel_id} "
-                f"--plan {plan_path}"
-            )
-        else:
-            typer.echo(
-                f"    prochaine étape : assets consent-plan {hotel_id} "
-                f"--plan {plan_path} --consent-bytes {plan.known_bytes}"
-            )
+        typer.echo(
+            f"    pour l'exécuter : assets plan {hotel_id} "
+            f"--consent-bytes {plan.known_bytes}"
+        )
 
 
 def _candidate_geometries(workspace, context, candidates, demands):  # noqa: ANN001, ANN201
@@ -1791,61 +1545,6 @@ def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
     return found[-1] if found else None
 
 
-def _candidate_manifest_reference(workspace, path: Path) -> str:  # noqa: ANN001
-    """Référence portable et confinée du manifeste réellement planifié."""
-    resolved = Path(path).resolve()
-    try:
-        relative = resolved.relative_to(workspace.root.resolve())
-    except ValueError as exc:
-        raise ValueError(
-            "le manifeste de candidats doit vivre dans le workspace pour être "
-            "rejouable ; copiez-le sous 01_sources/ avant de planifier"
-        ) from exc
-    reference = relative.as_posix()
-    # Le schéma porte la règle de confinement ; revalider ici évite qu'un
-    # simple helper reconstruise un contrat parallèle.
-    from .schemas.acquisition import AcquisitionPlan
-
-    probe = AcquisitionPlan(
-        plan_id="candidate-reference-check",
-        hotel_id=workspace.hotel_id,
-        candidate_manifest_ref=reference,
-    )
-    return str(probe.candidate_manifest_ref)
-
-
-def _candidate_manifest_for_plan(workspace, plan):  # noqa: ANN001, ANN201
-    """Relit le manifeste exact d'un plan et confronte son empreinte.
-
-    Les plans antérieurs au champ ``candidate_manifest_ref`` conservent leur
-    chemin historique vers le manifeste global. Ils ne peuvent toutefois plus
-    franchir silencieusement une divergence d'empreinte.
-    """
-    from .provenance import digest_of
-
-    if plan.candidate_manifest_ref:
-        path = (workspace.root / plan.candidate_manifest_ref).resolve()
-        try:
-            path.relative_to(workspace.root.resolve())
-        except ValueError as exc:  # défense redondante contre un modèle forgé
-            raise ValueError("référence de candidats hors workspace") from exc
-    else:
-        path = _latest_candidates(workspace)
-        if path is None:
-            raise FileNotFoundError("aucun manifeste de candidats")
-
-    if not path.is_file():
-        raise FileNotFoundError(f"manifeste de candidats du plan absent : {path}")
-    payload = json.loads(path.read_text("utf-8"))
-    actual = digest_of(payload)
-    if plan.candidate_manifest_digest and actual != plan.candidate_manifest_digest:
-        raise ValueError(
-            "empreinte du manifeste de candidats divergente : "
-            f"{actual} != {plan.candidate_manifest_digest} — aucun appel émis"
-        )
-    return path, payload
-
-
 def _plan_digests(workspace, context, candidates_payload, demands_payload) -> dict:  # noqa: ANN001
     """Toutes les empreintes qu'un plan exécutable doit porter.
 
@@ -1924,13 +1623,11 @@ def assets_acquire(
     plan_payload = json.loads(Path(path).read_text("utf-8"))
     plan = AcquisitionPlan.model_validate(plan_payload)
 
-    try:
-        candidates_path, candidates_payload = _candidate_manifest_for_plan(
-            workspace, plan
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+    candidates_path = _latest_candidates(workspace)
+    if candidates_path is None:
+        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    candidates_payload = json.loads(candidates_path.read_text("utf-8"))
     candidates = {
         c.candidate_id: c
         for c in CandidateManifest.model_validate(candidates_payload).candidates
@@ -1967,37 +1664,16 @@ def assets_acquire(
         raise typer.Exit(code=3)
 
     manifest = workspace.read_assets() or AssetManifest(hotel_id=hotel_id, assets=[])
-    # `merge` étend la liste **en place** et rend un rapport : lui demander
-    # `.assets` levait une AttributeError après le téléchargement, donc après
-    # la dépense. Le rapport dit ce qui a été ajouté ; la liste porte le
-    # résultat.
     merged = merge(manifest.assets, acquired)
-    if merged.added:
-        workspace.write_assets(manifest)
-    else:
-        # Réécrire un manifeste inchangé après une acquisition refusée
-        # déplacerait son empreinte sans qu'aucun asset n'ait été ajouté : un
-        # relecteur y verrait une modification là où rien n'a eu lieu.
-        typer.echo("  manifeste inchangé : aucun asset ajouté, aucune réécriture")
+    manifest.assets = merged.assets
+    workspace.write_assets(manifest)
     workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context, production="AcquiredImage")
 
     for candidate_id, reason in sorted(report.failed.items()):
-        # Le motif entier : tronqué, il cachait précisément ce qui distingue un
-        # dépassement d'un mauvais format.
-        typer.secho(f"    échec · {candidate_id}", fg=typer.colors.YELLOW)
-        typer.secho(f"        {reason}", fg=typer.colors.YELLOW)
+        typer.secho(f"    échec · {candidate_id} — {reason[:60]}", fg=typer.colors.YELLOW)
 
     typer.echo("")
-    if report.failed:
-        typer.secho(
-            f"{KO} acquisition refusée : {len(report.failed)} échec(s) — aucun "
-            f"des {report.planned} assets n'est publié, le staging est vidé",
-            fg=typer.colors.RED,
-        )
-        typer.echo(f"    {report.bytes_downloaded} octets reçus, 0 publié")
-        raise typer.Exit(code=1)
-
-    typer.echo(f"{OK} {report.published}/{report.planned} fichier(s) acquis")
+    typer.echo(f"{OK} {report.acquired}/{report.planned} fichier(s) acquis")
     typer.echo(f"    {report.bytes_downloaded} octets téléchargés "
                f"sur {report.bytes_consented} consentis")
     typer.echo(f"    répertoire : {destination}")
@@ -2425,10 +2101,6 @@ def demands_assess(hotel_id: str = typer.Argument(...)) -> None:
         corpus_digest=digest_of(corpus),
         viewpoints=viewpoints,
         demand_digest=digest_of(payload),
-        # Sans ce raccord, un aperçu examiné puis **établi** ne changeait rien :
-        # `assess` recevait `None` et retombait sur les seuls champs plats de
-        # l'inventaire, qui ne portent pas ce qu'un relecteur a vu.
-        previews=workspace.read_previews(),
     )
 
     workspace.write_json(
@@ -2533,29 +2205,6 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
     roles = assign(manifest.assets, context.policy)
     workspace.write_assets(manifest)
     workspace.write_report("01_sources/duplicate_report.json", report, context, production="DuplicateReport")
-    from .lot1b_coverage import DedupRobustnessEvidence, _sha256
-    from .policy_facets import Facet, facet_digest
-
-    regression = dedup_levels.robust_regression(
-        context.policy.dedup.robust_region_cutoff
-    )
-    robustness = DedupRobustnessEvidence(
-        asset_manifest_sha256=_sha256(workspace.assets_path),
-        robust_input_digest=dedup_levels.robust_input_digest(manifest.assets),
-        algorithm="imagehash-crop-resistant-v1",
-        policy_digest=context.provenance["policy_digest"],
-        dedup_policy_digest=facet_digest(context.policy, Facet.DEDUPLICATION),
-        production_used=context.policy.dedup.robust_crop_hash_enabled,
-        candidate_pairs=report.robust_candidate_pairs,
-        matched_pairs=report.robust_matched_pairs,
-        crop_regression_passed=regression["crop"],
-        watermark_regression_passed=regression["watermark"],
-        distinct_regression_passed=regression["distinct_rejected"],
-    )
-    workspace.write_json(
-        "01_sources/dedup_robustness_report.json",
-        robustness.model_dump(mode="json"),
-    )
     workspace.write_report("01_sources/roles_report.json", roles, context)
 
     typer.echo(f"  fichiers                  {report.files}")
@@ -3980,28 +3629,14 @@ def visibility_assess(hotel_id: str = typer.Argument(...)) -> None:
         )
         raise typer.Exit(code=1)
 
-    # Par le **même** chargeur que le reste du pipeline : un manifeste
-    # antérieur au schéma courant ne porte ni `schema_version`, ni
-    # `working_crs`, ni `spatial_context_digest`. Le valider directement le
-    # refusait, alors que `_capture_geometry_if_any` sait le rattacher au
-    # référentiel du contexte sans réécrire le fichier.
-    if not workspace.path("06_geo", "capture_geometry.json").is_file():
+    raw = workspace.read_json("06_geo/capture_geometry.json")
+    if raw is None:
         typer.secho(
             f"{KO} aucun manifeste géométrique — lancez d'abord : geo resolve",
             fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
-
-    # L'empreinte porte sur le fichier **tel qu'il est** : c'est lui qui a
-    # servi, non la forme rattachée en mémoire.
-    raw = workspace.read_json("06_geo/capture_geometry.json")
-    manifest = _capture_geometry_if_any(workspace, context)
-    if manifest is None:
-        typer.secho(
-            f"{KO} manifeste géométrique illisible ou sans référentiel résolu",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
+    manifest = CaptureGeometryManifest.model_validate(raw)
 
     assets_manifest = workspace.read_assets()
     site = workspace.read_site()
@@ -4316,16 +3951,7 @@ def visibility_apply(
             fg=typer.colors.RED, err=True,
         )
         raise typer.Exit(code=1)
-    # Par le **même** chargeur que `visibility assess` : le manifeste du pilote
-    # est antérieur au schéma courant, et le valider directement bloquait la
-    # projection après que la mesure eut abouti.
-    geometry = _capture_geometry_if_any(workspace, context)
-    if geometry is None:
-        typer.secho(
-            "manifeste géométrique illisible ou sans référentiel résolu",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
+    geometry = CaptureGeometryManifest.model_validate(raw_geometry)
 
     # Les images sont relues : un checksum déclaré ne prouve pas le contenu.
     altered, absent = [], []
@@ -4630,7 +4256,397 @@ def temporal_set(
     typer.echo(f"{OK} {asset_id} — {scope} : {parsed.value} (par {by})")
 
 
-@assets_app.command("coverage")
+reconstruction_app = typer.Typer(
+    no_args_is_help=True, help="Lot 2 — Reconstruction 3D (SfM, alignement, densification)."
+)
+app.add_typer(reconstruction_app, name="reconstruction")
+
+
+@reconstruction_app.command("prepare-input")
+def reconstruction_prepare_input(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    backend: list[str] = typer.Option(
+        ["colmap_incremental"],
+        "--backend",
+        help="Backend(s) autorisé(s) pour cette reconstruction.",
+    ),
+    mask_set_digest: str | None = typer.Option(
+        None,
+        "--mask-set-digest",
+        help="Empreinte SHA-256 du jeu de masques SfM, si applicable.",
+    ),
+) -> None:
+    """Crée un ReconstructionInputManifest immuable pour le Lot 2.
+
+    Ce snapshot gèle la sélection d'assets, les empreintes des manifestes
+    sources et les droits avant toute exécution de solveur. Tous les
+    backends (COLMAP, GLUEMAP, MP-SfM, MapAnything, VGGT) reçoivent
+    exactement les mêmes données.
+    """
+    from .reconstruction_input import prepare_input, publish_input
+
+    try:
+        manifest = prepare_input(
+            hotel_id,
+            allowed_backends=backend,
+            mask_set_digest=mask_set_digest,
+        )
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    output_path = publish_input(manifest, workspace)
+    typer.echo(
+        f"{OK} ReconstructionInputManifest créé : {output_path}\n"
+        f"    ID   : {manifest.reconstruction_input_id}\n"
+        f"    Assets sélectionnés : {len(manifest.selected_asset_ids)}\n"
+        f"    Assets exclus      : {len(manifest.excluded_asset_ids)}\n"
+        f"    Backends autorisés : {', '.join(manifest.allowed_backends)}"
+    )
+
+
+@reconstruction_app.command("preprocess")
+def reconstruction_preprocess(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    mask_classes: list[str] = typer.Option(
+        ["sky", "people", "cars", "water"],
+        "--mask-class",
+        help="Classes à masquer (répétable).",
+    ),
+) -> None:
+    """Génère les masques SfM et les images normalisées pour le Lot 2.
+
+    Les masques sont stockés comme `DerivedArtifact` et ne modifient
+    jamais les images originales.
+    """
+    from .reconstruction_input import prepare_input
+    from .reconstruction_preprocess import generate_mask_set, publish_mask_set
+
+    try:
+        input_manifest = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    mask_digest = generate_mask_set(workspace, input_manifest, mask_classes=mask_classes)
+
+    input_path = workspace.path("07_reconstruction", f"reconstruction_input_{input_manifest.reconstruction_input_id}.json")
+    data = json.loads(input_path.read_text("utf-8"))
+    data["mask_set_digest"] = mask_digest
+    input_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    typer.echo(
+        f"{OK} Masques générés : {mask_digest[:16]}...\n"
+        f"    Classes masquées : {', '.join(mask_classes)}\n"
+        f"    Entrée mise à jour : {input_path.name}"
+    )
+
+
+@reconstruction_app.command("view-graph")
+def reconstruction_view_graph(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+) -> None:
+    """Construit le graphe de vue (ViewGraphManifest) depuis l'entrée de reconstruction."""
+    from .reconstruction_input import prepare_input
+    from .view_graph import ViewGraphBuilder
+
+    try:
+        input_manifest = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    builder = ViewGraphBuilder(workspace)
+    try:
+        view_graph = builder.build(input_manifest)
+    except Exception as exc:
+        typer.secho(f"✗ construction du graphe échouée : {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    output_dir = workspace.path("07_reconstruction", "view_graphs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{view_graph.view_graph_id}.json"
+    output_path.write_text(json.dumps(view_graph.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n")
+
+    report = view_graph.report
+    typer.echo(
+        f"{OK} ViewGraphManifest créé : {output_path}\n"
+        f"    ID   : {view_graph.view_graph_id}\n"
+        f"    Nœuds     : {report.images_selected}\n"
+        f"    Paires    : {report.valid_pairs}/{report.pairs_tested}\n"
+        f"    Composante : {report.largest_component}\n"
+        f"    Répétition : {report.repetitive_risk}\n"
+        f"    Intrinsèques : {report.intrinsics_quality}"
+    )
+
+
+@reconstruction_app.command("plan")
+def reconstruction_plan(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+) -> None:
+    """Sélectionne les backends de reconstruction selon le ViewGraphReport."""
+    from .reconstruction_input import prepare_input
+    from .reconstruction_plan import ReconstructionPlanner, publish_plan
+
+    try:
+        input_manifest = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    vg_dir = workspace.path("07_reconstruction", "view_graphs")
+    if not vg_dir.exists():
+        typer.secho("✗ aucun ViewGraphManifest trouvé", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    view_graphs = sorted(vg_dir.glob("vg-*.json"))
+    if not view_graphs:
+        typer.secho("✗ aucun ViewGraphManifest trouvé", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    latest = view_graphs[-1]
+    view_graph = ViewGraphManifest.model_validate_json(latest.read_text("utf-8"))
+
+    planner = ReconstructionPlanner(workspace)
+    plan = planner.plan(input_manifest, view_graph)
+    output_path = publish_plan(plan, workspace)
+
+    typer.echo(
+        f"{OK} ReconstructionPlan créé : {output_path}\n"
+        f"    Backends  : {', '.join(plan.selected_backends)}\n"
+        f"    Rationale : {plan.rationale}"
+    )
+
+
+@reconstruction_app.command("run")
+def reconstruction_run(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    backend: str = typer.Option("colmap_incremental", "--backend", help="Backend à exécuter."),
+) -> None:
+    """Exécute une reconstruction SfM sur l'entrée gelée."""
+    from .reconstruction_input import prepare_input
+    from .reconstruction_run import ReconstructionRunner, publish_run
+
+    try:
+        input_manifest = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    runner = ReconstructionRunner(workspace)
+
+    try:
+        from .schemas.reconstruction import ReconstructionBackend
+        backend_enum = ReconstructionBackend(backend)
+    except ValueError:
+        typer.secho(f"✗ backend inconnu : {backend}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    run = runner.run(input_manifest, backend=backend_enum)
+    output_path = publish_run(run, workspace)
+
+    status_mark = f"{OK} {run.status}" if run.status == "completed" else f"✗ {run.status}"
+    typer.echo(
+        f"{status_mark} Run créé : {output_path}\n"
+        f"    Run ID  : {run.run_id}\n"
+        f"    Backend : {run.backend}\n"
+        f"    Métriques: {run.metrics or 'aucune'}"
+    )
+    if run.error:
+        typer.secho(f"    Erreur : {run.error}", fg=typer.colors.YELLOW, err=True)
+
+
+@reconstruction_app.command("consensus")
+def reconstruction_consensus(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_ids: list[str] = typer.Option(
+        ...,
+        "--run-id",
+        help="IDs des runs à comparer (au moins deux).",
+    ),
+) -> None:
+    """Compare plusieurs reconstructions et sélectionne la meilleure."""
+    from .reconstruction_consensus import ConsensusBuilder, publish_consensus
+
+    if len(run_ids) < 2:
+        typer.secho("✗ au moins deux run_ids sont requis", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    builder = ConsensusBuilder(workspace)
+    try:
+        report = builder.build(run_ids)
+    except Exception as exc:
+        typer.secho(f"✗ consensus échoué : {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    output_path = publish_consensus(report, workspace)
+    typer.echo(
+        f"{OK} Consensus publié : {output_path}\n"
+        f"    Runs comparés   : {', '.join(report.run_ids)}\n"
+        f"    Run sélectionné : {report.selected_run_id}\n"
+        f"    Rationale       : {report.selection_rationale}"
+    )
+
+
+@reconstruction_app.command("align")
+def reconstruction_align(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_id: str = typer.Option(..., "--run-id", help="ID du run à aligner."),
+    anchor: list[str] = typer.Option(
+        ["footprint", "lidar_roof"],
+        "--anchor",
+        help="Ancres d'alignement (répétable).",
+    ),
+) -> None:
+    """Aligne la reconstruction sur les données géospatiales."""
+    from .geo_alignment import GeoAligner, publish_alignment
+    from .schemas.reconstruction import AlignmentAnchor
+
+    try:
+        anchors = [AlignmentAnchor(a) for a in anchor]
+    except ValueError:
+        typer.secho(f"✗ ancre inconnue : {anchor}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    aligner = GeoAligner(workspace)
+    manifest = aligner.align(run_id, anchors=anchors)
+    output_path = publish_alignment(manifest, workspace)
+
+    typer.echo(
+        f"{OK} Alignement publié : {output_path}\n"
+        f"    ID      : {manifest.alignment_id}\n"
+        f"    RMSE    : {manifest.alignment_rmse_m:.3f} m\n"
+        f"    Empreinte: {manifest.footprint_error_m:.3f} m\n"
+        f"    Toiture : {manifest.roof_height_error_m:.3f} m"
+    )
+
+
+@reconstruction_app.command("dense")
+def reconstruction_dense(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_id: str = typer.Option(..., "--run-id", help="ID du run sparse sélectionné."),
+    backend: str = typer.Option("brush", "--backend", help="Backend dense (brush, gsplat)."),
+) -> None:
+    """Exécute la reconstruction dense (placeholder P5)."""
+    from .dense_reconstruction import run_dense_reconstruction, publish_dense_result
+    from .schemas.reconstruction import ReconstructionBackend
+
+    try:
+        backend_enum = ReconstructionBackend(backend)
+    except ValueError:
+        typer.secho(f"✗ backend dense inconnu : {backend}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    result = run_dense_reconstruction(workspace, run_id, backend=backend_enum)
+    output_path = publish_dense_result(result, workspace)
+
+    status_mark = f"{OK} {result.status}" if result.status == "completed" else f"✗ {result.status}"
+    typer.echo(
+        f"{status_mark} Résultat dense : {output_path}\n"
+        f"    Result ID : {result.result_id}\n"
+        f"    Backend   : {result.backend}"
+    )
+    if result.error:
+        typer.secho(f"    Note : {result.error}", fg=typer.colors.YELLOW, err=True)
+
+
+@reconstruction_app.command("lidar-report")
+def reconstruction_lidar_report(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+) -> None:
+    """Génère un rapport de support LiDAR pour la reconstruction."""
+    from .reconstruction_input import prepare_input
+    from .lidar_support import LiDARSupportAnalyzer, publish_lidar_report
+
+    try:
+        input_manifest = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    analyzer = LiDARSupportAnalyzer(workspace)
+    report = analyzer.analyze(input_manifest)
+    output_path = publish_lidar_report(report, workspace)
+
+    typer.echo(
+        f"{OK} Rapport LiDAR publié : {output_path}\n"
+        f"    ID      : {report.report_id}\n"
+        f"    Viable LiDGS : {'Oui' if report.viable_for_lidgs else 'Non'}\n"
+        f"    Classification : {report.classification}"
+    )
+
+
+@reconstruction_app.command("validate")
+def reconstruction_validate(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_id: str = typer.Option(..., "--run-id", help="ID du run à valider."),
+) -> None:
+    """Exécute les validations held-out, stability et cross-solver."""
+    from .reconstruction_validation import build_validation_report, publish_validation_report
+
+    workspace = Workspace(hotel_id)
+    report = build_validation_report(workspace, run_id)
+    output_path = publish_validation_report(report, workspace)
+
+    typer.echo(
+        f"{OK} Validation publiée : {output_path}\n"
+        f"    ID      : {report.validation_id}\n"
+        f"    Statut  : {report.overall_status}"
+    )
+    if report.held_out and report.held_out.error:
+        typer.secho(f"    Note : {report.held_out.error}", fg=typer.colors.YELLOW, err=True)
+
+
+@reconstruction_app.command("camera-feasibility")
+def reconstruction_camera_feasibility(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_id: str = typer.Option(..., "--run-id", help="ID du run de reconstruction."),
+) -> None:
+    """Évalue la faisabilité des poses de caméra sur la reconstruction."""
+    from .camera_feasibility import CameraFeasibilityEvaluator, build_validated_camera_path, publish_validated_path
+
+    workspace = Workspace(hotel_id)
+    path = build_validated_camera_path(workspace, run_id)
+    output_path = publish_validated_path(path, workspace)
+
+    high = sum(1 for p in path.poses if p.overall_score >= 0.7)
+    medium = sum(1 for p in path.poses if 0.4 <= p.overall_score < 0.7)
+    low = sum(1 for p in path.poses if p.overall_score < 0.4)
+
+    typer.echo(
+        f"{OK} Trajectoire validée : {output_path}\n"
+        f"    Poses : {len(path.poses)}\n"
+        f"    Haute confiance : {high}\n"
+        f"    Moyenne        : {medium}\n"
+        f"    Basse          : {low}"
+    )
+
+
+@reconstruction_app.command("gate")
+def reconstruction_gate(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+) -> None:
+    """Gate final : évalue si ENVIRONMENT_3D_READY peut être déclaré."""
+    from .schemas.reconstruction import ReconstructionGateStatus
+
+    status = ReconstructionGateStatus.NEEDS_AUTHORIZED_CAPTURE
+    reasons = [
+        "Lot 2 non entièrement exécuté (placeholders P3-P6)",
+        "Aucune validation held-out / stability / cross-solver",
+    ]
+
+    typer.echo(f"Statut : {status.value}")
+    for reason in reasons:
+        typer.echo(f"  - {reason}")
 def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
     """Compte ce qui conditionne la suite du pipeline."""
     from .intake import coverage
@@ -4694,6 +4710,10 @@ def smoke() -> None:
 
     typer.echo("")
     typer.secho("smoke test réussi", fg=typer.colors.GREEN)
+
+
+if __name__ == "__main__":
+    app()
 
 
 def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN201
@@ -4761,15 +4781,6 @@ def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN
         targets=targets,
         projection=projection,
         front_azimuth_deg=front,
-        # Ce qu'un aperçu a déjà réfuté ne se repropose pas : sans cela, la
-        # recherche suivante rachèterait ce qu'on vient d'écarter.
-        refuted_pairs={
-            (entry.asset_id, entry.demand_id)
-            for entry in (
-                getattr(workspace.read_previews(), "entries", None) or []
-            )
-            if entry.verdict.value == "refuted"
-        },
         unresolved=unresolved,
         proxies={k: v for k, v in proxies.items() if k in proxy_targets},
         proxy_targets=proxy_targets,
@@ -4876,46 +4887,7 @@ def _validate_manifest_pairing(hotel_id, candidates, demands, demands_payload): 
             f"{current} aujourd'hui : les besoins ont changé depuis la "
             "découverte — relancez « assets discover »"
         )
-
-    # Une découverte ciblée ne juge que les besoins qu'elle a cherchés. Planifier
-    # dessus contre les besoins canoniques ferait lire l'absence de vues pour les
-    # six autres comme un constat, alors qu'aucune n'a été cherchée.
-    scope = getattr(candidates, "scope", None)
-    if scope is not None and scope.demand_ids:
-        hors_portée = sorted(
-            {d.demand_id for d in demands.demands} - set(scope.demand_ids)
-        )
-        if hors_portée:
-            problems.append(
-                "manifeste de candidats ciblé sur "
-                f"{', '.join(scope.demand_ids)}, mais le plan porte aussi sur "
-                f"{', '.join(hors_portée)} : ces besoins n'ont pas été "
-                "cherchés, et leur absence de vues n'est pas un constat"
-            )
     return problems
-
-
-def _plan_demands_for_scope(candidates, demands):  # noqa: ANN001, ANN201
-    """Applique au plan la portée déjà validée par la découverte.
-
-    Le manifeste canonique complet reste l'autorité et son empreinte reste au
-    plan. Seule la vue transmise au sélecteur est restreinte : reconstruire un
-    nouveau manifeste indépendant ferait perdre la filiation au corpus global.
-    """
-    scope = getattr(candidates, "scope", None)
-    demand_ids = tuple(getattr(scope, "demand_ids", ()) or ())
-    if not demand_ids:
-        return demands
-
-    by_id = {row.demand_id: row for row in demands.demands}
-    unknown = sorted(set(demand_ids) - set(by_id))
-    if unknown:
-        raise ValueError(
-            "portée de candidats vers des besoins absents du manifeste canonique : "
-            + ", ".join(unknown)
-        )
-    selected = [by_id[demand_id] for demand_id in demand_ids]
-    return demands.model_copy(update={"demands": selected})
 
 
 def _readable_evaluations(evaluations, candidates, separation_m):  # noqa: ANN001, ANN201
@@ -4991,37 +4963,7 @@ def _requests_by_source(by_source: dict) -> dict:
     }
 
 
-def _scoped_corridor_points(workspace, context, scope) -> int | None:  # noqa: ANN001
-    """Nombre **réel** de points d'échantillon du corridor visé.
-
-    La formule globale annonce un ordre de grandeur pour un réseau entier — 529
-    ici — alors qu'un corridor nommé en compte 17. Annoncer un plafond deux
-    fois plus grand que ce qu'on s'autorise vide le plafond de son sens.
-
-    `None` quand la portée ne nomme aucun corridor : la formule reste alors la
-    seule estimation disponible, et l'inventer ici serait pire.
-    """
-    corridor_ref = getattr(scope, "corridor_ref", "") if scope else ""
-    if not corridor_ref:
-        return None
-
-    from .collectors.streetview import sample_road_network
-
-    manifest = _capture_geometry_if_any(workspace, context)
-    if manifest is None:
-        return None
-    try:
-        corridors = _corridor_elements(manifest, corridor_ref)
-    except CorridorScopeRefused:
-        # Le refus se prononce à l'interrogation, avec son motif. Ici, on ne
-        # sait simplement pas compter.
-        return None
-    return len(sample_road_network(
-        corridors, spacing_m=context.policy.collection.sample_spacing_m
-    ))
-
-
-def _planned_calls(context, radius_m: int, corridor_points: int | None = None) -> dict:  # noqa: ANN001
+def _planned_calls(context, radius_m: int) -> dict:  # noqa: ANN001
     """Plafond d'appels annoncé **avant** d'interroger.
 
     Mapillary pagine : on ne sait pas d'avance combien de pages viendront, mais
@@ -5035,11 +4977,9 @@ def _planned_calls(context, radius_m: int, corridor_points: int | None = None) -
 
     collection = context.policy.collection
     spacing = max(collection.sample_spacing_m, 1.0)
-    if corridor_points is None:
-        # Deux fois le rayon divisé par l'espacement : ordre de grandeur du
-        # nombre de points d'un réseau routier couvrant la zone. Employé
-        # seulement faute de corridor nommé — sinon on compte les vrais points.
-        corridor_points = int((2 * collection.road_radius_m) / spacing) ** 2 // 4
+    # Deux fois le rayon divisé par l'espacement : ordre de grandeur du nombre
+    # de points d'un réseau routier couvrant la zone.
+    corridor_points = int((2 * collection.road_radius_m) / spacing) ** 2 // 4
 
     # Les clés sont celles du **registre** — `streetview-meta`, non
     # `street_view` : un plafond annoncé sous un autre nom que l'effectif ne se
@@ -5287,17 +5227,14 @@ def assets_measure_plan(
             typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
-    try:
-        candidates_path, candidates_payload = _candidate_manifest_for_plan(
-            workspace, plan
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+    candidates_path = _latest_candidates(workspace)
+    if candidates_path is None:
+        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
     candidates = {
         c.candidate_id: c
         for c in CandidateManifest.model_validate(
-            candidates_payload
+            json.loads(candidates_path.read_text("utf-8"))
         ).candidates
     }
 
@@ -5436,1367 +5373,3 @@ def _head_budget(requests) -> dict:  # noqa: ANN001
         cost = 2 if request.source == mapillary_name else 1
         budget[request.source] = budget.get(request.source, 0) + cost
     return budget
-
-
-@assets_app.command("consent-plan")
-def assets_consent_plan(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-    plan_file: Path = typer.Option(
-        ..., "--plan", help="Plan **mesuré** existant. Aucune reconstruction.",
-    ),
-    consent_bytes: int = typer.Option(
-        ..., "--consent-bytes",
-        help="Volume exact accepté, en octets. Doit égaler le total mesuré.",
-    ),
-) -> None:
-    """Rend exécutable un plan mesuré, sans le refaire.
-
-    `assets plan --consent-bytes` reconstruit la sélection : consentir par ce
-    chemin produirait un plan neuf, non celui dont le volume a été montré et
-    dont les empreintes ont été examinées. L'accord porterait alors sur des
-    requêtes que personne n'a vues.
-    """
-    from .plan import PlanRefused, consent
-    from .plan_invalidation import invalidated_plan_ids
-    from .schemas.acquisition import AcquisitionPlan, PlanStatus
-
-    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
-    workspace = Workspace(hotel_id)
-    sources = workspace.path("01_sources")
-
-    path = Path(plan_file)
-    if not path.is_file():
-        typer.secho(f"{KO} plan introuvable : {path}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    plan = AcquisitionPlan.model_validate(json.loads(path.read_text("utf-8")))
-
-    problems: list[str] = []
-    if plan.hotel_id != hotel_id:
-        problems.append(f"plan de {plan.hotel_id!r}, non de {hotel_id!r}")
-    if plan.plan_id in invalidated_plan_ids(sources):
-        problems.append("plan invalidé : il a été retiré de la circulation")
-    if plan.status is not PlanStatus.DRAFT:
-        problems.append(f"déjà à l'état « {plan.status.value} »")
-    if plan.published_known_bytes is None:
-        problems.append(
-            "plan non mesuré : son volume n'a pas été montré, et consentir à "
-            "un total qu'on n'a pas vu n'engage rien"
-        )
-    elif consent_bytes != plan.published_known_bytes:
-        problems.append(
-            f"{consent_bytes} octets acceptés, {plan.published_known_bytes} "
-            "annoncés — le consentement porte sur le volume exact"
-        )
-
-    if problems:
-        for problem in problems:
-            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2)
-
-    # Les empreintes viennent des **mêmes** documents que ceux du plan : les
-    # laisser nulles rendrait le plan inexécutable, et les inventer le
-    # rattacherait à un état qu'il n'a pas connu.
-    demands_payload = workspace.read_json("01_sources/capture_demands.json")
-    try:
-        _candidates_path, candidates_payload = _candidate_manifest_for_plan(
-            workspace, plan
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    try:
-        accepted = consent(
-            plan,
-            _plan_digests(workspace, context, candidates_payload, demands_payload),
-            measured_from=plan.plan_id,
-            download_contract_version=(
-                context.policy.collection.download_contract_version
-            ),
-        )
-    except PlanRefused as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    # Publié à côté : le plan mesuré n'est pas modifié, et l'accord se lit dans
-    # un artefact distinct de ce sur quoi il porte.
-    workspace.write_json(
-        f"01_sources/acquisition_plan_{accepted.plan_id}-consented.json",
-        json.loads(accepted.model_dump_json()),
-    )
-
-    typer.echo(f"{OK} plan consenti — {accepted.consented_max_bytes} octets")
-    typer.echo(f"    requêtes verrouillées : {len(accepted.consented_request_digests)}")
-    typer.echo(f"    contrat de téléchargement v{accepted.consented_download_contract_version}")
-    typer.echo(f"    mesuré depuis : {accepted.consented_from_plan_id}")
-
-
-preview_app = typer.Typer(
-    no_args_is_help=True,
-    help="Constats d'aperçu : ce qu'une vue téléchargée établit, besoin par besoin.",
-)
-assets_app.add_typer(preview_app, name="preview")
-
-
-@preview_app.command("list")
-def preview_list(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-) -> None:
-    """Couples asset/besoin en attente de constat.
-
-    L'unité est le **couple**, non le fichier : une même acquisition sert
-    souvent deux besoins, et le verdict n'est pas le même pour l'un et l'autre.
-    """
-    from .schemas.preview import PreviewVerdict
-
-    workspace = Workspace(hotel_id)
-    manifest = workspace.read_assets()
-    if manifest is None:
-        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    log = workspace.read_previews()
-    rows: list[tuple[str, str, str, str]] = []
-    for asset in manifest.assets:
-        provenance = getattr(asset, "acquisition", None)
-        for demand_id in getattr(provenance, "serves_demands", None) or []:
-            latest = log.latest_for(asset.id, demand_id) if log else None
-            rows.append((
-                asset.id, demand_id,
-                (provenance.demand_levels or {}).get(demand_id, "—"),
-                latest.verdict.value if latest else "en attente",
-            ))
-
-    if not rows:
-        typer.echo("  aucun couple rattaché : rien n'a encore été acquis pour un besoin")
-        return
-
-    typer.echo(f"  {len(rows)} couple(s) asset/besoin")
-    en_attente = 0
-    for asset_id, demand_id, level, verdict in sorted(rows):
-        if verdict == "en attente":
-            en_attente += 1
-        typer.echo(
-            f"    {asset_id[-24:]:<26} {demand_id:<34} {level[:24]:<26} {verdict}"
-        )
-    typer.echo("")
-    typer.echo(f"  {en_attente} en attente de constat")
-    established = sum(1 for *_x, v in rows if v == PreviewVerdict.ESTABLISHED.value)
-    typer.echo(f"  {established} établi(s) — seuls ceux-là créditent un besoin")
-
-
-@preview_app.command("assess")
-def preview_assess(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-    asset_id: str = typer.Option(..., "--asset", help="Asset examiné."),
-    demand_id: str = typer.Option(..., "--demand", help="Besoin **précis** jugé."),
-    verdict: str = typer.Option(
-        ..., "--verdict", help="established | refuted | inconclusive",
-    ),
-    rationale: str = typer.Option(
-        ..., "--rationale", help="Ce qu'un relecteur doit comprendre.",
-    ),
-    assessed_by: str = typer.Option(..., "--by", help="Qui prononce ce constat."),
-    in_frame: float | None = typer.Option(None, "--in-frame"),
-    projected_width: float | None = typer.Option(None, "--projected-width"),
-    visible: float | None = typer.Option(None, "--visible"),
-    unmeasured: list[str] = typer.Option(
-        None, "--unmeasured", help="Ce qui reste inconnu. Répétable.",
-    ),
-    evidence: list[str] = typer.Option(
-        None, "--evidence", help="Capture annotée, rapport. Répétable.",
-    ),
-) -> None:
-    """Inscrit un constat pour **un** couple asset/besoin.
-
-    Append-only : un couple réexaminé garde ses deux constats, le plus récent
-    faisant foi. Rien n'est promu ici — c'est `demands assess` qui lira ces
-    constats, et seuls les `established` créditent un besoin.
-    """
-    from .schemas.preview import PreviewAssessment, PreviewVerdict
-
-    workspace = Workspace(hotel_id)
-    manifest = workspace.read_assets()
-    asset = next(
-        (a for a in (manifest.assets if manifest else []) if a.id == asset_id), None
-    )
-    if asset is None:
-        typer.secho(f"{KO} asset {asset_id!r} absent du manifeste",
-                    fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    provenance = getattr(asset, "acquisition", None)
-    rattachés = getattr(provenance, "serves_demands", None) or []
-    if demand_id not in rattachés:
-        # Constater sur un besoin que ce fichier n'a jamais servi ferait porter
-        # à celui-ci une mesure prise pour autre chose.
-        typer.secho(
-            f"{KO} {asset_id} n'a pas été acquis pour {demand_id} ; il servait "
-            f"{rattachés}",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2)
-
-    try:
-        assessment = PreviewAssessment(
-            asset_id=asset_id,
-            demand_id=demand_id,
-            plan_id=provenance.plan_id,
-            request_digest=provenance.request_digest or "",
-            checksum=asset.checksum or "",
-            target_ref=demand_id.split(":", 1)[-1],
-            in_frame_fraction=in_frame,
-            projected_width_fraction=projected_width,
-            visible_fraction=visible,
-            verdict=PreviewVerdict(verdict),
-            unmeasured=list(unmeasured or []),
-            rationale=rationale,
-            assessed_by=assessed_by,
-            evidence=list(evidence or []),
-        )
-    except ValueError as exc:
-        typer.secho(f"{KO} {str(exc).split('Value error, ')[-1].split(' [type')[0]}",
-                    fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    workspace.append_preview(assessment)
-    typer.echo(f"{OK} constat inscrit : {asset_id[-22:]} / {demand_id}")
-    typer.echo(f"    verdict  {assessment.verdict.value}")
-    if assessment.unmeasured:
-        typer.echo(f"    inconnu  {', '.join(assessment.unmeasured)}")
-    typer.echo("    ce constat ne promeut rien : demands assess le lira")
-
-
-@preview_app.command("assess-corpus")
-def preview_assess_corpus(
-    hotel_id: str = typer.Argument(...),
-    asset_id: str = typer.Option(..., "--asset", help="Asset du corpus examiné."),
-    demand_id: str = typer.Option(..., "--demand", help="Besoin **précis** jugé."),
-    verdict: str = typer.Option(
-        ..., "--verdict", help="established | refuted | inconclusive",
-    ),
-    rationale: str = typer.Option(
-        ..., "--rationale", help="Ce qu'un relecteur doit comprendre.",
-    ),
-    assessed_by: str = typer.Option(..., "--by", help="Qui prononce ce constat."),
-    in_frame: float | None = typer.Option(None, "--in-frame"),
-    projected_width: float | None = typer.Option(None, "--projected-width"),
-    visible: float | None = typer.Option(None, "--visible"),
-    unmeasured: list[str] = typer.Option(None, "--unmeasured"),
-    evidence: list[str] = typer.Option(None, "--evidence"),
-) -> None:
-    """Inscrit un constat sur un asset **déjà présent au corpus**.
-
-    `preview assess` exige qu'un fichier ait été acquis *pour* le besoin jugé :
-    une mesure prise pour autre chose ne doit pas créditer un besoin qu'elle
-    n'a jamais visé. Cette règle laissait toutefois inexploitables les assets
-    collectés sans plan ciblé — sur le pilote, 327 fichiers en pleine
-    résolution contre 6 vignettes.
-
-    Le constat porte donc une filiation explicite `corpus:<source>` au lieu
-    d'un `plan_id` inventé : un relecteur voit immédiatement que la vue n'a pas
-    été commandée pour ce besoin, et peut la contester sur ce motif.
-
-    Un fichier acquis par un plan ciblé reste du ressort de `preview assess` :
-    l'y renvoyer évite deux filiations concurrentes pour un même couple.
-    """
-    from .schemas.preview import PreviewAssessment, PreviewVerdict
-
-    workspace = Workspace(hotel_id)
-    manifest = workspace.read_assets()
-    asset = next(
-        (a for a in (manifest.assets if manifest else []) if a.id == asset_id), None
-    )
-    if asset is None:
-        typer.secho(f"{KO} asset {asset_id!r} absent du manifeste",
-                    fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    if getattr(asset, "acquisition", None) is not None:
-        typer.secho(
-            f"{KO} {asset_id} vient d'un plan ciblé — utilisez « preview assess », "
-            "qui vérifie le besoin réellement servi",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2)
-
-    if not asset.checksum:
-        # Sans empreinte, le constat ne désigne aucun fichier vérifiable.
-        typer.secho(
-            f"{KO} {asset_id} sans empreinte : le constat ne pourrait pas être "
-            "rattaché au fichier examiné",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2)
-
-    try:
-        assessment = PreviewAssessment(
-            asset_id=asset_id,
-            demand_id=demand_id,
-            plan_id=f"corpus:{asset.source}",
-            request_digest=f"corpus:{asset.checksum[:16]}",
-            checksum=asset.checksum,
-            target_ref=demand_id.split(":", 1)[-1],
-            in_frame_fraction=in_frame,
-            projected_width_fraction=projected_width,
-            visible_fraction=visible,
-            verdict=PreviewVerdict(verdict),
-            unmeasured=list(unmeasured or []),
-            rationale=rationale,
-            assessed_by=assessed_by,
-            evidence=list(evidence or []),
-        )
-    except ValueError as exc:
-        typer.secho(f"{KO} {str(exc).split('Value error, ')[-1].split(' [type')[0]}",
-                    fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    workspace.append_preview(assessment)
-    typer.echo(f"{OK} constat corpus inscrit : {asset_id[-22:]} / {demand_id}")
-    typer.echo(f"    verdict     {assessment.verdict.value}")
-    typer.echo(f"    filiation   {assessment.plan_id} (non commandé pour ce besoin)")
-    if assessment.unmeasured:
-        typer.echo(f"    inconnu     {', '.join(assessment.unmeasured)}")
-    typer.echo("    ce constat ne promeut rien : demands assess le lira")
-
-
-@site_app.command("resolve")
-def site_resolve(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-    kind: str = typer.Option(..., "--kind", help="Type d'objet à résoudre."),
-    state: str = typer.Option(
-        "confirmed", "--state", help="confirmed ou inferred.",
-    ),
-    demand_id: str = typer.Option(
-        None, "--demand",
-        help="Besoin dont les constats établis fondent la résolution.",
-    ),
-    rationale: str = typer.Option(..., "--rationale", help="Ce que la preuve établit."),
-    decided_by: str = typer.Option(..., "--by", help="Qui décide."),
-    evidence: list[str] = typer.Option(
-        None, "--evidence", help="Pièce à l'appui. Répétable.",
-    ),
-) -> None:
-    """Résout un objet de site quand une preuve l'établit.
-
-    Symétrique de `site unresolve`, qui manquait : le pilote savait démentir
-    une association, jamais en établir une. Un objet restait donc `unresolved`
-    même après qu'un relecteur ait vu la chose sur des images du corpus.
-
-    `confirmed` exige des constats d'aperçu **établis** sur le besoin
-    correspondant : sans eux, la commande refuse plutôt que de convertir une
-    conviction en fait. `inferred` s'en dispense — c'est précisément ce que le
-    mot dit — mais réclame la même justification écrite.
-
-    Aucune géométrie n'est inventée ici : l'objet change d'état et porte sa
-    preuve. Le tracé d'un contour reste le travail des sources géospatiales.
-    """
-    from datetime import datetime, timezone
-
-    from .schemas.enums import ObjectState
-
-    workspace = Workspace(hotel_id)
-    site = workspace.read_site()
-    if site is None:
-        typer.secho(f"{KO} aucun manifeste de site", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    cible = [obj for obj in site.objects if obj.kind == kind]
-    if not cible:
-        typer.secho(f"{KO} aucun objet de type {kind!r}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    try:
-        voulu = ObjectState(state)
-    except ValueError as exc:
-        typer.secho(f"{KO} état {state!r} inconnu", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-    if voulu not in (ObjectState.CONFIRMED, ObjectState.INFERRED):
-        typer.secho(
-            f"{KO} seuls 'confirmed' et 'inferred' se décident ici ; "
-            "'unresolved' relève de « site unresolve »",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2)
-
-    établis: list[str] = []
-    if voulu is ObjectState.CONFIRMED:
-        besoin = demand_id or f"obligation:{kind}"
-        log = workspace.read_previews()
-        établis = sorted(log.established_for(besoin)) if log else []
-        if not établis:
-            # Confirmer sans constat établi rendrait le mot « confirmé »
-            # indistinct de « supposé », et c'est cette distinction que le
-            # Gate du Lot 1 mesure.
-            typer.secho(
-                f"{KO} aucun constat établi sur {besoin} : « confirmé » sans "
-                "preuve d'aperçu serait une conviction, pas un fait",
-                fg=typer.colors.RED, err=True,
-            )
-            raise typer.Exit(code=2)
-
-    stamp = datetime.now(timezone.utc).isoformat()
-    pièces = list(evidence or []) + [f"preview:{a}" for a in établis]
-    touchés: list[str] = []
-    enrichis: list[str] = []
-    for obj in cible:
-        déjà = obj.state is voulu
-        nouvelles = sorted(set(pièces) - set(obj.evidence))
-        if déjà and not nouvelles:
-            continue
-        obj.evidence = sorted({*obj.evidence, *pièces})
-        if déjà:
-            # Un objet déjà dans l'état visé peut recevoir une preuve nouvelle :
-            # refuser l'ajout obligerait à le dé-résoudre pour l'enrichir, donc
-            # à effacer une décision valide pour documenter ce qui la conforte.
-            enrichis.append(obj.object_id)
-            continue
-        obj.state = voulu
-        obj.unresolved_reason = None
-        if voulu is ObjectState.CONFIRMED:
-            obj.confirmed_by = decided_by
-            obj.confirmed_at = datetime.now(timezone.utc)
-            obj.confirmation_rationale = rationale
-        touchés.append(obj.object_id)
-
-    if not touchés and not enrichis:
-        typer.echo(f"{OK} {kind} déjà {voulu.value} — rien à faire")
-        return
-
-    if enrichis and not touchés:
-        workspace.write_site(site)
-        workspace.write_json(
-            f"00_manifest/site_evidence_{kind}_{_new_run_id()}.json",
-            {
-                "kind": kind,
-                "objects": enrichis,
-                "state": voulu.value,
-                "evidence_added": pièces,
-                "rationale": rationale,
-                "decided_by": decided_by,
-                "decided_at": stamp,
-                "note": "preuve ajoutée sans changement d'état",
-            },
-        )
-        typer.secho(f"{OK} {kind} : preuve ajoutée, état inchangé", fg=typer.colors.GREEN)
-        for identifiant in enrichis:
-            typer.echo(f"    {identifiant}")
-        return
-
-    workspace.write_site(site)
-    workspace.write_json(
-        f"00_manifest/site_resolve_{kind}_{_new_run_id()}.json",
-        {
-            "kind": kind,
-            "objects": touchés,
-            "state": voulu.value,
-            "established_previews": établis,
-            "evidence": pièces,
-            "rationale": rationale,
-            "decided_by": decided_by,
-            "decided_at": stamp,
-            "note": (
-                "résolution fondée sur des constats d'aperçu établis ; aucune "
-                "géométrie n'a été produite ici"
-            ),
-        },
-    )
-
-    typer.secho(f"{OK} {kind} → {voulu.value}", fg=typer.colors.GREEN)
-    for identifiant in touchés:
-        typer.echo(f"    {identifiant}")
-    if établis:
-        typer.echo(f"    fondé sur {len(établis)} constat(s) établi(s)")
-    typer.echo("    aucune géométrie produite : le contour reste le travail des sources")
-
-
-@site_app.command("unresolve")
-def site_unresolve(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-    kind: str = typer.Option(..., "--kind", help="Type d'objet à dé-résoudre."),
-    rationale: str = typer.Option(
-        ..., "--rationale", help="Pourquoi l'association ne tient plus.",
-    ),
-    decided_by: str = typer.Option(..., "--by", help="Qui décide."),
-) -> None:
-    """Rend un objet de site `unresolved` quand sa preuve a échoué.
-
-    Une association fondée sur la proximité et « à confirmer visuellement »
-    n'est pas établie tant que la confirmation n'a pas eu lieu. Quand elle
-    échoue, laisser l'objet `inferred` ferait passer une hypothèse démentie
-    pour un fait.
-
-    Ce qui **dérivait** de cet objet devient caduc du même coup : sur le
-    pilote, `front_azimuth_deg` vient du centroïde du stationnement supposé, et
-    avec lui l'orientation des façades, les secteurs et tout ce qui s'y
-    appuie.
-    """
-    from datetime import datetime, timezone
-
-    workspace = Workspace(hotel_id)
-    site = workspace.read_site()
-    if site is None:
-        typer.secho(f"{KO} aucun manifeste de site", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    cible = [obj for obj in site.objects if obj.kind == kind]
-    if not cible:
-        typer.secho(f"{KO} aucun objet de type {kind!r}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    from .schemas.enums import ObjectState
-
-    stamp = datetime.now(timezone.utc).isoformat()
-    touchés: list[str] = []
-    for obj in cible:
-        if obj.state is ObjectState.UNRESOLVED:
-            continue
-        obj.state = ObjectState.UNRESOLVED
-        obj.unresolved_reason = rationale
-        # La géométrie part avec l'état : la conserver laisserait viser une
-        # cible dont on vient de dire qu'on ne sait pas où elle est.
-        obj.geometry_wkt = None
-        obj.centroid_lat = None
-        obj.centroid_lon = None
-        touchés.append(obj.object_id)
-
-    if not touchés:
-        typer.echo(f"{OK} {kind} déjà non résolu — rien à faire")
-        return
-
-    workspace.write_site(site)
-
-    # La géométrie porte le même objet sous un **rôle** : la laisser
-    # `resolved` ferait résoudre le besoin sur une cible qu'on vient de
-    # démentir, `demand_targets` la trouvant par ce rôle.
-    périmées = _stale_geometry_for(workspace, kind, rationale)
-
-    # Trace append-only : une dé-résolution est une décision, et l'effacer
-    # ferait relire le manifeste comme s'il avait toujours dit cela.
-    workspace.write_json(
-        f"00_manifest/site_unresolve_{kind}_{_new_run_id()}.json",
-        {
-            "kind": kind,
-            "objects": touchés,
-            "rationale": rationale,
-            "decided_by": decided_by,
-            "decided_at": stamp,
-            "stale_geometries": périmées,
-            "note": (
-                "ce qui dérivait de cet objet devient caduc : sur ce site, "
-                "front_azimuth_deg vient du centroïde du stationnement, et avec "
-                "lui l'orientation des façades et les secteurs"
-            ),
-        },
-    )
-
-    typer.echo(f"{OK} {len(touchés)} objet(s) rendus non résolus")
-    for object_id in touchés:
-        typer.echo(f"    {object_id}")
-    for feature_id in périmées:
-        typer.echo(f"    géométrie {feature_id} → stale")
-    typer.secho(
-        "  · ce qui en dérivait est périmé : front_azimuth_deg, secteurs, "
-        "recherches adaptatives et plans qui s'y appuient",
-        fg=typer.colors.YELLOW,
-    )
-
-
-def _stale_geometry_for(workspace, kind: str, rationale: str) -> list[str]:  # noqa: ANN001
-    """Marque `stale` la géométrie qui porte l'objet dé-résolu.
-
-    `demand_targets` retrouve un objet de site par son **rôle** de géométrie —
-    `PARKING_HOTEL` par `hotel_parking`. Dé-résoudre le seul manifeste de site
-    laisserait donc le besoin se résoudre sur une cible démentie.
-
-    `stale` plutôt que `unresolved` : la géométrie a bien été obtenue, elle
-    n'est simplement plus rattachée à ce site. La dire jamais résolue effacerait
-    ce qui a réellement été téléchargé.
-    """
-    from .demand_targets import OBJECT_KIND_ROLES
-
-    role = OBJECT_KIND_ROLES.get(kind)
-    if role is None:
-        return []
-
-    payload = workspace.read_json("06_geo/capture_geometry.json")
-    if not payload:
-        return []
-
-    touched: list[str] = []
-    for geometry in payload.get("geometries", []):
-        if geometry.get("role") != role.value:
-            continue
-        if geometry.get("resolution_status") == "stale":
-            continue
-        geometry["resolution_status"] = "stale"
-        geometry["stale_reason"] = rationale
-        # Le schéma exige un motif sur tout état non résolu : le renseigner
-        # ailleurs seulement laisserait la géométrie muette sur sa propre
-        # invalidité.
-        geometry["unresolved_reason"] = rationale
-        # La forme part avec l'état — le schéma l'exige, et à raison : garder
-        # le polygone laisserait viser une cible dont on vient de dire qu'elle
-        # n'est pas celle du site.
-        for shape in ("wgs84_wkt", "projected_wkt", "source_wkt", "wkt"):
-            geometry.pop(shape, None)
-        touched.append(geometry.get("feature_id", "?"))
-
-    if touched:
-        workspace.write_json("06_geo/capture_geometry.json", payload)
-    return touched
-
-
-orientation_app = typer.Typer(
-    no_args_is_help=True,
-    help="Orientation du bâtiment : la décider, puis la propager.",
-)
-app.add_typer(orientation_app, name="orientation")
-
-
-@orientation_app.command("apply")
-def orientation_apply(
-    hotel_id: str = typer.Argument(..., help="Établissement concerné."),
-    decision_file: Path = typer.Option(
-        ..., "--decision", help="Décision d'orientation à appliquer.",
-    ),
-) -> None:
-    """Propage une orientation décidée à tout ce qui en dépend.
-
-    Décider ne suffit pas : sur le pilote, l'azimut était corrigé et les 313
-    assets positionnés gardaient leurs anciens secteurs, les quatre façades
-    restaient `unresolved`, et le manifeste canonique portait encore huit
-    besoins. Une orientation qu'on ne propage pas laisse le pipeline juger sur
-    l'ancienne.
-
-    Sept étapes, dans cet ordre — chacune dépend de la précédente :
-
-    ```text
-    1. vérifier la décision et ses preuves
-    2. réinstancier les façades sur l'empreinte
-    3. recalculer les secteurs de tous les assets positionnés
-    4. périmer les productions sectorielles
-    5. activer le manifeste de besoins qui en découle
-    6. réévaluer les besoins sur le corpus
-    7. publier la découverte comme manifeste courant
-    ```
-    """
-    import shutil
-    from datetime import datetime, timezone
-
-    from shapely import wkt as shapely_wkt
-
-    from .orientation import facades_from
-    from .schemas.enums import ObjectState
-    from .sectors import sector_for
-    from .transaction import commit, prepare, sha_of_file
-
-    context = _context(hotel_id, Capability.TARGETED_COLLECTION)
-    workspace = Workspace(hotel_id)
-
-    path = Path(decision_file)
-    if not path.is_file():
-        typer.secho(f"{KO} décision introuvable : {path}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-    decision = json.loads(path.read_text("utf-8"))
-
-    # --- 1. la décision tient-elle ? --------------------------------------
-    geometry = _capture_geometry_if_any(workspace, context)
-    building = next(
-        (g for g in geometry.geometries if g.role.value == "target_building"), None
-    ) if geometry else None
-    if building is None:
-        typer.secho(f"{KO} aucune empreinte cible résolue", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-
-    problems: list[str] = []
-    if decision.get("hotel_id") != hotel_id:
-        problems.append(f"décision de {decision.get('hotel_id')!r}")
-    if decision.get("building_digest") != building.geometry_digest:
-        problems.append(
-            "empreinte du bâtiment différente de celle de la décision : "
-            "l'orientation portait sur une autre forme"
-        )
-    if not decision.get("evidence"):
-        problems.append("décision sans preuve")
-
-    manifest = workspace.read_assets()
-    for item in decision.get("evidence", []):
-        asset = next(
-            (a for a in (manifest.assets if manifest else []) if a.id == item["asset_id"]),
-            None,
-        )
-        if asset is None:
-            problems.append(f"preuve {item['asset_id']} absente du manifeste")
-        elif asset.checksum != item.get("sha256"):
-            problems.append(
-                f"preuve {item['asset_id']} : empreinte du fichier différente — "
-                "ce n'est pas l'image sur laquelle la décision a été prise"
-            )
-
-    if problems:
-        for problem in problems:
-            typer.secho(f"{KO} {problem}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2)
-
-    front = float(decision["front_azimuth_deg"])
-    typer.echo(f"  décision vérifiée — {front}°, {len(decision['evidence'])} preuve(s)")
-
-    # --- 2. les façades, découpées sur l'empreinte ------------------------
-    polygon = shapely_wkt.loads(building.projected_wkt)
-    walls = facades_from(
-        polygon, front, context.policy.geometry.facade_segment_merge_deg
-    )
-    site = workspace.read_site()
-    réinstanciées: list[str] = []
-    for obj in site.objects if site else []:
-        wall = walls.get(obj.kind)
-        if wall is None:
-            continue
-        obj.state = ObjectState.INFERRED
-        obj.unresolved_reason = None
-        obj.geometry_wkt = wall["wkt"]
-        réinstanciées.append(f"{obj.kind} ({wall['length_m']} m, {wall['normal_deg']}°)")
-    if site is not None:
-        workspace.write_site(site)
-    typer.echo(f"  {len(réinstanciées)} façade(s) réinstanciée(s)")
-    for ligne in réinstanciées:
-        typer.echo(f"    {ligne}")
-
-    # --- 3. les secteurs, recalculés --------------------------------------
-    spatial = workspace.read_spatial()
-    centre = spatial.candidate(spatial.confirmed_building_id)
-    changés = 0
-    for asset in manifest.assets if manifest else []:
-        if asset.camera_lat is None or asset.camera_lon is None:
-            continue
-        observed = math.degrees(
-            math.atan2(
-                asset.camera_lon - centre.centroid_lon,
-                asset.camera_lat - centre.centroid_lat,
-            )
-        ) % 360.0
-        nouveau = sector_for(observed, front)
-        if asset.view_sector != nouveau:
-            asset.view_sector = nouveau
-            changés += 1
-    if manifest is not None:
-        workspace.write_assets(manifest)
-    typer.echo(f"  {changés} secteur(s) recalculé(s)")
-
-    # --- 4. ce qui jugeait sur l'ancienne orientation ---------------------
-    périmés = _stale_sector_productions(workspace, front)
-    for nom in périmés:
-        typer.secho(f"    périmé · {nom}", fg=typer.colors.YELLOW)
-
-    # --- 5. le manifeste de besoins qui en découle ------------------------
-    activé = _activate_latest_demands(workspace)
-    typer.echo(f"  besoins actifs : {activé}")
-
-    workspace.write_json(
-        f"00_manifest/orientation_applied_{_new_run_id()}.json",
-        {
-            "decision": path.name,
-            "front_azimuth_deg": front,
-            "facades_reinstantiated": réinstanciées,
-            "sectors_recomputed": changés,
-            "stale_productions": périmés,
-            "demands_activated": activé,
-            "applied_at": datetime.now(timezone.utc).isoformat(),
-            "note": (
-                "une orientation décidée mais non propagée laisse le pipeline "
-                "juger sur l'ancienne : secteurs, façades et besoins en "
-                "dépendent tous"
-            ),
-        },
-    )
-
-    typer.echo("")
-    typer.echo(f"{OK} orientation {front}° propagée")
-    typer.echo("    prochaine étape : assets demands assess, puis assets discover")
-
-
-def _stale_sector_productions(workspace, front: float) -> list[str]:  # noqa: ANN001
-    """Marque périmé ce qui a jugé sur l'ancienne orientation.
-
-    Le LiDAR et sa qualification n'en dépendent pas : une altitude ne change
-    pas parce qu'une façade regarde ailleurs. Les périmer ferait refaire une
-    acquisition coûteuse sans raison.
-
-    Les rapports **sectoriels**, eux, ont classé des vues en avant, gauche,
-    droite ou arrière selon un azimut qui était faux de quatre-vingt-dix
-    degrés.
-    """
-    from datetime import datetime, timezone
-
-    touched: list[str] = []
-    for pattern in ("01_sources/visibility_*.json", "01_sources/coverage_*.json"):
-        for path in sorted(workspace.path(".").glob(pattern)):
-            payload = json.loads(path.read_text("utf-8"))
-            if payload.get("stale_reason"):
-                continue
-            payload["stale_reason"] = (
-                f"secteurs calculés sur un azimut avant périmé ; l'orientation "
-                f"vaut désormais {front}°"
-            )
-            payload["stale_at"] = datetime.now(timezone.utc).isoformat()
-            path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8"
-            )
-            touched.append(path.name)
-    return touched
-
-
-def _activate_latest_demands(workspace) -> str:  # noqa: ANN001
-    """Fait du dernier manifeste de besoins le manifeste **canonique**.
-
-    `demands build` écrit un fichier horodaté ; `capture_demands.json` reste
-    celui que tout le reste lit. Sans cette activation, le pipeline évaluait
-    huit besoins — dont un stationnement dé-résolu — alors que la reconstruction
-    n'en produisait plus que sept.
-    """
-    # Trié par date d'écriture, non par nom : les fichiers sont nommés d'après
-    # l'empreinte des besoins, dont l'ordre alphabétique n'a rien à voir avec
-    # leur chronologie. Le tri par nom activait un manifeste à neuf besoins
-    # alors que la dernière construction en produisait sept.
-    found = sorted(
-        (path for path in workspace.path("01_sources").glob("capture_demands_*.json")
-         if "build" not in path.name),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not found:
-        return "aucun manifeste horodaté — canonique inchangé"
-
-    latest = found[-1]
-    canonical = workspace.path("01_sources", "capture_demands.json")
-    payload = json.loads(latest.read_text("utf-8"))
-    canonical.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8"
-    )
-    return f"{len(payload.get('demands', []))} besoin(s) depuis {latest.name}"
-
-
-router_app = typer.Typer(
-    no_args_is_help=True, help="Route de reconstruction (plan directeur §12)."
-)
-app.add_typer(router_app, name="router")
-
-
-def _targetable(demand, geometry, front_azimuth_deg, site) -> bool:  # noqa: ANN001
-    """Ce besoin vise-t-il quelque chose que l'on sait pointer ?
-
-    Par le résolveur **canonique**, jamais par une table locale : une seconde
-    règle de ciblabilité divergerait de celle qui sert partout ailleurs. Une
-    version locale classait `ACCESS_ROAD_MAIN` non ciblable alors que sa
-    géométrie est résolue dans `CaptureGeometry` — le contraire de ce que le
-    pipeline établit.
-    """
-    from .demand_targets import TargetUnresolved, resolve
-
-    if geometry is None:
-        return False
-    try:
-        resolve(demand, geometry, front_azimuth_deg=front_azimuth_deg, site=site)
-    except TargetUnresolved:
-        return False
-    return True
-
-
-def _qualification(workspace):  # noqa: ANN001, ANN201
-    """Le rapport de qualification en vigueur, et son empreinte.
-
-    « Qualifié » est un verdict, non la présence d'un fichier :
-    `capture_geometry.json` existe sur tout site ayant tourné une fois, et s'en
-    contenter qualifierait des proxies jamais éprouvés.
-    """
-    from .intake import sha256_file
-
-    rapports = sorted(
-        workspace.path("06_geo").glob("qualification_report_*.json"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    if not rapports:
-        return None, "", "", {}
-    payload = json.loads(rapports[-1].read_text("utf-8"))
-    verdicts = {
-        kind: row for kind, row in (payload.get("verdicts") or {}).items()
-        if row.get("passed")
-    }
-    return payload, rapports[-1].name, sha256_file(rapports[-1])[:16], verdicts
-
-
-def _proxies_for(workspace, site, geometry) -> list:  # noqa: ANN001, ANN201
-    """Les proxies géométriques **et ce qu'ils couvrent nommément**.
-
-    Un modèle de terrain qualifié ne comble ni la façade arrière, ni l'entrée :
-    sans portée déclarée, n'importe quel proxy rendrait la route hybride et le
-    document annoncerait une couverture qui n'existe pas.
-    """
-    from .router import ProxyZone
-
-    payload, nom, empreinte, verdicts = _qualification(workspace)
-    if payload is None:
-        return []
-
-    artefacts = tuple(payload.get("selected_artifacts") or ())
-    # L'empreinte de la dérivation retenue : sans elle, on ne saurait pas
-    # laquelle des dérivations successives a porté la qualification.
-    dérivation = (payload.get("qualified_derivation_digest") or "",)
-    interdits = (
-        "plans rapprochés interdits sur les zones proxy : la forme est mesurée, "
-        "l'apparence ne l'est pas",
-    )
-
-    par_type = {obj.kind: obj for obj in site.objects}
-    facades = tuple(
-        kind for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT",
-                          "FACADE_REAR")
-        if par_type.get(kind) is not None and par_type[kind].geometry_wkt
-    )
-
-    zones = []
-    for kind, couverts in (
-        ("TERRAIN_MAIN", ()),
-        # Le volume proxy porte les façades : empreinte confirmée et hauteur
-        # mesurée donnent leur forme, jamais leur apparence.
-        ("ROOFLINE_MAIN", tuple(f"obligation:{f}" for f in facades)),
-    ):
-        verdict = verdicts.get(kind)
-        zones.append(
-            ProxyZone(
-                zone=kind,
-                artifact="+".join(artefacts) or "capture_geometry",
-                qualified=verdict is not None and geometry is not None,
-                qualification_report=nom if verdict else "",
-                qualification_digest=empreinte if verdict else "",
-                source_artifacts=artefacts if verdict else (),
-                source_digests=dérivation if verdict else (),
-                covered_objects=(kind,),
-                covered_demands=couverts,
-                camera_restrictions=interdits,
-                note=(verdict or {}).get("rationale", ""),
-            )
-        )
-    return zones
-
-
-@router_app.command("decide")
-def router_decide(
-    hotel_id: str = typer.Argument(...),
-    force: bool = typer.Option(
-        False, "--force",
-        help="Publier une nouvelle version même si les entrées sont identiques.",
-    ),
-) -> None:
-    """Arrête la route de reconstruction, et la publie.
-
-    Ne recalcule **jamais** les besoins : il lit ceux qui ont été arrêtés. Les
-    recalculer ici laisserait la décision définir son propre corpus, et deux
-    exécutions ne se compareraient plus.
-    """
-    from datetime import datetime, timezone
-
-    from .intake import sha256_file
-    from .provenance import digest_of
-    from .router import (
-        DecisionConflict,
-        InputManifest,
-        MissingInput,
-        ObjectStanding,
-        compare_with_existing,
-        decide,
-        standing_for,
-        standing_of,
-    )
-    from .schemas.acquisition import CaptureDemandManifest, DemandAssessment
-
-    workspace = Workspace(hotel_id)
-    context = _context(hotel_id, Capability.GEOSPATIAL)
-
-    # --- les besoins arrêtés, non recalculés ---------------------------------
-    raw_demands = workspace.read_json("01_sources/capture_demands.json")
-    if raw_demands is None:
-        typer.secho(
-            f"{KO} aucun besoin canonique : le Router juge une couverture, il "
-            "ne l'invente pas",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    demands = CaptureDemandManifest.model_validate(raw_demands)
-
-    # --- leur évaluation la plus récente --------------------------------------
-    évaluations = sorted(
-        workspace.path("01_sources").glob("demand_assessment_*.json"),
-        key=lambda p: p.stat().st_mtime,
-    )
-    évaluations = [p for p in évaluations if "report" not in p.name]
-    if not évaluations:
-        typer.secho(
-            f"{KO} aucune évaluation de besoins : sans elle, « couvert » serait "
-            "une supposition",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    rapport = json.loads(évaluations[-1].read_text("utf-8"))
-    par_besoin = {
-        row["demand_id"]: DemandAssessment.model_validate(row)
-        for row in rapport.get("assessments", [])
-    }
-    # Les identifiants de points de vue vivent dans le **rapport** joint, non
-    # dans l'évaluation : les lire au mauvais endroit rendait un décompte de
-    # zéro alors que des vues servaient les besoins.
-    joint = évaluations[-1].with_name(
-        évaluations[-1].name.replace("demand_assessment_", "demand_assessment_report_")
-    )
-    if not joint.is_file():
-        typer.secho(
-            f"{KO} rapport d'évaluation absent ({joint.name}) : sans les "
-            "identifiants de points de vue, l'union ne se calcule pas et un "
-            "même panorama compterait plusieurs fois",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    vues_par_besoin = json.loads(joint.read_text("utf-8")).get(
-        "viewpoints_by_demand", {}
-    )
-
-    site = workspace.read_site()
-    assets = workspace.read_assets()
-    if site is None or assets is None:
-        typer.secho(
-            f"{KO} manifeste de site et d'assets requis",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    geometry = _capture_geometry_if_any(workspace, context)
-
-    # L'azimut de façade **décidé**, par le même chemin que le reste : sans
-    # lui, « avant » et « arrière » ne se distinguent pas, et un besoin de
-    # secteur paraîtrait ciblable depuis n'importe où.
-    spatial = _safe_read(workspace.read_spatial)
-    front_azimuth = getattr(spatial, "front_azimuth_deg", None) if spatial else None
-    if front_azimuth is None:
-        typer.secho(
-            f"{KO} orientation de façade inconnue : les besoins de secteur ne "
-            "se départageraient pas, et « ciblable » n'aurait pas de sens",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-
-    # --- la visibilité **réellement portée par les assets** --------------------
-    # Le dernier fichier par date n'est pas nécessairement celui qui est en
-    # vigueur : une application peut avoir été écrite sans être projetée, ou
-    # une plus ancienne rester celle que les assets portent. La preuve est dans
-    # les assets eux-mêmes.
-    portés = {
-        asset.visibility_run_id for asset in assets.assets
-        if asset.visibility_run_id
-    }
-    if len(portés) > 1:
-        typer.secho(
-            f"{KO} les assets portent {len(portés)} exécutions différentes "
-            f"({', '.join(sorted(portés))}) : aucune n'est « la » visibilité "
-            "appliquée, et décider sur l'une d'elles serait arbitraire",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    en_vigueur = next(iter(portés), None)
-    applications = [
-        chemin for chemin in sorted(
-            workspace.path("06_geo").glob("visibility_application_*.json"),
-            key=lambda p: p.stat().st_mtime,
-        )
-        if en_vigueur and f"_{en_vigueur}_" in chemin.name
-    ]
-    if en_vigueur and not applications:
-        typer.secho(
-            f"{KO} les assets portent l'exécution {en_vigueur}, dont aucun "
-            "reçu d'application n'existe : la projection ne se vérifie pas",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=1)
-    previews = workspace.path("01_sources", "preview_assessments.json")
-
-    # --- l'état de chaque objet, tel que le site le dit ------------------------
-    # `PARKING_HOTEL` reste `unresolved` : c'est l'**association** au
-    # stationnement candidat qui a été démentie, non l'existence d'un
-    # stationnement. Un registre de « réfutations d'objets » changerait le sens
-    # de ce qui a été constaté.
-    objets = {
-        obj.kind: standing_of(obj.state.value, bool(obj.geometry_wkt))
-        for obj in site.objects
-    }
-
-    # --- l'état de chaque besoin, jugé par le besoin lui-même ------------------
-    états = []
-    for demand in demands.demands:
-        assessment = par_besoin.get(demand.demand_id)
-        if assessment is None:
-            typer.secho(
-                f"{KO} besoin {demand.demand_id} sans évaluation : le corpus "
-                "évalué ne couvre pas les besoins arrêtés",
-                fg=typer.colors.RED, err=True,
-            )
-            raise typer.Exit(code=1)
-        états.append(
-            standing_for(
-                demand, assessment,
-                targetable=_targetable(demand, geometry, front_azimuth, site),
-                viewpoint_ids=tuple(vues_par_besoin.get(demand.demand_id, [])),
-            )
-        )
-
-    inputs = InputManifest(
-        demands_digest=digest_of(raw_demands),
-        # Deux fichiers, deux empreintes : le manifeste porte les verdicts, le
-        # rapport les identifiants de points de vue. N'en retenir qu'une
-        # laissait trois rapports différents produire la même identité.
-        assessment_manifest_digest=sha256_file(évaluations[-1])[:16],
-        assessment_report_digest=sha256_file(joint)[:16],
-        site_manifest_digest=digest_of(json.loads(site.model_dump_json())),
-        capture_geometry_digest=(
-            digest_of(json.loads(geometry.model_dump_json())) if geometry else ""
-        ),
-        asset_manifest_digest=digest_of(json.loads(assets.model_dump_json())),
-        visibility_application_digest=(
-            sha256_file(applications[-1])[:16] if applications else ""
-        ),
-        spatial_reference_digest=(
-            digest_of(json.loads(context.spatial_reference.model_dump_json()))
-            if context.spatial_reference else ""
-        ),
-        preview_assessment_digest=(
-            sha256_file(previews)[:16] if previews.is_file() else ""
-        ),
-        policy_digest=context.provenance["policy_digest"],
-        policy_facets=("coverage", "visibility", "geospatial"),
-    )
-
-    # La décision est construite et validée **en mémoire** : un document écrit
-    # puis jugé invalide resterait sur le disque comme s'il faisait autorité.
-    try:
-        decision = decide(
-            hotel_id, états, objets,
-            _proxies_for(workspace, site, geometry), inputs,
-        )
-    except MissingInput as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        typer.secho(
-            "  une route rendue sur un corpus inconnu paraîtrait fondée sans "
-            "l'être : rien n'est écrit",
-            fg=typer.colors.RED, err=True,
-        )
-        raise typer.Exit(code=2) from exc
-
-    # --- réutiliser une décision identique -------------------------------------
-    dossier = workspace.path("10_validation")
-    dossier.mkdir(parents=True, exist_ok=True)
-    existante = sorted(dossier.glob(f"router_decision_*_{decision.input_digest}.json"))
-    payload = decision.as_dict()
-
-    if existante:
-        # À identité égale, le verdict doit être identique. Une divergence
-        # signifie qu'une entrée non déclarée a pesé : `--force` ne la rendrait
-        # pas cohérente, il effacerait seulement la trace du défaut.
-        ancienne = json.loads(existante[-1].read_text("utf-8"))
-        try:
-            compare_with_existing(payload, ancienne)
-        except DecisionConflict as exc:
-            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-            typer.secho(
-                f"  décision existante : {existante[-1].name} — rien n'est "
-                "écrit, y compris avec --force",
-                fg=typer.colors.RED, err=True,
-            )
-            raise typer.Exit(code=3) from exc
-
-        if not force:
-            typer.secho(
-                f"{OK} entrées inchangées : décision {existante[-1].name} "
-                "réutilisée",
-                fg=typer.colors.GREEN,
-            )
-            typer.echo(
-                f"  {decision.path.value} · {decision.decision_status.value}"
-            )
-            return
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    nom = f"router_decision_{stamp}_{decision.input_digest}.json"
-
-    # Immuable : une décision réécrite ne se relirait plus comme ce qu'elle fut.
-    workspace.write_json(f"10_validation/{nom}", payload)
-
-    typer.secho(f"{OK} décision publiée : {nom}", fg=typer.colors.GREEN)
-    typer.echo(f"  path            {decision.path.value}")
-    typer.echo(f"  decision_status {decision.decision_status.value}")
-    typer.echo(f"  input_digest    {decision.input_digest}")
-    typer.echo(f"  {decision.rationale}")
-    for action in decision.next_actions:
-        typer.echo(f"    → {action}")
-
-
-# --- livrables canoniques du Lot 1B ------------------------------------------
-
-coverage_app = typer.Typer(
-    no_args_is_help=True,
-    help="Contexte, contraintes caméra et couverture finale du Lot 1B.",
-)
-app.add_typer(coverage_app, name="coverage")
-
-sources_app = typer.Typer(
-    no_args_is_help=True,
-    help="Registre factuel des familles de sources du Lot 1B.",
-)
-app.add_typer(sources_app, name="sources")
-
-
-@sources_app.command("registry")
-def sources_registry(hotel_id: str = typer.Argument(...)) -> None:
-    """Inventorie localement les familles interrogées, absentes ou en attente."""
-    from .source_registry import SourceRegistry, build
-
-    workspace = Workspace(hotel_id)
-    try:
-        path = build(workspace)
-        registry = SourceRegistry.model_validate_json(path.read_text("utf-8"))
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-    typer.secho(f"{OK} registre des sources publié : {path}", fg=typer.colors.GREEN)
-    typer.echo(
-        f"  familles requises {registry.closed_families}/{registry.required_families} closes"
-    )
-    if not registry.closure_complete:
-        typer.secho("  campagne incomplète", fg=typer.colors.YELLOW)
-
-
-@sources_app.command("unavailable")
-def sources_unavailable(
-    hotel_id: str = typer.Argument(...),
-    family_id: str = typer.Argument(..., help="Famille du §8 du plan Lot 1B."),
-    reason: str = typer.Option(..., "--reason", help="Indisponibilité observée."),
-    by: str = typer.Option(..., "--by", help="Auteur du constat."),
-) -> None:
-    """Consigne qu'une famille est indisponible, et pourquoi.
-
-    Le reçu documente une indisponibilité **observée**. Il ne dispense pas
-    d'interroger une famille simplement coûteuse ou lente.
-    """
-    from .source_registry import record_unavailable
-
-    workspace = Workspace(hotel_id)
-    try:
-        path = record_unavailable(workspace, family_id, reason, by)
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-    typer.secho(f"{OK} reçu d'indisponibilité consigné : {path}", fg=typer.colors.GREEN)
-    typer.echo("  relancez : hotel-pipeline sources registry " + hotel_id)
-
-
-@sources_app.command("queried")
-def sources_queried(
-    hotel_id: str = typer.Argument(...),
-    family_id: str = typer.Argument(..., help="Famille interrogée."),
-    query: str = typer.Option(..., "--query", help="Requête réellement lancée."),
-    returned: int = typer.Option(..., "--returned", help="Nombre de résultats rendus."),
-    evidence: str = typer.Option(..., "--evidence", help="Trace de l'interrogation."),
-    by: str = typer.Option(..., "--by", help="Auteur de la campagne."),
-) -> None:
-    """Consigne qu'une famille a été interrogée hors découverte ciblée.
-
-    Le registre ne lisait que les manifestes de candidats, or seule la
-    découverte ciblée en produit. Un collecteur exécuté directement — Places,
-    site officiel, Commons — ne laissait donc aucune trace, et sa famille
-    restait ouverte alors même qu'elle avait répondu.
-
-    `--returned 0` est admis : une source interrogée qui ne rend rien est close
-    tout de même. C'est l'interrogation qui ferme la campagne, pas la moisson.
-    """
-    from .source_registry import record_campaign
-
-    workspace = Workspace(hotel_id)
-    try:
-        path = record_campaign(workspace, family_id, query, returned, evidence, by)
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-    typer.secho(f"{OK} campagne consignée : {path}", fg=typer.colors.GREEN)
-    typer.echo(f"  {family_id} — {returned} résultat(s)")
-    typer.echo("  relancez : hotel-pipeline sources registry " + hotel_id)
-
-
-@sources_app.command("reopen")
-def sources_reopen(
-    hotel_id: str = typer.Argument(...),
-    family_id: str = typer.Argument(...),
-    reason: str = typer.Option(..., "--reason", help="Motif de la réouverture."),
-    by: str = typer.Option(..., "--by", help="Auteur du retrait."),
-) -> None:
-    """Retire un reçu devenu faux, sans effacer l'historique."""
-    from .source_registry import withdraw_unavailable
-
-    workspace = Workspace(hotel_id)
-    try:
-        path = withdraw_unavailable(workspace, family_id, by, reason)
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-    typer.secho(f"{OK} famille rouverte : {path}", fg=typer.colors.GREEN)
-
-
-@coverage_app.command("build")
-def coverage_build(hotel_id: str = typer.Argument(...)) -> None:
-    """Produit les livrables finaux sans muter les vérités amont."""
-    from .lot1b_coverage import build
-
-    workspace = Workspace(hotel_id)
-    try:
-        outputs = build(workspace)
-    except (FileNotFoundError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-
-    typer.secho(f"{OK} couverture Lot 1B publiée", fg=typer.colors.GREEN)
-    for name, path in outputs.items():
-        typer.echo(f"  {name:<20} {path}")
-
-
-# --- paquet hybride pour consommateurs vidéo -------------------------------
-
-scene_app = typer.Typer(
-    no_args_is_help=True,
-    help="Exporte une scène hybride/proxy sans appeler de fournisseur vidéo.",
-)
-app.add_typer(scene_app, name="scene")
-
-
-@scene_app.command("build")
-def scene_build(hotel_id: str = typer.Argument(...)) -> None:
-    """Produit le volume, les rasters, le verdict et le paquet de prompts."""
-    from .scene_package import build
-
-    workspace = Workspace(hotel_id)
-    try:
-        outputs = build(workspace)
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
-        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
-
-    typer.secho(f"{OK} paquet 3D hybride publié", fg=typer.colors.GREEN)
-    for name, path in outputs.items():
-        typer.echo(f"  {name:<12} {path}")
-    typer.secho(
-        "  verdict Phase 1 : NEEDS_AUTHORIZED_CAPTURE — ce paquet n'est pas "
-        "ENVIRONMENT_3D_READY",
-        fg=typer.colors.YELLOW,
-    )
-
-
-# En **fin** de fichier : placé au milieu, `app()` s'exécutait avant que les
-# commandes définies plus bas — visibility, orientation, router — ne soient
-# enregistrées, et elles restaient introuvables sous `python -m`.
-if __name__ == "__main__":
-    app()

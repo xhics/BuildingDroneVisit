@@ -75,6 +75,11 @@ from .enums import (
     ViewSector,
 )
 from .project import BlockedState, ProjectManifest, StepRecord
+from .reconstruction import (
+    ReconstructionInputManifest,
+    ReconstructionSelection,
+    ReconstructionSelectionManifest,
+)
 from .site import (
     DerivedArtifact,
     GeoSourceProvenance,
@@ -154,6 +159,26 @@ __all__ = [
     "Phase1Status",
     "ProjectManifest",
     "PropertyMatchStatus",
+    "ReconstructionInputManifest",
+    "ReconstructionSelection",
+    "ReconstructionSelectionManifest",
+    "AlignmentAnchor",
+    "CameraConsensusEntry",
+    "ReconstructionConsensusReport",
+    "GeoAlignmentManifest",
+    "ReconstructionBackend",
+    "ReconstructionPlan",
+    "ReconstructionRun",
+    "ScenePackageType",
+    "ReconstructionGateStatus",
+    "SurfaceConfidence",
+    "SurfaceConfidenceManifest",
+    "ValidatedCameraPath",
+    "ViewGraphManifest",
+    "ViewGraphNode",
+    "ViewGraphReport",
+    "PairEvidence",
+    "CameraFeasibilityField",
     "Rights",
     "RouterPath",
     "SpatialRelation",

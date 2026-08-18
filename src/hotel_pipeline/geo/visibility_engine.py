@@ -76,9 +76,19 @@ class Obstacle:
     #: autre altitude suppose une origine commune que rien n'établit.
     vertical_crs: str | None = None
 
+    #: Catégorie de l'obstacle : bâtiment, végétation, ou obstacle au sol.
+    #: La végétation est un occludant partiel : son occlusion_fraction est
+    #: inférieure à 1.0 car le feuillage n'est pas opaque à 100 %.
+    category: str = "building"
+    occlusion_fraction: float = 1.0
+
     @property
     def height_known(self) -> bool:
         return self.height_m is not None
+
+    @property
+    def is_vegetation(self) -> bool:
+        return self.category == "vegetation"
 
 
 @dataclass(frozen=True)
@@ -374,6 +384,7 @@ def assess(
     at_risk: set[str] = set()
     blocking: set[str] = set()
     missing_vertical: set[str] = set()
+    vegetation_occlusion = 0.0
     clear_run = best_clear = 0.0
 
     for bearing, width in cells(start, span, policy):
@@ -383,6 +394,7 @@ def assess(
         )
         weights[partition] += width
         rays.append(ray)
+        vegetation_occlusion = max(vegetation_occlusion, ray.vegetation_occlusion_fraction)
 
         if partition is RayPartition.CLEAR_2D:
             clear_run += width
@@ -408,6 +420,7 @@ def assess(
         1.0 - assessment.proven_clear_fraction - assessment.risk_unknown_height_fraction,
         precision,
     )
+    assessment.vegetation_occlusion_fraction = round(vegetation_occlusion, precision)
     assessment.largest_clear_span_deg = round(best_clear, precision)
     assessment.obstacles_at_risk = sorted(at_risk)
     assessment.obstacles_blocking = sorted(blocking)
@@ -461,6 +474,7 @@ def _assess_cell(
     hits: list[ObstacleHit] = []
     blocked = False
     incomplete: list[str] = []
+    vegetation_occlusion = 0.0
     for distance, obstacle in interposed:
         proven, vertical_status, absent = vertical_verdict(
             origin, obstacle, distance, target_distance, camera, local_target,
@@ -471,6 +485,8 @@ def _assess_cell(
             else HitVerdict.BLOCKS if proven
             else HitVerdict.PASSES_UNDER
         )
+        if obstacle.is_vegetation and not proven:
+            vegetation_occlusion = max(vegetation_occlusion, obstacle.occlusion_fraction)
         hits.append(
             ObstacleHit(
                 obstacle_ref=obstacle.feature_id,
@@ -486,6 +502,7 @@ def _assess_cell(
     common = dict(
         bearing_deg=round(bearing, precision), angular_width_deg=width,
         target_distance_m=round(target_distance, precision), hits=hits,
+        vegetation_occlusion_fraction=round(vegetation_occlusion, precision),
     )
 
     # Priorité : blocage prouvé, puis risque, puis libre.

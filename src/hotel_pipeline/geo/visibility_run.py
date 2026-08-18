@@ -15,6 +15,7 @@ from ..logging import get_logger
 from ..schemas.geometry import GeometryResolutionStatus, GeometryRole
 from ..schemas.visibility import (
     CorridorVisibilityAssessment,
+    HitVerdict,
     LineOfSightStatus,
     UsefulnessVerdict,
     VisibilityRun,
@@ -85,6 +86,12 @@ class RunReport:
     #: bien davantage.
     obstacles_by_affected_assets: dict[str, int] = field(default_factory=dict)
 
+    #: Assets dont au moins un rayon rencontre un obstacle végétal sans pouvoir
+    #: conclure. La végétation est un occludant partiel : son impact est suivi
+    #: séparément des blocages prouvés.
+    vegetation_occluded_assets: int = 0
+    vegetation_occlusion_by_obstacle: dict[str, int] = field(default_factory=dict)
+
     framing_computable: int = 0
     framing_not_computable: dict[str, int] = field(default_factory=dict)
 
@@ -125,6 +132,10 @@ class RunReport:
                 "missing_vertical": self.missing_vertical_counts,
                 "obstacles_by_affected_assets": self.obstacles_by_affected_assets,
             },
+            "vegetation_occlusion": {
+                "assets_with_vegetation_risk": self.vegetation_occluded_assets,
+                "by_obstacle": self.vegetation_occlusion_by_obstacle,
+            },
             "framing": {
                 "computable": self.framing_computable,
                 "not_computable": self.framing_not_computable,
@@ -145,21 +156,39 @@ def _obstacles(manifest, heights: dict) -> list[engine.Obstacle]:  # noqa: ANN00
 
     obstacles = []
     for geometry in manifest.geometries:
-        if geometry.role is not GeometryRole.OBSTACLE_BUILDING:
-            continue
-        if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
-            continue
-        obstacles.append(
-            engine.Obstacle(
-                feature_id=geometry.feature_id,
-                shape=shapely_wkt.loads(geometry.projected_wkt),
-                # Hauteur du tag OSM si elle existe, sinon celle mesurée dans
-                # le nuage. Rien n'est estimé : sans mesure, la valeur reste
-                # absente et le rayon restera un risque.
-                height_m=geometry.height_m or heights.get(geometry.feature_id, {}).get("height_m"),
-                ground_m=heights.get(geometry.feature_id, {}).get("ground_m"),
+        if geometry.role in (GeometryRole.OBSTACLE_BUILDING, GeometryRole.OBSTACLE_GROUND):
+            if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
+                continue
+            obstacles.append(
+                engine.Obstacle(
+                    feature_id=geometry.feature_id,
+                    shape=shapely_wkt.loads(geometry.projected_wkt),
+                    height_m=geometry.height_m or heights.get(geometry.feature_id, {}).get("height_m"),
+                    ground_m=heights.get(geometry.feature_id, {}).get("ground_m"),
+                    category="building" if geometry.role is GeometryRole.OBSTACLE_BUILDING else "ground",
+                    occlusion_fraction=1.0,
+                )
             )
-        )
+        elif geometry.role is GeometryRole.OBSTACLE_VEGETATION:
+            if geometry.resolution_status is not GeometryResolutionStatus.RESOLVED:
+                continue
+            height_m = geometry.height_m or heights.get(geometry.feature_id, {}).get("height_m")
+            if height_m is not None and height_m > 10:
+                occlusion = 0.7
+            elif height_m is not None and height_m <= 10:
+                occlusion = 0.3
+            else:
+                occlusion = 0.5
+            obstacles.append(
+                engine.Obstacle(
+                    feature_id=geometry.feature_id,
+                    shape=shapely_wkt.loads(geometry.projected_wkt),
+                    height_m=height_m,
+                    ground_m=heights.get(geometry.feature_id, {}).get("ground_m"),
+                    category="vegetation",
+                    occlusion_fraction=occlusion,
+                )
+            )
     return obstacles
 
 
@@ -293,7 +322,6 @@ def run_assessment(
             _corridor(
                 corridor, line, target_shape, obstacles, settings, report,
                 sectors=_sector_reader(target_shape, front_azimuth_deg),
-                crs=manifest.working_crs,
             )
         )
 
@@ -418,6 +446,15 @@ def _tally(report: RunReport, asset, assessment) -> None:  # noqa: ANN001
             report.obstacles_by_affected_assets.get(obstacle, 0) + 1
         )
 
+    if assessment.vegetation_occlusion_fraction > 0:
+        report.vegetation_occluded_assets += 1
+        for ray in assessment.rays:
+            for hit in ray.hits:
+                if hit.verdict is HitVerdict.UNDECIDABLE:
+                    report.vegetation_occlusion_by_obstacle[hit.obstacle_ref] = (
+                        report.vegetation_occlusion_by_obstacle.get(hit.obstacle_ref, 0) + 1
+                    )
+
 
 def _framing(asset, assessment, settings):  # noqa: ANN001
     """Cadrage d'un asset, si ses paramètres le permettent.
@@ -444,10 +481,7 @@ def _framing(asset, assessment, settings):  # noqa: ANN001
     )
 
 
-def _corridor(  # noqa: ANN001
-    corridor, line, target_shape, obstacles, settings, report,
-    sectors=None, crs: str = "",
-):
+def _corridor(corridor, line, target_shape, obstacles, settings, report, sectors=None):  # noqa: ANN001
     """Ce qu'une voie promet, échantillon par échantillon.
 
     Les mesures publiées sont celles d'**un** échantillon — le meilleur —, non
@@ -469,10 +503,6 @@ def _corridor(  # noqa: ANN001
         assessment = engine.assess(
             f"corridor-{corridor.corridor_id}-{sample_id}", corridor.corridor_id,
             "BUILDING_MAIN", position, target_shape, obstacles, settings,
-            # Le référentiel du manifeste, comme les autres appels : une mesure
-            # sans CRS ne se rattache à rien, et le rendre facultatif ici
-            # laisserait ce chemin le deviner.
-            crs=crs,
         )
         at_risk.update(assessment.obstacles_at_risk)
         max_span = max(max_span, assessment.angular_span_deg or 0.0)

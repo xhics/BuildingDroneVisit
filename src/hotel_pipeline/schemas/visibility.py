@@ -131,6 +131,11 @@ class RayAssessment(BaseModel):
     #: Distance à la première intersection avec la cible, s'il y en a une.
     target_distance_m: float | None = Field(default=None, ge=0)
 
+    #: Fraction de la cellule occultée par la végétation (0 = pas de végétation,
+    #: 1 = canopée opaque). N'est ajoutée aux fractions principales que si la
+    #: végétation est un obstacle interposé dont la hauteur est inconnue.
+    vegetation_occlusion_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
     #: Chaque intersection rencontrée **avant** la cible, avec son verdict
     #: propre. Un obstacle croisé n'est pas un obstacle responsable : les
     #: confondre inscrivait comme bloquants des voisins dont on ne savait rien.
@@ -204,6 +209,11 @@ class VisibilityAssessment(BaseModel):
     proven_clear_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     risk_unknown_height_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     proven_blocked_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    #: Fraction de la vue potentiellement occultée par la végétation.
+    #: Distincte des trois fractions ci-dessus : elle n'est pas un risque
+    #: binaire mais une estimation de l'opacité du feuillage.
+    vegetation_occlusion_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
 
     #: Plus grand intervalle continu sans obstacle prouvé.
     largest_clear_span_deg: float = Field(default=0.0, ge=0)

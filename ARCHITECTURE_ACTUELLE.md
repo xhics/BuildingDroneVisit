@@ -372,6 +372,13 @@ Un obstacle sans données verticales suffisantes produit un risque, jamais un
 blocage prouvé. Les cadrages de caméra sont calculés séparément de la visibilité
 géométrique.
 
+La végétation et les obstacles au sol sont désormais pris en compte : ils
+produisent une `vegetation_occlusion_fraction` par rayon, agrégée dans
+`VisibilityAssessment` et `RunReport`. Un arbre dont la hauteur est inconnue
+reste un risque ; sa hauteur connue permet un verdict `PASSES_UNDER` ou
+`BLOCKS` selon la géométrie. Les obstacles au sol sont traités comme des
+bâtiments en termes de blocage.
+
 ---
 
 ## 9. Orientation des façades
@@ -511,8 +518,7 @@ Elle publie sous `work/<hotel_id>/coverage/` :
   proxies, sources et blocages ;
 - `zone_confidence.geojson` : géométries WGS84 et niveaux de confiance, avec
   `geometry: null` pour les objets indéterminés plutôt qu'une forme inventée ;
-- `capture_brief.md` : produit seulement comme consigne de capture bornée par
-  la décision courante.
+- `video_prompts.json` : conditionnement IA pour génération vidéo (facade_quality, pose_priorities, style_hints, temporal_sequence, blind_field_poses) ;
 
 Couverture et acquisition restent deux axes. Pour le pilote, l'orthophoto CMM
 2023 est couverte par déclaration territoriale du diffuseur, mais non acquise
@@ -538,10 +544,18 @@ Pour le pilote, la surface de toiture LiDAR est mesurée, le terrain et le nDSM
 sont des inférences qualifiées, et le volume de façade est un proxy extrudé.
 Les rasters sont copiés avec leurs empreintes, CRS horizontal et datum vertical.
 
-La trajectoire est une caméra **virtuelle de simulation**. Son rayon est dérivé
-de l'emprise et du FOV matérialisé dans la politique ; elle ne constitue jamais
-une autorisation de capturer depuis ces positions. Les contraintes du Lot 1B et
-les zones sans claim établi voyagent dans le même paquet que le mesh.
+La trajectoire est une caméra **virtuelle de simulation**, désormais **pilotée
+par la demande** : le nombre de poses par façade dépend de la couverture
+mesurée, avec un minimum de 8 poses. Les façades non observées reçoivent 4
+poses marquées `blind_field=True` ; les partiellement observées en reçoivent 3 ;
+les pleinement observées, 2. Les contraintes du Lot 1B et les zones sans claim
+établi voyagent dans le même paquet que le mesh.
+
+`video_prompts.json` exporte un conditionnement prêt pour la génération vidéo
+IA : `facade_quality` avec `weighted_union_fraction`, `pose_priorities`,
+`style_hints`, `temporal_sequence` et `blind_field_poses`. Le paquet reste
+provider-agnostic : il décrit ce qui est connu et ce qui manque, sans appeler
+de service vidéo.
 
 Le verdict Phase 1 est un contrat distinct. Il refuse structurellement
 `ENVIRONMENT_3D_READY` si un gate est échoué ou non vérifié, si une raison de

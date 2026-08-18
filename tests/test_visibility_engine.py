@@ -808,3 +808,44 @@ def test_the_old_single_occlusion_field_is_now_projected(tmp_path) -> None:
     cleared = asset_manifest(tmp_path, occluded_by=None)
 
     assert base_manifest_digest(occluded) == base_manifest_digest(cleared)
+
+
+# --- végétation ---------------------------------------------------------------
+
+
+def tree(x0, y0, x1, y1, height_m=8.0, occlusion=0.5, **kwargs):
+    return Obstacle(
+        kwargs.pop("feature_id", "TREE"),
+        Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)]),
+        height_m=height_m,
+        category="vegetation",
+        occlusion_fraction=occlusion,
+        **kwargs,
+    )
+
+
+def test_vegetation_creates_risk_with_unknown_height() -> None:
+    """Un arbre sans hauteur connue est un risque, pas un blocage."""
+    assessment = run([tree(-12, 20, 12, 25)])
+
+    assert assessment.risk_unknown_height_fraction > 0
+    assert assessment.proven_blocked_fraction == 0.0
+    assert assessment.status is LineOfSightStatus.AT_RISK
+    assert assessment.vegetation_occlusion_fraction == pytest.approx(0.5, abs=0.01)
+
+
+def test_dense_tree_has_higher_occlusion_than_shrub() -> None:
+    """Un grand arbre (occlusion 0.7) contribue plus qu'un arbuste (0.3)."""
+    dense = run([tree(-12, 20, 12, 25, height_m=15.0, occlusion=0.7)])
+    shrub = run([tree(-12, 20, 12, 25, height_m=3.0, occlusion=0.3)])
+
+    assert dense.vegetation_occlusion_fraction == pytest.approx(0.7, abs=0.01)
+    assert shrub.vegetation_occlusion_fraction == pytest.approx(0.3, abs=0.01)
+
+
+def test_vegetation_behind_target_does_not_occlude() -> None:
+    """Un arbre derrière la cible ne contribue pas à l'occlusion végétale."""
+    assessment = run([tree(-12, 80, 12, 85, occlusion=0.8)])
+
+    assert assessment.vegetation_occlusion_fraction == 0.0
+    assert assessment.proven_clear_fraction == 1.0

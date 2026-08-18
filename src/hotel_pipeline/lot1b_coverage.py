@@ -144,6 +144,10 @@ class CameraConstraint(BaseModel):
     severity: ConstraintSeverity
     rationale: str
     evidence_refs: list[str] = Field(min_length=1)
+    min_distance_m: float | None = None
+    allowed_angles_deg: str | None = None
+    detail_level: str | None = None
+    proof_required: str | None = None
 
 
 class CameraConstraintsManifest(BaseModel):
@@ -395,6 +399,65 @@ def _blind_field_kinds(router: dict, geometry, site) -> list[str]:  # noqa: ANN0
     return sorted(set(_positionless_kinds(router, geometry)) & established)
 
 
+_FACADE_BY_SECTOR = {
+    "front": "FACADE_PRIMARY",
+    "front_left_corner": "FACADE_PRIMARY",
+    "left": "FACADE_LEFT",
+    "rear_left_corner": "FACADE_REAR",
+    "rear": "FACADE_REAR",
+    "rear_right_corner": "FACADE_REAR",
+    "right": "FACADE_RIGHT",
+    "front_right_corner": "FACADE_PRIMARY",
+}
+
+_FACADE_VIEWPOINT_THRESHOLDS = {
+    "FACADE_PRIMARY": 8,
+    "FACADE_LEFT": 5,
+    "FACADE_RIGHT": 5,
+    "FACADE_REAR": 3,
+}
+
+
+def _per_facade_viewpoint_counts(assets) -> dict[str, int]:  # noqa: ANN001
+    """Compte les viewpoint_cluster uniques par façade.
+
+    L'unité est le cluster, non le fichier : un panorama comptant pour
+    plusieurs besoins reste un seul point de vue indépendant.
+    """
+    counts: dict[str, set[str]] = {kind: set() for kind in _FACADE_BY_SECTOR.values()}
+    for asset in assets.assets:
+        if asset.view_sector is None or asset.view_sector.value == "unknown":
+            continue
+        facade = _FACADE_BY_SECTOR.get(asset.view_sector.value)
+        if facade is None:
+            continue
+        cluster = asset.viewpoint_cluster or asset.id
+        counts[facade].add(cluster)
+    return {kind: len(clusters) for kind, clusters in counts.items()}
+
+
+def _zone_state_for_facade(
+    kind: str,
+    appearance_coverage: str,
+    viewpoint_count: int,
+    has_synthetic: bool,
+) -> str:
+    """Déduit l'état de zone trusted / proxy / unobserved.
+
+    - ``trusted`` : couverture photographique suffisante et viewpoints >= seuil.
+    - ``proxy`` : apparence partielle ou complétée synthétiquement.
+    - ``unobserved`` : aucune apparence observée ni synthétique.
+    """
+    threshold = _FACADE_VIEWPOINT_THRESHOLDS.get(kind, 3)
+    if appearance_coverage == "full" and viewpoint_count >= threshold:
+        return "trusted"
+    if appearance_coverage == "partial" or has_synthetic:
+        return "proxy"
+    if appearance_coverage == "none":
+        return "unobserved"
+    return "proxy"
+
+
 def _completion_findings(
     *,
     uncovered_capture_demands: list[str],
@@ -494,26 +557,166 @@ def _robust_dedup_is_current(workspace, policy=None) -> bool:  # noqa: ANN001
     return True
 
 
+def _synthesize_blind_facades_from_satellite(
+    by_kind, footprint_obj, measured, orthophoto_data=None, orthophoto_source_id=None,
+) -> list:  # noqa: ANN001
+    """Crée des complétions synthétiques pour les façades aveugles via satellite.
+    
+    Retourne une liste de SyntheticCompletion si des façades aveugles peuvent
+    être complétées par une orthophoto disponible ; retourne [] sinon.
+    
+    La logique cherche une orthophoto (GéoMont, Google, etc.) et teste
+    chaque façade qui a union_fraction==0 pour voir si elle est visible.
+    
+    L'orthophoto CMM à 5 m est réservée au contexte global ; elle ne sert
+    pas à la complétion d'apparence des façades.
+    """
+    synthetics = []
+    
+    blind_facades = [
+        (kind, obj)
+        for kind, obj in by_kind.items()
+        if kind.startswith("FACADE_") and kind in measured
+        and measured[kind].get("union_fraction", 0.0) <= 0.0
+    ]
+    if not blind_facades:
+        return synthetics
+    
+    if orthophoto_data is None or orthophoto_source_id is None:
+        return synthetics
+    
+    from .geo.satellite_completion import synthesize_completion_from_orthophoto
+    
+    for facade_kind, facade_obj in blind_facades:
+        if not facade_obj.geometry_wkt:
+            continue
+        
+        synthetic = synthesize_completion_from_orthophoto(
+            facade_kind=facade_kind,
+            facade_geometry_wkt=facade_obj.geometry_wkt,
+            footprint_geometry_wkt=footprint_obj.geometry_wkt,
+            orthophoto_source_id=orthophoto_source_id,
+            orthophoto_data=orthophoto_data,
+        )
+        if synthetic:
+            synthetics.append(synthetic)
+    
+    return synthetics
+
+
+def measure_facade_coverage(site, assets, geometry, policy, orthophoto_data=None, orthophoto_source_id=None) -> dict:  # noqa: ANN001
+    """Couverture d'apparence réellement reçue par chaque mur.
+
+    Remplace un littéral — « partial » pour FACADE_PRIMARY, « none » pour les
+    autres — qui n'était vrai que sur le premier site mesuré. Un second
+    bâtiment en aurait hérité le verdict sans qu'aucune image ne le fonde.
+
+    Seuls les assets **porteurs de géométrie** comptent : une vue écartée en
+    revue ou périmée par la déduplication ne texture rien. Les obstacles
+    viennent des bâtiments voisins déjà résolus, pas d'une hypothèse.
+
+    Les sujets sont dédupliqués par ``viewpoint_cluster`` : un panorama
+    comptant pour plusieurs besoins reste un seul point de vue indépendant.
+    """
+    from pyproj import Transformer
+    from shapely import wkt as shapely_wkt
+    from shapely.ops import transform as shapely_transform
+
+    from .geo.facade_coverage import coverage_from_subjects, sample_facade
+
+    by_kind = {obj.kind: obj for obj in site.objects}
+    footprint_obj = by_kind.get("BUILDING_MAIN")
+    if footprint_obj is None or not footprint_obj.geometry_wkt:
+        return {}
+
+    working_crs = geometry.working_crs
+    to_working = Transformer.from_crs("EPSG:4326", working_crs, always_xy=True)
+
+    def project(shape):  # noqa: ANN001
+        return shapely_transform(
+            lambda x, y, z=None: to_working.transform(x, y), shape
+        )
+
+    footprint = project(shapely_wkt.loads(footprint_obj.geometry_wkt))
+
+    obstacles = [
+        shapely_wkt.loads(item.projected_wkt)
+        for item in geometry.geometries
+        if item.role is GeometryRole.OBSTACLE_BUILDING and item.projected_wkt
+    ]
+
+    fov_deg = float(policy.collection.image_fov_deg)
+    
+    seen_clusters: set[str] = set()
+    subjects = []
+    for asset in assets.assets:
+        if asset.reconstruction_role is not ReconstructionRole.PHOTO_GEOMETRY:
+            continue
+        if asset.camera_lat is None or asset.camera_lon is None:
+            continue
+        cluster = asset.viewpoint_cluster or asset.id
+        if cluster in seen_clusters:
+            continue
+        seen_clusters.add(cluster)
+        subjects.append((
+            cluster,
+            to_working.transform(asset.camera_lon, asset.camera_lat),
+            asset.heading_deg,
+            fov_deg,
+        ))
+
+    measured: dict[str, dict] = {}
+    for kind, obj in sorted(by_kind.items()):
+        if not kind.startswith("FACADE_") or not obj.geometry_wkt:
+            continue
+        samples = sample_facade(shapely_wkt.loads(obj.geometry_wkt), footprint)
+        coverage = coverage_from_subjects(
+            kind, samples, subjects, footprint, obstacles
+        )
+        measured[kind] = coverage.as_dict()
+    
+    synthetics = _synthesize_blind_facades_from_satellite(
+        by_kind, footprint_obj, measured,
+        orthophoto_data=orthophoto_data,
+        orthophoto_source_id=orthophoto_source_id,
+    )
+    if synthetics:
+        from .geo.satellite_completion import merge_with_measured_coverage
+        measured = merge_with_measured_coverage(measured, synthetics)
+    
+    return measured
+
 def _geometry_feature(
     obj, *, confidence: ConfidenceLevel, use: str, working_crs: str,
-    appearance_coverage: str = "none",
+    appearance_coverage: str = "none", geometric_support_coverage: str = "none",
+    measurement: dict | None = None, zone_state: str | None = None,
+    viewpoint_count: int | None = None,
 ) -> dict:  # noqa: ANN001
     from shapely import wkt
     from shapely.geometry import mapping
 
     shape = wkt.loads(obj.geometry_wkt) if obj.geometry_wkt else None
     geometry = mapping(_as_wgs84(shape, working_crs)) if shape else None
+
+    properties = {
+        "kind": obj.kind,
+        "state": obj.state.value,
+        "confidence": confidence.value,
+        "use": use,
+        "appearance_coverage": appearance_coverage,
+        "geometric_support_coverage": geometric_support_coverage,
+    }
+    if zone_state is not None:
+        properties["zone_state"] = zone_state
+    if viewpoint_count is not None:
+        properties["independent_viewpoints"] = viewpoint_count
+    if measurement:
+        properties["appearance_measurement"] = measurement
     return {
         "type": "Feature",
         "id": obj.object_id,
         "geometry": geometry,
-        "properties": {
-            "kind": obj.kind,
-            "state": obj.state.value,
-            "confidence": confidence.value,
-            "use": use,
-            "appearance_coverage": appearance_coverage,
-        },
+        "properties": properties,
     }
 
 
@@ -590,7 +793,31 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         - set(router.get("appearance_gaps") or [])
     )
     no_claim_kinds = _no_claim_kinds(router, geometry, site)
-    blind_field_kinds = _blind_field_kinds(router, geometry, site)
+    per_facade_viewpoints = _per_facade_viewpoint_counts(assets)
+    
+    orthophoto_for_appearance = None
+    orthophoto_source_id = None
+    for candidate in routing.territorial_candidates:
+        if candidate.source_id == "cmm-ortho":
+            continue
+        if candidate.resolution_m is not None and candidate.resolution_m < 5.0:
+            orthophoto_for_appearance = {
+                "resolution_cm": candidate.resolution_m * 100.0,
+                "coverage_fraction": 1.0,
+                "notes": candidate.notes or "",
+            }
+            orthophoto_source_id = candidate.source_id
+            break
+    
+    facade_coverage = measure_facade_coverage(
+        site, assets, geometry, context.policy,
+        orthophoto_data=orthophoto_for_appearance,
+        orthophoto_source_id=orthophoto_source_id,
+    )
+    blind_field_kinds = sorted(set(_blind_field_kinds(router, geometry, site)) | {
+        kind for kind, row in facade_coverage.items()
+        if row.get("appearance_coverage") == "none"
+    })
 
     context_manifest = ContextManifest(
         hotel_id=workspace.hotel_id,
@@ -623,6 +850,10 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             severity=ConstraintSeverity.HARD,
             rationale="les quatre façades sont des volumes proxy sans apparence complète",
             evidence_refs=[router_path.name],
+            min_distance_m=25.0,
+            allowed_angles_deg="360",
+            detail_level="facade",
+            proof_required="acquisition et qualification d'une vue rapprochée sur chaque façade",
         ),
         CameraConstraint(
             constraint_id="roof-gaps",
@@ -631,6 +862,10 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             severity=ConstraintSeverity.HARD,
             rationale=roof_proxy.get("note") or "la toiture qualifiée conserve des lacunes",
             evidence_refs=[roof_proxy.get("qualification_report") or "06_geo/qualification_report"],
+            min_distance_m=None,
+            allowed_angles_deg="45-135",
+            detail_level="roof",
+            proof_required="reconstruction SfM ou acquisition drone orthogonale",
         ),
     ]
     if no_claim_kinds:
@@ -681,17 +916,55 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
 
     features = []
     by_kind = {o.kind: o for o in site.objects}
+    
+    # Couverture du bâtiment = union des mesures de façades, pas un littéral.
+    # Sans façades mesurées, on recule à "partial" (cas d'absence de données).
+    facade_fractions = [
+        facade_coverage.get(kind, {}).get("appearance_union_fraction", 0.0)
+        for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR")
+    ]
+    if facade_fractions and any(f > 0.0 for f in facade_fractions):
+        # Union approximée : le max des fractions individuelles majore la vraie union.
+        # (la vrai union nécessiterait de croiser tous les rayons, ce qui est coûteux).
+        building_union = max(facade_fractions)
+    else:
+        building_union = 0.0
+    building_coverage = (
+        "full" if building_union >= 0.9
+        else "none" if building_union <= 0.0
+        else "partial"
+    )
+    
     features.append(_geometry_feature(
         by_kind["BUILDING_MAIN"], confidence=ConfidenceLevel.HIGH,
         use="confirmed_footprint_proxy_volume", working_crs=geometry.working_crs,
-        appearance_coverage="partial",
+        appearance_coverage=building_coverage,
+        geometric_support_coverage=building_coverage,
+        zone_state=(
+            "trusted" if building_coverage == "full"
+            else "unobserved" if building_coverage == "none"
+            else "proxy"
+        ),
     ))
     for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR"):
+        mesure = facade_coverage.get(kind, {})
+        couverture = mesure.get("appearance_coverage", "none")
+        support = mesure.get("geometric_support_coverage", "none")
+        has_synthetic = "synthesis" in mesure
+        vp_count = per_facade_viewpoints.get(kind, 0)
+        zone_state = _zone_state_for_facade(kind, couverture, vp_count, has_synthetic)
         features.append(_geometry_feature(
             by_kind[kind], confidence=ConfidenceLevel.MEDIUM,
-            use="qualified_geometry_proxy_no_appearance",
+            use=(
+                "qualified_geometry_proxy_no_appearance" if couverture == "none"
+                else "qualified_geometry_with_observed_appearance"
+            ),
             working_crs=geometry.working_crs,
-            appearance_coverage=("partial" if kind == "FACADE_PRIMARY" else "none"),
+            appearance_coverage=couverture,
+            geometric_support_coverage=support,
+            measurement=mesure,
+            zone_state=zone_state,
+            viewpoint_count=vp_count,
         ))
     access = next(g for g in geometry.geometries if g.feature_id == "ACCESS_ROAD_MAIN")
     from shapely import wkt
@@ -811,7 +1084,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             "context_manifest": "coverage/context_manifest.json",
             "camera_constraints": "coverage/camera_constraints.json",
             "zone_confidence": "coverage/zone_confidence.geojson",
-            "capture_brief": "coverage/capture_brief.md",
+            "video_prompts": "scene_package/video_prompts.json",
             "lot_1b_report": "work/<hotel>/LOT_1B_REPORT.md",
         },
     )
@@ -824,17 +1097,36 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     workspace.write_json("coverage/coverage_report.json", report.model_dump(mode="json"))
 
     capture_lines = "\n".join(f"- `{demand}`" for demand in uncovered_capture_demands)
+    blind_lines = "\n".join(f"- `{kind}`" for kind in blind_field_kinds)
     brief = f"""# Brief de capture complémentaire — {workspace.hotel_id}
 
-Besoins autorisés par la décision courante :
+## Besoins à couvrir
 
 {capture_lines or '- aucun'}
+
+## Champs visuels morts à éviter
+
+{blind_lines or '- aucun'}
+
+## Consignes de capture
 
 - partir exclusivement des cibles et corridors résolus cités par ces besoins ;
 - acquérir d'abord une miniature, puis imposer une revue humaine ;
 - ne pas élargir aux autres besoins ;
 - ne pas créditer l'entrée, l'enseigne ou le stationnement depuis cette vue ;
-- ne lancer aucune prise de vue rapprochée sur une façade proxy.
+- ne lancer aucune prise de vue rapprochée sur une façade proxy ;
+- hauteur de caméra : 1,2 m à 1,8 m (niveau piéton) ;
+- distance recommandée : 10 m à 30 m de la façade ciblée ;
+- recouvrement visuel demandé : 60 % à 80 % entre images consécutives ;
+- sens de déplacement : continu, reliant façade, coins, côtés, arrière et stationnement ;
+- lumière homogène, absence de pluie si possible ;
+- aucune exigence de matériel spécialisé.
+
+## Zones déjà couvertes à ne pas refaire
+
+- toute zone `trusted` de `zone_confidence.geojson` ;
+- toute vue déjà classée `confirmed` dans `asset_reviews.json` ;
+- tout point de vue dont le `viewpoint_cluster` est déjà canonique.
 
 Le Router reste `{router['path']} / {router['decision_status']}`. Une capture ne
 change ce statut qu'après aperçu, décision humaine et nouvelle évaluation des besoins.
@@ -846,6 +1138,7 @@ change ce statut qu'après aperçu, décision humaine et nouvelle évaluation de
         for row in sources
     )
     unresolved_lines = ", ".join(f"`{kind}`" for kind in unresolved)
+    blind_lines = ", ".join(f"`{kind}`" for kind in blind_field_kinds)
     lot_report = f"""# Rapport Lot 1B — {workspace.hotel_id}
 
 ## Verdict
@@ -862,6 +1155,12 @@ exploitables comme proxies qualifiés ; leur apparence ne l'est pas.
 - capture complémentaire : {', '.join(uncovered_capture_demands) or 'aucune'} ;
 - droits : {rights_counts[Rights.PUBLIC_UNCLEARED.value] + rights_counts[Rights.UNKNOWN.value]} assets non clarifiés.
 
+## Zones de confiance
+
+Chaque façade est classée `trusted`, `proxy` ou `unobserved` dans
+`zone_confidence.geojson` selon sa couverture d'apparence mesurée et le nombre
+de points de vue indépendants qui l'observent.
+
 ## Contexte, orthophoto et cadastre
 
 {source_lines}
@@ -870,6 +1169,13 @@ exploitables comme proxies qualifiés ; leur apparence ne l'est pas.
 
 Les objets suivants restent `unresolved` : {unresolved_lines}. Cette
 relecture n'a apporté aucune preuve nouvelle et ne les promeut donc pas.
+
+## Champs visuels morts
+
+Les objets suivants sont établis mais jamais observés : {blind_lines}.
+Ils ne sont pas interdits d'affirmation : leur existence est connue.
+Ils doivent être évités par une caméra future, qui montrerait une forme
+sans texture mesurée.
 
 ## Condition de fermeture
 

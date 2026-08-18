@@ -47,6 +47,8 @@ class GeometryRole(StrEnum):
     ACCESS_ROAD = "access_road"
     ROAD_CANDIDATE = "road_candidate"
     OBSTACLE_BUILDING = "obstacle_building"
+    OBSTACLE_VEGETATION = "obstacle_vegetation"
+    OBSTACLE_GROUND = "obstacle_ground"
     CONTEXT_CORRIDOR = "context_corridor"
     FORBIDDEN_ZONE = "forbidden_zone"
 
@@ -92,6 +94,8 @@ GEOMETRY_TYPES: dict[GeometryRole, frozenset[str]] = {
     GeometryRole.TARGET_BUILDING: frozenset({"Polygon", "MultiPolygon"}),
     GeometryRole.HOTEL_PARKING: frozenset({"Polygon", "MultiPolygon"}),
     GeometryRole.OBSTACLE_BUILDING: frozenset({"Polygon", "MultiPolygon"}),
+    GeometryRole.OBSTACLE_VEGETATION: frozenset({"Polygon", "MultiPolygon"}),
+    GeometryRole.OBSTACLE_GROUND: frozenset({"Polygon", "MultiPolygon"}),
     GeometryRole.ACCESS_ROAD: frozenset({"LineString", "MultiLineString"}),
     GeometryRole.ROAD_CANDIDATE: frozenset({"LineString", "MultiLineString"}),
     GeometryRole.CONTEXT_CORRIDOR: frozenset({"Polygon", "MultiPolygon"}),
@@ -171,11 +175,6 @@ class ResolvedGeometry(BaseModel):
     feature_id: str
     role: GeometryRole
     resolution_status: GeometryResolutionStatus
-
-    #: Pourquoi cette géométrie a cessé d'être rattachée au site. `stale` sans
-    #: motif se relit comme une donnée périmée par le temps, alors qu'ici c'est
-    #: une association qui a été démentie.
-    stale_reason: str | None = None
 
     #: Référence telle que la source la nomme — `way/938806358`.
     source_ref: str | None = None

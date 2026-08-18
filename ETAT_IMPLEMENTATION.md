@@ -196,7 +196,7 @@ demeure inconnu.
 - `coverage/zone_confidence.geojson` ;
 - `coverage/camera_constraints.json` ;
 - `coverage/context_manifest.json` ;
-- `coverage/capture_brief.md`, si nécessaire ;
+- `coverage/video_prompts.json` avec conditionnement IA (facade_quality, pose_priorities, style_hints, temporal_sequence) ;
 - `work/<hotel>/LOT_1B_REPORT.md` et la synthèse pilote `LOT_1B_REPORT.md` ;
 - décision Router versionnée sous `10_validation/`.
 - `00_manifest/source_registry.json`, avec état, preuve et motif par famille.
@@ -539,7 +539,7 @@ Le pointeur canonique est
 
 - un volume OBJ extrudé depuis l'empreinte confirmée, classé `proxy` ;
 - les rasters actifs DTM, DSM de toiture et nDSM, relus par SHA-256 ;
-- 12 poses d'une orbite **virtuelle** dérivée du FOV de la politique ;
+- orbite virtuelle **pilotée par la demande** : 8 à 12 poses réparties par façade selon la couverture mesurée, avec `blind_field` marqué dynamiquement ;
 - les contraintes caméra, la carte de confiance et les claims interdits ;
 - un contrat de prompts sans appel à un fournisseur vidéo réel ;
 - un script d'import Blender et un verdict Phase 1 typé.

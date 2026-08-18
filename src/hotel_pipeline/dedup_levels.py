@@ -278,10 +278,13 @@ def viewpoint_groups(
     # points de vue différent selon l'ordre de parcours — 105 ou 118 sur le même
     # corpus, selon qu'on triait par identifiant ou par distance. L'ordre est
     # donc fixé ici, une fois pour toutes, et sur un critère utile : la vue la
-    # plus proche du bâtiment nomme son groupe.
+    # plus proche du bâtiment nomme son groupe, départagée par la qualité et la
+    # fraîcheur.
     def _order(asset: Asset) -> tuple:
         return (
             asset.target_distance_m if asset.target_distance_m is not None else float("inf"),
+            -(asset.quality_score or 0.0),
+            -(asset.capture_year or 1900),
             asset.id,
         )
 
@@ -342,6 +345,9 @@ def _quality_key(asset: Asset) -> tuple:
 
     Ensuite seulement : aptitude géométrique, résolution, poids — une
     recompression agressive perd du détail à dimensions égales — et provenance.
+
+    Fraîcheur temporelle et qualité mesurée départagent les ex aequo : une
+    capture récente ou mieux notée prime pour la représentation canonique.
     """
     pixels = (asset.width or 0) * (asset.height or 0)
     return (
@@ -351,6 +357,8 @@ def _quality_key(asset: Asset) -> tuple:
         -pixels,
         -(asset.file_size_bytes or 0),
         PROVENANCE_RANK.get(asset.rights, 99),
+        -(asset.capture_year or 1900),
+        -(asset.quality_score or 0.0),
         asset.id,
     )
 
