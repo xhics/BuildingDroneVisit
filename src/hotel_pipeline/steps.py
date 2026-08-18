@@ -453,7 +453,7 @@ def _reconstruct(workspace) -> None:  # noqa: ANN001 — Workspace, import circu
     from .reconstruction_validation import build_validation_report, publish_validation_report
 
     hotel_id = workspace.hotel_id
-    input_manifest = prepare_input(hotel_id)
+    input_manifest, _ = prepare_input(hotel_id)
 
     plans_dir = workspace.path("07_reconstruction", "plans")
     plan_files = sorted(plans_dir.glob("*.json")) if plans_dir.is_dir() else []
