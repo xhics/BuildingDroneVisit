@@ -164,8 +164,8 @@ def _resolve_image_path(workspace: Workspace, asset_id: str) -> Path | None:
         assets = AssetManifest.model_validate_json(workspace.assets_path.read_text("utf-8"))
         by_id = {a.id: a for a in assets.assets}
         asset = by_id.get(asset_id)
-        if asset and asset.file_path:
-            return workspace.path(asset.file_path)
+        if asset and asset.local_path:
+            return workspace.path(asset.local_path)
     except Exception:
         pass
     return None
