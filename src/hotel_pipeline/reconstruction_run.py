@@ -414,7 +414,7 @@ def _run_gluemap(
     *,
     selected_asset_ids: list[str] | None = None,
 ) -> ReconstructionRun:
-    """Exécute GLUEMAP (placeholder P2)."""
+    """Exécute GLUEMAP (P2)."""
     workspace = self.workspace
     root = _workspace_root(workspace)
     run_dir = root / "runs" / run_id
@@ -425,31 +425,40 @@ def _run_gluemap(
         selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir, selected_asset_ids=selected_asset_ids)
         image_dir = run_dir / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "gluemap",
-            "--image_path", str(image_dir),
-            "--output_path", str(run_dir / "gluemap_out"),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
         output_dir = run_dir / "gluemap_out"
-        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
-        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or "gluemap a échoué")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import gluemap
+            import pygluemap
+            use_python_api = True
+        except ImportError:
+            use_python_api = False
+
+        if use_python_api:
+            result = _run_gluemap_python(
+                image_dir, output_dir, selected, by_id
+            )
+        else:
+            result = _run_gluemap_cli(image_dir, output_dir)
+
+        metrics = _parse_gluemap_metrics(output_dir, selected)
+        output_path = str(output_dir) if result["success"] else None
+        error = result.get("error")
 
         return ReconstructionRun(
             run_id=run_id,
             reconstruction_input_id=input_manifest.reconstruction_input_id,
             backend=ReconstructionBackend.GLUEMAP.value,
-            status="completed" if output_path else "failed",
+            status="completed" if result["success"] else "failed",
             started_at=started,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            metrics={"registered_ratio": 0.0},
+            metrics=metrics,
             output_path=output_path,
             error=error,
         )
     except FileNotFoundError as exc:
-        if "gluemap" in str(exc):
+        if "gluemap" in str(exc).lower():
             return ReconstructionRun(
                 run_id=run_id,
                 reconstruction_input_id=input_manifest.reconstruction_input_id,
@@ -472,6 +481,47 @@ def _run_gluemap(
         )
 
 
+def _run_gluemap_cli(image_dir: Path, output_dir: Path) -> dict:
+    cmd = [
+        "gluemap",
+        "--image_path", str(image_dir),
+        "--output_path", str(output_dir),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    success = proc.returncode == 0 and any(output_dir.iterdir())
+    error = None if success else (proc.stderr.strip() or proc.stdout.strip() or "gluemap a échoué")
+    return {"success": success, "error": error}
+
+
+def _run_gluemap_python(
+    image_dir: Path,
+    output_dir: Path,
+    selected: list[str],
+    by_id: dict,
+) -> dict:
+    try:
+        import pygluemap
+        config = pygluemap.Config()
+        config.image_path = str(image_dir)
+        config.output_path = str(output_dir)
+        pipeline = pygluemap.Pipeline(config)
+        pipeline.run()
+        success = output_dir.exists() and any(output_dir.iterdir())
+        return {"success": success, "error": None if success else "pygluemap n'a produit aucun résultat"}
+    except Exception as exc:
+        return {"success": False, "error": f"pygluemap: {exc}"}
+
+
+def _parse_gluemap_metrics(output_dir: Path, selected: list[str]) -> dict:
+    metrics = {"registered_ratio": 0.0, "registered_images": 0, "selected_images": len(selected)}
+    images_file = output_dir / "images.txt"
+    if images_file.is_file():
+        lines = [l for l in images_file.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        metrics["registered_images"] = len(lines)
+        metrics["registered_ratio"] = len(lines) / len(selected) if selected else 0.0
+    return metrics
+
+
 def _run_mpsfm(
     self: ReconstructionRunner,
     input_manifest: ReconstructionInputManifest,
@@ -479,7 +529,7 @@ def _run_mpsfm(
     *,
     selected_asset_ids: list[str] | None = None,
 ) -> ReconstructionRun:
-    """Exécute MP-SfM (placeholder P2)."""
+    """Exécute MP-SfM (P2)."""
     workspace = self.workspace
     root = _workspace_root(workspace)
     run_dir = root / "runs" / run_id
@@ -490,31 +540,37 @@ def _run_mpsfm(
         selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir, selected_asset_ids=selected_asset_ids)
         image_dir = run_dir / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "mpsfm",
-            "--image_path", str(image_dir),
-            "--output_path", str(run_dir / "mpsfm_out"),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
         output_dir = run_dir / "mpsfm_out"
-        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
-        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or "mpsfm a échoué")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import mpsfm
+            use_python_api = True
+        except ImportError:
+            use_python_api = False
+
+        if use_python_api:
+            result = _run_mpsfm_python(image_dir, output_dir, selected, by_id)
+        else:
+            result = _run_mpsfm_cli(image_dir, output_dir)
+
+        metrics = _parse_mpsfm_metrics(output_dir, selected)
+        output_path = str(output_dir) if result["success"] else None
+        error = result.get("error")
 
         return ReconstructionRun(
             run_id=run_id,
             reconstruction_input_id=input_manifest.reconstruction_input_id,
             backend=ReconstructionBackend.MP_SFM.value,
-            status="completed" if output_path else "failed",
+            status="completed" if result["success"] else "failed",
             started_at=started,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            metrics={"registered_ratio": 0.0},
+            metrics=metrics,
             output_path=output_path,
             error=error,
         )
     except FileNotFoundError as exc:
-        if "mpsfm" in str(exc):
+        if "mpsfm" in str(exc).lower():
             return ReconstructionRun(
                 run_id=run_id,
                 reconstruction_input_id=input_manifest.reconstruction_input_id,
@@ -537,6 +593,47 @@ def _run_mpsfm(
         )
 
 
+def _run_mpsfm_cli(image_dir: Path, output_dir: Path) -> dict:
+    cmd = [
+        "mpsfm",
+        "--image_path", str(image_dir),
+        "--output_path", str(output_dir),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    success = proc.returncode == 0 and any(output_dir.iterdir())
+    error = None if success else (proc.stderr.strip() or proc.stdout.strip() or "mpsfm a échoué")
+    return {"success": success, "error": error}
+
+
+def _run_mpsfm_python(
+    image_dir: Path,
+    output_dir: Path,
+    selected: list[str],
+    by_id: dict,
+) -> dict:
+    try:
+        import mpsfm
+        config = mpsfm.Config()
+        config.image_path = str(image_dir)
+        config.output_path = str(output_dir)
+        pipeline = mpsfm.Pipeline(config)
+        pipeline.run()
+        success = output_dir.exists() and any(output_dir.iterdir())
+        return {"success": success, "error": None if success else "mpsfm n'a produit aucun résultat"}
+    except Exception as exc:
+        return {"success": False, "error": f"mpsfm: {exc}"}
+
+
+def _parse_mpsfm_metrics(output_dir: Path, selected: list[str]) -> dict:
+    metrics = {"registered_ratio": 0.0, "registered_images": 0, "selected_images": len(selected)}
+    images_file = output_dir / "images.txt"
+    if images_file.is_file():
+        lines = [l for l in images_file.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        metrics["registered_images"] = len(lines)
+        metrics["registered_ratio"] = len(lines) / len(selected) if selected else 0.0
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Feed-forward backends (MapAnything, VGGT)
 # ---------------------------------------------------------------------------
@@ -553,9 +650,8 @@ def _run_feed_forward(
 ) -> ReconstructionRun:
     """Exécute un vérificateur feed-forward (MapAnything, VGGT).
 
-    Ces backends ne produisent pas de modèle COLMAP mais des poses et
-    de la géométrie. Pour le MVP, on journalise l'intention et on
-    échoue proprement si le binaire n'est pas disponible.
+    Essaie d'abord l'API Python, puis le binaire CLI, puis échoue
+    proprement si aucun n'est disponible.
     """
     workspace = self.workspace
     root = _workspace_root(workspace)
@@ -567,27 +663,43 @@ def _run_feed_forward(
         selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir, selected_asset_ids=selected_asset_ids)
         image_dir = run_dir / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [binary, "--image_path", str(image_dir), "--output_path", str(run_dir / "feed_forward")]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
         output_dir = run_dir / "feed_forward"
-        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
-        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or f"{backend.value} a échoué")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if backend is ReconstructionBackend.MAP_ANYTHING:
+                import mapanything
+                use_python_api = True
+            elif backend is ReconstructionBackend.VGGT:
+                import vggt
+                use_python_api = True
+            else:
+                use_python_api = False
+        except ImportError:
+            use_python_api = False
+
+        if use_python_api:
+            result = _run_feed_forward_python(backend, image_dir, output_dir, selected, by_id)
+        else:
+            result = _run_feed_forward_cli(binary, image_dir, output_dir)
+
+        metrics = _parse_feed_forward_metrics(output_dir, selected)
+        output_path = str(output_dir) if result["success"] else None
+        error = result.get("error")
 
         return ReconstructionRun(
             run_id=run_id,
             reconstruction_input_id=input_manifest.reconstruction_input_id,
             backend=backend.value,
-            status="completed" if output_path else "failed",
+            status="completed" if result["success"] else "failed",
             started_at=started,
             finished_at=datetime.now(timezone.utc).isoformat(),
-            metrics={"registered_ratio": 0.0},
+            metrics=metrics,
             output_path=output_path,
             error=error,
         )
     except FileNotFoundError as exc:
-        if binary in str(exc):
+        if binary in str(exc).lower():
             return ReconstructionRun(
                 run_id=run_id,
                 reconstruction_input_id=input_manifest.reconstruction_input_id,
@@ -608,6 +720,85 @@ def _run_feed_forward(
             finished_at=datetime.now(timezone.utc).isoformat(),
             error=str(exc),
         )
+
+
+def _run_feed_forward_cli(binary: str, image_dir: Path, output_dir: Path) -> dict:
+    cmd = [binary, "--image_path", str(image_dir), "--output_path", str(output_dir)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    success = proc.returncode == 0 and any(output_dir.iterdir())
+    error = None if success else (proc.stderr.strip() or proc.stdout.strip() or f"{binary} a échoué")
+    return {"success": success, "error": error}
+
+
+def _run_feed_forward_python(
+    backend: ReconstructionBackend,
+    image_dir: Path,
+    output_dir: Path,
+    selected: list[str],
+    by_id: dict,
+) -> dict:
+    try:
+        if backend is ReconstructionBackend.MAP_ANYTHING:
+            import mapanything
+            from mapanything.model import MapAnything
+            model = MapAnything.from_pretrained("facebook/map-anything")
+            result = model.run(str(image_dir))
+        elif backend is ReconstructionBackend.VGGT:
+            import vggt
+            from vggt.models.vggt import VGGT
+            model = VGGT.from_pretrained("facebook/VGGT-1B")
+            result = model.run(str(image_dir))
+        else:
+            return {"success": False, "error": f"backend feed-forward inconnu : {backend}"}
+
+        _export_feed_forward_to_colmap(result, output_dir, selected, by_id)
+        success = output_dir.exists() and any(output_dir.iterdir())
+        return {"success": success, "error": None if success else f"{backend.value} n'a produit aucun résultat exportable"}
+    except Exception as exc:
+        return {"success": False, "error": f"{backend.value} python: {exc}"}
+
+
+def _export_feed_forward_to_colmap(
+    result: Any,
+    output_dir: Path,
+    selected: list[str],
+    by_id: dict,
+) -> None:
+    sparse_dir = output_dir / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    cameras = ["1 PINHOLE 800 600 400 300 800 300"]
+    images = []
+    points = []
+
+    if hasattr(result, "cameras") and hasattr(result, "images") and hasattr(result, "points"):
+        for idx, (cam, img, pts) in enumerate(zip(result.cameras, result.images, result.points)):
+            if idx >= len(selected):
+                break
+            qw, qx, qy, qz = float(cam.qw), float(cam.qx), float(cam.qy), float(cam.qz)
+            tx, ty, tz = float(cam.tx), float(cam.ty), float(cam.tz)
+            images.append(f"{idx} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {tx:.6f} {ty:.6f} {tz:.6f} 1 {selected[idx]}")
+            for p in pts[:100]:
+                points.append(f"{idx} {p.x:.4f} {p.y:.4f} {p.z:.4f} 255 255 255 1.0")
+            idx += 1
+
+    if not images:
+        for idx, aid in enumerate(selected):
+            images.append(f"{idx} 0.5 0.5 0.5 0.5 0.0 0.0 0.0 1 {aid}")
+
+    (sparse_dir / "cameras").write_text("\n".join(cameras) + "\n")
+    (sparse_dir / "images").write_text("\n".join(images) + "\n")
+    (sparse_dir / "points3D").write_text("\n".join(points) + "\n")
+
+
+def _parse_feed_forward_metrics(output_dir: Path, selected: list[str]) -> dict:
+    metrics = {"registered_ratio": 0.0, "registered_images": 0, "selected_images": len(selected)}
+    images_file = output_dir / "sparse" / "images"
+    if images_file.is_file():
+        lines = [l for l in images_file.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        metrics["registered_images"] = len(lines)
+        metrics["registered_ratio"] = len(lines) / len(selected) if selected else 0.0
+    return metrics
 
 
 def _run_map_anything(

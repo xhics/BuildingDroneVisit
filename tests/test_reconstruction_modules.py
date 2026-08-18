@@ -599,3 +599,143 @@ def test_reconstruction_plan_temporal_strategy_escalates_with_unknown_and_low_ov
     planner = ReconstructionPlanner(workspace)
     plan = planner.plan(input_manifest, view_graph)
     assert plan.temporal_strategy == "current_plus_unknown"
+
+
+# ---------------------------------------------------------------------------
+# GLUEMAP Integration
+# ---------------------------------------------------------------------------
+
+
+def test_gluemap_fails_gracefully_when_not_installed(tmp_path: Path):
+    """GLUEMAP doit échouer proprement sans installation."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+
+    runner = ReconstructionRunner(workspace)
+    from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+    run = runner.run(input_manifest, backend=ReconstructionBackend.GLUEMAP)
+    assert run.status == "failed"
+    assert "introuvable" in run.error or "pygluemap" in run.error
+
+
+# ---------------------------------------------------------------------------
+# MP-SfM Integration
+# ---------------------------------------------------------------------------
+
+
+def test_mpsfm_fails_gracefully_when_not_installed(tmp_path: Path):
+    """MP-SfM doit échouer proprement sans installation."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+
+    runner = ReconstructionRunner(workspace)
+    from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+    run = runner.run(input_manifest, backend=ReconstructionBackend.MP_SFM)
+    assert run.status == "failed"
+    assert "introuvable" in run.error or "mpsfm" in run.error
+
+
+# ---------------------------------------------------------------------------
+# LiDAR Support
+# ---------------------------------------------------------------------------
+
+
+def test_lidar_report_with_no_files(tmp_path: Path):
+    """Sans fichiers LiDAR, le rapport indique l'absence."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=1)
+    lidar_dir = workspace.path("06_geo", "lidar_raw")
+    if lidar_dir.exists():
+        for f in lidar_dir.glob("*"):
+            f.unlink()
+    from hotel_pipeline.lidar_support import LiDARSupportAnalyzer
+    analyzer = LiDARSupportAnalyzer(workspace)
+    report = analyzer.analyze()
+    assert report.classification == "no_lidar_files"
+    assert report.viable_for_lidgs is False
+
+
+def test_lidar_report_with_synthetic_las(tmp_path: Path):
+    """Avec un fichier .las synthétique, le rapport calcule les densités."""
+    import laspy
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=1)
+
+    lidar_dir = workspace.path("06_geo", "lidar_raw")
+    if lidar_dir.exists():
+        for f in lidar_dir.glob("*"):
+            f.unlink()
+    lidar_dir.mkdir(parents=True, exist_ok=True)
+    las_path = lidar_dir / "tile-1.las"
+
+    np.random.seed(42)
+    n_points = 1000
+    x = np.random.uniform(0, 10, n_points)
+    y = np.random.uniform(0, 10, n_points)
+    z = np.random.uniform(0, 5, n_points)
+
+    header = laspy.LasHeader(point_format=3, version="1.4")
+    header.offsets = np.array([0.0, 0.0, 0.0])
+    header.scales = np.array([0.01, 0.01, 0.01])
+    las = laspy.LasData(header)
+    las.x = x
+    las.y = y
+    las.z = z
+    las.write(str(las_path))
+
+    from hotel_pipeline.lidar_support import LiDARSupportAnalyzer
+    analyzer = LiDARSupportAnalyzer(workspace)
+    report = analyzer.analyze()
+    assert report.total_point_density > 0
+    assert report.classification in ("aerial", "hybrid", "terrestrial")
+
+
+# ---------------------------------------------------------------------------
+# Dense Reconstruction
+# ---------------------------------------------------------------------------
+
+
+def test_dense_backends_fail_gracefully_when_binary_missing(tmp_path: Path):
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+
+    runner = ReconstructionRunner(workspace)
+    run = runner.run(input_manifest)
+    publish_run(run, workspace)
+
+    sparse_dir = workspace.path("07_reconstruction", "runs", run.run_id, "sparse", "0")
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    (sparse_dir / "cameras").write_text("")
+    (sparse_dir / "images").write_text("#\n")
+    (sparse_dir / "points3D").write_text("")
+
+    run_json = workspace.path("07_reconstruction", "runs", f"{run.run_id}.json")
+    data = json.loads(run_json.read_text("utf-8"))
+    data["output_path"] = str(sparse_dir)
+    run_json.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    from hotel_pipeline.dense_reconstruction import run_dense_reconstruction
+    for backend_name, binary in [
+        ("brush", "Brush"),
+        ("gsplat", "gsplat"),
+    ]:
+        from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+        result = run_dense_reconstruction(workspace, run.run_id, backend=ReconstructionBackend(backend_name))
+        assert result.status == "failed"
+        assert binary in result.error
