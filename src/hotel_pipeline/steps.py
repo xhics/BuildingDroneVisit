@@ -29,6 +29,28 @@ STEP_ORDER: tuple[str, ...] = (
 ELEMENTS_FILE = "01_sources/overpass_elements.json"
 
 
+def _filter_assets_by_temporal_strategy(
+    input_manifest: ReconstructionInputManifest,
+    temporal_strategy: str,
+) -> list[str]:
+    """Filtre les assets sélectionnés selon la stratégie temporelle du plan.
+
+    Args:
+        input_manifest: manifeste d'entrée de reconstruction
+        temporal_strategy: "current_only" ou "current_plus_unknown"
+
+    Returns:
+        Liste des asset_ids à utiliser pour cette reconstruction
+    """
+    if temporal_strategy == "current_plus_unknown":
+        current = set(input_manifest.temporal_cohorts.get("current_confirmed", []))
+        unknown = set(input_manifest.temporal_cohorts.get("unknown", []))
+        allowed = current | unknown
+        if allowed:
+            return [aid for aid in input_manifest.selected_asset_ids if aid in allowed]
+    return list(input_manifest.selected_asset_ids)
+
+
 class StepNotImplemented(RuntimeError):
     """Étape prévue par le plan directeur, pas encore construite."""
 
@@ -444,6 +466,18 @@ def _reconstruct(workspace) -> None:  # noqa: ANN001 — Workspace, import circu
 
     plan_data = json.loads(plan_files[-1].read_text("utf-8"))
     selected_backends = plan_data.get("selected_backends", ["colmap_incremental"])
+    temporal_strategy = plan_data.get("temporal_strategy", "current_only")
+
+    # Filtrer les assets selon la stratégie temporelle du plan
+    selected_asset_ids = _filter_assets_by_temporal_strategy(
+        input_manifest, temporal_strategy
+    )
+    if selected_asset_ids:
+        log.info(
+            "Cohorte temporelle %s : %d assets sélectionnés",
+            temporal_strategy,
+            len(selected_asset_ids),
+        )
 
     runner = ReconstructionRunner(workspace)
     completed_runs = []
@@ -455,7 +489,11 @@ def _reconstruct(workspace) -> None:  # noqa: ANN001 — Workspace, import circu
             log.warning("backend inconnu dans le plan : %s", backend)
             continue
 
-        run = runner.run(input_manifest, backend=be)
+        run = runner.run(
+            input_manifest,
+            backend=be,
+            selected_asset_ids=selected_asset_ids or None,
+        )
         publish_run(run, workspace)
         log.info(
             "Run %s (%s) : %s",
