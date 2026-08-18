@@ -668,20 +668,45 @@ def _run_synthetic(
 
         rng = np.random.RandomState(42)
         points = []
-        for i in range(200):
-            x = rng.uniform(-5, 5)
-            y = rng.uniform(-3, 3)
-            z = rng.uniform(0, 4)
-            points.append(f"{i} {x:.4f} {y:.4f} {z:.4f} 255 255 255 1.0")
+        point_id = 0
+        wall_height = 3.0
+        wall_width = 8.0
+        wall_depth = 5.0
+
+        for xi in np.linspace(-wall_width/2, wall_width/2, 20):
+            for yi in np.linspace(0, wall_height, 10):
+                for zi in [-wall_depth/2, wall_depth/2]:
+                    x = xi + rng.uniform(-0.05, 0.05)
+                    y = yi + rng.uniform(-0.05, 0.05)
+                    z = zi + rng.uniform(-0.05, 0.05)
+                    points.append(f"{point_id} {x:.4f} {y:.4f} {z:.4f} 180 140 100 1.0")
+                    point_id += 1
+
+        for xi in [-wall_width/2, wall_width/2]:
+            for yi in np.linspace(0, wall_height, 10):
+                for zi in np.linspace(-wall_depth/2, wall_depth/2, 20):
+                    x = xi + rng.uniform(-0.05, 0.05)
+                    y = yi + rng.uniform(-0.05, 0.05)
+                    z = zi + rng.uniform(-0.05, 0.05)
+                    points.append(f"{point_id} {x:.4f} {y:.4f} {z:.4f} 140 140 140 1.0")
+                    point_id += 1
+
+        for xi in np.linspace(-wall_width/2, wall_width/2, 15):
+            for zi in np.linspace(-wall_depth/2, wall_depth/2, 15):
+                x = xi + rng.uniform(-0.05, 0.05)
+                y = wall_height + rng.uniform(-0.05, 0.05)
+                z = zi + rng.uniform(-0.05, 0.05)
+                points.append(f"{point_id} {x:.4f} {y:.4f} {z:.4f} 100 100 100 1.0")
+                point_id += 1
 
         up = np.array([0.0, 0.0, 1.0])
         cameras = ["1 PINHOLE 800 600 400 300 800 300"]
         images = []
         for idx, aid in enumerate(selected):
             angle = 2 * np.pi * idx / n
-            x = 8.0 * np.cos(angle)
-            y = 8.0 * np.sin(angle)
-            z = 2.0
+            x = 10.0 * np.cos(angle)
+            y = 10.0 * np.sin(angle)
+            z = 2.5
             C = np.array([x, y, z])
             f = -C
             f = f / np.linalg.norm(f)
