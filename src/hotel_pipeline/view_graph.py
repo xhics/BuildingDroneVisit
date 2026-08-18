@@ -130,8 +130,8 @@ def _retrieval_candidates(input_manifest: ReconstructionInputManifest, workspace
     orb = cv2.ORB_create(nfeatures=256)
     for aid in selected:
         asset = by_id[aid]
-        if asset.file_path:
-            img_path = workspace.path(asset.file_path)
+        if asset.local_path:
+            img_path = workspace.path(asset.local_path)
             if img_path.is_file():
                 img = _load_image(img_path)
                 if img is not None:
@@ -185,8 +185,8 @@ def _match_pair(
     orb = cv2.ORB_create(nfeatures=max_features)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    img_a = _load_image(workspace.path(asset_a.file_path)) if asset_a.file_path else None
-    img_b = _load_image(workspace.path(asset_b.file_path)) if asset_b.file_path else None
+    img_a = _load_image(workspace.path(asset_a.local_path)) if asset_a.local_path else None
+    img_b = _load_image(workspace.path(asset_b.local_path)) if asset_b.local_path else None
 
     if img_a is None or img_b is None:
         return PairEvidence(

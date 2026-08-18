@@ -199,6 +199,7 @@ class ReconstructionPlan(BaseModel):
     selected_backends: list[str] = Field(min_length=1)
     fallback_chain: list[str] = Field(default_factory=list)
     rationale: str = Field(min_length=1)
+    temporal_strategy: Literal["current_only", "current_plus_unknown"] = Field(default="current_only")
 
 
 class ReconstructionRunStatus(BaseModel):

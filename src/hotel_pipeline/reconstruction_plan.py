@@ -32,11 +32,12 @@ class ReconstructionPlanner:
     ) -> ReconstructionPlan:
         """Construit un `ReconstructionPlan` depuis le graphe de vue.
 
-        Règges :
+        Règles :
         - COLMAP incremental toujours inclus comme baseline
         - COLMAP global ajouté si graphe dense (valid_pairs > 50)
         - GLUEMAP ajouté si risque répétitif medium/high
         - MP-SfM ajouté si overlap faible (< 20% registered_candidate_ratio)
+        - Cohortes temporelles : current_confirmed d'abord, puis unknown si nécessaire
         """
         backends = ["colmap_incremental"]
         rationale = "baseline systématique"
@@ -55,6 +56,13 @@ class ReconstructionPlanner:
 
         fallback = [b for b in backends if b != "colmap_incremental"]
 
+        # Cohorte temporelle : prioriser current_confirmed, puis tester unknown
+        temporal_strategy = "current_only"
+        if "unknown" in input_manifest.temporal_cohorts and input_manifest.temporal_cohorts.get("unknown"):
+            if view_graph.report.registered_candidate_ratio < 0.3:
+                temporal_strategy = "current_plus_unknown"
+                rationale += " + cohorte unknown (overlap faible)"
+
         plan_id = (
             f"plan-{input_manifest.reconstruction_input_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
         )
@@ -66,6 +74,7 @@ class ReconstructionPlanner:
             selected_backends=backends,
             fallback_chain=fallback,
             rationale=rationale,
+            temporal_strategy=temporal_strategy,
         )
 
 

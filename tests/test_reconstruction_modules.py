@@ -12,12 +12,17 @@ import pytest
 from hotel_pipeline.geo_alignment import GeoAligner, publish_alignment
 from hotel_pipeline.reconstruction_consensus import ConsensusBuilder, publish_consensus
 from hotel_pipeline.reconstruction_run import ReconstructionRunner, publish_run
+from hotel_pipeline.reconstruction_plan import ReconstructionPlanner, publish_plan
 from hotel_pipeline.view_graph import ViewGraphBuilder, generate_mask_set
 from hotel_pipeline.workspace import Workspace
 from hotel_pipeline.schemas.reconstruction import (
     ReconstructionConsensusReport,
     ReconstructionInputManifest,
+    ReconstructionPlan,
     ReconstructionRun,
+    ViewGraphManifest,
+    ViewGraphNode,
+    ViewGraphReport,
     GeoAlignmentManifest,
 )
 
@@ -346,3 +351,76 @@ def test_validated_camera_path_builder():
     assert len(path.poses) >= 8
     assert path.simulation_only is True
     assert "validé par faisabilité" in path.derivation
+
+
+def test_reconstruction_plan_temporal_strategy_current_only_by_default(tmp_path: Path):
+    """Par défaut, le plan utilise current_only."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    from hotel_pipeline.reconstruction_input import prepare_input, publish_input
+    input_manifest, _ = prepare_input("test-hotel")
+    publish_input(input_manifest, workspace)
+
+    view_graph = ViewGraphManifest(
+        view_graph_id="vg-1",
+        reconstruction_input_id=input_manifest.reconstruction_input_id,
+        nodes=[
+            ViewGraphNode(asset_id="asset-1", pose_status="registered"),
+            ViewGraphNode(asset_id="asset-2", pose_status="registered"),
+        ],
+        pairs=[],
+        report=ViewGraphReport(
+            images_selected=2,
+            pairs_tested=1,
+            valid_pairs=10,
+            largest_component=2,
+            registered_candidate_ratio=0.5,
+            median_inlier_ratio=0.8,
+            continuity_by_demand={},
+            repetitive_risk="low",
+            intrinsics_quality="good",
+        ),
+    )
+
+    planner = ReconstructionPlanner(workspace)
+    plan = planner.plan(input_manifest, view_graph)
+    assert plan.temporal_strategy == "current_only"
+
+
+def test_reconstruction_plan_temporal_strategy_escalates_with_unknown_and_low_overlap(tmp_path: Path):
+    """Avec une cohorte unknown et overlap faible, le plan bascule vers current_plus_unknown."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    from hotel_pipeline.reconstruction_input import prepare_input, publish_input
+    input_manifest, _ = prepare_input("test-hotel")
+    publish_input(input_manifest, workspace)
+
+    # Ajouter une cohorte unknown
+    input_manifest.temporal_cohorts = {"current_confirmed": ["asset-1"], "unknown": ["asset-2"]}
+    input_path = workspace.path("07_reconstruction", f"reconstruction_input_{input_manifest.reconstruction_input_id}.json")
+    data = json.loads(input_path.read_text("utf-8"))
+    data["temporal_cohorts"] = {"current_confirmed": ["asset-1"], "unknown": ["asset-2"]}
+    input_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    view_graph = ViewGraphManifest(
+        view_graph_id="vg-1",
+        reconstruction_input_id=input_manifest.reconstruction_input_id,
+        nodes=[
+            ViewGraphNode(asset_id="asset-1", pose_status="registered"),
+            ViewGraphNode(asset_id="asset-2", pose_status="registered"),
+        ],
+        pairs=[],
+        report=ViewGraphReport(
+            images_selected=2,
+            pairs_tested=1,
+            valid_pairs=5,
+            largest_component=1,
+            registered_candidate_ratio=0.15,
+            median_inlier_ratio=0.6,
+            continuity_by_demand={},
+            repetitive_risk="low",
+            intrinsics_quality="poor",
+        ),
+    )
+
+    planner = ReconstructionPlanner(workspace)
+    plan = planner.plan(input_manifest, view_graph)
+    assert plan.temporal_strategy == "current_plus_unknown"
