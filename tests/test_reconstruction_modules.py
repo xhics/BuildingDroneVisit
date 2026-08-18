@@ -485,6 +485,38 @@ def test_camera_feasibility_evaluator_basic():
     assert field.visible_surface_confidence == pytest.approx(0.85, abs=0.01)
 
 
+def test_camera_feasibility_with_synthetic_reconstruction(tmp_path: Path):
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=3)
+    for i in range(3):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input(hotel_id)
+
+    runner = ReconstructionRunner(workspace)
+    from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+    run = runner.run(input_manifest, backend=ReconstructionBackend.SYNTHETIC)
+    assert run.status == "completed"
+
+    from hotel_pipeline.reconstruction_run import publish_run
+    publish_run(run, workspace)
+
+    from hotel_pipeline.camera_feasibility import CameraFeasibilityEvaluator
+    evaluator = CameraFeasibilityEvaluator(workspace)
+    field = evaluator.evaluate_pose(
+        pose_id="pose-1",
+        position_local_m=(0.0, 0.0, 2.0),
+        yaw_deg=0.0,
+        pitch_deg=0.0,
+        fov_deg=80.0,
+        reconstruction_run_id=run.run_id,
+    )
+    assert field.reconstructed_fraction > 0.0
+
+
 def test_validated_camera_path_builder():
     from hotel_pipeline.camera_feasibility import build_validated_camera_path
 

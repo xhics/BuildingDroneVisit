@@ -54,7 +54,15 @@ def _load_run_points(reconstruction_run_id: str, workspace: Workspace) -> np.nda
     run_dir = Path(output_path)
     if not run_dir.is_dir():
         run_dir = run_dir.parent
-    return _load_colmap_points3d(run_dir)
+
+    normalized_dir = run_dir / "normalized"
+    if not normalized_dir.is_dir():
+        normalized_dir = run_dir.parent / "normalized"
+    if not normalized_dir.is_dir():
+        normalized_dir = run_dir.parent.parent / "normalized"
+    if not normalized_dir.is_dir():
+        return None
+    return _load_colmap_points3d(normalized_dir.parent)
 
 
 def _visible_fraction_from_points(
