@@ -43,7 +43,37 @@ def _load_image(path: Path) -> np.ndarray | None:
 
 
 def _load_intrinsics(asset) -> dict | None:  # noqa: ANN001
-    return None
+    """Estime les intrinsèques depuis les métadonnées EXIF de l'image."""
+    try:
+        from PIL import Image, ExifTags
+        import PIL.Image
+        image_path = Path(asset.local_path) if asset.local_path else None
+        if image_path is None or not image_path.is_file():
+            return None
+        with Image.open(image_path) as img:
+            exif = img._getexif()
+        if not exif:
+            return None
+        exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+        focal_length = exif_data.get("FocalLength")
+        if isinstance(focal_length, tuple):
+            focal_length = focal_length[0] / focal_length[1]
+        if focal_length is None or focal_length <= 0:
+            return None
+        width = exif_data.get("ExifImageWidth") or exif_data.get("ImageWidth")
+        height = exif_data.get("ExifImageHeight") or exif_data.get("ImageLength")
+        if width is None or height is None:
+            return None
+        fx = fy = float(focal_length)
+        cx = float(width) / 2.0
+        cy = float(height) / 2.0
+        return {
+            "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+            "width": int(width), "height": int(height),
+            "distortion": None,
+        }
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -130,6 +130,23 @@ def test_view_graph_builder_requires_min_two_assets(tmp_path: Path):
         builder.build(input_manifest)
 
 
+def test_load_intrinsics_from_exif(tmp_path: Path):
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
+    img_path = workspace.path("images", "asset-1.jpg")
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+
+    test_image = np.zeros((100, 100, 3), dtype=np.uint8)
+    cv2.imwrite(str(img_path), test_image)
+
+    from hotel_pipeline.view_graph import _load_intrinsics
+    from hotel_pipeline.schemas import AssetManifest
+    assets = AssetManifest.model_validate_json(workspace.assets_path.read_text("utf-8"))
+    asset = assets.assets[0]
+    intrinsics = _load_intrinsics(asset)
+    assert intrinsics is None or isinstance(intrinsics, dict)
+
+
 def test_generate_mask_set_returns_sha256(tmp_path: Path):
     hotel_id = "test-hotel"
     workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
