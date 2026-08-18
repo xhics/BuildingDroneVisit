@@ -49,6 +49,10 @@ class ReconstructionRunner:
             result = _run_colmap_incremental(self, input_manifest, run_id)
         elif backend is ReconstructionBackend.COLMAP_GLOBAL:
             result = _run_colmap_global(self, input_manifest, run_id)
+        elif backend is ReconstructionBackend.MAP_ANYTHING:
+            result = _run_map_anything(self, input_manifest, run_id)
+        elif backend is ReconstructionBackend.VGGT:
+            result = _run_vggt(self, input_manifest, run_id)
         else:
             result = ReconstructionRun(
                 run_id=run_id,
@@ -109,8 +113,8 @@ def _setup_run_images(
     image_paths = []
     for aid in selected:
         asset = by_id[aid]
-        if asset.file_path:
-            src = runner.workspace.path(asset.file_path)
+        if asset.local_path:
+            src = runner.workspace.path(asset.local_path)
             if src.is_file():
                 dst = image_dir / src.name
                 if not dst.exists():
@@ -368,6 +372,224 @@ def _run_colmap_global(
             finished_at=datetime.now(timezone.utc).isoformat(),
             error=str(exc),
         )
+
+
+# ---------------------------------------------------------------------------
+# Feed-forward backends (MapAnything, VGGT)
+# ---------------------------------------------------------------------------
+
+
+def _run_gluemap(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+) -> ReconstructionRun:
+    """Exécute GLUEMAP (placeholder P2)."""
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir)
+        image_dir = run_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "gluemap",
+            "--image_path", str(image_dir),
+            "--output_path", str(run_dir / "gluemap_out"),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        output_dir = run_dir / "gluemap_out"
+        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
+        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or "gluemap a échoué")
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.GLUEMAP.value,
+            status="completed" if output_path else "failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            metrics={"registered_ratio": 0.0},
+            output_path=output_path,
+            error=error,
+        )
+    except FileNotFoundError as exc:
+        if "gluemap" in str(exc):
+            return ReconstructionRun(
+                run_id=run_id,
+                reconstruction_input_id=input_manifest.reconstruction_input_id,
+                backend=ReconstructionBackend.GLUEMAP.value,
+                status="failed",
+                started_at=started,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error="binaire GLUEMAP introuvable",
+            )
+        raise
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.GLUEMAP.value,
+            status="failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
+
+
+def _run_mpsfm(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+) -> ReconstructionRun:
+    """Exécute MP-SfM (placeholder P2)."""
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir)
+        image_dir = run_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "mpsfm",
+            "--image_path", str(image_dir),
+            "--output_path", str(run_dir / "mpsfm_out"),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        output_dir = run_dir / "mpsfm_out"
+        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
+        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or "mpsfm a échoué")
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.MP_SFM.value,
+            status="completed" if output_path else "failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            metrics={"registered_ratio": 0.0},
+            output_path=output_path,
+            error=error,
+        )
+    except FileNotFoundError as exc:
+        if "mpsfm" in str(exc):
+            return ReconstructionRun(
+                run_id=run_id,
+                reconstruction_input_id=input_manifest.reconstruction_input_id,
+                backend=ReconstructionBackend.MP_SFM.value,
+                status="failed",
+                started_at=started,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error="binaire MP-SfM introuvable",
+            )
+        raise
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.MP_SFM.value,
+            status="failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Feed-forward backends (MapAnything, VGGT)
+# ---------------------------------------------------------------------------
+
+
+def _run_feed_forward(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+    backend: ReconstructionBackend,
+    binary: str,
+) -> ReconstructionRun:
+    """Exécute un vérificateur feed-forward (MapAnything, VGGT).
+
+    Ces backends ne produisent pas de modèle COLMAP mais des poses et
+    de la géométrie. Pour le MVP, on journalise l'intention et on
+    échoue proprement si le binaire n'est pas disponible.
+    """
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir)
+        image_dir = run_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [binary, "--image_path", str(image_dir), "--output_path", str(run_dir / "feed_forward")]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        output_dir = run_dir / "feed_forward"
+        output_path = str(output_dir) if output_dir.exists() and any(output_dir.iterdir()) else None
+        error = None if proc.returncode == 0 and output_path else (proc.stderr.strip() or proc.stdout.strip() or f"{backend.value} a échoué")
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=backend.value,
+            status="completed" if output_path else "failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            metrics={"registered_ratio": 0.0},
+            output_path=output_path,
+            error=error,
+        )
+    except FileNotFoundError as exc:
+        if binary in str(exc):
+            return ReconstructionRun(
+                run_id=run_id,
+                reconstruction_input_id=input_manifest.reconstruction_input_id,
+                backend=backend.value,
+                status="failed",
+                started_at=started,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error=f"binaire {backend.value} introuvable : {binary}",
+            )
+        raise
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=backend.value,
+            status="failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
+
+
+def _run_map_anything(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+) -> ReconstructionRun:
+    return _run_feed_forward(self, input_manifest, run_id, ReconstructionBackend.MAP_ANYTHING, "mapanything")
+
+
+def _run_vggt(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+) -> ReconstructionRun:
+    return _run_feed_forward(self, input_manifest, run_id, ReconstructionBackend.VGGT, "vggt")
 
 
 # ---------------------------------------------------------------------------

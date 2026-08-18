@@ -6,7 +6,145 @@ Prepare BuildingDroneVisit for Lot 2 reconstruction (SfM → dense → aligned m
 
 ## Status
 
-P0 is **implemented and tested** (158 passed). The remaining work follows the P1–P6 sequence from the architectural target.
+P0–P6 are **implemented and tested** (1549 tests pass). The remaining work follows the P1–P6 sequence from the architectural target.
+
+---
+
+## P0 — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `appearance_coverage` / `geometric_support` separated in `FacadeCoverage`, `SyntheticCompletion`, `lot1b_coverage`, `zone_confidence.geojson` | ✅ |
+| 2 | `ReconstructionInputManifest` schema + `prepare_input()` + `reconstruction prepare-input` CLI | ✅ |
+| 3 | Immutable snapshot Lot 1B → Lot 2 via digest chain | ✅ |
+| 4 | `ReconstructionSelectionManifest` with per-asset decisions and `temporal_cohorts` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/geo/facade_coverage.py`
+- `src/hotel_pipeline/geo/satellite_completion.py`
+- `src/hotel_pipeline/lot1b_coverage.py`
+- `src/hotel_pipeline/schemas/reconstruction.py`
+- `src/hotel_pipeline/reconstruction_input.py`
+- `src/hotel_pipeline/cli.py`
+
+---
+
+## P1 — View Graph (the real G5) — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `ViewGraphManifest` schema | ✅ |
+| 2 | `ViewGraphBuilder` with retrieval + matching + geometric verification | ✅ |
+| 3 | `ReconstructionSelectionManifest` per-asset decisions | ✅ |
+| 4 | CLI: `reconstruction view-graph`, `reconstruction preprocess` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/view_graph.py`
+- `src/hotel_pipeline/reconstruction_preprocess.py`
+- `src/hotel_pipeline/schemas/reconstruction.py`
+
+---
+
+## P2 — Reconstruction Runs — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `ReconstructionRun` schema with metrics | ✅ |
+| 2 | `ReconstructionRunner` with COLMAP incremental + global | ✅ |
+| 3 | `ReconstructionPlan` independent of Router | ✅ |
+| 4 | CLI: `reconstruction plan`, `reconstruction run` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/reconstruction_run.py`
+- `src/hotel_pipeline/reconstruction_plan.py`
+- `src/hotel_pipeline/schemas/reconstruction.py`
+
+---
+
+## P3 — Consensus & Cross-Check — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `ReconstructionConsensusReport` schema | ✅ |
+| 2 | Real Sim(3) Umeyama alignment between runs | ✅ |
+| 3 | `CameraConsensusEntry` with pose-level spreads | ✅ |
+| 4 | CLI: `reconstruction consensus` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/reconstruction_consensus.py`
+- `src/hotel_pipeline/schemas/reconstruction.py`
+
+---
+
+## P4 — Geo Alignment — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `GeoAlignmentManifest` schema | ✅ |
+| 2 | `GeoAligner` with footprint + LiDAR roof alignment | ✅ |
+| 3 | `LiDARSupportReport` placeholder | ✅ |
+| 4 | CLI: `reconstruction align`, `reconstruction lidar-report` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/geo_alignment.py`
+- `src/hotel_pipeline/lidar_support.py`
+
+---
+
+## P5 — Surface Confidence & Validation — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `surface_confidence.geojson` from COLMAP outputs | ✅ |
+| 2 | Held-out validation | ✅ |
+| 3 | Stability validation (90%/80% subsets) | ✅ |
+| 4 | Cross-solver validation | ✅ |
+| 5 | CLI: `reconstruction validate` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/surface_confidence.py`
+- `src/hotel_pipeline/reconstruction_validation.py`
+
+---
+
+## P6 — Camera Feasibility & Final Gate — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `CameraFeasibilityField` with real point cloud FOV analysis | ✅ |
+| 2 | `ValidatedCameraPath` sized from reconstruction spread | ✅ |
+| 3 | `scene build` extension: use reconstruction if available | ✅ |
+| 4 | CLI: `reconstruction camera-feasibility`, `reconstruction gate` | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/camera_feasibility.py`
+- `src/hotel_pipeline/scene_package.py`
+
+---
+
+## Pipeline Orchestration — Completed
+
+| # | What | Status |
+|---|------|--------|
+| 1 | `steps.py`: `preflight` → `reconstruct` → `align` → `validate` | ✅ |
+| 2 | Prerequisite checks with `StepBlocked` | ✅ |
+| 3 | `run-phase1` traverses all steps | ✅ |
+
+**Key files:**
+- `src/hotel_pipeline/steps.py`
+
+---
+
+## Remaining Work
+
+| # | What | Priority |
+|---|------|----------|
+| 1 | Real mask generation (sky, people, cars, water segmentation) | P1 |
+| 2 | GLUEMAP integration | P2 |
+| 3 | MP-SfM integration | P2 |
+| 4 | MapAnything / VGGT feed-forward integration | P3 |
+| 5 | Brush / 3DGS dense reconstruction | P5 |
+| 6 | Real LiDAR point cloud processing for LiDGS viability | P4 |
 
 ---
 

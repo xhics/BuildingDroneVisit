@@ -163,6 +163,34 @@ def test_reconstruction_run_publishes_and_loads(tmp_path: Path):
     assert loaded.backend == "colmap_incremental"
 
 
+def test_feed_forward_backends_fail_gracefully_when_binary_missing(tmp_path: Path):
+    """MapAnything et VGGT doivent échouer proprement sans binaire."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+
+    runner = ReconstructionRunner(workspace)
+
+    for backend_name, binary in [
+        ("mapanything", "mapanything"),
+        ("vggt", "vggt"),
+        ("gluemap", "gluemap"),
+        ("mpsfm", "mpsfm"),
+    ]:
+        from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+        backend = ReconstructionBackend(backend_name)
+        run = runner.run(input_manifest, backend=backend)
+        assert run.status == "failed"
+        assert binary in run.error
+        assert run.backend == backend_name
+
+
 # ---------------------------------------------------------------------------
 # Consensus
 # ---------------------------------------------------------------------------
