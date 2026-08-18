@@ -15,8 +15,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .schemas.reconstruction import ReconstructionBackend, ReconstructionRun
+from .schemas.reconstruction import ReconstructionBackend, ReconstructionInputManifest, ReconstructionRun
 from .workspace import Workspace
+from .reconstruction_run import ReconstructionRunner, publish_run
 
 
 class FeedForwardRun(BaseModel):
@@ -37,36 +38,24 @@ def run_mapanything(
     workspace: Workspace,
     input_manifest: ReconstructionInputManifest,
 ) -> FeedForwardRun:
-    """Exécute MapAnything en mode vérification.
-
-    Pour le MVP, c'est un placeholder qui journalise l'intention.
-    """
+    """Exécute MapAnything en mode vérification."""
+    runner = ReconstructionRunner(workspace)
     run_id = _new_run_id("mapanything", input_manifest.reconstruction_input_id)
-    return FeedForwardRun(
-        run_id=run_id,
-        backend=ReconstructionBackend.MAP_ANYTHING.value,
-        reconstruction_input_id=input_manifest.reconstruction_input_id,
-        status="pending",
-        error="MapAnything non implémenté dans cette phase",
-    )
+    run = runner.run_map_anything(input_manifest, run_id)
+    publish_run(run, workspace)
+    return _to_feed_forward_run(run)
 
 
 def run_vggt(
     workspace: Workspace,
     input_manifest: ReconstructionInputManifest,
 ) -> FeedForwardRun:
-    """Exécute VGGT en mode vérification.
-
-    Pour le MVP, c'est un placeholder qui journalise l'intention.
-    """
+    """Exécute VGGT en mode vérification."""
+    runner = ReconstructionRunner(workspace)
     run_id = _new_run_id("vggt", input_manifest.reconstruction_input_id)
-    return FeedForwardRun(
-        run_id=run_id,
-        backend=ReconstructionBackend.VGGT.value,
-        reconstruction_input_id=input_manifest.reconstruction_input_id,
-        status="pending",
-        error="VGGT non implémenté dans cette phase",
-    )
+    run = runner.run_vggt(input_manifest, run_id)
+    publish_run(run, workspace)
+    return _to_feed_forward_run(run)
 
 
 def publish_feed_forward(run: FeedForwardRun, workspace: Workspace) -> Path:
@@ -81,6 +70,19 @@ def publish_feed_forward(run: FeedForwardRun, workspace: Workspace) -> Path:
 def _new_run_id(backend: str, input_id: str) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"run-{backend}-{input_id}-{stamp}"
+
+
+def _to_feed_forward_run(run: ReconstructionRun) -> FeedForwardRun:
+    """Convertit un ReconstructionRun en FeedForwardRun."""
+    return FeedForwardRun(
+        run_id=run.run_id,
+        backend=run.backend,
+        reconstruction_input_id=run.reconstruction_input_id,
+        status=run.status,
+        output_path=run.output_path,
+        metrics=run.metrics,
+        error=run.error,
+    )
 
 
 __all__ = [
