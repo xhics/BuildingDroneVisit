@@ -26,6 +26,7 @@ class ReconstructionBackend(str, Enum):
     VGGT = "vggt"
     BRUSH = "brush"
     GSPLAT = "gsplat"
+    SYNTHETIC = "synthetic"
 
 
 class AlignmentAnchor(str, Enum):

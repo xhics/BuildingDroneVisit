@@ -274,6 +274,55 @@ def test_feed_forward_backends_fail_gracefully_when_binary_missing(tmp_path: Pat
         assert run.backend == backend_name
 
 
+def test_synthetic_backend_produces_valid_colmap_output(tmp_path: Path):
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=2)
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input(hotel_id)
+
+    runner = ReconstructionRunner(workspace)
+    from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+    run = runner.run(input_manifest, backend=ReconstructionBackend.SYNTHETIC)
+    assert run.status == "completed"
+    assert run.output_path is not None
+    run_dir = Path(run.output_path)
+    assert (run_dir / "cameras").exists()
+    assert (run_dir / "images").exists()
+    assert (run_dir / "points3D").exists()
+    assert run.metrics.get("synthetic") is True
+    assert run.metrics.get("registered_ratio") == 1.0
+    """MapAnything et VGGT doivent échouer proprement sans binaire."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+
+    runner = ReconstructionRunner(workspace)
+
+    for backend_name, binary in [
+        ("mapanything", "mapanything"),
+        ("vggt", "vggt"),
+        ("gluemap", "GLUEMAP"),
+        ("mpsfm", "MP-SfM"),
+    ]:
+        from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+        backend = ReconstructionBackend(backend_name)
+        run = runner.run(input_manifest, backend=backend)
+        assert run.status == "failed"
+        assert binary in run.error
+        assert run.backend == backend_name
+
+
 # ---------------------------------------------------------------------------
 # Consensus
 # ---------------------------------------------------------------------------

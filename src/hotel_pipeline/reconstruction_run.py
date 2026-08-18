@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from .schemas.reconstruction import ReconstructionBackend, ReconstructionRun
@@ -65,6 +66,8 @@ class ReconstructionRunner:
             result = _run_gluemap(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
         elif backend is ReconstructionBackend.MP_SFM:
             result = _run_mpsfm(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+        elif backend is ReconstructionBackend.SYNTHETIC:
+            result = _run_synthetic(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
         else:
             result = ReconstructionRun(
                 run_id=run_id,
@@ -638,6 +641,126 @@ def publish_run(run: ReconstructionRun, workspace: Workspace) -> Path:
     path = root / "runs" / f"{run.run_id}.json"
     _write_json(path, run.model_dump(mode="json"))
     return path
+
+
+def _run_synthetic(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+    *,
+    selected_asset_ids: list[str] | None = None,
+) -> ReconstructionRun:
+    """Génère une reconstruction synthetic pour les tests et démos."""
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    started = datetime.now(timezone.utc).isoformat()
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir, selected_asset_ids=selected_asset_ids)
+        sparse_dir = run_dir / "sparse"
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+
+        n = len(selected)
+        if n == 0:
+            raise ValueError("aucun asset sélectionné")
+
+        rng = np.random.RandomState(42)
+        points = []
+        for i in range(200):
+            x = rng.uniform(-5, 5)
+            y = rng.uniform(-3, 3)
+            z = rng.uniform(0, 4)
+            points.append(f"{i} {x:.4f} {y:.4f} {z:.4f} 255 255 255 1.0")
+
+        cameras = ["1 PINHOLE 800 600 400 300 800 300"]
+        images = []
+        for idx, aid in enumerate(selected):
+            angle = 2 * np.pi * idx / n
+            x = 8 * np.cos(angle)
+            y = 8 * np.sin(angle)
+            z = 2.0
+            qw, qx, qy, qz = _lookat([x, y, z], [0, 0, 2])
+            tx, ty, tz = -(-qw*qx + qy*qz), -(-qw*qy - qx*qz), -(-qw*qz + qx*qy)
+            tx, ty, tz = float(tx), float(ty), float(tz)
+            images.append(f"{idx} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {tx:.6f} {ty:.6f} {tz:.6f} 1 {aid}")
+
+        (sparse_dir / "cameras").write_text("\n".join(cameras) + "\n")
+        (sparse_dir / "images").write_text("\n".join(images) + "\n")
+        (sparse_dir / "points3D").write_text("\n".join(points) + "\n")
+
+        _export_colmap_normalized(sparse_dir, run_dir, selected, by_id)
+
+        finished = datetime.now(timezone.utc).isoformat()
+        metrics = {
+            "registered_ratio": 1.0,
+            "registered_images": n,
+            "selected_images": n,
+            "synthetic": True,
+        }
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.SYNTHETIC.value,
+            status="completed",
+            started_at=started,
+            finished_at=finished,
+            metrics=metrics,
+            output_path=str(sparse_dir),
+            error=None,
+        )
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.SYNTHETIC.value,
+            status="failed",
+            started_at=started,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
+
+
+def _lookat(eye, center):
+    f = np.array(center) - np.array(eye)
+    f = f / np.linalg.norm(f)
+    up = np.array([0, 0, 1])
+    s = np.cross(f, up)
+    s = s / np.linalg.norm(s)
+    u = np.cross(s, f)
+    M = np.eye(3)
+    M[0, :] = s
+    M[1, :] = u
+    M[2, :] = -f
+    R = M.T
+    trace = np.trace(R)
+    if trace > 0:
+        s = 2.0 * np.sqrt(trace + 1.0)
+        qw = 0.25 * s
+        qx = (R[2, 1] - R[1, 2]) / s
+        qy = (R[0, 2] - R[2, 0]) / s
+        qz = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+    return qw, qx, qy, qz
 
 
 def load_run(run_id: str, workspace: Workspace) -> ReconstructionRun | None:
