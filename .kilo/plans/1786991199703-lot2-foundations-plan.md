@@ -139,12 +139,26 @@ P0–P6 are **implemented and tested** (1549 tests pass). The remaining work fol
 
 | # | What | Priority |
 |---|------|----------|
-| 1 | Real mask generation (sky, people, cars, water segmentation) | P1 |
-| 2 | GLUEMAP integration | P2 |
-| 3 | MP-SfM integration | P2 |
-| 4 | MapAnything / VGGT feed-forward integration | P3 |
-| 5 | Brush / 3DGS dense reconstruction | P5 |
-| 6 | Real LiDAR point cloud processing for LiDGS viability | P4 |
+| 1 | GLUEMAP integration | P2 |
+| 2 | MP-SfM integration | P2 |
+| 3 | MapAnything / VGGT feed-forward integration | P3 |
+| 4 | Brush / 3DGS dense reconstruction | P5 |
+| 5 | Real LiDAR point cloud processing for LiDGS viability | P4 |
+
+---
+
+## Completed Since Last Update
+
+| # | What | Status |
+|---|------|--------|
+| 1 | Real mask generation with OpenCV heuristics (sky, water, people, cars, signage, reflections, mobile_furniture) | ✅ |
+| 2 | SIFT detector option in ViewGraphBuilder | ✅ |
+| 3 | EXIF-based intrinsics estimation | ✅ |
+| 4 | Temporal strategy in ReconstructionPlan (current_only vs current_plus_unknown) | ✅ |
+| 5 | selected_asset_ids override in all reconstruction runners | ✅ |
+| 6 | SYNTHETIC backend for testing and demos | ✅ |
+| 7 | Scene package reconstruction integration (reconstructed_photo_first) | ✅ |
+| 8 | CLI command `reconstruction run-all` | ✅ |
 
 ---
 

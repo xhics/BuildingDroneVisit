@@ -83,7 +83,15 @@ def _load_run_centers(run: ReconstructionRun) -> dict[str, np.ndarray]:
     run_dir = Path(run.output_path)
     if not run_dir.is_dir():
         run_dir = run_dir.parent
-    return _load_colmap_camera_centers(run_dir)
+
+    normalized_dir = run_dir / "normalized"
+    if not normalized_dir.is_dir():
+        normalized_dir = run_dir.parent / "normalized"
+    if not normalized_dir.is_dir():
+        normalized_dir = run_dir.parent.parent / "normalized"
+    if not normalized_dir.is_dir():
+        return {}
+    return _load_colmap_camera_centers(normalized_dir.parent)
 
 
 # ---------------------------------------------------------------------------

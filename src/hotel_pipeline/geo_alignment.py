@@ -145,9 +145,18 @@ class GeoAligner:
         run_dir = Path(output_path)
         if not run_dir.is_dir():
             run_dir = run_dir.parent
-        centers = _load_colmap_camera_centers(run_dir)
+
+        normalized_dir = run_dir / "normalized"
+        if not normalized_dir.is_dir():
+            normalized_dir = run_dir.parent / "normalized"
+        if not normalized_dir.is_dir():
+            normalized_dir = run_dir.parent.parent / "normalized"
+        if not normalized_dir.is_dir():
+            raise ValueError(f"aucun répertoire normalisé dans {run_dir}")
+
+        centers = _load_colmap_camera_centers(normalized_dir.parent)
         if not centers:
-            raise ValueError(f"aucun centre de caméra dans {run_dir}")
+            raise ValueError(f"aucun centre de caméra dans {normalized_dir.parent}")
 
         recon_centroid, recon_xy_spread, recon_z_median, recon_z_max = _recon_stats(centers)
 

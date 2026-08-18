@@ -674,16 +674,24 @@ def _run_synthetic(
             z = rng.uniform(0, 4)
             points.append(f"{i} {x:.4f} {y:.4f} {z:.4f} 255 255 255 1.0")
 
+        up = np.array([0.0, 0.0, 1.0])
         cameras = ["1 PINHOLE 800 600 400 300 800 300"]
         images = []
         for idx, aid in enumerate(selected):
             angle = 2 * np.pi * idx / n
-            x = 8 * np.cos(angle)
-            y = 8 * np.sin(angle)
+            x = 8.0 * np.cos(angle)
+            y = 8.0 * np.sin(angle)
             z = 2.0
-            qw, qx, qy, qz = _lookat([x, y, z], [0, 0, 2])
-            tx, ty, tz = -(-qw*qx + qy*qz), -(-qw*qy - qx*qz), -(-qw*qz + qx*qy)
-            tx, ty, tz = float(tx), float(ty), float(tz)
+            C = np.array([x, y, z])
+            f = -C
+            f = f / np.linalg.norm(f)
+            s = np.cross(f, up)
+            s = s / np.linalg.norm(s)
+            u = np.cross(s, f)
+            R = np.column_stack([s, u, -f])
+            qw, qx, qy, qz = _quaternion_from_rotation_matrix(R)
+            t = -R @ C
+            tx, ty, tz = float(t[0]), float(t[1]), float(t[2])
             images.append(f"{idx} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {tx:.6f} {ty:.6f} {tz:.6f} 1 {aid}")
 
         (sparse_dir / "cameras").write_text("\n".join(cameras) + "\n")
@@ -723,19 +731,8 @@ def _run_synthetic(
         )
 
 
-def _lookat(eye, center):
-    f = np.array(center) - np.array(eye)
-    f = f / np.linalg.norm(f)
-    up = np.array([0, 0, 1])
-    s = np.cross(f, up)
-    s = s / np.linalg.norm(s)
-    u = np.cross(s, f)
-    M = np.eye(3)
-    M[0, :] = s
-    M[1, :] = u
-    M[2, :] = -f
-    R = M.T
-    trace = np.trace(R)
+def _quaternion_from_rotation_matrix(R: np.ndarray) -> tuple[float, float, float, float]:
+    trace = float(np.trace(R))
     if trace > 0:
         s = 2.0 * np.sqrt(trace + 1.0)
         qw = 0.25 * s
@@ -760,7 +757,7 @@ def _lookat(eye, center):
         qx = (R[0, 2] + R[2, 0]) / s
         qy = (R[1, 2] + R[2, 1]) / s
         qz = 0.25 * s
-    return qw, qx, qy, qz
+    return float(qw), float(qx), float(qy), float(qz)
 
 
 def load_run(run_id: str, workspace: Workspace) -> ReconstructionRun | None:

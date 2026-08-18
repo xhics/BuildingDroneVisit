@@ -296,6 +296,42 @@ def test_synthetic_backend_produces_valid_colmap_output(tmp_path: Path):
     assert (run_dir / "points3D").exists()
     assert run.metrics.get("synthetic") is True
     assert run.metrics.get("registered_ratio") == 1.0
+
+
+def test_synthetic_backend_works_end_to_end_with_consensus_and_alignment(tmp_path: Path):
+    import time
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=3)
+    for i in range(3):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input(hotel_id)
+
+    runner = ReconstructionRunner(workspace)
+    from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+
+    run1 = runner.run(input_manifest, backend=ReconstructionBackend.SYNTHETIC)
+    time.sleep(1.1)
+    run2 = runner.run(input_manifest, backend=ReconstructionBackend.SYNTHETIC)
+    assert run1.status == "completed"
+    assert run2.status == "completed"
+    assert run1.run_id != run2.run_id
+
+    from hotel_pipeline.reconstruction_run import publish_run
+    publish_run(run1, workspace)
+    publish_run(run2, workspace)
+
+    from hotel_pipeline.reconstruction_consensus import ConsensusBuilder
+    builder = ConsensusBuilder(workspace)
+    consensus = builder.build([run1.run_id, run2.run_id])
+    assert consensus.selected_run_id is not None
+    assert len(consensus.camera_consensus) == 3
+
+
+def test_feed_forward_backends_fail_gracefully_when_binary_missing(tmp_path: Path):
     """MapAnything et VGGT doivent échouer proprement sans binaire."""
     workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
 
