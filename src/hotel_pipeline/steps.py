@@ -132,6 +132,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     from .intake import ASSET_MANIFEST_NAME
     from .resolve import check_separations, resolve
     from .schemas import AssetManifest
+    from .demands_build import build_initial_demands
 
     project = workspace.read_manifest()
     context = _context(workspace, project)
@@ -189,7 +190,7 @@ def _collect(workspace) -> None:  # noqa: ANN001 — Workspace, import circulair
     # déductible — les droits assumés et la version de l'entrée.
     assets_path = workspace.path("00_manifest", ASSET_MANIFEST_NAME)
     if not assets_path.is_file():
-        _gather(workspace, project, spatial, context)
+        _collect_v2(workspace, project, spatial, context)
 
     assets = AssetManifest.model_validate_json(assets_path.read_text("utf-8"))
     eligible = assets.production_eligible()
@@ -299,6 +300,192 @@ def _gather(workspace, project, spatial: SpatialManifest, context) -> None:  # n
         context,
     )
     log.info("collecte : %s", summarise(manifest))
+
+
+def _collect_v2(workspace, project, spatial, context) -> None:
+    """Collecte V2 : discover → plan → acquire (§9, §11 V2).
+
+    Remplace l'ancien _gather() qui téléchargeait tout puis qualifiait.
+    Ici : besoins d'abord, puis découverte ciblée, plan avec consentement,
+    acquisition seulement de ce qui est planifié.
+    """
+    import json
+    from pathlib import Path
+    from .demands_build import build_initial_demands
+    from .discover import discover
+    from .plan import build as build_plan, consent as consent_plan
+    from .acquire import run as acquire_run
+    from .schemas.acquisition import CaptureDemandManifest
+    from .provenance import digest_of
+
+    building = spatial.candidate(spatial.confirmed_building_id or "")
+    lat, lon = building.centroid_lat, building.centroid_lon
+
+    # 1. Construire les besoins initiaux depuis le bâtiment confirmé + politique
+    demands_manifest, demands_report = build_initial_demands(
+        hotel_id=project.hotel_id,
+        policy=context.policy,
+        confirmed_building_id=spatial.confirmed_building_id,
+        spatial=spatial,
+    )
+
+    demands_path = workspace.path("01_sources", "capture_demands.json")
+    demands_path.parent.mkdir(parents=True, exist_ok=True)
+    demands_path.write_text(
+        demands_manifest.model_dump_json(indent=2) + "\n", "utf-8"
+    )
+    log.info("besoins initiaux écrits : %s", demands_path)
+
+    # 2. Découverte (métadonnées seulement)
+    from .cli import _query_sources, _adaptive_context
+
+    profile = context.profile
+    radius = context.policy.collection.radius_m
+    search = _adaptive_context(workspace, context, demands_manifest.demands,
+                                demands_manifest.model_dump())
+    queries = _query_sources(profile, context, workspace, radius, search.outstanding or demands_manifest.demands)
+
+    from .providers.transport import ledger, reset_ledger
+    reset_ledger()
+    candidates_manifest, discovery_report = discover(
+        project.hotel_id,
+        demands_manifest,
+        queries,
+        demand_digest=digest_of(demands_manifest.model_dump()),
+        policy_digest=context.provenance["policy_digest"],
+        search=search,
+    )
+
+    # Sauvegarder le manifeste de candidats
+    candidates_path = workspace.path("01_sources", f"candidates_{discovery_report.run_id}.json")
+    candidates_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates_path.write_text(candidates_manifest.model_dump_json(indent=2), "utf-8")
+    log.info("découverte : %d candidat(s)", len(candidates_manifest.candidates))
+
+    # Mode hors ligne : aucun candidat trouvé, créer un manifeste d'assets vide
+    # et bloquer sur "aucun asset éligible" comme l'ancien flux
+    if not candidates_manifest.candidates:
+        log.info("aucun candidat découvert (mode hors ligne) — création d'un manifeste d'assets vide")
+        from .gather import build_manifest as build_asset_manifest
+        asset_manifest = build_asset_manifest(project.hotel_id, [], assume_rights=project.assume_rights)
+        workspace.write_assets(asset_manifest)
+        # Le reste de _collect() bloquera sur "aucun asset éligible production"
+        return
+
+    # 3. Planification (avec mesure des volumes pour consentement exact)
+    from .plan import build as build_plan_fn, consent as consent_plan
+    from .cli import _candidate_geometries, _plan_digests, _check_coverage, _measure_volumes
+    from .schemas.acquisition import VolumeStatus
+
+    def _recommendation_levels(candidates):  # noqa: ANN001, ANN201
+        """Niveau prononcé par la recherche, par couple candidat/besoin."""
+        if not getattr(candidates, "adaptive_search_run_id", None):
+            return None
+        return {
+            (entry.candidate_id, entry.demand_id): entry.level
+            for entry in getattr(candidates, "recommendations", [])
+        }
+
+    digests = _plan_digests(workspace, context,
+                            candidates_manifest.model_dump(),
+                            demands_manifest.model_dump())
+    geometries, _ = _candidate_geometries(workspace, context, candidates_manifest.candidates, demands_manifest.demands)
+
+    plan, evaluations, plan_report = build_plan_fn(
+        project.hotel_id,
+        candidates_manifest.candidates,
+        demands_manifest.demands,
+        digests,
+        geometries=geometries,
+        sizes=None,
+        separation_m=context.policy.geometry.viewpoint_separation_m,
+        policy=context.policy,
+        levels=_recommendation_levels(candidates_manifest),
+    )
+
+    # Résoudre les requêtes pour mesurer les volumes
+    from .acquisition_request import resolve_all
+    acquisition_requests = resolve_all(
+        {c.candidate_id: c for c in candidates_manifest.candidates},
+        plan.acquisitions
+    )
+
+    # Mesurer les volumes (requis pour consentement exact)
+    sizes, _ = _measure_volumes(
+        [acquisition_requests[a.candidate_id] for a in plan.acquisitions if a.candidate_id in acquisition_requests],
+        True,
+    )
+
+    # Mettre à jour le plan avec les tailles mesurées
+    plan = plan.model_copy(update={"acquisitions": [
+        a.model_copy(update={
+            "provider_resolution": (
+                acquisition_requests[a.candidate_id].provider_resolution
+                if a.candidate_id in acquisition_requests else None
+            ),
+            "request_digest": (
+                acquisition_requests[a.candidate_id].digest
+                if a.candidate_id in acquisition_requests else None
+            ),
+            **({"expected_bytes": sizes.get(a.candidate_id)} if sizes else {}),
+        })
+        for a in plan.acquisitions
+    ]})
+
+    # Consentement automatique pour la collecte initiale (volume exact connu)
+    # Le plan doit avoir un volume EXACT pour être consenti
+    if plan.volume_status is not VolumeStatus.EXACT:
+        log.warning("volume non exact (%s) — la collecte initiale continuera mais le plan restera brouillon",
+                   plan.volume_status.value)
+    else:
+        # Consentement implicite pour la collecte initiale
+        plan = consent_plan(
+            plan, digests,
+            measured_from=plan.plan_id,
+            download_contract_version=context.policy.collection.download_contract_version,
+        )
+        log.info("plan consenti : %d octets", plan.known_bytes)
+
+    # Sauvegarder le plan
+    plan_path = workspace.path("01_sources", f"acquisition_plan_{plan.plan_id}.json")
+    plan_path.write_text(plan.model_dump_json(indent=2), "utf-8")
+
+    # 4. Acquisition
+    acquired_assets, acquire_report = acquire_run(
+        plan,
+        {c.candidate_id: c for c in candidates_manifest.candidates},
+        workspace.path("02_images", "reference_only"),
+        digests,
+        plan_digest=digest_of(plan.model_dump()),
+        policy=context.policy,
+    )
+
+    # Construire le manifeste d'assets final
+    from .gather import build_manifest as build_asset_manifest, summarise
+    from .triage import triage
+
+    asset_manifest = build_asset_manifest(
+        project.hotel_id, acquired_assets, assume_rights=project.assume_rights
+    )
+
+    # Classification
+    classifier = None
+    if any(a.local_path for a in asset_manifest.assets):
+        try:
+            from .triage.classify import Classifier
+            classifier = Classifier(policy=context.policy)
+        except ImportError:
+            log.warning("OpenCLIP absent — classification ignorée")
+
+    triage_report = triage(asset_manifest.assets, classifier=classifier)
+
+    workspace.write_assets(asset_manifest)
+    workspace.write_report(
+        "01_sources/gather_report.json",
+        {**triage_report.as_dict(), "summary": summarise(asset_manifest)},
+        context,
+    )
+    log.info("collecte V2 terminée : %s", summarise(asset_manifest))
 
 
 def _lot1b(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire

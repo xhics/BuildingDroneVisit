@@ -224,6 +224,101 @@ def build(
     return manifest, report
 
 
+def build_initial_demands(
+    hotel_id: str,
+    policy,  # noqa: ANN001 — PipelinePolicy
+    confirmed_building_id: str,
+    spatial,  # noqa: ANN001 — SpatialManifest
+) -> tuple[CaptureDemandManifest, BuildReport]:
+    """Construit les besoins initiaux pour la collecte, sans SiteManifest.
+
+    Utilise les obligations qui ne dépendent que du bâtiment confirmé :
+    - 4 façades (VIEW_SECTOR)
+    - Entrée principale (SITE_OBJECT, proxy façade primaire)
+    - Enseigne (SITE_OBJECT, proxy bâtiment)
+    - Voie d'accès principale (CONTEXT_CORRIDOR)
+
+    Les obligations conditionnelles (parking, allée) attendront le SiteManifest.
+    """
+    from .coverage_obligations import (
+        OBLIGATIONS,
+        Applicability,
+        ObligationStatus,
+        NO_PHOTOGRAPHIC_OBLIGATION,
+    )
+    from .schemas.acquisition import CaptureDemand, CaptureDemandManifest, CaptureIntent, TargetKind
+    from .schemas.policy import CoveragePolicy
+
+    coverage = policy.coverage
+    dispensed = {}
+
+    report = BuildReport()
+    demands: dict[str, CaptureDemand] = {}
+
+    # Obligations toujours dues avec un bâtiment confirmé
+    initial_obligations = [
+        o for o in OBLIGATIONS
+        if o.applicability is Applicability.ALWAYS
+    ]
+
+    for obligation in initial_obligations:
+        object_id = obligation.object_id
+        demand_id = demand_id_for(object_id)
+
+        waiver = dispensed.get(object_id)
+        if waiver is not None:
+            bucket = (
+                report.waived
+                if waiver.status is ObligationStatus.WAIVED
+                else report.not_applicable
+            )
+            bucket[object_id] = waiver.rationale
+            continue
+
+        targetable = True
+        unresolved_reason = None
+
+        # Pour les secteurs de vue, la cible est résoluble si on a front_azimuth
+        if obligation.target_kind is TargetKind.VIEW_SECTOR:
+            front = getattr(spatial, "front_azimuth_deg", None)
+            if front is None:
+                targetable = False
+                unresolved_reason = "orientation de façade inconnue (front_azimuth_deg manquant)"
+
+        if not targetable and obligation.target_kind is TargetKind.SITE_OBJECT:
+            # Entrée et enseigne : cible non résolue sans SiteManifest
+            unresolved_reason = "SiteManifest non encore disponible"
+
+        demands[demand_id] = CaptureDemand(
+            demand_id=demand_id,
+            intent=obligation.intent,
+            target_kind=obligation.target_kind,
+            target_ref=obligation.expected_target_ref,
+            rationale=obligation.rationale,
+            **_thresholds(obligation.intent, coverage),
+        )
+        report.generated_from_obligation.append(demand_id)
+
+        if not targetable:
+            report.unresolved_target[object_id] = unresolved_reason
+            if obligation.search_proxy_ref:
+                report.search_proxies[demand_id] = obligation.search_proxy_ref
+
+    # Ajouter les obligations sans obligation photographique au rapport pour traçabilité
+    for obj_id, reason in NO_PHOTOGRAPHIC_OBLIGATION.items():
+        report.not_applicable[obj_id] = reason
+
+    manifest = CaptureDemandManifest(
+        hotel_id=hotel_id,
+        demands=[demands[key] for key in sorted(demands)],
+    )
+    log.info(
+        "besoins initiaux : %d généré(s), %d non ciblable(s) — 0 octet téléchargé",
+        len(report.generated_from_obligation), len(report.unresolved_target),
+    )
+    return manifest, report
+
+
 def validate_targets(  # noqa: ANN001
     manifest: CaptureDemandManifest, site, geometry=None,
 ) -> list[str]:

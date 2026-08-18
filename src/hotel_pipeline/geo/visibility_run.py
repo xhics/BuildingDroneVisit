@@ -322,6 +322,7 @@ def run_assessment(
             _corridor(
                 corridor, line, target_shape, obstacles, settings, report,
                 sectors=_sector_reader(target_shape, front_azimuth_deg),
+                crs=manifest.working_crs,
             )
         )
 
@@ -481,7 +482,7 @@ def _framing(asset, assessment, settings):  # noqa: ANN001
     )
 
 
-def _corridor(corridor, line, target_shape, obstacles, settings, report, sectors=None):  # noqa: ANN001
+def _corridor(corridor, line, target_shape, obstacles, settings, report, sectors=None, crs=None):  # noqa: ANN001
     """Ce qu'une voie promet, échantillon par échantillon.
 
     Les mesures publiées sont celles d'**un** échantillon — le meilleur —, non
@@ -503,6 +504,7 @@ def _corridor(corridor, line, target_shape, obstacles, settings, report, sectors
         assessment = engine.assess(
             f"corridor-{corridor.corridor_id}-{sample_id}", corridor.corridor_id,
             "BUILDING_MAIN", position, target_shape, obstacles, settings,
+            crs=crs if crs is not None else "",
         )
         at_risk.update(assessment.obstacles_at_risk)
         max_span = max(max_span, assessment.angular_span_deg or 0.0)

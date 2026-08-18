@@ -16,6 +16,7 @@ et qu'une URL signée porterait la clé d'API jusque dans un fichier versionné.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -207,6 +208,17 @@ def run(
     staging = destination / ".staging"
     staging.mkdir(parents=True, exist_ok=True)
 
+    # Checkpoint pour reprise : suit les candidats déjà acquis avec succès
+    checkpoint_path = destination / ".acquire_checkpoint.json"
+    completed_candidates: set[str] = set()
+    if checkpoint_path.is_file():
+        import json
+        try:
+            completed_candidates = set(json.loads(checkpoint_path.read_text("utf-8")))
+            log.info("reprise acquisition : %d candidat(s) déjà acquis", len(completed_candidates))
+        except (json.JSONDecodeError, OSError):
+            pass
+
     budget = Budget(
         total_consented=plan.known_bytes,
         per_request={
@@ -218,118 +230,147 @@ def run(
     staged: list[tuple[Path, Path]] = []
     acquired = []
 
-    for acquisition in plan.acquisitions:
-        candidate = candidates.get(acquisition.candidate_id)
-        if candidate is None:
-            report.failed[acquisition.candidate_id] = (
-                "candidat absent du manifeste : le plan cite une vue qui n'existe plus"
-            )
-            continue
+    # Filtrer les acquisitions déjà complétées
+    pending_acquisitions = [
+        a for a in plan.acquisitions
+        if a.candidate_id not in completed_candidates
+    ]
 
-        request = requests_by_candidate.get(acquisition.candidate_id)
-        if request is None:
-            report.failed[acquisition.candidate_id] = (
-                "requête non résolue : ce que le plan demande ne se traduit "
-                "pas dans les termes de la source"
-            )
-            continue
+    if not pending_acquisitions:
+        log.info("toutes les acquisitions déjà complétées — rien à faire")
+    else:
+        # Téléchargement parallèle avec ThreadPoolExecutor
+        max_workers = min(4, len(pending_acquisitions))  # Limite pour éviter de saturer les APIs
+        
+        def _download_one(acquisition):
+            """Télécharge une seule acquisition, retourne (acquisition, outcome_or_exception)."""
+            candidate = candidates.get(acquisition.candidate_id)
+            if candidate is None:
+                return acquisition, Exception(
+                    "candidat absent du manifeste : le plan cite une vue qui n'existe plus"
+                )
 
-        target = staging / f"{acquisition.candidate_id}.jpg"
-        ceiling = budget.ceiling_for(acquisition.candidate_id)
-        try:
-            written = (fetcher or fetch)(candidate, target, request, ceiling)
-            # Vérifié **avant** de compter l'octet comme acquis : un fichier
-            # illisible ou aux mauvaises dimensions n'est pas une acquisition.
-            outcome = verify(Path(written), candidate.source, request)
-        except (AcquisitionRefused, DownloadRefused, OSError, RuntimeError, ValueError) as exc:
-            # Mesuré **avant** la suppression : un refus aux dimensions arrive
-            # après l'écriture, et inscrire zéro ferait croire que rien n'a
-            # transité. Le réseau, lui, a bien été consommé.
-            staged_bytes = Path(target).stat().st_size if Path(target).is_file() else 0
-            Path(target).unlink(missing_ok=True)
-            report.failed[acquisition.candidate_id] = str(exc)
-            outcomes[acquisition.candidate_id] = {
-                "candidate_id": acquisition.candidate_id,
-                "declared_bytes": acquisition.expected_bytes,
-                "bytes_received": staged_bytes,
-                # Historiquement écrit en temporaire, même supprimé depuis :
-                # c'est ce qui distingue un refus avant lecture d'un refus
-                # après décodage.
-                "bytes_staged": staged_bytes,
-                "bytes_published": 0,
-                "refused": str(exc),
-                "failure": _structured_failure(exc, request),
+            request = requests_by_candidate.get(acquisition.candidate_id)
+            if request is None:
+                return acquisition, Exception(
+                    "requête non résolue : ce que le plan demande ne se traduit "
+                    "pas dans les termes de la source"
+                )
+
+            target = staging / f"{acquisition.candidate_id}.jpg"
+            ceiling = budget.ceiling_for(acquisition.candidate_id)
+            try:
+                written = (fetcher or fetch)(candidate, target, request, ceiling)
+                outcome = verify(Path(written), candidate.source, request)
+                return acquisition, (candidate, request, written, outcome, ceiling)
+            except (AcquisitionRefused, DownloadRefused, OSError, RuntimeError, ValueError) as exc:
+                staged_bytes = Path(target).stat().st_size if Path(target).is_file() else 0
+                Path(target).unlink(missing_ok=True)
+                return acquisition, (exc, staged_bytes)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_acq = {
+                executor.submit(_download_one, acq): acq
+                for acq in pending_acquisitions
             }
-            continue
+            for future in as_completed(future_to_acq):
+                acquisition = future_to_acq[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = (acquisition, exc)
 
-        outcome.declared_bytes = acquisition.expected_bytes
-        outcome.bytes_received = outcome.bytes_staged
-        outcomes[acquisition.candidate_id] = outcome.as_dict()
-        budget.spent += outcome.bytes_staged
-        staged.append((Path(written), destination / f"{acquisition.candidate_id}.jpg"))
+                acq, result_data = result
+                if isinstance(result_data, tuple) and len(result_data) == 2 and isinstance(result_data[0], Exception):
+                    exc, staged_bytes = result_data
+                    report.failed[acq.candidate_id] = str(exc)
+                    outcomes[acq.candidate_id] = {
+                        "candidate_id": acq.candidate_id,
+                        "declared_bytes": acq.expected_bytes,
+                        "bytes_received": staged_bytes,
+                        "bytes_staged": staged_bytes,
+                        "bytes_published": 0,
+                        "refused": str(exc),
+                        "failure": _structured_failure(exc, requests_by_candidate.get(acq.candidate_id)),
+                    }
+                    continue
+                if isinstance(result_data, Exception):
+                    exc = result_data
+                    report.failed[acq.candidate_id] = str(exc)
+                    outcomes[acq.candidate_id] = {
+                        "candidate_id": acq.candidate_id,
+                        "declared_bytes": acq.expected_bytes,
+                        "bytes_received": 0,
+                        "bytes_staged": 0,
+                        "bytes_published": 0,
+                        "refused": str(exc),
+                        "failure": _structured_failure(exc, requests_by_candidate.get(acq.candidate_id)),
+                    }
+                    continue
 
-        provenance = AcquisitionProvenance(
-            provider_id=candidate.provider_id,
-            plan_id=plan.plan_id,
-            plan_digest=plan_digest,
-            candidate_id=candidate.candidate_id,
-            intents=list(acquisition.intents),
-            primary_intent=acquisition.primary_intent,
-            queried_lat=candidate.queried_lat, queried_lon=candidate.queried_lon,
-            returned_lat=candidate.camera_lat, returned_lon=candidate.camera_lon,
-            original_heading_deg=candidate.original_heading_deg,
-            computed_heading_deg=candidate.computed_heading_deg,
-            requested_heading_deg=candidate.requested_heading_deg,
-            requested_fov_deg=candidate.requested_fov_deg,
-            # Ce que l'optique **vaut**, à côté de ce qui a servi au cadrage :
-            # un fichier acquis d'un ultra-grand-angle doit le dire.
-            observed_horizontal_fov_deg=candidate.observed_horizontal_fov_deg,
-            projection_support=candidate.projection_support,
-            # Ce que ce fichier venait vérifier, besoin par besoin : la preview
-            # arrivait sinon sans rattachement, et son constat n'aurait su à
-            # quelle exigence répondre.
-            serves_demands=list(acquisition.serves_demands),
-            demand_levels=dict(acquisition.demand_levels or {}),
-            requested_pitch_deg=candidate.requested_pitch_deg,
-            sequence_id=candidate.sequence_id,
-            panorama_id=candidate.panorama_id,
-            camera_type=candidate.camera_type,
-            # La résolution **fournisseur**, non celle du vocabulaire du plan :
-            # inscrire « 256 » sur une image obtenue en `thumb_2048` décrirait
-            # un fichier qui n'est pas celui du disque.
-            resolution=request.provider_resolution,
-            requested_resolution=request.semantic_resolution,
-            request_digest=request.digest,
-            acquired_at=datetime.now(timezone.utc),
-            # Annoncées, conservées **à côté** des mesures : les faire
-            # coïncider d'office masquerait un rendu tronqué ou redimensionné.
-            advertised_width=candidate.advertised_width,
-            advertised_height=candidate.advertised_height,
-            run_id=report.run_id,
-        )
+                candidate, request, written, outcome, ceiling = result_data
+                outcome.declared_bytes = acq.expected_bytes
+                outcome.bytes_received = outcome.bytes_staged
+                outcomes[acq.candidate_id] = outcome.as_dict()
+                budget.spent += outcome.bytes_staged
+                staged.append((Path(written), destination / f"{acq.candidate_id}.jpg"))
 
-        # L'acquisition constate un fait ; elle ne tranche aucun droit. Une
-        # source tierce téléchargée est `public_uncleared`, et la licence
-        # revendiquée par le fournisseur reste une **revendication**.
-        report.requested[acquisition.candidate_id] = {
-            "semantic_resolution": request.semantic_resolution,
-            "provider_resolution": request.provider_resolution,
-            "request_digest": request.digest,
-        }
-        # L'asset porte sa place **définitive**, non celle du staging : ce
-        # chemin temporaire n'existera plus après publication, et un manifeste
-        # qui le citerait décrirait un fichier introuvable.
-        final_path = destination / f"{acquisition.candidate_id}.jpg"
-        asset = as_asset(
-            candidate, provenance, final_path, Rights.PUBLIC_UNCLEARED,
-            measured_from=Path(written),
-        )
-        asset = asset.model_copy(
-            update=acquisition_rights(candidate.request_spec.get("licence_claim"))
-        )
-        acquired.append(asset)
-        report.acquired += 1
-        report.bytes_downloaded += asset.file_size_bytes or 0
+                provenance = AcquisitionProvenance(
+                    provider_id=candidate.provider_id,
+                    plan_id=plan.plan_id,
+                    plan_digest=plan_digest,
+                    candidate_id=candidate.candidate_id,
+                    intents=list(acq.intents),
+                    primary_intent=acq.primary_intent,
+                    queried_lat=candidate.queried_lat, queried_lon=candidate.queried_lon,
+                    returned_lat=candidate.camera_lat, returned_lon=candidate.camera_lon,
+                    original_heading_deg=candidate.original_heading_deg,
+                    computed_heading_deg=candidate.computed_heading_deg,
+                    requested_heading_deg=candidate.requested_heading_deg,
+                    requested_fov_deg=candidate.requested_fov_deg,
+                    observed_horizontal_fov_deg=candidate.observed_horizontal_fov_deg,
+                    projection_support=candidate.projection_support,
+                    serves_demands=list(acq.serves_demands),
+                    demand_levels=dict(acq.demand_levels or {}),
+                    requested_pitch_deg=candidate.requested_pitch_deg,
+                    sequence_id=candidate.sequence_id,
+                    panorama_id=candidate.panorama_id,
+                    camera_type=candidate.camera_type,
+                    resolution=request.provider_resolution,
+                    requested_resolution=request.semantic_resolution,
+                    request_digest=request.digest,
+                    acquired_at=datetime.now(timezone.utc),
+                    advertised_width=candidate.advertised_width,
+                    advertised_height=candidate.advertised_height,
+                    run_id=report.run_id,
+                )
+
+                report.requested[acq.candidate_id] = {
+                    "semantic_resolution": request.semantic_resolution,
+                    "provider_resolution": request.provider_resolution,
+                    "request_digest": request.digest,
+                }
+                final_path = destination / f"{acq.candidate_id}.jpg"
+                asset = as_asset(
+                    candidate, provenance, final_path, Rights.PUBLIC_UNCLEARED,
+                    measured_from=Path(written),
+                )
+                asset = asset.model_copy(
+                    update=acquisition_rights(candidate.request_spec.get("licence_claim"))
+                )
+                acquired.append(asset)
+                report.acquired += 1
+                report.bytes_downloaded += asset.file_size_bytes or 0
+
+                # Mettre à jour le checkpoint
+                completed_candidates.add(acq.candidate_id)
+                try:
+                    import json
+                    checkpoint_path.write_text(
+                        json.dumps(sorted(completed_candidates)), "utf-8"
+                    )
+                except OSError:
+                    pass
 
     # --- publication : les six ou aucun -----------------------------------
     if report.failed:

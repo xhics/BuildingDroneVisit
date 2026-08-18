@@ -207,6 +207,9 @@ class ResolvedGeometry(BaseModel):
     #: Motif obligatoire lorsqu'aucune forme n'a été obtenue.
     unresolved_reason: str | None = None
 
+    #: Motif lorsqu'une géométrie résolue devient invalide.
+    stale_reason: str | None = None
+
     #: Hauteur de l'obstacle, si elle est connue. Jamais inventée : une hauteur
     #: absente deviendra un `occlusion_risk`, pas une certitude.
     height_known: bool = False
