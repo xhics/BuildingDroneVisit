@@ -180,10 +180,17 @@ def _match_pair(
     matcher: Any,
     *,
     max_features: int = 2048,
+    detector: str = "orb",
 ) -> PairEvidence:
     """Match deux images et vérifie géométriquement."""
-    orb = cv2.ORB_create(nfeatures=max_features)
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    if detector == "sift":
+        detector_obj = cv2.SIFT_create(nfeatures=max_features)
+        norm_type = cv2.NORM_L2
+    else:
+        detector_obj = cv2.ORB_create(nfeatures=max_features)
+        norm_type = cv2.NORM_HAMMING
+
+    bf = cv2.BFMatcher(norm_type, crossCheck=True)
 
     img_a = _load_image(workspace.path(asset_a.local_path)) if asset_a.local_path else None
     img_b = _load_image(workspace.path(asset_b.local_path)) if asset_b.local_path else None
@@ -195,8 +202,8 @@ def _match_pair(
             status="failed",
         )
 
-    kp_a, desc_a = orb.detectAndCompute(img_a, None)
-    kp_b, desc_b = orb.detectAndCompute(img_b, None)
+    kp_a, desc_a = detector_obj.detectAndCompute(img_a, None)
+    kp_b, desc_b = detector_obj.detectAndCompute(img_b, None)
 
     if desc_a is None or desc_b is None or len(kp_a) < 8 or len(kp_b) < 8:
         return PairEvidence(
@@ -267,9 +274,10 @@ def _match_pair(
 class ViewGraphBuilder:
     """Construit un ViewGraphManifest depuis un ReconstructionInputManifest."""
 
-    def __init__(self, workspace: Workspace, *, max_features: int = 2048):
+    def __init__(self, workspace: Workspace, *, max_features: int = 2048, detector: str = "orb"):
         self.workspace = workspace
         self.max_features = max_features
+        self.detector = detector
 
     def build(self, input_manifest: ReconstructionInputManifest) -> ViewGraphManifest:
         from .schemas import AssetManifest
@@ -296,7 +304,7 @@ class ViewGraphBuilder:
         for a_id, b_id, _ in candidates:
             if a_id not in by_id or b_id not in by_id:
                 continue
-            pair = _match_pair(by_id[a_id], by_id[b_id], self.workspace, None, max_features=self.max_features)
+            pair = _match_pair(by_id[a_id], by_id[b_id], self.workspace, None, max_features=self.max_features, detector=self.detector)
             pairs.append(pair)
 
         valid_pairs = [p for p in pairs if p.status == "valid"]
