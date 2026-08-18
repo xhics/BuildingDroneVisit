@@ -31,6 +31,8 @@ class DenseReconstructionResult(BaseModel):
     output_path: str | None = None
     metrics: dict = Field(default_factory=dict)
     error: str | None = None
+    started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 def run_dense_reconstruction(

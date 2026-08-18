@@ -257,6 +257,43 @@ def test_dense_reconstruction_placeholder():
     assert result.backend == "brush"
 
 
+def test_dense_backends_fail_gracefully_when_binary_missing(tmp_path: Path):
+    """Brush et gsplat doivent échouer proprement sans binaire."""
+    workspace = _write_minimal_workspace(tmp_path, "test-hotel", asset_count=2)
+    for i in range(2):
+        img_path = workspace.path("images", f"asset-{i+1}.jpg")
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF")
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input("test-hotel")
+    from hotel_pipeline.reconstruction_run import ReconstructionRunner, publish_run
+    runner = ReconstructionRunner(workspace)
+    run = runner.run(input_manifest)
+    publish_run(run, workspace)
+
+    sparse_dir = workspace.path("07_reconstruction", "runs", run.run_id, "sparse", "0")
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    (sparse_dir / "cameras").write_text("")
+    (sparse_dir / "images").write_text("#\n")
+    (sparse_dir / "points3D").write_text("")
+
+    run_json = workspace.path("07_reconstruction", "runs", f"{run.run_id}.json")
+    data = json.loads(run_json.read_text("utf-8"))
+    data["output_path"] = str(sparse_dir)
+    run_json.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    from hotel_pipeline.dense_reconstruction import run_dense_reconstruction
+    for backend_name, binary in [
+        ("brush", "Brush"),
+        ("gsplat", "gsplat"),
+    ]:
+        from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
+        result = run_dense_reconstruction(workspace, run.run_id, backend=ReconstructionBackend(backend_name))
+        assert result.status == "failed"
+        assert binary in result.error
+
+
 # ---------------------------------------------------------------------------
 # Camera Feasibility
 # ---------------------------------------------------------------------------

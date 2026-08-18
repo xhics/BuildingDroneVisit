@@ -4637,16 +4637,55 @@ def reconstruction_gate(
 ) -> None:
     """Gate final : évalue si ENVIRONMENT_3D_READY peut être déclaré."""
     from .schemas.reconstruction import ReconstructionGateStatus
+    from .workspace import Workspace
 
-    status = ReconstructionGateStatus.NEEDS_AUTHORIZED_CAPTURE
-    reasons = [
-        "Lot 2 non entièrement exécuté (placeholders P3-P6)",
-        "Aucune validation held-out / stability / cross-solver",
-    ]
+    workspace = Workspace(hotel_id)
+
+    consensus_dir = workspace.path("07_reconstruction", "consensus")
+    alignment_dir = workspace.path("07_reconstruction", "alignment")
+    confidence_dir = workspace.path("07_reconstruction", "confidence")
+    validation_dir = workspace.path("07_reconstruction", "validation")
+    camera_path_dir = workspace.path("07_reconstruction", "validated_camera_paths")
+
+    checks = []
+
+    consensus_files = sorted(consensus_dir.glob("*.json")) if consensus_dir.is_dir() else []
+    if consensus_files:
+        checks.append(("consensus", True, consensus_files[-1].name))
+    else:
+        checks.append(("consensus", False, "aucun consensus publié"))
+
+    alignment_files = sorted(alignment_dir.glob("*.json")) if alignment_dir.is_dir() else []
+    if alignment_files:
+        checks.append(("alignement", True, alignment_files[-1].name))
+    else:
+        checks.append(("alignement", False, "aucun alignement publié"))
+
+    confidence_files = sorted(confidence_dir.glob("*.geojson")) if confidence_dir.is_dir() else []
+    if confidence_files:
+        checks.append(("confiance surface", True, confidence_files[-1].name))
+    else:
+        checks.append(("confiance surface", False, "aucune confiance publiée"))
+
+    validation_files = sorted(validation_dir.glob("*.json")) if validation_dir.is_dir() else []
+    if validation_files:
+        checks.append(("validation", True, validation_files[-1].name))
+    else:
+        checks.append(("validation", False, "aucune validation publiée"))
+
+    camera_path_files = sorted(camera_path_dir.glob("*.json")) if camera_path_dir.is_dir() else []
+    if camera_path_files:
+        checks.append(("trajectoire validée", True, camera_path_files[-1].name))
+    else:
+        checks.append(("trajectoire validée", False, "aucune trajectoire validée"))
+
+    all_passed = all(passed for _, passed, _ in checks)
+    status = ReconstructionGateStatus.ENVIRONMENT_3D_READY if all_passed else ReconstructionGateStatus.NEEDS_AUTHORIZED_CAPTURE
 
     typer.echo(f"Statut : {status.value}")
-    for reason in reasons:
-        typer.echo(f"  - {reason}")
+    for name, passed, detail in checks:
+        mark = "✓" if passed else "✗"
+        typer.echo(f"  {mark} {name}: {detail}")
 def assets_coverage(hotel_id: str = typer.Argument(...)) -> None:
     """Compte ce qui conditionne la suite du pipeline."""
     from .intake import coverage
