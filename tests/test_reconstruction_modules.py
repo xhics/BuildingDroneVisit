@@ -158,6 +158,47 @@ def test_mask_generation_produces_non_empty_masks_for_sky_and_water(tmp_path: Pa
     assert mask_path.stat().st_size > 0
 
 
+def test_mask_generation_produces_non_empty_masks_for_people_and_cars(tmp_path: Path):
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
+    img_path = workspace.path("images", "asset-1.jpg")
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+    test_image = np.zeros((200, 200, 3), dtype=np.uint8)
+    test_image[:, :] = (100, 100, 100)
+    cv2.rectangle(test_image, (80, 50), (120, 150), (0, 0, 255), -1)
+    cv2.rectangle(test_image, (50, 140), (150, 180), (255, 255, 255), -1)
+    cv2.imwrite(str(img_path), test_image)
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input(hotel_id)
+    mask_digest = generate_mask_set(workspace, input_manifest, mask_classes=["people", "cars"])
+    mask_dir = workspace.path("05_colmap", "preprocessed", "masks")
+    mask_path = mask_dir / "asset-1.png"
+    assert mask_path.exists()
+    assert mask_path.stat().st_size > 0
+
+
+def test_mask_generation_produces_non_empty_masks_for_signage_and_reflections(tmp_path: Path):
+    hotel_id = "test-hotel"
+    workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
+    img_path = workspace.path("images", "asset-1.jpg")
+    img_path.parent.mkdir(parents=True, exist_ok=True)
+    test_image = np.zeros((200, 200, 3), dtype=np.uint8)
+    test_image[:, :] = (100, 100, 100)
+    cv2.rectangle(test_image, (60, 40), (100, 80), (0, 0, 255), -1)
+    cv2.rectangle(test_image, (110, 40), (150, 80), (255, 0, 0), -1)
+    cv2.rectangle(test_image, (70, 100), (140, 140), (200, 200, 200), -1)
+    cv2.imwrite(str(img_path), test_image)
+
+    from hotel_pipeline.reconstruction_input import prepare_input
+    input_manifest, _ = prepare_input(hotel_id)
+    mask_digest = generate_mask_set(workspace, input_manifest, mask_classes=["signage", "large_reflections"])
+    mask_dir = workspace.path("05_colmap", "preprocessed", "masks")
+    mask_path = mask_dir / "asset-1.png"
+    assert mask_path.exists()
+    assert mask_path.stat().st_size > 0
+
+
 # ---------------------------------------------------------------------------
 # Reconstruction Run
 # ---------------------------------------------------------------------------
