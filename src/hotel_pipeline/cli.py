@@ -4461,6 +4461,65 @@ def reconstruction_run(
         typer.secho(f"    Erreur : {run.error}", fg=typer.colors.YELLOW, err=True)
 
 
+@reconstruction_app.command("run-all")
+def reconstruction_run_all(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+) -> None:
+    """Exécute tous les backends du ReconstructionPlan."""
+    from .reconstruction_input import prepare_input
+    from .reconstruction_plan import ReconstructionPlanner, publish_plan
+    from .reconstruction_run import ReconstructionRunner, publish_run
+    from .reconstruction_consensus import ConsensusBuilder, publish_consensus
+
+    try:
+        input_manifest, _ = prepare_input(hotel_id)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    plans_dir = workspace.path("07_reconstruction", "plans")
+    plan_files = sorted(plans_dir.glob("*.json")) if plans_dir.is_dir() else []
+    if not plan_files:
+        typer.secho("✗ aucun ReconstructionPlan publié — exécutez d'abord reconstruction plan", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    plan_data = json.loads(plan_files[-1].read_text("utf-8"))
+    selected_backends = plan_data.get("selected_backends", ["colmap_incremental"])
+    temporal_strategy = plan_data.get("temporal_strategy", "current_only")
+
+    from .schemas.reconstruction import ReconstructionBackend
+    runner = ReconstructionRunner(workspace)
+    completed_runs = []
+
+    for backend_name in selected_backends:
+        try:
+            be = ReconstructionBackend(backend_name)
+        except ValueError:
+            typer.secho(f"  · backend inconnu : {backend_name}", fg=typer.colors.YELLOW, err=True)
+            continue
+
+        typer.echo(f"  → {backend_name}...")
+        run = runner.run(input_manifest, backend=be)
+        publish_run(run, workspace)
+
+        status_mark = f"{OK}" if run.status == "completed" else f"✗"
+        typer.echo(f"    {status_mark} {run.run_id} : {run.status}")
+        if run.error:
+            typer.secho(f"      Erreur : {run.error}", fg=typer.colors.YELLOW, err=True)
+        if run.status == "completed":
+            completed_runs.append(run.run_id)
+
+    if len(completed_runs) >= 2:
+        try:
+            builder = ConsensusBuilder(workspace)
+            consensus = builder.build(completed_runs)
+            publish_consensus(consensus, workspace)
+            typer.echo(f"\n{OK} Consensus prêt : run sélectionné = {consensus.selected_run_id}")
+        except Exception as exc:
+            typer.secho(f"\n  · consensus impossible : {exc}", fg=typer.colors.YELLOW, err=True)
+
+
 @reconstruction_app.command("consensus")
 def reconstruction_consensus(
     hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
