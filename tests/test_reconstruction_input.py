@@ -133,7 +133,7 @@ def test_prepare_input_requires_workspace(tmp_path):
     }))
 
     from hotel_pipeline.reconstruction_input import prepare_input
-    manifest = prepare_input(hotel_id)
+    manifest, _ = prepare_input(hotel_id)
     assert manifest.reconstruction_input_id.startswith(f"recon-{hotel_id}-")
     assert manifest.selected_asset_ids == ["asset-1"]
     assert manifest.excluded_asset_ids == []

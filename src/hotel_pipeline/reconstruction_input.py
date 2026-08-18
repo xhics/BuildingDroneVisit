@@ -4,12 +4,17 @@ Ce module crée un `ReconstructionInputManifest` immuable qui snapshot
 le corpus Lot 1B sélectionné pour la reconstruction. Tous les backends
 (COLMAP, GLUEMAP, MP-SfM, MapAnything, VGGT) reçoivent exactement
 les mêmes données.
+
+Il produit également un `ReconstructionSelectionManifest` détaillé par asset
+(selected, rejected, auxiliary, texture_only) avec motifs, et sépare
+les cohortes temporelles (current_confirmed, historical, unknown).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +25,7 @@ from .schemas.reconstruction import (
     ReconstructionSelection,
     ReconstructionSelectionManifest,
 )
+from .schemas.enums import ReconstructionRole, Rights
 from .workspace import Workspace
 
 
@@ -36,20 +42,14 @@ def prepare_input(
     *,
     allowed_backends: list[str] | None = None,
     mask_set_digest: str | None = None,
-) -> ReconstructionInputManifest:
-    """Crée un ReconstructionInputManifest immuable pour le Lot 2.
-
-    Arguments:
-      hotel_id: identifiant de l'hôtel
-      allowed_backends: backends autorisés (défaut: colmap_incremental)
-      mask_set_digest: empreinte du jeu de masques SfM, si applicable
+) -> tuple[ReconstructionInputManifest, ReconstructionSelectionManifest]:
+    """Crée les manifestes d'entrée de reconstruction pour le Lot 2.
 
     Retourne:
-      ReconstructionInputManifest prêt à être publié.
+        (ReconstructionInputManifest, ReconstructionSelectionManifest)
     """
     workspace = Workspace(hotel_id)
 
-    # Vérifier que les manifestes sources existent
     required_files = {
         "asset_manifest": workspace.assets_path,
         "spatial_manifest": workspace.spatial_path,
@@ -61,7 +61,6 @@ def prepare_input(
         if not path.is_file():
             raise FileNotFoundError(f"manifeste requis absent : {name} ({path})")
 
-    # Calculer les empreintes des manifestes sources
     digests = {
         "asset_manifest": _sha256(workspace.assets_path),
         "spatial_manifest": _sha256(workspace.spatial_path),
@@ -70,32 +69,58 @@ def prepare_input(
         "coverage": _sha256(required_files["coverage"]),
     }
 
-    # Charger les assets et sélectionner ceux éligibles pour la reconstruction
     from .schemas import AssetManifest
-    from .schemas.enums import ReconstructionRole, Rights
-
     assets = AssetManifest.model_validate_json(workspace.assets_path.read_text("utf-8"))
 
     selected_ids: list[str] = []
     excluded_ids: list[str] = []
     selection_reasons: dict[str, str] = {}
+    selections: list[ReconstructionSelection] = []
+    temporal_cohorts: dict[str, list[str]] = defaultdict(list)
 
     for asset in assets.assets:
+        cohort = _temporal_cohort(asset)
+        if cohort:
+            temporal_cohorts[cohort].append(asset.id)
+
         if asset.reconstruction_role is ReconstructionRole.PHOTO_GEOMETRY:
             if asset.rights in {Rights.OWNED, Rights.LICENSED, Rights.OPEN_DATA}:
                 selected_ids.append(asset.id)
+                selections.append(ReconstructionSelection(
+                    asset_id=asset.id,
+                    decision="selected",
+                    reason=_selected_reason(asset),
+                    reconstruction_role=asset.reconstruction_role,
+                ))
             else:
                 excluded_ids.append(asset.id)
                 selection_reasons[asset.id] = f"droits non clarifiés ({asset.rights.value})"
-        elif asset.reconstruction_role in (
-            ReconstructionRole.TEXTURE_REFERENCE,
-            ReconstructionRole.CONTEXT_LOCK,
-            ReconstructionRole.IDENTITY_EVIDENCE,
-        ):
+                selections.append(ReconstructionSelection(
+                    asset_id=asset.id,
+                    decision="rejected",
+                    reason=selection_reasons[asset.id],
+                    reconstruction_role=asset.reconstruction_role,
+                ))
+        elif asset.reconstruction_role is ReconstructionRole.TEXTURE_REFERENCE:
+            excluded_ids.append(asset.id)
+            selection_reasons[asset.id] = "rôle texture_only"
+            selections.append(ReconstructionSelection(
+                asset_id=asset.id,
+                decision="texture_only",
+                reason=selection_reasons[asset.id],
+                reconstruction_role=asset.reconstruction_role,
+            ))
+        else:
             excluded_ids.append(asset.id)
             selection_reasons[asset.id] = (
                 f"rôle {asset.reconstruction_role.value} hors reconstruction"
             )
+            selections.append(ReconstructionSelection(
+                asset_id=asset.id,
+                decision="rejected",
+                reason=selection_reasons[asset.id],
+                reconstruction_role=asset.reconstruction_role,
+            ))
 
     if not selected_ids:
         raise ValueError(
@@ -107,7 +132,7 @@ def prepare_input(
         f"recon-{hotel_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     )
 
-    return ReconstructionInputManifest(
+    input_manifest = ReconstructionInputManifest(
         reconstruction_input_id=reconstruction_input_id,
         asset_manifest_digest=digests["asset_manifest"],
         spatial_manifest_digest=digests["spatial_manifest"],
@@ -119,7 +144,44 @@ def prepare_input(
         selection_reasons=selection_reasons,
         mask_set_digest=mask_set_digest,
         allowed_backends=allowed_backends or ["colmap_incremental"],
+        temporal_cohorts=dict(temporal_cohorts),
     )
+
+    selection_manifest = ReconstructionSelectionManifest(
+        reconstruction_input_id=reconstruction_input_id,
+        selections=selections,
+    )
+
+    return input_manifest, selection_manifest
+
+
+def _temporal_cohort(asset) -> str | None:
+    """Détermine la cohorte temporelle d'un asset (point 17)."""
+    try:
+        from .temporal import TemporalStatus
+        if asset.temporal_status is TemporalStatus.CURRENT_CONFIRMED:
+            return "current_confirmed"
+        if asset.temporal_status is TemporalStatus.HISTORICAL:
+            return "historical"
+        if asset.temporal_status is TemporalStatus.UNKNOWN:
+            return "unknown"
+    except Exception:
+        pass
+    return None
+
+
+def _selected_reason(asset) -> str:
+    """Raison de sélection d'un asset."""
+    reasons = []
+    if asset.reconstruction_role:
+        reasons.append(f"rôle={asset.reconstruction_role.value}")
+    if asset.view_sector and asset.view_sector.value != "unknown":
+        reasons.append(f"secteur={asset.view_sector.value}")
+    if asset.viewpoint_cluster:
+        reasons.append(f"cluster={asset.viewpoint_cluster}")
+    if asset.duplicate_group:
+        reasons.append(f"duplicate_group={asset.duplicate_group}")
+    return "; ".join(reasons) if reasons else "photo_geometry éligible"
 
 
 def publish_input(manifest: ReconstructionInputManifest, workspace: Workspace) -> Path:
@@ -127,5 +189,14 @@ def publish_input(manifest: ReconstructionInputManifest, workspace: Workspace) -
     output_dir = workspace.path("07_reconstruction")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"reconstruction_input_{manifest.reconstruction_input_id}.json"
+    workspace.write_json(output_path, manifest.model_dump(mode="json"))
+    return output_path
+
+
+def publish_selection(manifest: ReconstructionSelectionManifest, workspace: Workspace) -> Path:
+    """Publie le ReconstructionSelectionManifest sous 07_reconstruction/."""
+    output_dir = workspace.path("07_reconstruction")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"reconstruction_selection_{manifest.reconstruction_input_id}.json"
     workspace.write_json(output_path, manifest.model_dump(mode="json"))
     return output_path

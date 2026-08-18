@@ -86,98 +86,45 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text("utf-8"))
 
 
-def _colmap_command(base_args: list[str]) -> list[str]:
-    return [self.colmap_binary] + base_args
-
-
-# ---------------------------------------------------------------------------
-# COLMAP incremental
-# ---------------------------------------------------------------------------
-
-
-def _run_colmap_incremental(
-    self: ReconstructionRunner,
+def _setup_run_images(
+    runner: ReconstructionRunner,
     input_manifest: ReconstructionInputManifest,
-    run_id: str,
-) -> ReconstructionRun:
-    workspace = self.workspace
-    root = _workspace_root(workspace)
-    run_dir = root / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir: Path,
+) -> list[str]:
+    """Prépare le répertoire d'images et retourne la liste des chemins copiés."""
+    from .schemas import AssetManifest
 
-    # Écrire l'entrée COLMAP (database + image list)
-    db_path = run_dir / "database.db"
-    image_list_path = run_dir / "images.txt"
+    assets = AssetManifest.model_validate_json(
+        runner.workspace.assets_path.read_text("utf-8")
+    )
+    by_id = {a.id: a for a in assets.assets}
 
-    try:
-        from .schemas import AssetManifest
+    selected = [aid for aid in input_manifest.selected_asset_ids if aid in by_id]
+    if not selected:
+        raise ValueError("aucun asset sélectionné pour la reconstruction")
 
-        assets = AssetManifest.model_validate_json(workspace.assets_path.read_text("utf-8"))
-        by_id = {a.id: a for a in assets.assets}
+    image_dir = run_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
 
-        selected = [aid for aid in input_manifest.selected_asset_ids if aid in by_id]
-        if not selected:
-            raise ValueError("aucun asset sélectionné pour COLMAP")
+    image_paths = []
+    for aid in selected:
+        asset = by_id[aid]
+        if asset.file_path:
+            src = runner.workspace.path(asset.file_path)
+            if src.is_file():
+                dst = image_dir / src.name
+                if not dst.exists():
+                    import shutil
+                    shutil.copy2(src, dst)
+                image_paths.append(str(dst))
 
-        image_paths = []
-        for aid in selected:
-            asset = by_id[aid]
-            if asset.file_path:
-                p = workspace.path(asset.file_path)
-                if p.is_file():
-                    image_paths.append(str(p))
-
-        if not image_paths:
-            raise ValueError("aucune image accessible pour COLMAP")
-
-        _run_colmap_feature_extractor(self, image_paths, db_path)
-        _run_colmap_exhaustive_matcher(self, db_path)
-        sparse_dir = run_dir / "sparse"
-        sparse_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            self.colmap_binary,
-            "mapper",
-            "--database_path", str(db_path),
-            "--image_path", str(run_dir / "images"),
-            "--output_path", str(sparse_dir),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        sparse_model = None
-        if (sparse_dir / "0").exists():
-            sparse_model = sparse_dir / "0"
-            _export_colmap_normalized(sparse_model, run_dir, selected, by_id)
-
-        finished = datetime.now(timezone.utc).isoformat()
-        metrics = _parse_colmap_metrics(sparse_model, selected, by_id) if sparse_model else {}
-
-        return ReconstructionRun(
-            run_id=run_id,
-            reconstruction_input_id=input_manifest.reconstruction_input_id,
-            backend=ReconstructionBackend.COLMAP_INCREMENTAL.value,
-            status="completed" if sparse_model else "failed",
-            started_at=result.start_time if hasattr(result, "start_time") else None,
-            finished_at=finished,
-            metrics=metrics,
-            output_path=str(sparse_model) if sparse_model else None,
-            error=None if sparse_model else "mapper n'a pas produit de modèle",
-        )
-
-    except Exception as exc:
-        return ReconstructionRun(
-            run_id=run_id,
-            reconstruction_input_id=input_manifest.reconstruction_input_id,
-            backend=ReconstructionBackend.COLMAP_INCREMENTAL.value,
-            status="failed",
-            started_at=datetime.now(timezone.utc).isoformat(),
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            error=str(exc),
-        )
+    if not image_paths:
+        raise ValueError("aucune image accessible pour la reconstruction")
+    return selected, by_id, image_paths
 
 
 def _run_colmap_feature_extractor(
-    self: ReconstructionRunner,
+    runner: ReconstructionRunner,
     image_paths: list[str],
     db_path: Path,
 ) -> None:
@@ -190,7 +137,7 @@ def _run_colmap_feature_extractor(
             shutil.copy2(src, dst)
 
     cmd = [
-        self.colmap_binary,
+        runner.colmap_binary,
         "feature_extractor",
         "--database_path", str(db_path),
         "--image_path", str(image_dir),
@@ -200,9 +147,9 @@ def _run_colmap_feature_extractor(
     subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
-def _run_colmap_exhaustive_matcher(self: ReconstructionRunner, db_path: Path) -> None:
+def _run_colmap_exhaustive_matcher(runner: ReconstructionRunner, db_path: Path) -> None:
     cmd = [
-        self.colmap_binary,
+        runner.colmap_binary,
         "exhaustive_matcher",
         "--database_path", str(db_path),
         "--SiftMatching.use_gpu", "0",
@@ -226,11 +173,13 @@ def _parse_colmap_metrics(sparse_model: Path | None, selected: list[str], by_id:
         return {"registered_ratio": 0.0}
 
     images_file = sparse_model / "images"
+    points3d_file = sparse_model / "points3D"
     if not images_file.exists():
         return {"registered_ratio": 0.0}
 
     lines = images_file.read_text().splitlines()
     registered = 0
+    track_lengths: list[int] = []
     for line in lines:
         if line.startswith("#"):
             continue
@@ -238,16 +187,114 @@ def _parse_colmap_metrics(sparse_model: Path | None, selected: list[str], by_id:
         if len(parts) >= 10:
             registered += 1
 
-    return {
+    # Parser points3D pour erreurs de reprojection et longueurs de tracks
+    reproj_errors: list[float] = []
+    if points3d_file.exists():
+        for line in points3d_file.read_text().splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 8:
+                reproj_errors.append(float(parts[7]))
+                # Track length = nombre de paires IMAGE_ID POINT2D_IDX
+                track_len = max(0, (len(parts) - 8)) // 2
+                if track_len > 0:
+                    track_lengths.append(track_len)
+
+    metrics = {
         "registered_ratio": round(registered / len(selected), 3) if selected else 0.0,
         "registered_images": registered,
         "selected_images": len(selected),
     }
+    if reproj_errors:
+        metrics["median_reprojection_error"] = round(float(np.median(reproj_errors)), 4)
+        metrics["mean_reprojection_error"] = round(float(np.mean(reproj_errors)), 4)
+        metrics["max_reprojection_error"] = round(float(np.max(reproj_errors)), 4)
+    if track_lengths:
+        metrics["median_track_length"] = round(float(np.median(track_lengths)), 2)
+        metrics["mean_track_length"] = round(float(np.mean(track_lengths)), 2)
+        metrics["max_track_length"] = int(np.max(track_lengths))
+    return metrics
 
 
 # ---------------------------------------------------------------------------
-# COLMAP global (placeholder)
+# COLMAP incremental
 # ---------------------------------------------------------------------------
+
+
+def _run_colmap_incremental(
+    self: ReconstructionRunner,
+    input_manifest: ReconstructionInputManifest,
+    run_id: str,
+) -> ReconstructionRun:
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    db_path = run_dir / "database.db"
+
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir)
+        _run_colmap_feature_extractor(self, image_paths, db_path)
+        _run_colmap_exhaustive_matcher(self, db_path)
+        sparse_dir = run_dir / "sparse"
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            self.colmap_binary,
+            "mapper",
+            "--database_path", str(db_path),
+            "--image_path", str(run_dir / "images"),
+            "--output_path", str(sparse_dir),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        sparse_model = None
+        if (sparse_dir / "0").exists():
+            sparse_model = sparse_dir / "0"
+            _export_colmap_normalized(sparse_model, run_dir, selected, by_id)
+
+        finished = datetime.now(timezone.utc).isoformat()
+        metrics = _parse_colmap_metrics(sparse_model, selected, by_id)
+        if proc.returncode != 0 and not sparse_model:
+            error = proc.stderr.strip() or proc.stdout.strip() or "mapper a échoué"
+        else:
+            error = None
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.COLMAP_INCREMENTAL.value,
+            status="completed" if sparse_model else "failed",
+            started_at=finished,
+            finished_at=finished,
+            metrics=metrics,
+            output_path=str(sparse_model) if sparse_model else None,
+            error=error,
+        )
+
+    except FileNotFoundError as exc:
+        if "No such file or directory" in str(exc) and self.colmap_binary in str(exc):
+            return ReconstructionRun(
+                run_id=run_id,
+                reconstruction_input_id=input_manifest.reconstruction_input_id,
+                backend=ReconstructionBackend.COLMAP_INCREMENTAL.value,
+                status="failed",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error=f"binaire COLMAP introuvable : {self.colmap_binary}",
+            )
+        raise
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.COLMAP_INCREMENTAL.value,
+            status="failed",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
 
 
 def _run_colmap_global(
@@ -255,18 +302,72 @@ def _run_colmap_global(
     input_manifest: ReconstructionInputManifest,
     run_id: str,
 ) -> ReconstructionRun:
-    """Placeholder pour COLMAP global. Implémenter en P2."""
-    started = datetime.now(timezone.utc).isoformat()
-    finished = datetime.now(timezone.utc).isoformat()
-    return ReconstructionRun(
-        run_id=run_id,
-        reconstruction_input_id=input_manifest.reconstruction_input_id,
-        backend=ReconstructionBackend.COLMAP_GLOBAL.value,
-        status="failed",
-        started_at=started,
-        finished_at=finished,
-        error="COLMAP global non implémenté dans cette phase",
-    )
+    workspace = self.workspace
+    root = _workspace_root(workspace)
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    db_path = run_dir / "database.db"
+
+    try:
+        selected, by_id, image_paths = _setup_run_images(self, input_manifest, run_dir)
+        _run_colmap_feature_extractor(self, image_paths, db_path)
+        _run_colmap_exhaustive_matcher(self, db_path)
+        sparse_dir = run_dir / "sparse"
+        sparse_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            self.colmap_binary,
+            "mapper",
+            "--database_path", str(db_path),
+            "--image_path", str(run_dir / "images"),
+            "--output_path", str(sparse_dir),
+            "--Mapper.init_mode", "global",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        sparse_model = None
+        if (sparse_dir / "0").exists():
+            sparse_model = sparse_dir / "0"
+            _export_colmap_normalized(sparse_model, run_dir, selected, by_id)
+
+        finished = datetime.now(timezone.utc).isoformat()
+        metrics = _parse_colmap_metrics(sparse_model, selected, by_id)
+        error = None if sparse_model else (proc.stderr.strip() or proc.stdout.strip() or "mapper global a échoué")
+
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.COLMAP_GLOBAL.value,
+            status="completed" if sparse_model else "failed",
+            started_at=finished,
+            finished_at=finished,
+            metrics=metrics,
+            output_path=str(sparse_model) if sparse_model else None,
+            error=error,
+        )
+
+    except FileNotFoundError as exc:
+        if "No such file or directory" in str(exc) and self.colmap_binary in str(exc):
+            return ReconstructionRun(
+                run_id=run_id,
+                reconstruction_input_id=input_manifest.reconstruction_input_id,
+                backend=ReconstructionBackend.COLMAP_GLOBAL.value,
+                status="failed",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                error=f"binaire COLMAP introuvable : {self.colmap_binary}",
+            )
+        raise
+    except Exception as exc:
+        return ReconstructionRun(
+            run_id=run_id,
+            reconstruction_input_id=input_manifest.reconstruction_input_id,
+            backend=ReconstructionBackend.COLMAP_GLOBAL.value,
+            status="failed",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=str(exc),
+        )
 
 
 # ---------------------------------------------------------------------------

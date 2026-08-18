@@ -361,6 +361,199 @@ def _fetch_elements(spatial: SpatialManifest) -> list[dict]:
     )
 
 
+def _preflight(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
+    """Cascade G0 à G5, du comptage au SfM sparse réel (Lot 2 — P1/P2)."""
+    from .reconstruction_input import prepare_input, publish_input
+    from .reconstruction_preprocess import generate_mask_set
+    from .view_graph import ViewGraphBuilder, publish_view_graph
+    from .reconstruction_plan import ReconstructionPlanner, publish_plan
+
+    hotel_id = workspace.hotel_id
+
+    prerequisites = [
+        ("asset_manifest", workspace.assets_path),
+        ("spatial_manifest", workspace.spatial_path),
+        ("site_manifest", workspace.site_path),
+        ("coverage_report", workspace.path("coverage", "coverage_report.json")),
+        ("router_decision", workspace.path("10_validation", "router_decision.json")),
+    ]
+    missing = [name for name, path in prerequisites if not path.is_file()]
+    if missing:
+        raise StepBlocked(
+            "preflight",
+            f"preflight bloqué : manifestes Lot 1B manquants : {', '.join(missing)}",
+            "hotel-pipeline lot1b <hotel>",
+        )
+
+    try:
+        input_manifest, selection_manifest = prepare_input(hotel_id)
+    except FileNotFoundError as exc:
+        raise StepBlocked(
+            "preflight",
+            f"preflight bloqué : corpus incomplet pour la reconstruction : {exc}",
+            "hotel-pipeline lot1b <hotel>",
+        ) from exc
+
+    mask_digest = generate_mask_set(workspace, input_manifest)
+    input_manifest.mask_set_digest = mask_digest
+    publish_input(input_manifest, workspace)
+    publish_selection(selection_manifest, workspace)
+    log.info(
+        "ReconstructionInputManifest prêt : %d assets sélectionnés",
+        len(input_manifest.selected_asset_ids),
+    )
+
+    builder = ViewGraphBuilder(workspace)
+    view_graph = builder.build(input_manifest)
+    publish_view_graph(view_graph, workspace)
+    log.info(
+        "ViewGraph prêt : %d images, %d paires valides, composante max=%d",
+        view_graph.report.images_selected,
+        view_graph.report.valid_pairs,
+        view_graph.report.largest_component,
+    )
+
+    planner = ReconstructionPlanner(workspace)
+    plan = planner.plan(input_manifest, view_graph.report)
+    publish_plan(plan, workspace)
+    log.info(
+        "ReconstructionPlan prêt : backends=%s",
+        ", ".join(plan.selected_backends),
+    )
+
+
+def _reconstruct(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
+    """Route de reconstruction et production du modèle 3D (Lot 2 — P2/P3)."""
+    from .reconstruction_input import prepare_input
+    from .reconstruction_plan import publish_plan
+    from .reconstruction_run import ReconstructionRunner, publish_run
+    from .reconstruction_consensus import ConsensusBuilder, publish_consensus
+    from .reconstruction_validation import build_validation_report, publish_validation_report
+
+    hotel_id = workspace.hotel_id
+    input_manifest = prepare_input(hotel_id)
+
+    plans_dir = workspace.path("07_reconstruction", "plans")
+    plan_files = sorted(plans_dir.glob("*.json")) if plans_dir.is_dir() else []
+    if not plan_files:
+        raise StepBlocked(
+            "reconstruct",
+            "reconstruct bloqué : aucun ReconstructionPlan publié — exécuter d'abord preflight (Lot 2)",
+            "hotel-pipeline reconstruction plan <hotel>",
+        )
+
+    plan_data = json.loads(plan_files[-1].read_text("utf-8"))
+    selected_backends = plan_data.get("selected_backends", ["colmap_incremental"])
+
+    runner = ReconstructionRunner(workspace)
+    completed_runs = []
+    for backend in selected_backends:
+        from .schemas.reconstruction import ReconstructionBackend
+        try:
+            be = ReconstructionBackend(backend)
+        except ValueError:
+            log.warning("backend inconnu dans le plan : %s", backend)
+            continue
+
+        run = runner.run(input_manifest, backend=be)
+        publish_run(run, workspace)
+        log.info(
+            "Run %s (%s) : %s",
+            run.run_id,
+            run.backend,
+            run.status,
+        )
+        if run.status == "completed":
+            completed_runs.append(run.run_id)
+
+    if len(completed_runs) >= 2:
+        try:
+            builder = ConsensusBuilder(workspace)
+            consensus = builder.build(completed_runs)
+            publish_consensus(consensus, workspace)
+            log.info(
+                "Consensus prêt : run sélectionné = %s",
+                consensus.selected_run_id,
+            )
+        except Exception as exc:
+            log.warning("consensus impossible : %s", exc)
+
+    # Validation préliminaire sur le meilleur run disponible
+    best_run = completed_runs[0] if completed_runs else None
+    if best_run:
+        report = build_validation_report(workspace, best_run)
+        publish_validation_report(report, workspace)
+        log.info("Validation préliminaire : %s", report.overall_status)
+
+
+def _align(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
+    """Géoréférencement, alignement et environnement composite (Lot 2 — P4)."""
+    from .reconstruction_consensus import ConsensusBuilder
+    from .geo_alignment import GeoAligner, publish_alignment
+
+    consensus_dir = workspace.path("07_reconstruction", "consensus")
+    consensus_files = sorted(consensus_dir.glob("*.json")) if consensus_dir.is_dir() else []
+    if not consensus_files:
+        raise StepBlocked(
+            "align",
+            "align bloqué : aucun consensus de reconstruction publié — exécuter d'abord reconstruct (Lot 2)",
+            "hotel-pipeline reconstruct <hotel>",
+        )
+
+    consensus_data = json.loads(consensus_files[-1].read_text("utf-8"))
+    selected_run_id = consensus_data.get("selected_run_id")
+    if not selected_run_id:
+        raise StepBlocked(
+            "align",
+            "align bloqué : le consensus n'a pas désigné de run sélectionné (Lot 2)",
+            "vérifier les runs de reconstruction",
+        )
+
+    aligner = GeoAligner(workspace)
+    manifest = aligner.align(selected_run_id)
+    publish_alignment(manifest, workspace)
+    log.info(
+        "Alignement géospatial prêt : scale=%.4f, rmse=%.3fm",
+        manifest.scale,
+        manifest.alignment_rmse_m,
+    )
+
+
+def _validate(workspace) -> None:  # noqa: ANN001 — Workspace, import circulaire
+    """Carte de confiance, comparaison aux références, rapport (Lot 2 — P5)."""
+    from .surface_confidence import SurfaceConfidenceBuilder, publish_surface_confidence
+    from .camera_feasibility import build_validated_camera_path, publish_validated_path
+
+    consensus_dir = workspace.path("07_reconstruction", "consensus")
+    consensus_files = sorted(consensus_dir.glob("*.json")) if consensus_dir.is_dir() else []
+    if not consensus_files:
+        raise StepBlocked(
+            "validate",
+            "validate bloqué : aucun consensus de reconstruction publié — exécuter d'abord reconstruct (Lot 2)",
+            "hotel-pipeline reconstruct <hotel>",
+        )
+
+    consensus_data = json.loads(consensus_files[-1].read_text("utf-8"))
+    selected_run_id = consensus_data.get("selected_run_id")
+    if not selected_run_id:
+        raise StepBlocked(
+            "validate",
+            "validate bloqué : le consensus n'a pas désigné de run sélectionné (Lot 2)",
+            "vérifier les runs de reconstruction",
+        )
+
+    # Confiance de surface post-reconstruction
+    builder = SurfaceConfidenceBuilder(workspace)
+    confidence = builder.build(selected_run_id)
+    publish_surface_confidence(confidence, workspace)
+    log.info("Confiance de surface publiée : %d zones", len(confidence.surfaces))
+
+    # Trajectoire validée
+    path = build_validated_camera_path(workspace, selected_run_id)
+    publish_validated_path(path, workspace)
+    log.info("Trajectoire validée : %d poses", len(path.poses))
+
+
 def run_step(name: str, workspace) -> None:  # noqa: ANN001
     """Exécute une étape."""
     if name == "collect":
@@ -369,6 +562,22 @@ def run_step(name: str, workspace) -> None:  # noqa: ANN001
 
     if name == "lot1b":
         _lot1b(workspace)
+        return
+
+    if name == "preflight":
+        _preflight(workspace)
+        return
+
+    if name == "reconstruct":
+        _reconstruct(workspace)
+        return
+
+    if name == "align":
+        _align(workspace)
+        return
+
+    if name == "validate":
+        _validate(workspace)
         return
 
     step = STEPS[name]

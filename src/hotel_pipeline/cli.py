@@ -4286,7 +4286,7 @@ def reconstruction_prepare_input(
     from .reconstruction_input import prepare_input, publish_input
 
     try:
-        manifest = prepare_input(
+        manifest, _ = prepare_input(
             hotel_id,
             allowed_backends=backend,
             mask_set_digest=mask_set_digest,
@@ -4324,7 +4324,7 @@ def reconstruction_preprocess(
     from .reconstruction_preprocess import generate_mask_set, publish_mask_set
 
     try:
-        input_manifest = prepare_input(hotel_id)
+        input_manifest, _ = prepare_input(hotel_id)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -4353,7 +4353,7 @@ def reconstruction_view_graph(
     from .view_graph import ViewGraphBuilder
 
     try:
-        input_manifest = prepare_input(hotel_id)
+        input_manifest, _ = prepare_input(hotel_id)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -4392,7 +4392,7 @@ def reconstruction_plan(
     from .reconstruction_plan import ReconstructionPlanner, publish_plan
 
     try:
-        input_manifest = prepare_input(hotel_id)
+        input_manifest, _ = prepare_input(hotel_id)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -4432,7 +4432,7 @@ def reconstruction_run(
     from .reconstruction_run import ReconstructionRunner, publish_run
 
     try:
-        input_manifest = prepare_input(hotel_id)
+        input_manifest, _ = prepare_input(hotel_id)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -4567,7 +4567,7 @@ def reconstruction_lidar_report(
     from .lidar_support import LiDARSupportAnalyzer, publish_lidar_report
 
     try:
-        input_manifest = prepare_input(hotel_id)
+        input_manifest, _ = prepare_input(hotel_id)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         typer.secho(f"✗ {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)

@@ -418,7 +418,26 @@ def generate_mask_set(
         if not mask_path.exists():
             mask_path.write_bytes(b"")
 
-        hasher.update(asset_id.encode("utf-8"))
-        hasher.update(mask_path.read_bytes())
+    hasher.update(asset_id.encode("utf-8"))
+    hasher.update(mask_path.read_bytes())
 
     return hasher.hexdigest()
+
+
+def publish_view_graph(
+    manifest: ViewGraphManifest,
+    workspace: Workspace,
+) -> Path:
+    """Publie le ViewGraphManifest sous `07_reconstruction/view_graphs/`."""
+    output_dir = workspace.path("07_reconstruction", "view_graphs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{manifest.view_graph_id}.json"
+    output_path.write_text(json.dumps(manifest.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n")
+    return output_path
+
+
+__all__ = [
+    "ViewGraphBuilder",
+    "generate_mask_set",
+    "publish_view_graph",
+]

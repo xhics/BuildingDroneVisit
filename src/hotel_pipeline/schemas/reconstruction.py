@@ -72,6 +72,11 @@ class ReconstructionInputManifest(BaseModel):
     #: Backends autorisés pour cette reconstruction.
     allowed_backends: list[str] = Field(default_factory=lambda: ["colmap_incremental"])
 
+    #: Cohortes temporelles séparées (point 17 du plan).
+    #: Clé = nom de cohorte, valeur = asset_ids.
+    #: Exemple : {"current_confirmed": [...], "historical": [...], "unknown": [...]}
+    temporal_cohorts: dict[str, list[str]] = Field(default_factory=dict)
+
     @model_validator(mode="after")
     def _no_overlap_between_selected_and_excluded(self) -> "ReconstructionInputManifest":
         overlap = set(self.selected_asset_ids) & set(self.excluded_asset_ids)

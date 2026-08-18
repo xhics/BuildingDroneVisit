@@ -195,12 +195,12 @@ class TestMediaLocks:
         assert result.exit_code == EXIT_BLOCKED
         assert "corpus incomplet" in result.stdout
 
-    def test_preflight_remains_the_unbuilt_boundary(self, confirmed):
-        """L'étape non construite reste `preflight`, au Lot 2."""
+    def test_preflight_blocks_on_incomplete_lot1b(self, confirmed):
+        """preflight est construit, mais bloque si le Lot 1B est incomplet."""
         result = runner.invoke(app, ["preflight", confirmed])
-        assert result.exit_code == EXIT_NOT_IMPLEMENTED
+        assert result.exit_code == EXIT_BLOCKED
         assert "preflight" in result.stdout
-        assert "Lot 2" in result.stdout
+        assert "Lot 1B" in result.stdout
 
 
 class TestOfflineGuard:

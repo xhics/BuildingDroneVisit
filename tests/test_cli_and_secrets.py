@@ -89,13 +89,13 @@ class TestCommands:
         assert runner.invoke(app, ["status", "h"]).stdout.count("autre") == 0
 
     def test_unimplemented_step_stops_cleanly(self, tmp_path, monkeypatch):
-        """Arrêt propre sur une étape non construite (acceptation Lot 0)."""
+        """Arrêt propre sur une étape dont les prérequis manquent."""
         monkeypatch.setenv("HOTEL_PIPELINE_WORK", str(tmp_path))
         runner.invoke(app, ["init", "h", "--address", "a"])
 
-        result = runner.invoke(app, ["preflight", "h"])
-        assert result.exit_code == 2
-        assert "preflight" in result.stdout
+        result = runner.invoke(app, ["align", "h"])
+        assert result.exit_code == 3
+        assert "align" in result.stdout
         assert "Lot 2" in result.stdout
 
     def test_status_on_unknown_hotel_is_actionable(self, tmp_path, monkeypatch):

@@ -117,7 +117,7 @@ def test_view_graph_builder_requires_min_two_assets(tmp_path: Path):
     workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
 
     from hotel_pipeline.reconstruction_input import prepare_input
-    input_manifest = prepare_input(hotel_id)
+    input_manifest, _ = prepare_input(hotel_id)
     builder = ViewGraphBuilder(workspace)
     with pytest.raises(ValueError, match="au moins deux assets"):
         builder.build(input_manifest)
@@ -128,7 +128,7 @@ def test_generate_mask_set_returns_sha256(tmp_path: Path):
     workspace = _write_minimal_workspace(tmp_path, hotel_id, asset_count=1)
 
     from hotel_pipeline.reconstruction_input import prepare_input
-    input_manifest = prepare_input(hotel_id)
+    input_manifest, _ = prepare_input(hotel_id)
     mask_digest = generate_mask_set(workspace, input_manifest)
     assert len(mask_digest) == 64
 
