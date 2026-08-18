@@ -205,8 +205,8 @@ def test_feed_forward_backends_fail_gracefully_when_binary_missing(tmp_path: Pat
     for backend_name, binary in [
         ("mapanything", "mapanything"),
         ("vggt", "vggt"),
-        ("gluemap", "gluemap"),
-        ("mpsfm", "mpsfm"),
+        ("gluemap", "GLUEMAP"),
+        ("mpsfm", "MP-SfM"),
     ]:
         from hotel_pipeline.schemas.reconstruction import ReconstructionBackend
         backend = ReconstructionBackend(backend_name)
