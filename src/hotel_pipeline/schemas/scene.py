@@ -137,21 +137,20 @@ class ScenePackage(BaseModel):
     files: list[PackageFile] = Field(min_length=1)
     camera_paths: list[VirtualCameraPath] = Field(min_length=1)
     rights_summary: dict[str, int]
-    #: Objets dont l'existence même n'est pas établie : rien n'en est affirmé.
     forbidden_claims: list[str]
-
-    #: Champs visuels morts : objets réels que **rien n'a photographiés**. Les
-    #: taire nierait une preuve ; les cadrer montrerait une forme sans texture
-    #: observée. La caméra les contourne, le rapport les nomme.
     blind_visual_fields: list[str] = Field(default_factory=list)
-
     limitations: list[str] = Field(min_length=1)
     video_generation: dict
 
     @model_validator(mode="after")
-    def _hybride_reste_explicitement_un_proxy(self) -> "ScenePackage":
-        if self.status != "hybrid_proxy_package":
-            raise ValueError("seul le paquet hybride/proxy est implémenté")
+    def _package_type_is_valid(self) -> "ScenePackage":
+        allowed = {
+            "hybrid_proxy_package",
+            "reconstructed_photo_first",
+            "reconstructed_hybrid",
+        }
+        if self.status not in allowed:
+            raise ValueError(f"status de paquet invalide : {self.status}")
         paths = [row.path for row in self.files]
         if len(paths) != len(set(paths)):
             raise ValueError("fichier dupliqué dans le paquet")

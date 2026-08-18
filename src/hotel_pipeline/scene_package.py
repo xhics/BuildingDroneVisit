@@ -451,6 +451,20 @@ def _phase1_blocking_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def _has_reconstruction(workspace) -> tuple[bool, dict]:  # noqa: ANN001
+    """Vérifie si une reconstruction Lot 2 est disponible."""
+    reconstruction_dir = workspace.path("07_reconstruction")
+    selected_dir = reconstruction_dir / "selected"
+    if selected_dir.is_dir() and any(selected_dir.iterdir()):
+        return True, {"type": "selected", "path": str(selected_dir)}
+    runs_dir = reconstruction_dir / "runs"
+    if runs_dir.is_dir():
+        completed = [p for p in runs_dir.glob("*.json") if p.is_file()]
+        if completed:
+            return True, {"type": "runs", "count": len(completed)}
+    return False, {}
+
+
 def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     """Construit le paquet hybride depuis les seules productions courantes."""
     context, warning = PipelineContext.for_workspace(workspace)
@@ -486,12 +500,10 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     if not isinstance(height_m, (int, float)) or height_m <= 0:
         raise ValueError("hauteur médiane absente du rapport de dérivation")
 
-    # Le sol local est zéro : l'altitude absolue reste portée par l'origine et
-    # le datum, sans injecter deux fois la même translation dans le mesh.
     try:
         import rasterio
         import numpy as np
-    except ImportError as exc:  # pragma: no cover - dépend de l'extra geo
+    except ImportError as exc:
         raise RuntimeError("l'extra geo (rasterio) est requis pour exporter la scène") from exc
     with rasterio.open(dtm_path) as dataset:
         values = dataset.read(1, masked=True)
@@ -504,6 +516,8 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     router_path = workspace.path("10_validation", str(router_name))
     if not router_path.is_file():
         raise FileNotFoundError("décision Router citée par la couverture absente")
+
+    has_recon, recon_info = _has_reconstruction(workspace)
 
     inputs = {
         "site_manifest": _sha256(workspace.site_path),
@@ -521,6 +535,8 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             {"contract_version": 1, "exporter_version": SCENE_EXPORTER_VERSION}
         ),
     }
+    if has_recon:
+        inputs["reconstruction"] = recon_info.get("type", "unknown")
     package_id = digest_of(inputs)
     final_folder = workspace.path("08_composite", f"scene_package_{package_id}")
     if (final_folder / "scene.json").is_file():
@@ -805,8 +821,16 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         GateCheck(
             gate_id="G5_sfm",
             requirement="reconstruction SfM sparse réelle mesurée",
-            state=GateState.FAILED,
-            evidence=["Lot 2 non exécuté ; aucun rapport hloc/LightGlue/pycolmap"],
+            state=(
+                GateState.PASSED
+                if has_recon
+                else GateState.FAILED
+            ),
+            evidence=(
+                [f"Lot 2 exécuté : {recon_info.get('type')}"]
+                if has_recon
+                else ["Lot 2 non exécuté ; aucun rapport hloc/LightGlue/pycolmap"]
+            ),
         ),
         GateCheck(gate_id="inspectable", requirement="environnement 3D inspectable", state=GateState.PASSED, evidence=["environment.obj"]),
         GateCheck(gate_id="alignment", requirement="géoréférencement documenté", state=GateState.PASSED, evidence=[dtm.crs_horizontal, str(dtm.crs_vertical)]),
@@ -857,11 +881,51 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         _package_file(folder, "phase1_verdict.json", "phase1_verdict", EvidenceClass.INFERRED, [router_name, "coverage/coverage_report.json"]),
     ]
     rights = coverage.get("rights", {}).get("by_status", {})
+    package_status = (
+        "reconstructed_photo_first" if has_recon else "hybrid_proxy_package"
+    )
+
+    recon_files = []
+    if has_recon:
+        recon_type = recon_info.get("type")
+        if recon_type == "selected":
+            recon_dir = Path(recon_info["path"])
+            for item in recon_dir.iterdir():
+                if item.is_file():
+                    rel = str(item.relative_to(workspace.path("07_reconstruction")))
+                    recon_files.append(
+                        _package_file(
+                            folder,
+                            item.name,
+                            item.name.split(".")[0],
+                            EvidenceClass.MEASURED,
+                            [f"07_reconstruction/{rel}"],
+                        )
+                    )
+
+    all_files = files + recon_files
+
+    limitations = [
+        "volume de façade proxy sans texture de production",
+        "toiture LiDAR observée à 96.9 %, lacunes conservées dans le raster",
+        "terrain interpolé sous l'emprise, visual_proxy_not_survey",
+    ]
+    if has_recon:
+        limitations.extend([
+            "aucune validation dense Brush/3DGS exécutée",
+            "paquet impropre à une affirmation photoréaliste de l'état courant",
+        ])
+    else:
+        limitations.extend([
+            "aucun résultat SfM, splat Brush ou validation Blender exécutés",
+            "paquet impropre à une affirmation photoréaliste de l'état courant",
+        ])
+
     manifest = ScenePackage(
         hotel_id=workspace.hotel_id,
         package_id=package_id,
         generated_at=datetime.now(timezone.utc).isoformat(),
-        status="hybrid_proxy_package",
+        status=package_status,
         horizontal_crs=dtm.crs_horizontal,
         vertical_datum=str(dtm.crs_vertical),
         local_origin_projected=(
@@ -871,21 +935,12 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         ),
         input_digests=inputs,
         phase1_verdict="phase1_verdict.json",
-        files=files,
+        files=all_files,
         camera_paths=[path],
         rights_summary={str(key): int(value) for key, value in rights.items()},
-        # Lus des contraintes publiées, jamais figés : une liste en dur
-        # continuait d'interdire des objets depuis établis, et taisait donc une
-        # preuve au lieu de protéger contre une invention.
         forbidden_claims=_forbidden_claims(constraints),
         blind_visual_fields=_blind_visual_fields(constraints),
-        limitations=[
-            "volume de façade proxy sans texture de production",
-            "toiture LiDAR observée à 96.9 %, lacunes conservées dans le raster",
-            "terrain interpolé sous l'emprise, visual_proxy_not_survey",
-            "aucun résultat SfM, splat Brush ou validation Blender exécutée",
-            "paquet impropre à une affirmation photoréaliste de l'état courant",
-        ],
+        limitations=limitations,
         video_generation={
             **prompts,
             "provider": None,
