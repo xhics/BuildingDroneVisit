@@ -11,6 +11,8 @@ plutôt que d'imposer une contrainte fausse au générateur.
 
 from __future__ import annotations
 
+import os
+
 import json
 import math
 from dataclasses import dataclass, field
@@ -222,6 +224,131 @@ def orbit_camera(
     )
 
 
+@dataclass
+class _FrameJob:
+    """Ce qu'une image a besoin de savoir, identique d'une pose à l'autre.
+
+    Regroupé pour n'être transmis qu'une fois par processus : la scène et son
+    environnement pèsent lourd, et les réexpédier à chaque image annulerait le
+    gain de la répartition.
+    """
+
+    scene: ConditioningScene
+    environment: object
+    support: SupportMap | None
+    output_dir: Path
+    distance: float
+    fov_deg: float
+    width: int
+    height: int
+    near: float
+    far: float
+    write_images: bool
+
+
+#: Job du processus courant, posé une fois à l'ouverture du pool.
+_WORKER_JOB: "_FrameJob | None" = None
+
+
+def _worker_init(job: "_FrameJob") -> None:
+    global _WORKER_JOB
+    _WORKER_JOB = job
+
+
+def _worker_render(pose: tuple[int, float, float]) -> "FrameRecord":
+    assert _WORKER_JOB is not None
+    return _render_one(_WORKER_JOB, pose)
+
+
+def _render_one(job: "_FrameJob", pose: tuple[int, float, float]) -> "FrameRecord":
+    """Rend une image et écrit ses cartes. Sans effet sur les autres poses."""
+    index, bearing, altitude = pose
+    camera = orbit_camera(
+        job.scene, bearing, altitude, job.distance, job.fov_deg, job.width, job.height
+    )
+    frame = render_frame(job.scene, camera, job.environment)
+    photo_support, nearest = (
+        job.support.support_at(bearing) if job.support is not None else (None, None)
+    )
+    mode, reason = _grade(frame, photo_support)
+
+    files: dict[str, str] = {}
+    if job.write_images:
+        stem = f"{index:04d}.png"
+        write_png(
+            job.output_dir / "depth" / stem,
+            depth_to_png(frame.depth, job.near, job.far),
+        )
+        write_png(job.output_dir / "normal" / stem, normal_to_png(frame.normal))
+        write_png(
+            job.output_dir / "silhouette" / stem, silhouette_to_png(frame.silhouette)
+        )
+        write_png(
+            job.output_dir / "confidence" / stem, confidence_to_png(frame.confidence)
+        )
+        files = {
+            "depth": f"depth/{stem}",
+            "normal": f"normal/{stem}",
+            "silhouette": f"silhouette/{stem}",
+            "confidence": f"confidence/{stem}",
+        }
+
+    return FrameRecord(
+        index=index,
+        bearing_deg=bearing % 360.0,
+        altitude_m=altitude,
+        distance_m=job.distance,
+        stats=frame.stats(),
+        guidance_mode=mode,
+        guidance_reason=reason,
+        photo_support=1.0 if photo_support is None else photo_support,
+        nearest_reference=nearest,
+        files=files,
+    )
+
+
+def _worker_count(requested: int | None, frames: int) -> int:
+    """Combien de processus ouvrir, sans en ouvrir pour rien."""
+    if requested is not None:
+        return max(1, min(requested, frames))
+    # Les cœurs physiques, non les logiques : le rastériseur sature déjà son
+    # cœur, et deux fils sur le même n'y ajoutent rien.
+    available = os.cpu_count() or 1
+    return max(1, min(available // 2 or 1, frames))
+
+
+def _render_poses(
+    job: "_FrameJob", poses: list[tuple[int, float, float]], workers: int | None
+) -> list["FrameRecord"]:
+    """Rend toutes les poses, réparties sur les cœurs disponibles.
+
+    Un seul processus demandé — ou une seule image — reste en direct : ouvrir
+    un pool pour cela coûterait plus que le calcul lui-même. Un pool qui refuse
+    de démarrer n'arrête pas le rendu : on retombe sur la boucle séquentielle,
+    plus lente mais sûre.
+    """
+    count = _worker_count(workers, len(poses))
+    if count <= 1 or len(poses) <= 1:
+        return [_render_one(job, pose) for pose in poses]
+
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(
+            max_workers=count, initializer=_worker_init, initargs=(job,)
+        ) as pool:
+            records = list(pool.map(_worker_render, poses, chunksize=1))
+    except Exception as exc:  # noqa: BLE001 - repli délibérément large
+        log.warning(
+            "rendu réparti indisponible (%s) : retour au rendu séquentiel", exc
+        )
+        return [_render_one(job, pose) for pose in poses]
+
+    log.info("rendu réparti sur %d processus", count)
+    # `pool.map` conserve l'ordre, mais l'index le dit sans avoir à le supposer.
+    return sorted(records, key=lambda r: r.index)
+
+
 def render_sequence(
     scene: ConditioningScene,
     output_dir: Path,
@@ -237,6 +364,7 @@ def render_sequence(
     write_images: bool = True,
     support: SupportMap | None = None,
     environment=None,  # noqa: ANN001
+    workers: int | None = None,
 ) -> SequenceResult:
     """Rend l'orbite descendante et écrit les cartes de conditionnement."""
     output_dir = Path(output_dir)
@@ -263,53 +391,32 @@ def render_sequence(
         end_altitude_m = max(target_height * END_ALTITUDE_RATIO, 3.0)
     near, far = max(distance - radius * 2.0, 1.0), distance + radius * 2.5
 
-    records: list[FrameRecord] = []
+    poses = []
     for i in range(frame_count):
         t = i / max(frame_count - 1, 1)
         bearing = start_bearing_deg + arc_deg * t
         # Descente en ease-out : l'approche ralentit près du sol.
         altitude = end_altitude_m + (start_altitude_m - end_altitude_m) * (1.0 - t) ** 1.6
-        camera = orbit_camera(
-            scene, bearing, altitude, distance, fov_deg, width, height
-        )
-        frame = render_frame(scene, camera, environment)
-        photo_support, nearest = (
-            support.support_at(bearing) if support is not None else (None, None)
-        )
-        mode, reason = _grade(frame, photo_support)
+        poses.append((i, bearing, altitude))
 
-        files: dict[str, str] = {}
-        if write_images:
-            stem = f"{i:04d}.png"
-            write_png(output_dir / "depth" / stem, depth_to_png(frame.depth, near, far))
-            write_png(output_dir / "normal" / stem, normal_to_png(frame.normal))
-            write_png(
-                output_dir / "silhouette" / stem, silhouette_to_png(frame.silhouette)
-            )
-            write_png(
-                output_dir / "confidence" / stem, confidence_to_png(frame.confidence)
-            )
-            files = {
-                "depth": f"depth/{stem}",
-                "normal": f"normal/{stem}",
-                "silhouette": f"silhouette/{stem}",
-                "confidence": f"confidence/{stem}",
-            }
+    job = _FrameJob(
+        scene=scene,
+        environment=environment,
+        support=support,
+        output_dir=output_dir,
+        distance=distance,
+        fov_deg=fov_deg,
+        width=width,
+        height=height,
+        near=near,
+        far=far,
+        write_images=write_images,
+    )
 
-        records.append(
-            FrameRecord(
-                index=i,
-                bearing_deg=bearing % 360.0,
-                altitude_m=altitude,
-                distance_m=distance,
-                stats=frame.stats(),
-                guidance_mode=mode,
-                guidance_reason=reason,
-                photo_support=1.0 if photo_support is None else photo_support,
-                nearest_reference=nearest,
-                files=files,
-            )
-        )
+    # Les images sont indépendantes : chacune part d'une pose et n'écrit que
+    # ses propres fichiers. Les répartir sur les cœurs disponibles est le seul
+    # gain qui reste sans toucher au rastériseur lui-même.
+    records = _render_poses(job, poses, workers)
 
     result = SequenceResult(
         hotel_id=scene.hotel_id,

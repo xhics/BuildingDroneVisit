@@ -7662,6 +7662,11 @@ def conditioning_audit(
 def conditioning_render(
     hotel_id: str = typer.Argument(...),
     frames: int = typer.Option(90, "--frames", help="Nombre de poses rendues."),
+    workers: int = typer.Option(
+        0,
+        "--workers",
+        help="Processus de rendu en parallèle. 0 laisse choisir selon les cœurs.",
+    ),
     arc: float = typer.Option(180.0, "--arc", help="Étendue angulaire, en degrés."),
     start_bearing: float = typer.Option(
         200.0, "--start-bearing", help="Azimut de départ, en degrés."
@@ -7921,6 +7926,7 @@ def conditioning_render(
         end_altitude_m=end_altitude,
         width=width,
         height=height,
+        workers=workers or None,
     )
 
     typer.secho(f"{OK} {len(result.frames)} frame(s) dans {destination}", fg=typer.colors.GREEN)

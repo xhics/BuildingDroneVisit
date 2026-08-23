@@ -490,6 +490,7 @@ def _rasterise(
     confidence: np.ndarray,
     silhouette_value: int,
     confidence_value: float,
+    projected: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     """Projette un triangle et l'inscrit s'il est plus proche que le z-buffer.
 
@@ -498,14 +499,20 @@ def _rasterise(
     produire des occultations incohérentes entre un massif et un mur.
     """
     h, w = depth.shape
-    screen, zcam = _project(tri, camera)
-    if np.any(zcam <= 0.05):
-        return
-
-    a, b, c = screen
-    area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
-    if abs(area) < 1e-9:
-        return
+    if projected is not None:
+        # Le pré-filtre a déjà projeté ce triangle et validé sa profondeur
+        # comme son aire : refaire les deux ne changerait aucun pixel.
+        screen, zcam = projected
+        a, b, c = screen
+        area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+    else:
+        screen, zcam = _project(tri, camera)
+        if np.any(zcam <= 0.05):
+            return
+        a, b, c = screen
+        area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+        if abs(area) < 1e-9:
+            return
 
     min_x = max(int(np.floor(screen[:, 0].min())), 0)
     max_x = min(int(np.ceil(screen[:, 0].max())), w - 1)
@@ -554,25 +561,58 @@ def _rasterise(
         nx, ny, nz = -nx, -ny, -nz
     face_normal = np.array([nx, ny, nz])
 
-    region_depth = depth[min_y : max_y + 1, min_x : max_x + 1]
+    # Le découpage numpy rend une vue, non une copie : écrire dedans écrit
+    # dans la carte. Les quatre recopies qui suivaient étaient sans effet.
+    rows, cols = slice(min_y, max_y + 1), slice(min_x, max_x + 1)
+    region_depth = depth[rows, cols]
     closer = inside & (tri_depth < region_depth) & (tri_depth > 0)
     if not closer.any():
         return
 
     region_depth[closer] = tri_depth[closer]
-    depth[min_y : max_y + 1, min_x : max_x + 1] = region_depth
+    silhouette[rows, cols][closer] = silhouette_value
+    normal[rows, cols][closer] = face_normal
+    confidence[rows, cols][closer] = confidence_value
 
-    sil = silhouette[min_y : max_y + 1, min_x : max_x + 1]
-    sil[closer] = silhouette_value
-    silhouette[min_y : max_y + 1, min_x : max_x + 1] = sil
 
-    nrm = normal[min_y : max_y + 1, min_x : max_x + 1]
-    nrm[closer] = face_normal
-    normal[min_y : max_y + 1, min_x : max_x + 1] = nrm
+def _keep_mask(faces: list, camera: Camera):
+    """Quels triangles peuvent toucher l'image, décidé en une seule passe.
 
-    cnf = confidence[min_y : max_y + 1, min_x : max_x + 1]
-    cnf[closer] = confidence_value
-    confidence[min_y : max_y + 1, min_x : max_x + 1] = cnf
+    Le rastériseur rejette déjà ce qui sort du cadre — mais il le fait un
+    triangle à la fois, après un appel de fonction et une projection. Les
+    projeter tous ensemble et n'entrer dans la boucle que pour les survivants
+    remplace des dizaines de milliers d'appels Python par trois opérations
+    numpy.
+
+    La projection est rendue avec le verdict : `_rasterise` la reprendrait
+    sinon à l'identique, et la calculer deux fois annulait le gain.
+    """
+    if not faces:
+        return np.zeros(0, dtype=bool), None, None
+
+    corners = np.asarray([tri for tri, *_rest in faces], dtype=np.float64)
+    flat = corners.reshape(-1, 3)
+    screen, zcam = _project(flat, camera)
+    screen = screen.reshape(len(faces), 3, 2)
+    zcam = zcam.reshape(len(faces), 3)
+
+    # Un sommet derrière la caméra suffit à écarter : c'est exactement la
+    # condition que `_rasterise` applique ensuite.
+    keep = (zcam > 0.05).all(axis=1)
+
+    # Boîte du triangle entièrement hors cadre : rien à inscrire.
+    keep &= screen[:, :, 0].max(axis=1) >= 0.0
+    keep &= screen[:, :, 0].min(axis=1) <= camera.width - 1
+    keep &= screen[:, :, 1].max(axis=1) >= 0.0
+    keep &= screen[:, :, 1].min(axis=1) <= camera.height - 1
+
+    # Triangle dégénéré à l'écran : aire nulle, aucun pixel couvert.
+    a, b, c = screen[:, 0], screen[:, 1], screen[:, 2]
+    area = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (c[:, 0] - a[:, 0]) * (
+        b[:, 1] - a[:, 1]
+    )
+    keep &= np.abs(area) >= 1e-9
+    return keep, screen, zcam
 
 
 def _prism_bounds(prism: Prism) -> tuple[np.ndarray, float]:
@@ -679,7 +719,11 @@ def render_frame(
         if not _visible(_prism_bounds(prism), camera):
             continue
         base_conf = prism.confidence
-        for tri, is_roof in _prism_faces(prism):
+        faces = _prism_faces(prism)
+        keep, screens, zcams = _keep_mask(faces, camera)
+        for slot, ((tri, is_roof), wanted) in enumerate(zip(faces, keep)):
+            if not wanted:
+                continue
             _rasterise(
                 tri,
                 camera,
@@ -692,6 +736,7 @@ def render_frame(
                 # qu'une fermeture géométrique, égal aux murs quand un nDSM
                 # aérien l'atteste directement.
                 confidence_value=prism.roof_confidence if is_roof else base_conf,
+                projected=(screens[slot], zcams[slot]),
             )
 
     # La végétation est rendue après les volumes bâtis : elle les occulte
