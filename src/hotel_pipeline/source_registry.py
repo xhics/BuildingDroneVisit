@@ -103,7 +103,7 @@ _FAMILIES = (
     ("discovery_directories", "C", None, True),
     ("yelp_apple_bing", "C", None, True),
     ("mapillary", "STREET_OPEN", "mapillary", True),
-    ("kartaview", "STREET_OPEN", None, True),
+    ("kartaview", "STREET_OPEN", "kartaview", True),
     ("panoramax", "MONITOR", None, False),
     ("wikimedia_commons", "MONITOR", "commons", False),
     ("street_view", "STREET", "street_view", True),

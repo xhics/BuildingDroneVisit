@@ -379,6 +379,10 @@ def assess(
     # traversait des voisins hors sujet et coûtait pour rien.
     reach = _reach(origin, target_shape)
 
+    # Index spatial STRtree : évite d'itérer tous les obstacles pour chaque
+    # rayon. Construit une seule fois, réutilisé sur toutes les cellules.
+    obstacle_tree = _build_obstacle_tree(obstacles)
+
     weights = {partition: 0.0 for partition in RayPartition}
     rays: list[RayAssessment] = []
     at_risk: set[str] = set()
@@ -390,7 +394,7 @@ def assess(
     for bearing, width in cells(start, span, policy):
         partition, ray = _assess_cell(
             origin, bearing, width, target_shape, obstacles, camera, target_vertical,
-            policy, reach, vertical,
+            policy, reach, vertical, obstacle_tree=obstacle_tree,
         )
         weights[partition] += width
         rays.append(ray)
@@ -438,10 +442,27 @@ def _reach(origin, target_shape) -> float:  # noqa: ANN001
     return farthest * 1.05 + 1.0
 
 
+def _build_obstacle_tree(obstacles: list[Obstacle]):  # noqa: ANN202
+    """Construit un index STRtree des obstacles (P4.3).
+
+    Retourne None si shapely/strtree est indisponible ou s'il n'y a pas
+    d'obstacles : l'appelant retombe alors sur l'itération complète.
+    """
+    if not obstacles:
+        return None
+    try:
+        from shapely.strtree import STRtree
+
+        return STRtree([obs.shape for obs in obstacles])
+    except Exception:
+        return None
+
+
 def _assess_cell(
     origin, bearing: float, width: float, target_shape, obstacles: list[Obstacle],  # noqa: ANN001
     camera: CameraVertical, target_vertical: TargetVertical, policy, reach: float,  # noqa: ANN001
     vertical: object = None,
+    obstacle_tree=None,
 ) -> tuple[RayPartition, RayAssessment]:
     precision = policy.output_precision
     ray = _ray(origin, bearing, reach)
@@ -455,10 +476,22 @@ def _assess_cell(
             partition=RayPartition.CLEAR_2D,
         )
 
+    # Index spatial : on ne teste que les obstacles dont la boîte englobante
+    # croise celle du rayon, au lieu de tous les obstacles pour chaque cellule.
+    if obstacle_tree is not None:
+        try:
+            from shapely.geometry import box
+
+            candidates = [obstacles[i] for i in obstacle_tree.query(box(*ray.bounds))]
+        except Exception:
+            candidates = obstacles
+    else:
+        candidates = obstacles
+
     # Seuls comptent les obstacles **avant** la cible : derrière, ils ne
     # masquent rien, et les compter condamnait des vues parfaitement dégagées.
     interposed: list[tuple[float, Obstacle]] = []
-    for obstacle in obstacles:
+    for obstacle in candidates:
         hit = _first_hit(origin, ray, obstacle.shape)
         if hit is None or hit >= target_distance - policy.intersection_tolerance_m:
             continue

@@ -35,25 +35,64 @@ class MaskSet(BaseModel):
 
 
 def _mask_sky(image: np.ndarray) -> np.ndarray:
-    """Masque le ciel par seuillage couleur HSV (MVP heuristique)."""
+    """Masque le ciel : couleur bleue OU zone très claire, en haut du cadre.
+
+    Le seuillage bleu seul masque le bardage bleu, le verre et la façade à
+    l'ombre — c'est-à-dire précisément ce qu'on veut reconstruire. Deux
+    garde-fous : (1) le ciel couvre aussi le cas couvert/blanc, non bleu, et
+    (2) il est contigu au haut de l'image. On ne retient donc que les
+    composantes qui touchent le bord supérieur.
+    """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lower = np.array([80, 20, 150])
-    upper = np.array([130, 255, 255])
-    mask = cv2.inRange(hsv, lower, upper)
+    h, w = image.shape[:2]
+
+    blue = cv2.inRange(hsv, np.array([90, 20, 150]), np.array([135, 255, 255]))
+    # Ciel couvert : peu saturé, très lumineux.
+    overcast = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 40, 255]))
+    candidate = cv2.bitwise_or(blue, overcast)
+
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel)
+
+    # Ne garder que ce qui est connecté au bord supérieur du cadre.
+    n_labels, labels = cv2.connectedComponents(candidate)
+    if n_labels <= 1:
+        return np.zeros((h, w), dtype=np.uint8)
+    top_band = labels[: max(1, int(h * 0.05)), :]
+    top_labels = {int(v) for v in np.unique(top_band) if v != 0}
+    if not top_labels:
+        return np.zeros((h, w), dtype=np.uint8)
+    mask = np.isin(labels, list(top_labels)).astype(np.uint8) * 255
     return mask
 
 
 def _mask_water(image: np.ndarray) -> np.ndarray:
-    """Masque l'eau par seuillage couleur (MVP heuristique)."""
+    """Masque l'eau : surfaces bleu-cyan saturées, dans la moitié basse.
+
+    Distinct du ciel : l'eau d'une piscine est plus saturée, moins lumineuse,
+    et se trouve au sol. Restreindre au bas du cadre évite de masquer le ciel
+    une seconde fois sous un autre nom.
+    """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lower = np.array([80, 30, 80])
-    upper = np.array([130, 255, 255])
-    mask = cv2.inRange(hsv, lower, upper)
+    h, w = image.shape[:2]
+
+    water = cv2.inRange(hsv, np.array([85, 60, 40]), np.array([110, 255, 220]))
+
+    # Zone basse uniquement.
+    region = np.zeros((h, w), dtype=np.uint8)
+    region[int(h * 0.4):, :] = 255
+    mask = cv2.bitwise_and(water, region)
+
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
+
+    # Une nappe d'eau est étendue : éliminer le bruit ponctuel.
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filtered = np.zeros_like(mask)
+    for cnt in contours:
+        if cv2.contourArea(cnt) > 1000:
+            cv2.drawContours(filtered, [cnt], -1, 255, -1)
+    return filtered
 
 
 def _generate_mask(image_path: Path, mask_classes: list[str]) -> np.ndarray:
@@ -185,7 +224,9 @@ def _mask_mobile_furniture(image: np.ndarray) -> np.ndarray:
         if len(approx) >= 4:
             x, y, bw, bh = cv2.boundingRect(cnt)
             if bh > 15 and bw > 15:
-                cv2.rectangle(mask, (x, y + int(h * 0.6)), (x + bw, y + int(h * 0.6) + bh), 255, -1)
+                # `y` est relatif à `bottom_region` : on le décale une fois.
+                y_full = y + int(h * 0.6)
+                cv2.rectangle(mask, (x, y_full), (x + bw, y_full + bh), 255, -1)
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
@@ -216,7 +257,12 @@ def generate_mask_set(
     hasher = hashlib.sha256()
     asset_mask_paths: dict[str, str] = {}
 
-    for asset_id in input_manifest.selected_asset_ids:
+    # Le digest engage le CONTENU des masques et les paramètres de génération.
+    # Hacher les seuls chemins rendrait le manifeste insensible à un changement
+    # de masque ou de classes — la reproductibilité annoncée serait fausse.
+    hasher.update(("classes:" + ",".join(sorted(mask_classes))).encode("utf-8"))
+
+    for asset_id in sorted(input_manifest.selected_asset_ids):
         mask_path = mask_dir / f"{asset_id}.png"
         image_path = _resolve_image_path(workspace, asset_id)
         if image_path and image_path.is_file():
@@ -227,6 +273,7 @@ def generate_mask_set(
         relative = str(mask_path.relative_to(workspace.path("05_colmap")))
         asset_mask_paths[asset_id] = relative
         hasher.update(relative.encode("utf-8"))
+        hasher.update(mask_path.read_bytes() if mask_path.is_file() else b"")
 
     digest = hasher.hexdigest()
     mask_set = MaskSet(

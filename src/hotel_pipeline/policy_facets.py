@@ -147,6 +147,14 @@ FACET_FIELDS: dict[Facet, tuple[str, ...]] = {
         "model.subject_accept",
         "model.subject_reject",
         "model.review_confidence_floor",
+        # Lecture pixel de la prominence : les descriptions et leurs seuils
+        # décrivent un site. Les changer périme les scores, comme changer le
+        # modèle lui-même — d'où leur place dans cette facette et non dans
+        # `candidate_geometry`, qui ne parle que de géométrie.
+        "geometry.subject_prompt",
+        "geometry.absence_prompts",
+        "geometry.prominence_accept",
+        "geometry.prominence_partial",
     ),
     Facet.TEMPORAL: (
         "temporal.allow_unknown_for_geometry",

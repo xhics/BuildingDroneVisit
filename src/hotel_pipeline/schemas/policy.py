@@ -101,6 +101,35 @@ class GeometryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     half_fov_deg: float = Field(default=45.0, gt=0, le=180)
+
+    #: Description du sujet recherché, pour la lecture pixel de prominence.
+    #: Portable : un hôtel de centre-ville ne se décrit pas comme un motel de
+    #: banlieue, et les seuils calibrés sur l'un ne valent pas pour l'autre.
+    subject_prompt: str = Field(
+        default=(
+            "a large hotel or motel building filling most of the photograph, "
+            "its facade clearly visible"
+        ),
+        min_length=1,
+    )
+
+    #: Scènes concrètes que le corpus contient **quand le sujet manque**.
+    #: Jamais des négations : CLIP n'encode pas « sans bâtiment ». Ces valeurs
+    #: décrivent une banlieue nord-américaine ; un autre site en demande
+    #: d'autres — rue commerçante dense, front de mer, cour intérieure.
+    absence_prompts: tuple[str, ...] = (
+        "an empty road, parking lot or snowbank with no building nearby",
+        "a distant skyline where buildings are tiny specks on the horizon",
+        "trees, street lights and utility poles occupying the frame",
+        "a residential house or small commercial storefront",
+    )
+
+    #: Seuils de prominence. Calibrés sur 47 décisions humaines du pilote :
+    #: 0,60 donne 100 % de précision pour 32 % de rappel. Le rappel est assumé
+    #: — la bande « partielle » récupère le reste — mais un autre site voudra
+    #: recalibrer plutôt que d'hériter ces nombres.
+    prominence_accept: float = Field(default=0.60, ge=0.0, le=1.0)
+    prominence_partial: float = Field(default=0.15, ge=0.0, le=1.0)
     max_distance_m: float = Field(default=200.0, gt=0)
 
     #: Contiguïté franche puis association plausible entre bâtiment et parking.

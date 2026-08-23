@@ -310,7 +310,7 @@ def test_a_written_report_carries_both_levels(tmp_path, monkeypatch) -> None:
         "--lat", "45.573", "--lon", "-73.443",
     ])
 
-    from tests.test_plan import candidate, demand  # noqa: PLC0415
+    from test_plan import candidate, demand  # noqa: PLC0415
 
     workspace = Workspace("hotel-test")
     workspace.write_json(

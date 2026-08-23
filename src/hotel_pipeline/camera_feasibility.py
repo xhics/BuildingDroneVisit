@@ -19,6 +19,7 @@ from .schemas.reconstruction import (
     CameraFeasibilityField,
     ValidatedCameraPath,
 )
+from .reconstruction_consensus import resolve_model_dir
 from .workspace import Workspace
 
 
@@ -51,9 +52,7 @@ def _load_run_points(reconstruction_run_id: str, workspace: Workspace) -> np.nda
     output_path = run_data.get("output_path")
     if not output_path:
         return None
-    run_dir = Path(output_path)
-    if not run_dir.is_dir():
-        run_dir = run_dir.parent
+    run_dir = resolve_model_dir(output_path)
 
     normalized_dir = run_dir / "normalized"
     if not normalized_dir.is_dir():

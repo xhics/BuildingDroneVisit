@@ -7,11 +7,15 @@ rejouable, détecte un résultat existant, et n'expose aucun secret.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 import requests
 import typer
+from pydantic import ValidationError
 
 from . import __version__, logging as pipeline_logging
 from .config import check_providers, load_env
@@ -21,6 +25,7 @@ from .providers.cache import OfflineError
 from .providers.geocode import GeocodingError
 from .providers.overpass import OverpassError
 from .schemas import ProjectManifest, StepRecord
+from .schemas.acquisition import RecommendationLevel
 from .steps import STEP_ORDER, STEPS, StepBlocked, StepNotImplemented, run_step
 from .workspace import SUBDIRS, Workspace
 
@@ -1280,7 +1285,10 @@ def assets_plan(
 
     coverage = _check_coverage(workspace, demands.demands)
 
-    digests = _plan_digests(workspace, context, candidates_payload, demands_payload)
+    digests = _plan_digests(
+        workspace, context, candidates_payload, demands_payload,
+        candidates_path=Path(path),
+    )
     geometries, geometry_report = _candidate_geometries(
         workspace, context, candidates.candidates, demands.demands
     )
@@ -1645,10 +1653,19 @@ def _latest_candidates(workspace) -> Path | None:  # noqa: ANN001
     return found[-1] if found else None
 
 
-def _plan_digests(workspace, context, candidates_payload, demands_payload) -> dict:  # noqa: ANN001
+def _plan_digests(  # noqa: ANN001
+    workspace, context, candidates_payload, demands_payload,
+    candidates_path=None,
+) -> dict:
     """Toutes les empreintes qu'un plan exécutable doit porter.
 
     Une absente n'est pas comblée : le plan restera brouillon, et le dira.
+
+    `candidates_path` enregistre **quel** manifeste a été planifié. Sans lui,
+    la relecture retombait sur le manifeste courant : un plan bâti sur une
+    découverte ciblée — écrite sous `01_sources/targeted/` — se comparait
+    alors à un autre fichier et échouait sur une empreinte divergente, alors
+    que rien n'avait changé.
     """
     from .provenance import digest_of
 
@@ -1662,7 +1679,17 @@ def _plan_digests(workspace, context, candidates_payload, demands_payload) -> di
         g for g in geometry.get("geometries", []) if g.get("role") == "obstacle_building"
     ]
 
+    reference = None
+    if candidates_path is not None:
+        try:
+            reference = _candidate_manifest_reference(workspace, candidates_path)
+        except ValueError:
+            # Hors workspace : le plan reste lisible, mais non rejouable. On
+            # ne fabrique pas une référence qui ne se relirait pas.
+            reference = None
+
     return {
+        "candidate_manifest_ref": reference,
         "candidate_manifest_digest": digest_of(candidates_payload),
         "demand_digest": digest_of(demands_payload),
         "policy_digest": context.provenance["policy_digest"],
@@ -1723,11 +1750,17 @@ def assets_acquire(
     plan_payload = json.loads(Path(path).read_text("utf-8"))
     plan = AcquisitionPlan.model_validate(plan_payload)
 
-    candidates_path = _latest_candidates(workspace)
-    if candidates_path is None:
-        typer.secho(f"{KO} aucun manifeste de candidats", fg=typer.colors.RED, err=True)
+    # Le manifeste **du plan**, non le plus récent : un plan bâti sur une
+    # découverte ciblée se comparait sinon à un autre fichier et se déclarait
+    # périmé alors que rien n'avait changé. `_candidate_manifest_for_plan`
+    # confronte déjà l'empreinte et refuse une référence hors workspace.
+    try:
+        candidates_path, candidates_payload = _candidate_manifest_for_plan(
+            workspace, plan
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    candidates_payload = json.loads(candidates_path.read_text("utf-8"))
     candidates = {
         c.candidate_id: c
         for c in CandidateManifest.model_validate(candidates_payload).candidates
@@ -1764,8 +1797,11 @@ def assets_acquire(
         raise typer.Exit(code=3)
 
     manifest = workspace.read_assets() or AssetManifest(hotel_id=hotel_id, assets=[])
-    merged = merge(manifest.assets, acquired)
-    manifest.assets = merged.assets
+    # `merge` complète `manifest.assets` **en place** et rend un rapport de
+    # fusion — non une liste. Lui demander `.assets` levait un AttributeError
+    # après un téléchargement pourtant réussi : les fichiers étaient sur le
+    # disque, le manifeste ne les voyait pas.
+    merge_report = merge(manifest.assets, acquired)
     workspace.write_assets(manifest)
     workspace.write_report(f"01_sources/acquisition_{run_id}.json", report, context, production="AcquiredImage")
 
@@ -2366,11 +2402,28 @@ def assets_classify(
         except ImportError:
             typer.secho("  · OpenCLIP absent — étape 4 ignorée", fg=typer.colors.YELLOW)
 
+    # Empreinte confirmée : elle rend le test de cadrage mesuré possible, et
+    # ce test prime sur le classifieur. Sans elle, la cascade retombe sur
+    # l'avis du modèle seul.
+    building_wkt = None
+    confirmed = getattr(spatial, "confirmed_building_id", None)
+    if confirmed:
+        for candidate in getattr(spatial, "candidates", []) or []:
+            if getattr(candidate, "feature_id", None) == confirmed:
+                building_wkt = getattr(candidate, "wkt", None)
+                break
+    if building_wkt is None:
+        typer.secho(
+            "  · empreinte du bâtiment absente — cadrage mesuré indisponible",
+            fg=typer.colors.YELLOW,
+        )
+
     report = classify(
         manifest.assets,
         classifier=classifier,
         front_azimuth=front.degrees if front else None,
         policy=context.policy,
+        building_wkt=building_wkt,
     )
     workspace.write_assets(manifest)
     workspace.write_report("01_sources/classification_report.json", report, context, production="ClassificationReport")
@@ -3090,6 +3143,11 @@ def _reference_position(context, workspace) -> tuple[float, float] | None:  # no
 def geo_discover(
     hotel_id: str = typer.Argument(...),
     no_sizes: bool = typer.Option(False, "--no-sizes", help="Ne pas mesurer les volumes."),
+    scene: bool = typer.Option(
+        False,
+        "--scene",
+        help="Interroger l'emprise de la scène rendue, obstacles compris.",
+    ),
 ) -> None:
     """Découvre les tuiles LiDAR couvrant l'empreinte. **Ne télécharge aucun LAZ.**"""
     from .geo import CoverageState, route
@@ -3128,7 +3186,30 @@ def geo_discover(
         raise typer.Exit(code=3)
 
     typer.echo(f"  source      {adapter.source_id}")
-    result = adapter(building.wkt, measure_sizes=not no_sizes)
+
+    # L'empreinte du bâtiment cible ne mesure que quelques dizaines de mètres,
+    # alors qu'une scène rendue porte aussi les volumes qui l'occultent — plus
+    # d'un kilomètre sur ce pilote. Interroger l'index à l'échelle de la seule
+    # cible laissait donc vingt volumes sur vingt-sept hors des tuiles obtenues,
+    # et autant de hauteurs supposées faute d'avoir demandé la bonne emprise.
+    query_wkt = building.wkt
+    if scene:
+        from .conditioning.scene_extent import scene_envelope_wkt
+
+        geometry_path = workspace.path("06_geo", "capture_geometry.json")
+        envelope = (
+            scene_envelope_wkt(geometry_path) if geometry_path.is_file() else None
+        )
+        if envelope is None:
+            typer.secho(
+                "  aucune géométrie de scène : emprise du bâtiment seul",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            query_wkt = envelope
+            typer.echo("  emprise     scène rendue (cible + obstacles résolus)")
+
+    result = adapter(query_wkt, measure_sizes=not no_sizes)
     workspace.write_report("06_geo/lidar_discovery.json", result, context)
 
     if result.state is CoverageState.DISCOVERY_ERROR:
@@ -3160,6 +3241,95 @@ def geo_discover(
         fg=typer.colors.YELLOW,
     )
     typer.echo("  aucun LAZ téléchargé — accord requis avant acquisition")
+
+
+@geo_app.command("ground")
+def geo_ground(
+    hotel_id: str = typer.Argument(...),
+    radius_m: int = typer.Option(300, "--radius", help="Rayon d'interrogation."),
+    keep_m: float = typer.Option(
+        200.0, "--keep", help="Rayon conservé autour du bâtiment."
+    ),
+) -> None:
+    """Collecte les surfaces au sol et les arbres cartographiés (§ environnement)."""
+    from .conditioning.ground import from_elements
+    from .providers.overpass import OverpassError, ground_around
+
+    workspace = Workspace(hotel_id)
+    spatial = workspace.read_spatial()
+    if spatial is None or not spatial.confirmed_building_id:
+        typer.secho(
+            f"{KO} bâtiment confirmé requis avant d'interroger le sol",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    building = spatial.candidate(spatial.confirmed_building_id)
+    geometry_path = workspace.path("06_geo", "capture_geometry.json")
+    if not geometry_path.is_file():
+        typer.secho(
+            f"{KO} géométrie de capture absente : {geometry_path}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    from .conditioning import load_scene
+
+    scene = load_scene(geometry_path)
+
+    typer.echo(f"  interrogation Overpass, rayon {radius_m} m")
+    try:
+        elements = ground_around(
+            building.centroid_lat, building.centroid_lon, radius_m
+        )
+    except OverpassError as exc:
+        typer.secho(f"{KO} Overpass injoignable : {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "  ce n'est pas une absence de végétation — le service n'a pas répondu",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=4) from exc
+
+    cover = from_elements(
+        elements,
+        scene.crs,
+        hotel_id=hotel_id,
+        centre=scene.centre,
+        radius_m=keep_m,
+    )
+
+    payload = cover.as_dict()
+    payload["surfaces"] = [
+        {**s.as_dict(), "ring": [[round(x, 2), round(y, 2)] for x, y in s.ring]}
+        for s in cover.surfaces
+    ]
+    path = workspace.write_json("06_geo/ground_cover.json", payload)
+
+    typer.secho(f"{OK} {len(cover.surfaces)} surface(s), {len(cover.trees)} arbre(s)", fg=typer.colors.GREEN)
+    typer.echo(f"  {path}")
+    for kind, area in sorted(cover.by_kind().items(), key=lambda i: -i[1]):
+        typer.echo(f"    {kind:<10} {area:>10,.0f} m²".replace(",", " "))
+
+    # Une superficie lointaine ne dit rien de ce qui entrera dans le cadre.
+    close = cover.near(scene.centre, 120.0)
+    typer.echo(f"  dont à moins de 120 m du bâtiment : {len(close)} surface(s)")
+    kinds_close = sorted({s.kind for s in close})
+    if kinds_close:
+        typer.echo(f"    natures présentes : {', '.join(kinds_close)}")
+    if close and not any(s.kind in {"pelouse", "boise"} for s in close):
+        typer.secho(
+            "  aucune surface végétale cartographiée aux abords : le sol du "
+            "site est minéral pour OpenStreetMap, ce que le rendu suivra",
+            fg=typer.colors.YELLOW,
+        )
+    if not cover.surfaces and not cover.trees:
+        typer.secho(
+            "  aucune emprise cartographiée ici — le sol reste indéterminé, "
+            "il n'est pas supposé",
+            fg=typer.colors.YELLOW,
+        )
 
 
 @geo_app.command("acquire")
@@ -4651,6 +4821,134 @@ def reconstruction_consensus(
     )
 
 
+@reconstruction_app.command("anchor-localize")
+def reconstruction_anchor_localize(
+    hotel_id: str = typer.Argument(...),
+    input_manifest: Path = typer.Option(..., "--input-manifest", exists=True, dir_okay=False),
+    source_model: Path = typer.Option(..., "--source-model", exists=True, file_okay=False),
+    database: Path = typer.Option(..., "--database", exists=True, dir_okay=False),
+    image_dir: Path = typer.Option(..., "--image-dir", exists=True, file_okay=False),
+    features: Path = typer.Option(..., "--features", exists=True, dir_okay=False),
+    matches: Path = typer.Option(..., "--matches", exists=True, dir_okay=False),
+    source_run_id: str | None = typer.Option(None, "--source-run-id"),
+    stability_repeats: int = typer.Option(3, "--stability-repeats", min=2, max=10),
+    allow_virtual_suggestions: bool = typer.Option(False, "--allow-virtual-suggestions"),
+) -> None:
+    """Reconstruit un noyau fiable puis localise automatiquement les autres vues."""
+    import pycolmap
+
+    from .anchor_localization import (
+        AnchorLocalizationRefused,
+        AssetResolver,
+        H5PnPLocalizationBackend,
+        build_anchor_model,
+        publish_anchor_model,
+        publish_anchor_selection,
+        publish_localization_manifest,
+        run_anchor_localization,
+        select_anchor_core,
+    )
+    from .schemas import ReconstructionInputManifest
+
+    workspace = Workspace(hotel_id)
+    try:
+        snapshot = ReconstructionInputManifest.model_validate_json(
+            input_manifest.read_text("utf-8")
+        )
+        if snapshot.hotel_id != hotel_id:
+            raise AnchorLocalizationRefused(
+                f"snapshot de {snapshot.hotel_id}, pas de {hotel_id}"
+            )
+        asset_manifest = workspace.read_assets()
+        if asset_manifest is None:
+            raise AnchorLocalizationRefused("asset_manifest.json absent")
+        by_id = {asset.id: asset for asset in asset_manifest.assets}
+        missing = sorted(set(snapshot.selected_asset_ids) - set(by_id))
+        if missing:
+            raise AnchorLocalizationRefused(f"assets du snapshot introuvables: {missing}")
+
+        selection = select_anchor_core(
+            workspace=workspace,
+            reconstruction_input_id=snapshot.reconstruction_input_id,
+            source_run_id=source_run_id,
+            source_model_path=source_model,
+            image_dir=image_dir,
+        )
+        selection_path = publish_anchor_selection(workspace, selection)
+        typer.echo(
+            f"  ancres      {len(selection.anchor_asset_ids)}/{len(selection.candidates)} "
+            f"({selection.status})"
+        )
+        if selection.status != "ready":
+            raise AnchorLocalizationRefused("; ".join(selection.refusal_reasons))
+
+        anchor_model = build_anchor_model(
+            workspace=workspace,
+            selection=selection,
+            source_database=database,
+            image_dir=image_dir,
+            stability_repeats=stability_repeats,
+        )
+        anchor_model_path = publish_anchor_model(workspace, anchor_model)
+        typer.echo(
+            f"  noyau       {len(anchor_model.anchor_asset_ids)} vue(s) "
+            f"({anchor_model.status})"
+        )
+        if anchor_model.status != "ready":
+            raise AnchorLocalizationRefused("; ".join(anchor_model.refusal_reasons))
+
+        resolver = AssetResolver(asset_manifest, image_dir)
+        reconstruction = pycolmap.Reconstruction(anchor_model.model_path)
+        anchor_poses: dict[str, dict] = {}
+        for image in reconstruction.images.values():
+            asset = resolver.resolve(image.name)
+            if asset is None or asset.id not in anchor_model.anchor_asset_ids:
+                continue
+            transform = image.cam_from_world.inverse()
+            anchor_poses[asset.id] = {
+                "rotation": transform.rotation.matrix().tolist(),
+                "translation": transform.translation.tolist(),
+                "convention": "world_from_camera",
+            }
+        backend = H5PnPLocalizationBackend(
+            workspace=workspace,
+            anchor_model=anchor_model,
+            anchor_selection=selection,
+            source_database=database,
+            features_path=features,
+            matches_path=matches,
+            image_dir=image_dir,
+        )
+        localization = run_anchor_localization(
+            reconstruction_input_id=snapshot.reconstruction_input_id,
+            anchor_model_id=anchor_model.anchor_model_id,
+            selected_assets=[by_id[asset_id] for asset_id in snapshot.selected_asset_ids],
+            anchor_poses=anchor_poses,
+            backend=backend,
+            policy=selection.policy,
+            raw_registered_images=len(pycolmap.Reconstruction(str(source_model)).images),
+            allow_virtual_suggestions=allow_virtual_suggestions,
+        )
+        localization_path = publish_localization_manifest(workspace, localization)
+    except (AnchorLocalizationRefused, FileNotFoundError, ValueError, RuntimeError) as exc:
+        typer.secho(f"✗ localisation ancrée refusée: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"✓ sélection   {selection_path}")
+    typer.echo(f"✓ noyau       {anchor_model_path}")
+    typer.echo(f"✓ localisation {localization_path}")
+    typer.echo(
+        f"  mesuré       {localization.measured_anchor_images} ancres + "
+        f"{localization.measured_localized_images} localisées / "
+        f"{len(localization.selected_asset_ids)}"
+    )
+    if localization.validated_registration_rate < 0.60:
+        typer.secho(
+            "  G5 reste refusé: taux validé < 60%; acquisition adjacente requise",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @reconstruction_app.command("align")
 def reconstruction_align(
     hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
@@ -4761,6 +5059,120 @@ def reconstruction_validate(
     )
     if report.held_out and report.held_out.error:
         typer.secho(f"    Note : {report.held_out.error}", fg=typer.colors.YELLOW, err=True)
+
+
+@reconstruction_app.command("fidelity")
+def reconstruction_fidelity(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    run_id: str = typer.Option(None, "--run-id", help="Run de reconstruction à évaluer (sinon le plus récent)."),
+    stability: bool = typer.Option(
+        False,
+        "--stability/--no-stability",
+        help=(
+            "Relancer la reconstruction sur les sous-corpus 90 % et 80 % pour "
+            "mesurer la dérive. Deux runs SfM supplémentaires : coûteux, donc "
+            "hors du chemin par défaut."
+        ),
+    ),
+) -> None:
+    """Porte finale de fidélité (Gate D) + analyse des lacunes (P4.5).
+
+    Combine la porte novel-view, la stabilité, et la criticité promotionnelle
+    des cibles pour produire les `FidelityGate` (PASS | FAIL |
+    INSUFFICIENT_EVIDENCE | NOT_APPLICABLE) et les `ReconstructionGap`
+    structurées qui déclenchent la collecte active.
+
+    L'ablation de stabilité relance réellement le solveur sur des sous-corpus
+    dégradés. Sans `--stability`, elle n'est pas exécutée et la porte
+    correspondante reste `INSUFFICIENT_EVIDENCE` : une mesure non faite n'est
+    pas une mesure réussie.
+    """
+    from .schemas.reconstruction import ViewGraphManifest
+    from .reconstruction_input import prepare_input
+    from .novel_view_validation import build_novel_view_gate, publish_novel_view_gate
+    from .stability import build_stability_manifest, publish_stability_manifest
+    from .fidelity_gate import evaluate_targets, publish_fidelity_gates
+    from .gap_analysis import analyze_gaps, publish_gap_analysis
+
+    workspace = Workspace(hotel_id)
+    input_manifest, _ = prepare_input(hotel_id)
+
+    # Run le plus récent complété
+    if run_id is None:
+        runs_dir = workspace.path("07_reconstruction", "runs")
+        run_files = sorted(runs_dir.glob("*.json")) if runs_dir.is_dir() else []
+        run_id = run_files[-1].stem if run_files else None
+
+    # Novel-view gate (Gate C)
+    nv_gate = None
+    if run_id is not None:
+        try:
+            nv_gate = build_novel_view_gate(workspace, run_id)
+            publish_novel_view_gate(nv_gate, workspace)
+        except Exception as exc:
+            typer.secho(f"    Note novel-view : {exc}", fg=typer.colors.YELLOW, err=True)
+
+    # Stabilité — opt-in : chaque ablation est un run SfM complet.
+    stability_manifest = None
+    if run_id is not None and stability:
+        typer.echo("    Ablations de stabilité : 2 runs SfM supplémentaires…")
+        try:
+            stability_manifest = build_stability_manifest(
+                workspace, run_id, input_manifest=input_manifest
+            )
+            publish_stability_manifest(stability_manifest, workspace)
+        except Exception as exc:
+            typer.secho(f"    Note stabilité : {exc}", fg=typer.colors.YELLOW, err=True)
+    elif run_id is not None:
+        typer.secho(
+            "    Stabilité non mesurée (--stability pour l'exécuter).",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+    # ViewGraph
+    vg_dir = workspace.path("07_reconstruction", "view_graphs")
+    vg_files = sorted(vg_dir.glob("vg-*.json")) if vg_dir.is_dir() else []
+    view_graph = (
+        ViewGraphManifest.model_validate_json(vg_files[-1].read_text("utf-8"))
+        if vg_files
+        else None
+    )
+
+    # Portes de fidélité par cible
+    gates = evaluate_targets(
+        input_manifest.targets,
+        {
+            t.target_id: {
+                "novel_view_gate": nv_gate,
+                "stability_gate": (
+                    stability_manifest.result if stability_manifest else None
+                ),
+            }
+            for t in input_manifest.targets
+        },
+    )
+    pub = publish_fidelity_gates(gates, workspace)
+
+    # Lacunes structurées (P4.5). L'orientation de façade rend les angles de
+    # vue absolus ; sans elle, seul le secteur est exploitable.
+    spatial = _safe_read(workspace.read_spatial)
+    front_azimuth = getattr(spatial, "front_azimuth_deg", None) if spatial else None
+    gaps = analyze_gaps(
+        gates, view_graph, workspace, front_azimuth_deg=front_azimuth
+    )
+    gap_pub = publish_gap_analysis(gaps, workspace)
+
+    blocked = [g.target_id for g in gates if g.overall.value in ("fail", "insufficient_evidence")]
+    typer.echo(
+        f"{OK} Fidélité publiée : {pub}\n"
+        f"    Cibles évaluées : {len(gates)}\n"
+        f"    PASS            : {sum(1 for g in gates if g.overall.value == 'pass')}\n"
+        f"    FAIL/INSUFF     : {len(blocked)}\n"
+        f"    Lacunes         : {len(gaps)} → {gap_pub}"
+    )
+    for g in gates:
+        typer.echo(f"    - {g.target_id:<16} {g.criticality.value:<12} {g.overall.value}")
 
 
 @reconstruction_app.command("camera-feasibility")
@@ -4906,10 +5318,6 @@ def smoke() -> None:
 
     typer.echo("")
     typer.secho("smoke test réussi", fg=typer.colors.GREEN)
-
-
-if __name__ == "__main__":
-    app()
 
 
 def _sector_context(workspace, context, demands, geometry):  # noqa: ANN001, ANN201
@@ -5645,6 +6053,10 @@ def _discovery_scope(demands, selected: list[str], demand_digest: str):  # noqa:
     return scope, restreint
 
 
+#: Niveau vers lequel une découverte ciblée rétrograde la pleine résolution.
+_PREVIEW_LEVEL = RecommendationLevel.PREVIEW
+
+
 def _targeted_manifest(workspace, manifest, scope):  # noqa: ANN001, ANN201
     """Écarte ce qu'un aperçu a déjà réfuté, et borne le reste à l'aperçu."""
     from .schemas.preview import PreviewAssessmentLog
@@ -5664,15 +6076,30 @@ def _targeted_manifest(workspace, manifest, scope):  # noqa: ANN001, ANN201
         "evaluations": [
             e for e in manifest.evaluations if e.candidate_id in restants
         ],
-        "recommendations": [
-            r for r in manifest.recommendations if r.candidate_id in restants
-        ],
         "recommended_for_enrichment": [
             c for c in manifest.recommended_for_enrichment if c in restants
         ],
-        "recommended_for_preview": [
-            c for c in manifest.recommended_for_preview if c in restants
+        # Une découverte ciblée borne la collecte à l'aperçu : engager la
+        # pleine résolution paierait une image dont personne n'a vérifié
+        # qu'elle montre ce qu'on cherche.
+        #
+        # Cela se fait en **rétrogradant** les recommandations, pas en vidant
+        # le seul résumé : le manifeste exige que le résumé reflète les
+        # recommandations par besoin, si bien qu'une liste vide face à une
+        # recommandation « pleine » restante rendait le manifeste invalide et
+        # le plan refusait de le lire.
+        "recommendations": [
+            r.model_copy(update={"level": _PREVIEW_LEVEL})
+            if r.candidate_id in restants
+            and r.level.value == "eligible_for_full_acquisition"
+            else r
+            for r in manifest.recommendations
+            if r.candidate_id in restants
         ],
+        "recommended_for_preview": sorted(
+            {c for c in manifest.recommended_for_preview if c in restants}
+            | {c for c in manifest.eligible_for_full_acquisition if c in restants}
+        ),
         "eligible_for_full_acquisition": [],
     })
 
@@ -5693,6 +6120,42 @@ def _query_sources(profile, context, workspace, radius_m: int, demands, scope=No
         queries["mapillary"] = f"interrogation impossible : {exc}"
     else:
         queries["mapillary"] = candidates_from("mapillary", images)
+
+    # Seconde source de roulage **ouverte**, aux caps observés comme Mapillary.
+    # Elle ne parcourt ni les mêmes rues ni les mêmes dates : c'est l'angle
+    # qui manque au corpus, pas le volume. Aucune clé requise.
+    from .collectors import kartaview
+
+    try:
+        images = kartaview.collect(profile.lat, profile.lon, radius_m=radius_m)
+    except OfflineError as exc:
+        queries["kartaview"] = f"hors ligne : {exc}"
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        queries["kartaview"] = f"interrogation impossible : {exc}"
+    else:
+        queries["kartaview"] = candidates_from("kartaview", images)
+
+    # Photos de voyageurs : prises **sur place**, donc les seuls angles que
+    # l'imagerie de roulage ne peut pas atteindre — arrière et côtés du
+    # bâtiment n'ont aucune ligne de vue publique. Le quota se compte en
+    # appels et le cache les conserve un an : une relance ne coûte rien.
+    place_query = getattr(profile, "place_query", None)
+    if place_query:
+        from .collectors import tripadvisor
+
+        try:
+            images = tripadvisor.collect(place_query)
+        except OfflineError as exc:
+            queries["tripadvisor"] = f"hors ligne : {exc}"
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            queries["tripadvisor"] = f"interrogation impossible : {exc}"
+        else:
+            queries["tripadvisor"] = candidates_from("tripadvisor", images)
+    else:
+        queries["tripadvisor"] = (
+            "aucune requête Places déclarée au profil : la fiche de "
+            "l'établissement ne peut pas être retrouvée"
+        )
 
     queries["street_view"] = _street_view_candidates(
         context, workspace, radius_m, demands, scope
@@ -5717,16 +6180,30 @@ def _street_view_candidates(context, workspace, radius_m: int, demands, scope=No
     except LegacyManifestRefused as exc:
         return f"géométrie illisible : {exc}"
 
+    # La **découverte** balaie tous les corridors ; le corridor déclaré borne
+    # l'**acquisition**, non le regard.
+    #
+    # Borner l'échantillonnage à `corridor_ref` réduisait la recherche à
+    # 17 points au lieu de 1021, et Street View ne rendait plus rien. Or les
+    # métadonnées de panorama sont gratuites, et un panorama d'une voie
+    # voisine est parfois le seul point de vue sur une façade que les besoins,
+    # eux, exigent bel et bien. Audit du pilote : 458 panoramas atteignables,
+    # 98 au corpus — dont 133 points de vue inexploités sur la façade arrière,
+    # déclarée « jamais vue ».
+    #
+    # C'est la même confusion que le filtre de cap : demander « cette vue
+    # visait-elle notre corridor ? » quand la question est « notre bâtiment
+    # se voit-il d'ici ? ».
     corridor_ref = getattr(scope, "corridor_ref", "") if scope else ""
-    corridors = _corridor_elements(manifest, corridor_ref)
+    corridors = _corridor_elements(manifest)
     if not corridors:
         return "aucun corridor résolu autour du site"
 
     if corridor_ref:
         typer.secho(
-            f"    street_view · échantillonnage borné au corridor "
-            f"{corridor_ref}",
-            fg=typer.colors.DIM,
+            f"    street_view · {len(corridors)} corridor(s) balayé(s) ; "
+            f"acquisition bornée à {corridor_ref}",
+            fg=typer.colors.BRIGHT_BLACK,
         )
 
     from .demand_targets import TargetUnresolved, resolve
@@ -5756,9 +6233,15 @@ def _street_view_candidates(context, workspace, radius_m: int, demands, scope=No
     except CorridorScopeRefused as exc:
         return f"portée de corridor refusée : {exc}"
 
-    targets_wkt = [t.wkt for t in targets if getattr(t, "wkt", None)]
-    framings = framings_for_targets(panoramas, targets_wkt, front)
-    return [candidate_from(p, f) for p, f in zip(panoramas, framings)]
+    # `framings_for_targets` cadre **un** panorama vers les cibles, et attend
+    # des cibles portant `.shape` — non une liste de panoramas ni des WKT.
+    # Un cadrage par (panorama, cible) : les apparier par `zip` aurait relié
+    # le n-ième panorama au n-ième cadrage, ce qui n'a pas de sens.
+    candidates = []
+    for panorama in panoramas:
+        for framing in framings_for_targets(panorama, targets):
+            candidates.append(candidate_from(panorama, framing))
+    return candidates
 
 
 class CorridorScopeRefused(RuntimeError):
@@ -5766,10 +6249,66 @@ class CorridorScopeRefused(RuntimeError):
 
 
 def _corridor_elements(manifest, corridor_ref: str = "") -> list[dict]:  # noqa: ANN001
-    """Corridors résolus, éventuellement bornés à une référence."""
-    if not corridor_ref:
-        return manifest.corridors
-    return [c for c in manifest.corridors if c.get("feature_id") == corridor_ref]
+    """Corridors résolus, sous la forme attendue par l'échantillonneur.
+
+    Un `RoadCorridor` **qualifie** une voie — classe, accès, distances — mais
+    ne porte pas son tracé : celui-ci vit dans `geometries`, relié par
+    `feature_id`. L'échantillonnage, lui, attend la forme OSM
+    `{"geometry": [{"lat": …, "lon": …}, …]}`.
+
+    Rendre les corridors tels quels faisait donc échouer `sample_road_network`
+    sur `element.get("geometry")` — un modèle Pydantic n'a pas de `.get` — et
+    aucun test n'exécutait ce chemin. On effectue ici la jointure, une fois,
+    plutôt que de la laisser se deviner plus loin.
+
+    Un corridor dont la géométrie est absente ou n'est pas une ligne est
+    ignoré : il n'a pas de tracé à parcourir.
+    """
+    from shapely import wkt as shapely_wkt
+
+    corridors = manifest.corridors
+    if corridor_ref:
+        corridors = [
+            c for c in corridors
+            if getattr(c, "feature_id", None) == corridor_ref
+        ]
+
+    by_feature = {
+        getattr(g, "feature_id", None): g for g in manifest.geometries
+    }
+
+    elements: list[dict] = []
+    for corridor in corridors:
+        geometry = by_feature.get(getattr(corridor, "feature_id", None))
+        shape_wkt = getattr(geometry, "wgs84_wkt", None) if geometry else None
+        if not shape_wkt:
+            continue
+        try:
+            shape = shapely_wkt.loads(shape_wkt)
+        except Exception:
+            continue
+
+        for line in _line_parts(shape):
+            elements.append(
+                {
+                    "feature_id": getattr(corridor, "feature_id", None),
+                    "corridor_id": getattr(corridor, "corridor_id", None),
+                    # `wgs84_wkt` est en (lon, lat) : l'ordre compte.
+                    "geometry": [
+                        {"lat": y, "lon": x} for x, y in line.coords
+                    ],
+                }
+            )
+    return elements
+
+
+def _line_parts(shape):  # noqa: ANN001, ANN201
+    """Composantes linéaires d'une géométrie, sans en inventer."""
+    if shape.geom_type == "LineString":
+        return [shape]
+    if shape.geom_type == "MultiLineString":
+        return list(shape.geoms)
+    return []
 
 
 # --- CLI commands restored ----------------------------------------------------
@@ -6359,3 +6898,1327 @@ def _plan_demands_for_scope(candidates, demands):  # noqa: ANN001, ANN201
         )
     selected = [by_id[demand_id] for demand_id in demand_ids]
     return demands.model_copy(update={"demands": selected})
+
+
+# --- Analyse spatiale (Lot 2) -------------------------------------------------
+
+survey_app = typer.Typer(
+    no_args_is_help=True,
+    help="Analyse spatiale : couverture par façade, recadrages, confiance.",
+)
+app.add_typer(survey_app, name="survey")
+
+
+@survey_app.command("coverage")
+def survey_coverage(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    candidates: Path = typer.Option(
+        None, "--candidates",
+        help="Manifeste de candidats ; défaut : le corpus acquis.",
+    ),
+    segments: int = typer.Option(10, "--segments", help="Tronçons par façade."),
+) -> None:
+    """Couverture cumulée par **tronçon** de façade.
+
+    Une vue partielle n'est pas une vue pauvre : c'est l'union qui compte. Ce
+    rapport dit ce que la réunion des vues couvre, ce qu'une seule vue couvre,
+    et surtout **quels tronçons ne sont vus par personne** — c'est cela qu'on
+    demande à l'hôtel de photographier.
+    """
+    from .facade_segments import accumulate, capture_request
+    from .scene_context import load, viewpoints_from_candidates
+
+    scene = load(hotel_id)
+    for problem in scene.problems:
+        typer.secho(f"  · {problem}", fg=typer.colors.YELLOW)
+    if not scene.usable:
+        raise typer.Exit(code=1)
+
+    viewpoints = (
+        viewpoints_from_candidates(scene, candidates)
+        if candidates else scene.viewpoints
+    )
+    # Le cap est laissé libre — un panorama se recadre — mais le **champ**
+    # doit borner ce qu'une image contient. Sans lui, `visible_points` promet
+    # qu'une seule vue couvre 100 % d'un mur de 88 m, ce qu'aucun cadrage ne
+    # rend. Le champ suit la distance, comme pour les recadrages.
+    from .recrop_opportunities import fov_for
+
+    # `visible_points` n'applique le champ **que si un cap est fourni** : avec
+    # `heading=None` la condition de cadre est ignorée, et une seule vue
+    # semblait couvrir 100 % d'un mur de 88 m. On dirige donc chaque vue vers
+    # le mur examiné — c'est bien ce qu'un recadrage ferait — et le champ,
+    # dérivé de la distance, borne alors ce que l'image contient.
+    from .recrop_opportunities import fov_for
+
+    viewpoint_geometry = [
+        (
+            asset_id,
+            origin,
+            math.hypot(
+                origin[0] - scene.footprint.centroid.x,
+                origin[1] - scene.footprint.centroid.y,
+            ),
+        )
+        for asset_id, _provider, origin in viewpoints
+    ]
+    typer.echo(f"  points de vue : {len(viewpoint_geometry)}")
+    typer.echo("")
+
+    for facade_id, samples in sorted(scene.facades.items()):
+        centre_x = sum(p.x for p in samples) / len(samples)
+        centre_y = sum(p.y for p in samples) / len(samples)
+        subjects = [
+            (
+                asset_id,
+                origin,
+                math.degrees(
+                    math.atan2(centre_x - origin[0], centre_y - origin[1])
+                ) % 360.0,
+                fov_for(distance),
+                distance,
+            )
+            for asset_id, origin, distance in viewpoint_geometry
+        ]
+        report = accumulate(
+            facade_id, samples, subjects, scene.footprint, scene.obstacles,
+            segments=segments,
+        )
+        typer.echo(
+            f"  {facade_id:<16} union={report.union_fraction:>5.0%} "
+            f"corroborée={report.corroborated_fraction:>5.0%} "
+            f"meilleure_vue={report.best_single_fraction:>5.0%}  "
+            f"{report.verdict()}"
+        )
+        request = capture_request(report)
+        if request:
+            typer.secho(f"      → {request}", fg=typer.colors.YELLOW)
+
+
+@survey_app.command("recrops")
+def survey_recrops(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    facade: str = typer.Option(None, "--facade", help="Borner à une façade."),
+    limit: int = typer.Option(10, "--limit", help="Recadrages par façade."),
+    candidates: Path = typer.Option(None, "--candidates"),
+) -> None:
+    """Recadrages récupérables sur les panoramas déjà connus.
+
+    **Aucune image n'est téléchargée.** Le cap, le champ et l'inclinaison sont
+    dérivés de la distance : un champ fixe de 70° remplit l'image de
+    stationnement dès 120 m, et rejetait des façades parfaitement lisibles.
+    """
+    from .recrop_opportunities import opportunities_for_facade, select_minimal
+    from .scene_context import load, viewpoints_from_candidates
+
+    scene = load(hotel_id)
+    if not scene.usable:
+        for problem in scene.problems:
+            typer.secho(f"  · {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    viewpoints = (
+        viewpoints_from_candidates(scene, candidates)
+        if candidates else scene.viewpoints
+    )
+    typer.echo(f"  panoramas disponibles : {len(viewpoints)}")
+
+    for facade_id, samples in sorted(scene.facades.items()):
+        if facade and facade_id != facade:
+            continue
+        found = opportunities_for_facade(
+            facade_id, samples, viewpoints, scene.footprint, scene.obstacles,
+        )
+        chosen = select_minimal(found, len(samples), max_requests=limit)
+        typer.echo("")
+        typer.echo(f"  {facade_id} — {len(found)} candidat(s), {len(chosen)} retenu(s)")
+        for opportunity in chosen:
+            typer.echo(
+                f"      cap {opportunity.heading_deg:>6.1f}°  "
+                f"champ {opportunity.fov_deg:>5.1f}°  "
+                f"pitch {opportunity.pitch_deg:>4.1f}°  "
+                f"{opportunity.distance_m:>5.0f} m  "
+                f"couvre {len(opportunity.covers)}/{len(samples)}"
+            )
+
+
+@survey_app.command("confidence")
+def survey_confidence(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    candidates: Path = typer.Option(None, "--candidates"),
+    required: str = typer.Option(
+        None, "--required",
+        help="Façades exigées par le livrable, séparées par des virgules.",
+    ),
+) -> None:
+    """Confiance jointe par surface, et confiance du livrable.
+
+    Les axes se composent **avant** de trancher : trois passages tout juste
+    au-dessus du seuil ne valent pas trois passages francs, et un `ET` booléen
+    les confondait. Un axe non mesuré laisse la confiance indéterminée plutôt
+    que de la fabriquer.
+    """
+    from .facade_segments import accumulate
+    from .scene_confidence import compose, deliverable_confidence
+    from .scene_context import load, viewpoints_from_candidates
+
+    scene = load(hotel_id)
+    if not scene.usable:
+        for problem in scene.problems:
+            typer.secho(f"  · {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    viewpoints = (
+        viewpoints_from_candidates(scene, candidates)
+        if candidates else scene.viewpoints
+    )
+    from .recrop_opportunities import fov_for
+
+    subjects = []
+    for asset_id, _provider, origin in viewpoints:
+        distance = math.hypot(
+            origin[0] - scene.footprint.centroid.x,
+            origin[1] - scene.footprint.centroid.y,
+        )
+        subjects.append((asset_id, origin, None, fov_for(distance), distance))
+
+    surfaces = []
+    for facade_id, samples in sorted(scene.facades.items()):
+        report = accumulate(
+            facade_id, samples, subjects, scene.footprint, scene.obstacles
+        )
+        surfaces.append(
+            compose(facade_id, coverage=report.corroborated_fraction)
+        )
+
+    for surface in surfaces:
+        typer.echo(
+            f"  {surface.surface_id:<16} couverture="
+            f"{(surface.coverage or 0):>5.0%}  {surface.verdict}"
+            + (f"  manque : {', '.join(surface.missing_axes)}"
+               if surface.missing_axes else "")
+        )
+
+    wanted = (
+        {name.strip() for name in required.split(",")} if required else None
+    )
+    joint, reason = deliverable_confidence(surfaces, wanted)
+    typer.echo("")
+    if joint is None:
+        typer.secho(f"  livrable : indéterminé — {reason}", fg=typer.colors.YELLOW)
+    else:
+        typer.echo(f"  livrable : {joint:.0%} — {reason}")
+
+
+@survey_app.command("prominence")
+def survey_prominence(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    limit: int = typer.Option(50, "--limit", help="Images à lire."),
+) -> None:
+    """Lit sur les **pixels** la place du sujet dans chaque image acquise.
+
+    La géométrie prédit ce qu'une vue *devrait* montrer ; elle ignore ce qui se
+    met devant. Ce classement propose, il ne retire rien : un score faible ne
+    supprime aucun asset.
+    """
+    from .subject_prominence import ProminenceReader, reference_strength
+
+    workspace = Workspace(hotel_id)
+    manifest = workspace.read_assets()
+    if manifest is None:
+        typer.secho(f"{KO} aucun manifeste d'assets", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    items = [
+        (asset, workspace.path(asset.local_path))
+        for asset in manifest.assets
+        if asset.local_path and workspace.path(asset.local_path).is_file()
+    ][:limit]
+    if not items:
+        typer.secho("  aucune image acquise à lire", fg=typer.colors.YELLOW)
+        return
+
+    reader = ProminenceReader()
+    readings = reader.read_many([(a.id, p) for a, p in items])
+
+    rows = []
+    for (asset, _path), reading in zip(items, readings):
+        strength, motive = reference_strength(reading, asset.target_building_visible)
+        rows.append((strength if strength is not None else -1.0, asset.id, reading, motive))
+    rows.sort(key=lambda row: -row[0])
+
+    typer.echo(f"  {len(rows)} image(s) lue(s)")
+    for strength, asset_id, reading, motive in rows[:20]:
+        shown = f"{strength:.3f}" if strength >= 0 else "  n/m"
+        typer.echo(f"    {shown}  {reading.verdict:<20} {asset_id[-28:]}  {motive}")
+
+
+@survey_app.command("verify")
+def survey_verify(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    facade: str = typer.Option(None, "--facade", help="Borner à une façade."),
+    budget: int = typer.Option(
+        20, "--budget",
+        help="Recadrages à acquérir au maximum. Chacun est une requête facturée.",
+    ),
+    candidates: Path = typer.Option(None, "--candidates"),
+) -> None:
+    """Ferme la boucle : proposer, acquérir, **lire**, inscrire, re-sélectionner.
+
+    La géométrie ignore ce qui se met devant — arbres, pavillons absents du
+    modèle d'obstacles. Sans vérification, la sélection classait par distance et
+    proposait la rue arrière, bouchée. Ici chaque recadrage est jugé sur ses
+    pixels, le verdict est **écrit**, et la sélection suivante s'en sert.
+
+    Un recadrage déjà jugé n'est jamais redemandé : la campagne reprend où elle
+    s'est arrêtée, et `--budget` borne la dépense.
+    """
+    from .recrop_opportunities import opportunities_for_facade, select_minimal
+    from .recrop_verification import (
+        apply_known, fetch_and_read, load_register, save_register,
+    )
+    from .scene_context import load, viewpoints_from_candidates
+
+    scene = load(hotel_id)
+    if not scene.usable:
+        for problem in scene.problems:
+            typer.secho(f"  · {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    for problem in scene.problems:
+        typer.secho(f"  · {problem}", fg=typer.colors.YELLOW)
+
+    workspace = Workspace(hotel_id)
+    register = load_register(workspace)
+    typer.echo(f"  registre : {len(register.entries)} vérification(s) connue(s)")
+
+    viewpoints = (
+        viewpoints_from_candidates(scene, candidates)
+        if candidates else scene.viewpoints
+    )
+    cache = workspace.path("02_images", "recrops")
+    remaining = budget
+
+    for facade_id, samples in sorted(scene.facades.items()):
+        if facade and facade_id != facade:
+            continue
+
+        found = opportunities_for_facade(
+            facade_id, samples, viewpoints, scene.footprint, scene.obstacles
+        )
+        if not found:
+            typer.echo(f"  {facade_id} — aucun recadrage possible")
+            continue
+
+        known, unknown = apply_known(found, register)
+        typer.echo("")
+        typer.echo(
+            f"  {facade_id} — {len(found)} candidat(s) "
+            f"({known} déjà jugé(s), {unknown} inconnu(s))"
+        )
+
+        # On ne vérifie pas tout, mais on ne vérifie pas non plus le seul
+        # gagnant : la couverture gloutonne s'arrête dès que le mur est
+        # couvert, et un unique candidat « couvrant 44/44 » serait retenu sans
+        # rival — c'est précisément lui qui, au pilote, montrait des maisons.
+        # On échantillonne donc des **alternatives** : le vainqueur glouton,
+        # puis les meilleurs candidats indépendants par distance croissante.
+        shortlist = select_minimal(found, len(samples), max_requests=max(1, remaining))
+        already = {id(o) for o in shortlist}
+        # Alternatives **réparties**, non les plus proches : les vues
+        # exploitables de l'arrière du pilote se trouvent à 98-166 m, à travers
+        # les stationnements, tandis que les plus proches sont dans la rue
+        # résidentielle où des pavillons bouchent la vue. Échantillonner par
+        # distance croissante ne les atteignait jamais.
+        ordered = sorted(found, key=lambda o: o.distance_m)
+        step = max(1, len(ordered) // max(1, remaining))
+        for alternative in ordered[::step]:
+            if len(shortlist) >= max(1, remaining):
+                break
+            if id(alternative) in already:
+                continue
+            shortlist.append(alternative)
+            already.add(id(alternative))
+        if remaining > 0:
+            read, skipped = fetch_and_read(
+                shortlist, register, cache_dir=cache, limit=remaining
+            )
+            remaining -= read
+            if read or skipped:
+                typer.echo(f"      acquis et lus : {read}, ignorés : {skipped}")
+
+        # Re-sélection : la prominence vérifiée départage désormais.
+        apply_known(found, register)
+        chosen = select_minimal(found, len(samples), max_requests=6)
+        for opportunity in chosen:
+            score = opportunity.verified_prominence
+            shown = f"{score:.3f}" if score is not None else " n/v "
+            typer.echo(
+                f"      {shown}  cap {opportunity.heading_deg:>6.1f}°  "
+                f"champ {opportunity.fov_deg:>5.1f}°  "
+                f"{opportunity.distance_m:>5.0f} m  "
+                f"couvre {len(opportunity.covers)}/{len(samples)}"
+            )
+
+    path = save_register(workspace, register)
+    typer.echo("")
+    typer.echo(f"{OK} registre écrit : {path}")
+    typer.echo(f"    budget restant : {remaining}")
+
+
+@survey_app.command("path")
+def survey_path(
+    hotel_id: str = typer.Argument(..., help="Identifiant de l'hôtel."),
+    poses: int = typer.Option(24, "--poses", help="Poses de l'orbite."),
+    start_altitude: float = typer.Option(40.0, "--from", help="Altitude de départ, m."),
+    end_altitude: float = typer.Option(2.5, "--to", help="Altitude d'arrivée, m."),
+    download: bool = typer.Option(
+        False, "--download/--no-download",
+        help="Acquérir les références. Chacune est une requête facturée.",
+    ),
+) -> None:
+    """Orbite descendante **ancrée sur des points de vue réels**.
+
+    L'orbite virtuelle du paquet de scène tourne autour d'une boîte proxy : elle
+    décrit un cadrage souhaitable sans se demander si une image le soutient.
+    Ici chaque pose s'adosse à un panorama dont la lecture pixel a confirmé
+    qu'il montre le bâtiment — et les arcs sans vantage restent **déclarés**,
+    jamais interpolés.
+
+    L'altitude est une consigne d'animation : l'imagerie de rue vit à ~2,5 m et
+    n'atteste aucune vue à 40 m. Le paquet le dit.
+    """
+    from .camera_path_real import build, reference_requests
+    from .recrop_verification import load_register
+    from .scene_context import load as load_scene
+
+    scene = load_scene(hotel_id)
+    if not scene.usable:
+        for problem in scene.problems:
+            typer.secho(f"  · {problem}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    workspace = Workspace(hotel_id)
+    register = load_register(workspace)
+    verifications = list(register.entries.values())
+    if not verifications:
+        typer.secho(
+            "  aucune vérification : lancez `survey verify` avant de tracer "
+            "une trajectoire — sans elle, rien n'atteste ce que les poses "
+            "montreraient",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(code=1)
+
+    path = build(hotel_id, scene, verifications, poses=poses)
+    path.start_altitude_m = start_altitude
+    path.end_altitude_m = end_altitude
+    for pose in path.poses:
+        ratio = pose.index / max(1, poses - 1)
+        pose.altitude_m = start_altitude + (end_altitude - start_altitude) * ratio
+
+    typer.echo(
+        f"  {len(path.poses)} pose(s) — {path.anchored_fraction:.0%} ancrée(s), "
+        f"arc {path.arc_deg:.0f}°, {path.verdict()}"
+    )
+    typer.echo(f"  descente {start_altitude:.0f} m → {end_altitude:.0f} m")
+    for start, end in path.gaps:
+        typer.secho(
+            f"      trou d'azimut {start:.0f}° → {end:.0f}° : aucune référence",
+            fg=typer.colors.YELLOW,
+        )
+
+    requests = reference_requests(path)
+    typer.echo(f"  références distinctes : {len(requests)}")
+
+    payload = path.as_dict()
+    payload["reference_requests"] = requests
+    written = workspace.write_json("08_composite/real_camera_path.json", payload)
+    typer.echo(f"{OK} trajectoire écrite : {written}")
+
+    if not download:
+        typer.echo("    pour acquérir les références : --download")
+        return
+
+    from .recrop_verification import _street_view_fetcher
+
+    folder = workspace.path("02_images", "references")
+    folder.mkdir(parents=True, exist_ok=True)
+
+    class _Request:  # noqa: D401 — porteur minimal pour le téléchargeur
+        pass
+
+    acquired = 0
+    for request in requests:
+        holder = _Request()
+        holder.panorama_id = request["panorama_id"]
+        holder.heading_deg = request["heading_deg"] or 0.0
+        holder.fov_deg = request["fov_deg"] or 70.0
+        holder.pitch_deg = request["pitch_deg"] or 0.0
+        target = folder / (
+            f"pose{request['for_pose']:02d}_{holder.panorama_id[:12]}"
+            f"_{holder.heading_deg:.0f}h_{holder.fov_deg:.0f}f.jpg"
+        )
+        if target.is_file():
+            acquired += 1
+            continue
+        try:
+            content = _street_view_fetcher(holder)
+        except Exception as exc:
+            typer.secho(f"    · {holder.panorama_id[:12]} : {exc}", fg=typer.colors.YELLOW)
+            continue
+        if content:
+            target.write_bytes(content)
+            acquired += 1
+    typer.echo(f"{OK} {acquired}/{len(requests)} référence(s) dans {folder}")
+
+
+def _ground_reference(workspace, scene) -> float:  # noqa: ANN001
+    """Altitude du sol de référence d'un site, pour rapporter les hauteurs.
+
+    Le modèle de terrain la porte quand il existe ; à défaut, la médiane des
+    retours de sol autour du site. Une référence fausse déplacerait toute la
+    toiture d'autant.
+    """
+    from .conditioning.laz_cache import read_window
+    from .conditioning.heights import find_laz as _find_laz
+
+    tile = _find_laz(workspace, scene.centre)
+    if tile is None:
+        return 0.0
+    window = read_window(tile, scene.centre, 120.0)
+    if window is None:
+        return 0.0
+    ground = window.classification == 2
+    if not ground.any():
+        return 0.0
+    return float(np.median(window.z[ground]))
+
+
+conditioning_app = typer.Typer(
+    no_args_is_help=True,
+    help="Conditionnement géométrique d'un générateur vidéo (Lot 3).",
+)
+app.add_typer(conditioning_app, name="conditioning")
+
+
+@conditioning_app.command("compare")
+def conditioning_compare(
+    hotel_id: str = typer.Argument(...),
+    views: int = typer.Option(4, "--views", help="Vues de référence confrontées."),
+) -> None:
+    """Confronte le volume rendu aux photographies, ronde par ronde."""
+    import json as _json
+
+    from .conditioning import load_scene
+    from .conditioning import environment as environment_module
+    from .conditioning import rounds as rounds_module
+    from .conditioning.heights import (
+        apply_cloud_roofs,
+        apply_laz_heights,
+        apply_measured_heights,
+        find_laz,
+        find_laz_tiles,
+        find_ndsm,
+    )
+    from .conditioning.support import _resolve_asset
+    from .conditioning.terrain import find_dtm
+
+    workspace = Workspace(hotel_id)
+    geometry = workspace.path("06_geo", "capture_geometry.json")
+    screening = workspace.path("09_confidence", "identity_screening.json")
+    manifest_path = workspace.path("00_manifest", "asset_manifest.json")
+    for required in (geometry, screening, manifest_path):
+        if not required.is_file():
+            typer.secho(f"{KO} absent : {required}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1)
+
+    scene = load_scene(geometry)
+    ndsm = find_ndsm(workspace)
+    if ndsm is not None:
+        apply_measured_heights(scene, ndsm)
+    tiles = find_laz_tiles(workspace)
+    if tiles:
+        apply_laz_heights(scene, tiles)
+    environment = (
+        environment_module.build(
+            scene, find_laz(workspace, scene.centre), dtm_path=find_dtm(workspace)
+        )
+        if tiles
+        else None
+    )
+
+    assets = {
+        a["id"]: a
+        for a in _json.loads(manifest_path.read_text(encoding="utf-8")).get("assets", [])
+    }
+    screened = _json.loads(screening.read_text(encoding="utf-8"))
+    retained = sorted(
+        (x for x in screened.get("assets", []) if x.get("status") == "match"),
+        key=lambda x: -float(x.get("reference_score", 0.0)),
+    )
+
+    selected: list[tuple[str, Path, float]] = []
+    for entry in retained:
+        if len(selected) >= views:
+            break
+        asset = _resolve_asset(entry["asset_id"], assets)
+        bearing = asset.get("bearing_from_building_deg") if asset else None
+        if bearing in (None, "None"):
+            continue
+        selected.append((entry["asset_id"], Path(entry["path"]), float(bearing)))
+
+    if not selected:
+        typer.secho(
+            f"{KO} aucune référence dont l'azimut soit mesuré",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(f"  {len(selected)} vue(s) confrontée(s) au volume")
+    report = rounds_module.run(scene, environment, selected)
+    path = workspace.write_json("09_confidence/comparison_rounds.json", report.as_dict())
+
+    couleur = {
+        "silhouette_conforme": typer.colors.GREEN,
+        "silhouette_approchante": typer.colors.YELLOW,
+    }.get(report.verdict(), typer.colors.RED)
+    typer.secho(
+        f"{OK} {report.verdict()} — accord moyen {report.mean_correlation:.3f}",
+        fg=couleur,
+    )
+    typer.echo(f"  {path}")
+    for best in report.best:
+        typer.echo(
+            f"    {best.correlation:.3f}  azimut {best.bearing_deg:.0f}°, "
+            f"cadrage {best.distance_m:.0f} m / {best.fov_deg:.0f}°"
+        )
+    typer.secho(
+        "  l'accord porte sur la répartition verticale du bâti, non sur "
+        "l'apparence : une silhouette juste peut avoir la mauvaise façade",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@conditioning_app.command("audit")
+def conditioning_audit(
+    hotel_id: str = typer.Argument(...),
+    top: int = typer.Option(6, "--top", help="Écarts détaillés à lister."),
+    record_projections: bool = typer.Option(
+        False, "--record", help="Consigner les projections au registre."
+    ),
+    close_levier: str | None = typer.Option(
+        None, "--close", help="Refermer la projection ouverte de ce levier."
+    ),
+) -> None:
+    """Chiffre la fidélité de la scène et projette ce qui la fermerait."""
+    from .conditioning import load_scene
+    from .conditioning import environment as environment_module
+    from .conditioning.audit import audit as run_audit
+    from .conditioning.heights import (
+        apply_cloud_roofs,
+        apply_laz_heights,
+        apply_measured_heights,
+        find_laz,
+        find_laz_tiles,
+        find_ndsm,
+    )
+    from .conditioning.support import from_screening
+    from .conditioning.terrain import find_dtm
+
+    workspace = Workspace(hotel_id)
+    geometry = workspace.path("06_geo", "capture_geometry.json")
+    if not geometry.is_file():
+        typer.secho(f"{KO} géométrie absente : {geometry}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    scene = load_scene(geometry)
+    ndsm = find_ndsm(workspace)
+    if ndsm is not None:
+        apply_measured_heights(scene, ndsm)
+    laz = find_laz_tiles(workspace)
+    if laz:
+        apply_laz_heights(scene, laz)
+
+    environment = (
+        environment_module.build(
+            scene, find_laz(workspace, scene.centre), dtm_path=find_dtm(workspace)
+        )
+        if laz
+        else None
+    )
+
+    support = None
+    screening = workspace.path("09_confidence", "identity_screening.json")
+    manifest_path = workspace.path("00_manifest", "asset_manifest.json")
+    if screening.is_file() and manifest_path.is_file():
+        support = from_screening(screening, manifest_path)
+
+    # Le registre calibre les rendements attendus sur ce qui a été observé :
+    # une projection tirée d'un jugement devient une projection tirée de faits.
+    from .conditioning.projection import close as close_projection
+    from .conditioning.projection import load_ledger, record as record_projection
+
+    ledger = load_ledger(workspace)
+    calibration = ledger.calibration()
+    result = run_audit(
+        scene,
+        environment,
+        support,
+        yields=calibration or None,
+        coverage_bias=ledger.coverage_bias(),
+    )
+    path = workspace.write_json("09_confidence/fidelity_audit.json", result.as_dict())
+
+    if close_levier:
+        entry = close_projection(workspace, close_levier, result.score)
+        if entry is None:
+            typer.secho(
+                f"  aucune projection ouverte pour {close_levier!r}",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            marque = "dans" if entry.within_interval else "hors"
+            typer.secho(
+                f"  projection refermée : projeté {entry.predicted_median:.1f}, "
+                f"réalisé {entry.realised_points:.1f} ({entry.error:+.1f}, "
+                f"{marque} l'intervalle)",
+                fg=typer.colors.GREEN if entry.within_interval else typer.colors.YELLOW,
+            )
+
+    if record_projections:
+        for projection in result.projections:
+            if not projection.distribution:
+                continue
+            from .conditioning.projection import ProbabilisticGain
+
+            gain = ProbabilisticGain(
+                levier=projection.levier,
+                samples=np.array([projection.distribution["median_points"]]),
+                coverage=projection.distribution["coverage"],
+                yield_mean=projection.distribution["yield_mean"],
+                yield_sigma=projection.distribution["yield_sigma"],
+            )
+            gain.samples = np.array([
+                projection.distribution["p10_points"],
+                projection.distribution["median_points"],
+                projection.distribution["p90_points"],
+            ])
+            record_projection(
+                workspace, hotel_id, gain, "lidar_cloud", result.score
+            )
+        typer.echo("  projections consignées au registre")
+
+    typer.secho(
+        f"{OK} fidélité {result.score:.1%} sur {result.total_surface:,.0f} m²".replace(",", " "),
+        fg=typer.colors.GREEN,
+    )
+    typer.echo(f"  {path}")
+    typer.echo("\n  part de surface par source :")
+    for source, share in sorted(
+        result.by_source().items(), key=lambda i: -i[1]
+    ):
+        typer.echo(f"    {source:<16} {share:>6.1%}")
+
+    gaps = result.gaps()[:top]
+    if gaps:
+        typer.secho(f"\n  {len(gaps)} écart(s) le(s) plus lourd(s) :", fg=typer.colors.YELLOW)
+        for item in gaps:
+            poids = item.surface_m2 * (1.0 - item.fidelity)
+            typer.echo(f"    {poids:>8.0f}  {item.poste}")
+            typer.echo(f"              {item.gap}")
+
+    if result.projections:
+        typer.secho("\n  ce qui fermerait ces écarts :", fg=typer.colors.GREEN)
+        for projection in result.projections:
+            dist = projection.distribution
+            if dist:
+                typer.echo(
+                    f"    +{dist['median_points']:>5.1f} pts "
+                    f"[{dist['p10_points']:.1f} – {dist['p90_points']:.1f}]  "
+                    f"{projection.levier}"
+                )
+                typer.echo(
+                    f"                 couverture attendue "
+                    f"{dist['coverage']:.0%}, rendement {dist['yield_mean']:.0%}"
+                )
+            else:
+                typer.echo(
+                    f"    +{projection.gain_points:>5.1f} pts  {projection.levier}"
+                )
+            typer.echo(f"                 coût : {projection.cout}")
+
+    resume = ledger.summary()
+    if resume.get("closed"):
+        typer.secho("\n  registre des projections :", fg=typer.colors.GREEN)
+        typer.echo(
+            f"    {resume['closed']} refermée(s), écart médian "
+            f"{resume['median_error_points']:+.1f} pts, "
+            f"{resume['within_interval']} dans l'intervalle"
+        )
+
+
+@conditioning_app.command("render")
+def conditioning_render(
+    hotel_id: str = typer.Argument(...),
+    frames: int = typer.Option(90, "--frames", help="Nombre de poses rendues."),
+    arc: float = typer.Option(180.0, "--arc", help="Étendue angulaire, en degrés."),
+    start_bearing: float = typer.Option(
+        200.0, "--start-bearing", help="Azimut de départ, en degrés."
+    ),
+    start_altitude: float = typer.Option(
+        45.0, "--start-altitude", help="Altitude initiale, en mètres."
+    ),
+    end_altitude: float = typer.Option(
+        6.0, "--end-altitude", help="Altitude finale, en mètres."
+    ),
+    width: int = typer.Option(512, "--width", help="Largeur des cartes."),
+    height: int = typer.Option(288, "--height", help="Hauteur des cartes."),
+    out: Path | None = typer.Option(None, "--out", help="Dossier de sortie."),
+    measured_heights: bool = typer.Option(
+        True,
+        "--measured-heights/--assumed-heights",
+        help="Mesurer les hauteurs au nDSM LiDAR quand il couvre l'emprise.",
+    ),
+) -> None:
+    """Rend les cartes qui contraignent le générateur, le long d'une orbite."""
+    from .conditioning import load_scene, render_sequence
+    from .conditioning.heights import (
+        RasterUnavailable,
+        apply_cloud_roofs,
+        apply_laz_heights,
+        apply_measured_heights,
+        find_laz,
+        find_laz_tiles,
+        find_ndsm,
+    )
+
+    workspace = Workspace(hotel_id)
+    geometry = workspace.path("06_geo", "capture_geometry.json")
+    if not geometry.is_file():
+        typer.secho(
+            f"{KO} aucune géométrie de capture : {geometry}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        scene = load_scene(geometry)
+    except ValueError as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    if measured_heights:
+        ndsm = find_ndsm(workspace)
+        if ndsm is None:
+            typer.secho(
+                "  aucun nDSM dérivé : les hauteurs restent des hypothèses",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            try:
+                summary = apply_measured_heights(scene, ndsm)
+            except RasterUnavailable as exc:
+                typer.secho(f"  {exc}", fg=typer.colors.YELLOW)
+            else:
+                typer.echo(
+                    f"  hauteurs mesurées : {summary['measured']}/{summary['total']}"
+                    f" volumes ({summary['still_assumed']} encore supposés)"
+                )
+                for item in summary["measurements"]:
+                    typer.echo(
+                        f"    {item['feature_id']:<24} {item['height_m']:>6.2f} m"
+                        f"  ({item['cells']} cellules)"
+                    )
+
+        # Les emprises sont redressées avant toute extrusion : un mur
+        # d'équerre porte un toit d'équerre, et corriger après coup obligerait
+        # à rejouer la segmentation en pans.
+        from .conditioning.regularize import apply_to_scene as _regularize_scene
+
+        squared = _regularize_scene(scene)
+        if squared.get("regularized"):
+            typer.echo(
+                f"  emprises redressées : {squared['regularized']} volume(s), "
+                f"écart max {squared['max_shift_m']} m"
+            )
+
+        # Les volumes que le nDSM ne couvre pas reçoivent une toiture
+        # triangulée depuis le nuage : sans elle, ils se fermaient par un cône
+        # et la segmentation en pans n'avait rien à corriger.
+        ground_ref = _ground_reference(workspace, scene)
+        cloud_tiles = find_laz_tiles(workspace)
+        if cloud_tiles:
+            roofs = apply_cloud_roofs(scene, cloud_tiles, ground_ref)
+            if roofs.get("built"):
+                typer.echo(
+                    f"  toitures depuis le nuage : {roofs['built']} volume(s)"
+                )
+
+        # La toiture est segmentée en pans, puis réajustée sur eux : une
+        # triangulation directe du modèle de hauteur rend une nappe irrégulière
+        # là où un toit est fait de versants francs.
+        from .conditioning.roof_planes import apply_to_scene, ridges
+
+        roof_tile = find_laz(workspace, scene.centre)
+        if roof_tile is not None:
+            from .conditioning.terrain import find_dtm as _find_dtm
+
+            planes = apply_to_scene(scene, cloud_tiles or roof_tile, ground_ref)
+            if planes.get("segmented"):
+                typer.echo(
+                    f"  toiture : {planes['segmented']} volume(s) segmenté(s), "
+                    f"{planes['pitched_planes']} pan(s) en pente, "
+                    f"{planes['vertices_adjusted']} sommet(s) réajusté(s)"
+                )
+                target = scene.target
+                if target is not None and target.roof_planes is not None:
+                    edges = ridges(target.roof_planes)
+                    faitages = [e for e in edges if e.kind == "faitage"]
+                    if faitages:
+                        typer.echo(
+                            f"    {len(faitages)} faîtage(s) vectorisé(s), "
+                            f"le plus long {faitages[0].length_m:.0f} m"
+                        )
+
+        # Le relief des murs se lit dans le nuage : la vue de dessus n'en
+        # donne que le pourtour, et les décrochements verticaux s'aplanissaient.
+        from .conditioning.facade import apply_relief
+
+        site_tile = find_laz(workspace, scene.centre)
+        if site_tile is not None:
+            relief = apply_relief(scene, site_tile)
+            if relief.get("profiled"):
+                typer.echo(
+                    f"  relief de façade : {relief['profiled']}/{relief['total']} "
+                    f"volume(s), décrochement max {relief['max_relief_m']:.1f} m"
+                )
+
+        # Le nDSM ne couvre que la cible : le nuage brut porte les voisins.
+        laz = find_laz_tiles(workspace)
+        if laz and scene.assumed_height_count:
+            try:
+                extra = apply_laz_heights(scene, laz)
+            except RasterUnavailable as exc:
+                typer.secho(f"  {exc}", fg=typer.colors.YELLOW)
+            else:
+                if extra["measured"]:
+                    typer.echo(
+                        f"  complétées au nuage : {extra['measured']} volume(s)"
+                        f" — {extra['still_assumed']} encore supposé(s)"
+                    )
+                if extra.get("outside_tile"):
+                    typer.secho(
+                        f"  dont {extra['outside_tile']} hors de la tuile obtenue "
+                        "— `geo discover --scene` élargit l'emprise interrogée",
+                        fg=typer.colors.YELLOW,
+                    )
+
+    environment = None
+    laz_for_env = find_laz(workspace, scene.centre)
+    if laz_for_env is not None:
+        from .conditioning import environment as environment_module
+
+        from .conditioning.terrain import find_dtm
+
+        environment = environment_module.build(
+            scene, laz_for_env, dtm_path=find_dtm(workspace)
+        )
+        typer.echo(
+            f"  environnement : {len(environment.patches)} massif(s) végétal(aux), "
+            f"{len(environment.linked)} bâtiment(s) lié(s)"
+        )
+        if environment.terrain is not None:
+            typer.echo(
+                f"    terrain : relief de {environment.terrain.relief_m:.2f} m "
+                "porté au sol"
+            )
+        if environment.ground_cells:
+            kinds = environment.provenance.get("ground_by_kind", {})
+            summary = ", ".join(f"{k} {v}" for k, v in sorted(kinds.items()))
+            typer.echo(
+                f"    sol : {summary} "
+                f"(cellules de {environment.ground_cell_m:.0f} m)"
+            )
+        if environment.patches:
+            strata = ", ".join(
+                f"{name} {count}" for name, count in environment.by_stratum().items()
+            )
+            typer.echo(f"    {strata}")
+        typer.secho(
+            "    la végétation vient des points non classés, par leur hauteur : "
+            "elle borne un encombrement, pas une espèce",
+            fg=typer.colors.YELLOW,
+        )
+
+        # Le relevé aérien donne la position et la hauteur ; les vues au sol
+        # disent l'allure. Sans elles, tout arbre serait rendu en cylindre.
+        screening_path = workspace.path("09_confidence", "identity_screening.json")
+        manifest_path = workspace.path("00_manifest", "asset_manifest.json")
+        if environment.patches and screening_path.is_file() and manifest_path.is_file():
+            from .conditioning.shape_input import build as build_lot
+            from .conditioning.silhouette import read_views, shape_hints
+
+            lot = build_lot(screening_path, manifest_path, max_images=6)
+            if lot.images:
+                reading = read_views(
+                    hotel_id,
+                    [(i.asset_id, i.path, i.bearing_deg) for i in lot.images],
+                    cache_dir=workspace.path("11_conditioning", "silhouette_cache"),
+                )
+                hints = shape_hints(reading)
+                dominant = hints["dominant_shape"]
+                if dominant != "indetermine":
+                    for patch in environment.patches:
+                        patch.shape = dominant
+                    typer.echo(
+                        f"    allure lue sur {hints['views_used']} vue(s) : "
+                        f"{dominant} (score {hints['mean_score']})"
+                    )
+                    typer.secho(
+                        "    l'allure est une hypothèse plausible tirée des "
+                        "images, non une mesure de géométrie",
+                        fg=typer.colors.YELLOW,
+                    )
+
+    support = None
+    screening = workspace.path("09_confidence", "identity_screening.json")
+    manifest_path = workspace.path("00_manifest", "asset_manifest.json")
+    if screening.is_file() and manifest_path.is_file():
+        from .conditioning.support import from_screening
+
+        support = from_screening(screening, manifest_path)
+        if len(support):
+            typer.echo(
+                f"  appui photographique : {len(support)} référence(s) placée(s), "
+                f"plus grand trou {support.widest_gap():.0f}°"
+            )
+        else:
+            typer.secho(
+                "  aucune référence placée sur le cercle : l'appui "
+                "photographique n'est pas évalué",
+                fg=typer.colors.YELLOW,
+            )
+            support = None
+    else:
+        typer.secho(
+            "  pas de dépistage d'identité : lancer `identity screen` pour "
+            "vérifier que les références couvrent la trajectoire",
+            fg=typer.colors.YELLOW,
+        )
+
+    destination = out or workspace.path("11_conditioning", "orbit")
+    result = render_sequence(
+        scene,
+        destination,
+        support=support,
+        environment=environment,
+        frame_count=frames,
+        arc_deg=arc,
+        start_bearing_deg=start_bearing,
+        start_altitude_m=start_altitude,
+        end_altitude_m=end_altitude,
+        width=width,
+        height=height,
+    )
+
+    typer.secho(f"{OK} {len(result.frames)} frame(s) dans {destination}", fg=typer.colors.GREEN)
+    typer.echo(f"  verdict      {result.verdict()}")
+    typer.echo(f"  contraintes  {result.strong_fraction:.0%} des frames")
+    if support is not None and result.unreferenced_fraction:
+        typer.secho(
+            f"  non appuyé   {result.unreferenced_fraction:.0%} des frames — "
+            "aucune photographie ne montre ces angles",
+            fg=typer.colors.YELLOW,
+        )
+    if scene.assumed_height_count:
+        typer.secho(
+            f"  {scene.assumed_height_count} volume(s) sans hauteur mesurée : "
+            "la silhouette verticale est une hypothèse, pas une mesure",
+            fg=typer.colors.YELLOW,
+        )
+    if result.verdict() == "prefer_ungrounded":
+        typer.secho(
+            "  la géométrie ne contraint rien d'utile ici — mieux vaut "
+            "générer sans conditionnement que d'imposer une erreur",
+            fg=typer.colors.YELLOW,
+        )
+
+
+def _establishment_names(workspace) -> tuple[list[str], list[str]]:  # noqa: ANN001
+    """Noms attendus et exclus d'un établissement, depuis son profil.
+
+    Le profil porte `official_name` et `competitor_names` : ce sont exactement
+    les termes qu'une enseigne doit confirmer ou démentir. À défaut de profil,
+    l'identifiant du projet sert de repli — il contient souvent la raison
+    sociale, mais rien ne le garantit.
+    """
+    expected: list[str] = []
+    excluded: list[str] = []
+
+    profile_path = Path("profiles") / f"{workspace.hotel_id}.json"
+    if profile_path.is_file():
+        payload = json.loads(profile_path.read_text(encoding="utf-8"))
+        official = payload.get("official_name")
+        if official:
+            expected.append(str(official))
+        excluded.extend(str(n) for n in payload.get("competitor_names", []) or [])
+
+    fallback = workspace.hotel_id.replace("-", " ").strip()
+    if fallback and fallback not in expected:
+        expected.append(fallback)
+    return expected, excluded
+
+
+identity_app = typer.Typer(
+    no_args_is_help=True,
+    help="Identité visuelle du bâtiment : est-ce bien cet établissement ?",
+)
+app.add_typer(identity_app, name="identity")
+
+
+@identity_app.command("screen")
+def identity_screen(
+    hotel_id: str = typer.Argument(...),
+    folders: list[str] = typer.Option(
+        ["02_images"], "--folder", help="Dossiers à dépister ; répétable."
+    ),
+    limit: int = typer.Option(0, "--limit", help="Plafond d'images ; 0 = tout."),
+    top: int = typer.Option(8, "--top", help="Références à retenir."),
+    sign_budget: int = typer.Option(
+        12, "--sign-budget", help="Images soumises à l'OCR d'enseigne."
+    ),
+    no_attributes: bool = typer.Option(
+        False, "--no-attributes", help="Sauter la notation d'attributs."
+    ),
+) -> None:
+    """Trie un corpus par identité du bâtiment, sans intervention humaine."""
+    from .identity import AnchorSet, screen_assets
+    from .identity.anchors import load_anchors
+    from .identity.embedding import EmbeddingIndex, VisionUnavailable
+    from .identity.verdict import IdentityStatus
+
+    workspace = Workspace(hotel_id)
+    index = EmbeddingIndex(workspace.path("09_confidence", "identity_index.npz"))
+    anchors = load_anchors(workspace)
+    if not len(anchors):
+        typer.secho(
+            f"{KO} aucune ancre déclarée — sans elle, rien n'atteste à quoi "
+            "ressemble ce site. Voir `identity anchor add`.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Les candidats viennent du **manifeste**, non d'un parcours de disque :
+    # sans ce lien, le verdict d'identité ignorait les droits, l'azimut et la
+    # cohorte temporelle que tout le reste du pipeline maintient.
+    from .identity.candidates import collect
+
+    manifest_file = workspace.path("00_manifest", "asset_manifest.json")
+    if not manifest_file.is_file():
+        typer.secho(
+            f"{KO} manifeste d'assets absent : {manifest_file}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    extra = [workspace.path(*Path(f).parts) for f in folders]
+    candidate_set = collect(manifest_file, extra_folders=extra)
+    if not len(candidate_set):
+        typer.secho(f"{KO} aucun asset exploitable", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    candidates = candidate_set.pairs()
+    rights_by_id = {c.asset_id: c.rights for c in candidate_set.candidates}
+    if limit:
+        candidates = candidates[:limit]
+
+    summary = candidate_set.as_dict()
+    typer.echo(
+        f"  {summary['count']} candidat(s) — {summary['rights_cleared']} aux "
+        f"droits établis, {summary['rights_unclear']} à vérifier"
+    )
+
+    # Les noms viennent du profil, attendus **et** exclus. Construits à la main
+    # ici, la liste des concurrents était perdue : l'OCR lisait bien
+    # « TETRA 1205 TECH » sur l'immeuble voisin mais le rendait `uncertain`,
+    # faute de savoir que ce nom disqualifie l'image.
+    expected, excluded = _establishment_names(workspace)
+
+    # Le numéro civique du site : un voisin qui affiche le sien dément
+    # l'appartenance sans qu'aucune enseigne ne soit lisible.
+    from .identity.sign_match import civic_number
+
+    manifest = workspace.read_manifest()
+    expected_civic = civic_number(manifest.address) if manifest.address else None
+
+    typer.echo(f"  {len(candidates)} image(s), {len(anchors)} ancre(s)")
+    try:
+        result = screen_assets(
+            hotel_id,
+            candidates,
+            anchors,
+            index,
+            with_attributes=not no_attributes,
+            expected_names=expected,
+            excluded_names=excluded,
+            sign_budget=sign_budget,
+            rights_by_id=rights_by_id,
+            expected_civic=expected_civic,
+        )
+    except VisionUnavailable as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    report = workspace.write_json("09_confidence/identity_screening.json", result.as_dict())
+    typer.secho(f"{OK} dépistage écrit : {report}", fg=typer.colors.GREEN)
+    typer.echo(f"  seuil {result.threshold:.3f} — {result.threshold_reason}")
+    for status in IdentityStatus:
+        typer.echo(f"  {str(status):<12} {len(result.by_status(status))}")
+
+    rights = result.rights_summary()
+    if rights:
+        typer.echo(f"  droits des retenues : {rights}")
+
+    best = result.best_references(top)
+    if best:
+        typer.secho(f"\n  {len(best)} référence(s) retenue(s) :", fg=typer.colors.GREEN)
+        for asset in best:
+            mark = "" if asset.rights in {"open_data", "owner_licensed", "public_domain"} else "  ⚠ droits à vérifier"
+            typer.echo(
+                f"    {asset.reference_score:.3f}  {asset.path.name}"
+                f"  [{asset.rights}]{mark}"
+            )
+    typer.secho(
+        "  `uncertain` n'est pas un rejet : ces images attendent une revue.",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@identity_app.command("discover")
+def identity_discover(
+    hotel_id: str = typer.Argument(...),
+    folders: list[str] = typer.Option(
+        ["02_images"], "--folder", help="Dossiers à fouiller ; répétable."
+    ),
+    limit: int = typer.Option(4, "--limit", help="Ancres à proposer au plus."),
+    budget: int = typer.Option(
+        40, "--budget", help="Images ouvertes à l'OCR, les mieux classées."
+    ),
+    write: bool = typer.Option(
+        False, "--write", help="Publier les ancres trouvées au manifeste."
+    ),
+) -> None:
+    """Propose des ancres en lisant les enseignes, sans confirmation humaine."""
+    from .identity.anchors import load_anchors, write_anchors
+    from .identity.embedding import EmbeddingIndex, VisionUnavailable
+    from .identity.screen import discover_anchors_by_sign, rank_sign_candidates
+
+    workspace = Workspace(hotel_id)
+    expected, excluded = _establishment_names(workspace)
+    if not expected:
+        typer.secho(
+            f"{KO} aucun nom d'établissement connu — renseigner `official_name` "
+            "au profil, sinon aucune enseigne ne peut être reconnue.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    candidates: list[tuple[str, Path]] = []
+    for folder in folders:
+        root = workspace.path(*Path(folder).parts)
+        for image in sorted(root.rglob("*.jpg")) + sorted(root.rglob("*.png")):
+            candidates.append((image.stem, image))
+    if not candidates:
+        typer.secho(f"{KO} aucune image dans {folders}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"  {len(candidates)} image(s) — recherche de {expected}")
+    index = EmbeddingIndex(workspace.path("09_confidence", "identity_index.npz"))
+    try:
+        ranked, photographic = rank_sign_candidates(index, candidates)
+    except VisionUnavailable as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    index.save()
+
+    typer.echo(f"  lecture d'enseigne sur les {min(budget, len(ranked))} mieux classées")
+    found = discover_anchors_by_sign(
+        ranked, expected, excluded, limit=limit, budget=budget,
+        photo_scores=photographic,
+    )
+
+    if not found:
+        typer.secho(
+            f"{KO} aucune enseigne lisible portant {expected} — "
+            "confirmer une ancre à la main via `identity anchor`.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho(f"{OK} {len(found)} ancre(s) proposée(s) :", fg=typer.colors.GREEN)
+    for anchor in found:
+        typer.echo(f"    {anchor.path.name}")
+        typer.echo(f"      {anchor.evidence}")
+
+    if not write:
+        typer.secho(
+            "  propositions non publiées — relancer avec --write pour les retenir.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    anchors = load_anchors(workspace)
+    known = {a.path.resolve() for a in anchors.anchors}
+    added = [a for a in found if a.path.resolve() not in known]
+    anchors.anchors.extend(added)
+    path = write_anchors(workspace, anchors)
+    typer.secho(
+        f"{OK} {len(added)} ajoutée(s), {len(anchors)} au total — {path}",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        "  une ancre lue vaut moins qu'une ancre confirmée : vérifier les "
+        "images ci-dessus avant de dépister le corpus.",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@identity_app.command("anchor")
+def identity_anchor(
+    hotel_id: str = typer.Argument(...),
+    image: Path = typer.Argument(..., help="Image confirmée montrant le site."),
+    evidence: str = typer.Option(..., "--evidence", help="Ce qui l'atteste."),
+    origin: str = typer.Option(
+        "operator_confirmed", "--origin", help="operator_confirmed, sign_ocr, official_website."
+    ),
+) -> None:
+    """Déclare une ancre : une image dont l'appartenance est établie."""
+    from .identity.anchors import Anchor, load_anchors, write_anchors
+
+    workspace = Workspace(hotel_id)
+    if not image.is_file():
+        typer.secho(f"{KO} fichier absent : {image}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    anchors = load_anchors(workspace)
+    anchors.anchors.append(
+        Anchor(asset_id=image.stem, path=image.resolve(), origin=origin, evidence=evidence)
+    )
+    path = write_anchors(workspace, anchors)
+    typer.secho(f"{OK} {len(anchors)} ancre(s) — {path}", fg=typer.colors.GREEN)
+
+
+# L'entrée du programme doit rester la **dernière** instruction du module.
+# Placée au milieu du fichier, `app()` s'exécutait avant que les ~1500 lignes
+# suivantes ne soient définies : toute commande les appelant échouait en
+# `NameError`, alors que les mêmes fonctions existaient à l'import. C'est ce
+# qui rendait `assets discover` inutilisable tout en laissant la suite verte,
+# les tests important le module au lieu de l'exécuter.
+if __name__ == "__main__":
+    app()

@@ -89,6 +89,82 @@ class AccessStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ReachabilityStatus(StrEnum):
+    """Joignabilité physique d'une voie (distincte de l'accessibilité juridique)."""
+
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    UNKNOWN = "unknown"
+
+
+class FeasibilityStatus(StrEnum):
+    """Verdict global de faisabilité de capture d'une cible."""
+
+    FEASIBLE = "feasible"
+    INFEASIBLE_PROVEN = "infeasible_proven"
+    NOT_FOUND_REMOTELY = "not_found_remotely"
+    OWNER_CAPTURE_REQUIRED = "owner_capture_required"
+    UNKNOWN = "unknown"
+
+
+class FeasibilityDetail(BaseModel):
+    """Détail de faisabilité pour un canal de capture donné."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: FeasibilityStatus = FeasibilityStatus.UNKNOWN
+    reason: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+
+
+class RoadSegment(BaseModel):
+    """Un tronçon de voie, avec son statut d'accès et son potentiel de capture."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_id: str
+    geometry_wkt: str = ""  # LineString (WKT, cohérent avec SiteObject.geometry_wkt)
+    access_status: AccessStatus = AccessStatus.UNKNOWN
+    service: str | None = None
+    reachability_status: ReachabilityStatus = ReachabilityStatus.UNKNOWN
+    camera_candidate: bool = False
+    streetview_candidate: bool = False
+    mapillary_candidate: bool = False
+
+
+class CaptureFeasibilityAssessment(BaseModel):
+    """Évaluation de faisabilité de capture d'une cible (P4.1).
+
+    Remplace la décision binaire « possible / impossible » : chaque canal
+    (public à distance, assisté propriétaire, professionnel sur site,
+    physiquement impossible) porte son propre détail. C'est cet objet — pas
+    un vague « introuvable » — qui alimente `capture_feasibility_assessment_refs`
+    du ReconstructionInputManifest et déclenche la collecte active.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_id: str
+    status: FeasibilityStatus = FeasibilityStatus.UNKNOWN
+    remote_public: FeasibilityDetail = Field(default_factory=FeasibilityDetail)
+    owner_assisted: FeasibilityDetail = Field(default_factory=FeasibilityDetail)
+    professional_onsite: FeasibilityDetail = Field(default_factory=FeasibilityDetail)
+    physically_impossible: FeasibilityDetail = Field(default_factory=FeasibilityDetail)
+    evidence: list[str] = Field(default_factory=list)
+    assessed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RoadAccessGraph(BaseModel):
+    """Graphe d'accessibilité routière d'un site (P4.1)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    hotel_id: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    road_segments: list[RoadSegment] = Field(default_factory=list)
+    feasibility_assessments: dict[str, CaptureFeasibilityAssessment] = Field(default_factory=dict)
+
+
 #: Types géométriques admis par rôle.
 GEOMETRY_TYPES: dict[GeometryRole, frozenset[str]] = {
     GeometryRole.TARGET_BUILDING: frozenset({"Polygon", "MultiPolygon"}),

@@ -9,6 +9,7 @@ Ce module fournit trois validations obligatoires avant `ENVIRONMENT_3D_READY` :
 from __future__ import annotations
 
 import json
+import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +18,14 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
+from .geometry_align import (
+    align_by_correspondence,
+    alignment_rmse,
+    apply_sim3,
+    umeyama_sim3,
+)
 from .schemas.reconstruction import ReconstructionRun
+from .reconstruction_consensus import resolve_model_dir
 from .workspace import Workspace
 
 
@@ -26,40 +34,46 @@ from .workspace import Workspace
 # ---------------------------------------------------------------------------
 
 
-def _umeyama_sim3(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    if X.shape != Y.shape or X.shape[0] < 3:
-        return np.eye(3), np.zeros(3), 1.0
-    mu_x = X.mean(axis=0)
-    mu_y = Y.mean(axis=0)
-    Xc = X - mu_x
-    Yc = Y - mu_y
-    Sigma = Xc.T @ Yc / X.shape[0]
-    U, d, Vt = np.linalg.svd(Sigma)
-    V = Vt.T
-    S = np.eye(3)
-    if np.linalg.det(U @ V.T) < 0:
-        S[2, 2] = -1
-        d[2] *= -1
-    R = U @ S @ V.T
-    var_x = (Xc ** 2).sum() / X.shape[0]
-    scale = d.sum() / var_x if var_x > 1e-12 else 1.0
-    scale = max(scale, 1e-6)
-    t = mu_y - scale * R @ mu_x
-    return R, t, float(scale)
+def _umeyama_sim3(
+    source: np.ndarray, target: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Sim(3) amenant `source` sur `target`. Délègue à `geometry_align`."""
+    return umeyama_sim3(source, target)
 
 
 def _apply_sim3(points: np.ndarray, R: np.ndarray, t: np.ndarray, s: float) -> np.ndarray:
-    return s * (points @ R.T) + t
+    return apply_sim3(points, R, t, s)
+
+
+def _is_pose_line(line: str) -> bool:
+    """Une ligne de pose finit par `CAMERA_ID NAME` ; une ligne d'observations
+    n'est faite que de nombres."""
+    parts = line.split()
+    if len(parts) < 10:
+        return False
+    try:
+        float(parts[-1])
+    except ValueError:
+        return True
+    return False
 
 
 def _load_colmap_camera_centers(run_dir: Path) -> dict[str, np.ndarray]:
     images_file = run_dir / "normalized" / "images"
     if not images_file.is_file():
         return {}
+    # COLMAP écrit **deux** lignes par image : la pose, puis les
+    # observations « X Y POINT3D_ID … ». Lire toutes les lignes prenait ces
+    # observations pour des poses — autant de caméras fantômes.
+    _lines = [
+        line for line in images_file.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if any(not _is_pose_line(line) for line in _lines):
+        _lines = _lines[::2]
+
     centers: dict[str, np.ndarray] = {}
-    for line in images_file.read_text().splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
+    for line in _lines:
         parts = line.split()
         if len(parts) < 9:
             continue
@@ -80,9 +94,7 @@ def _load_colmap_camera_centers(run_dir: Path) -> dict[str, np.ndarray]:
 def _load_run_centers(run: ReconstructionRun) -> dict[str, np.ndarray]:
     if not run.output_path:
         return {}
-    run_dir = Path(run.output_path)
-    if not run_dir.is_dir():
-        run_dir = run_dir.parent
+    run_dir = resolve_model_dir(run.output_path)
 
     normalized_dir = run_dir / "normalized"
     if not normalized_dir.is_dir():
@@ -199,10 +211,23 @@ def validate_held_out(
         )
 
     # Vues cachées = assets sélectionnés mais non enregistrés
+    snapshot_path = workspace.path(
+        "07_reconstruction", f"reconstruction_input_{run.reconstruction_input_id}.json"
+    )
     input_path = workspace.path("07_reconstruction", "plans")
     selected_ids = list(centers.keys())
     held_out_ids = []
-    if input_path.is_dir():
+    if snapshot_path.is_file():
+        try:
+            from .schemas import ReconstructionInputManifest
+
+            snapshot = ReconstructionInputManifest.model_validate_json(
+                snapshot_path.read_text("utf-8")
+            )
+            selected_ids = snapshot.selected_asset_ids
+        except Exception:
+            pass
+    elif input_path.is_dir():
         for plan_file in input_path.glob("*.json"):
             try:
                 plan = json.loads(plan_file.read_text("utf-8"))
@@ -222,15 +247,42 @@ def validate_held_out(
         "held_out_ids": held_out_ids[:20],
     }
 
+    localization = None
+    localization_dir = workspace.path("07_reconstruction", "localization")
+    if localization_dir.is_dir():
+        from .schemas import LocalizationManifest, PoseEvidenceClass
+
+        for path in sorted(localization_dir.glob("*.json"), reverse=True):
+            try:
+                candidate = LocalizationManifest.model_validate_json(path.read_text("utf-8"))
+            except Exception:
+                continue
+            if candidate.reconstruction_input_id == run.reconstruction_input_id:
+                localization = candidate
+                break
+
     if len(held_out_ids) == 0:
-        status = "passed"
-        metrics["note"] = "aucune vue cachée disponible"
+        status = "insufficient_evidence"
+        metrics["note"] = "aucune vue cachée n'a été réellement testée"
     elif len(registered) < 3:
         status = "failed"
         metrics["note"] = "trop peu de vues enregistrées pour valider"
+    elif localization is None:
+        status = "insufficient_evidence"
+        metrics["note"] = "aucun LocalizationManifest: identifier les vues cachées ne les valide pas"
     else:
-        status = "passed"
-        metrics["note"] = "vue(s) cachée(s) identifiée(s) — potentiel d'enregistrement évalué"
+        measured = {
+            pose.asset_id
+            for pose in localization.poses
+            if pose.evidence_class is PoseEvidenceClass.LOCALIZED_MEASURED
+        }
+        tested = set(held_out_ids) & {attempt.asset_id for attempt in localization.attempts}
+        passed = set(held_out_ids) & measured
+        metrics["held_out_tested"] = len(tested)
+        metrics["held_out_localized_measured"] = len(passed)
+        metrics["held_out_success_rate"] = len(passed) / len(held_out_ids)
+        status = "passed" if tested == set(held_out_ids) and passed == set(held_out_ids) else "failed"
+        metrics["note"] = "validation fondée sur les tentatives PnP du manifeste de localisation"
 
     return HeldOutValidation(
         validation_id=validation_id,
@@ -269,37 +321,40 @@ def validate_stability(
     asset_ids = sorted(centers.keys())
     subsets_results = []
 
-    # Sous-ensemble 90%
+    # Les sous-corpus sont comparés au corpus plein par identifiant partagé.
+    # Comparer par position alignerait des caméras sans rapport : deux
+    # échantillonnages n'ont aucune raison d'être dans le même ordre.
     rng = random.Random(42)
-    subset_90 = sorted(rng.sample(asset_ids, max(int(len(asset_ids) * 0.9), 3)))
-    pts_full = np.array([centers[aid] for aid in asset_ids])
-    pts_90 = np.array([centers[aid] for aid in subset_90 if aid in centers])
-    if pts_90.shape[0] >= 3:
-        R, t, s = _umeyama_sim3(pts_90, pts_full)
-        aligned = _apply_sim3(pts_90, R, t, s)
-        rmse = float(np.sqrt(((aligned - pts_full[:len(pts_90)]) ** 2).mean()))
+    for label, fraction, threshold in (("90%", 0.9, 0.5), ("80%", 0.8, 1.0)):
+        subset = sorted(rng.sample(asset_ids, max(int(len(asset_ids) * fraction), 3)))
+        subset_centers = {aid: centers[aid] for aid in subset if aid in centers}
+        if len(subset_centers) < 3:
+            continue
+        rmse, n_common = align_by_correspondence(subset_centers, centers)
+        if not math.isfinite(rmse):
+            subsets_results.append({
+                "subset": label,
+                "n_cameras": len(subset),
+                "alignment_rmse_m": None,
+                "status": "insufficient_evidence",
+            })
+            continue
         subsets_results.append({
-            "subset": "90%",
-            "n_cameras": len(subset_90),
+            "subset": label,
+            "n_cameras": len(subset),
             "alignment_rmse_m": round(rmse, 4),
-            "status": "passed" if rmse < 0.5 else "review",
+            "status": "passed" if rmse < threshold else "review",
         })
 
-    # Sous-ensemble 80%
-    subset_80 = sorted(rng.sample(asset_ids, max(int(len(asset_ids) * 0.8), 3)))
-    pts_80 = np.array([centers[aid] for aid in subset_80 if aid in centers])
-    if pts_80.shape[0] >= 3:
-        R, t, s = _umeyama_sim3(pts_80, pts_full)
-        aligned = _apply_sim3(pts_80, R, t, s)
-        rmse = float(np.sqrt(((aligned - pts_full[:len(pts_80)]) ** 2).mean()))
-        subsets_results.append({
-            "subset": "80%",
-            "n_cameras": len(subset_80),
-            "alignment_rmse_m": round(rmse, 4),
-            "status": "passed" if rmse < 1.0 else "review",
-        })
-
-    overall = "passed" if all(s.get("status") == "passed" for s in subsets_results) else "review"
+    # Une ablation non concluante n'est pas une ablation en échec : on la
+    # distingue explicitement plutôt que de la fondre dans "review".
+    statuses = {s.get("status") for s in subsets_results}
+    if not subsets_results or statuses == {"insufficient_evidence"}:
+        overall = "insufficient_evidence"
+    elif statuses <= {"passed"}:
+        overall = "passed"
+    else:
+        overall = "review"
     return StabilityValidation(
         validation_id=validation_id,
         reconstruction_run_id=reconstruction_run_id,
@@ -355,9 +410,10 @@ def validate_cross_solver(
             continue
         X = np.array([centers_run[k] for k in common])
         Y = np.array([centers_sib[k] for k in common])
-        R, t, s = _umeyama_sim3(X, Y)
-        Y_aligned = _apply_sim3(Y, R, t, s)
-        rmse = float(np.sqrt(((Y_aligned - X) ** 2).mean()))
+        # On amène le frère (source) sur le run courant (target).
+        R, t, s = umeyama_sim3(Y, X)
+        Y_aligned = apply_sim3(Y, R, t, s)
+        rmse = alignment_rmse(Y_aligned, X)
         score = max(0.0, 1.0 - rmse / 2.0)
         best_score = max(best_score, score)
         if rmse > 1.0:

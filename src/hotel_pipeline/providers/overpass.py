@@ -140,3 +140,52 @@ def features_around(lat: float, lon: float, radius_m: int = 500) -> list[dict[st
     elements = payload["elements"]
     log.info("Overpass a retourné %d éléments dans un rayon de %d m", len(elements), radius_m)
     return elements
+
+#: Emprises décrivant le sol et les plantations d'un site. La requête des
+#: bâtiments ne les demande pas : sur le pilote, cinquante-six éléments
+#: collectés ne portaient pas un seul tag de végétation, alors que pelouses et
+#: massifs sont cartographiés en amont. Ce qui n'est pas demandé n'arrive pas.
+GROUND_SELECTORS: tuple[str, ...] = (
+    'way["landuse"~"^(grass|meadow|forest|village_green|greenfield|farmland)$"]',
+    'way["natural"~"^(wood|scrub|grassland|tree_row|water|wetland)$"]',
+    'way["leisure"~"^(garden|park|pitch|golf_course|playground)$"]',
+    'way["surface"~"^(grass|dirt|gravel|paving_stones|concrete|asphalt)$"]',
+    # Un arbre isolé est un nœud, non une emprise : il compte pourtant, car il
+    # occulte une façade à lui seul devant une entrée.
+    'node["natural"="tree"]',
+    'relation["landuse"~"^(grass|forest|meadow)$"]',
+    'relation["leisure"~"^(garden|park)$"]',
+)
+
+
+def ground_around(
+    lat: float, lon: float, radius_m: int = 300
+) -> list[dict[str, Any]]:
+    """Sol, plantations et arbres isolés dans un rayon, avec leur géométrie.
+
+    Séparé de `features_around` à dessein : élargir la requête des bâtiments
+    aurait laissé la clé de cache inchangée, et les anciennes réponses — sans
+    végétation — auraient été resservies indéfiniment. Une requête distincte a
+    sa propre clé, et le cache existant reste valide pour ce qu'il décrit.
+    """
+    selectors = "\n      ".join(
+        f"{selector}(around:{radius_m},{lat},{lon});" for selector in GROUND_SELECTORS
+    )
+    ql = f"""
+    [out:json][timeout:{TIMEOUT}];
+    (
+      {selectors}
+    );
+    out geom tags;
+    """.strip()
+
+    payload = cached_call(
+        f"overpass-ground::{lat:.6f}::{lon:.6f}::{radius_m}", lambda: _query(ql)
+    )
+    elements = payload["elements"]
+    log.info(
+        "Overpass a retourné %d élément(s) de sol dans un rayon de %d m",
+        len(elements),
+        radius_m,
+    )
+    return elements

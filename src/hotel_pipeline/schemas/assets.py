@@ -342,6 +342,19 @@ class Asset(BaseModel):
     #: `heading_is_measured`.
     sees_building: bool | None = None
 
+    #: Force continue du cadrage mesuré, dans [0, 1] : 1,0 sur l'axe optique,
+    #: 0 au bord du champ. `None` quand aucun cadrage n'a été mesuré.
+    #:
+    #: `target_building_visible` est un tri-état : il dit *si* la cible est
+    #: établie, jamais *à quel point*. Une vue où le pylône remplit le cadre et
+    #: une vue où un coin dépasse à peine y portent la même valeur, et le tri
+    #: en aval ne peut plus les départager. La grandeur mesurée voyage donc
+    #: ici, à côté du verdict qu'elle a produit.
+    framing_strength: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: Prominence du sujet lue sur les pixels, dans [0, 1]. `None` = non lue.
+    subject_prominence: float | None = Field(default=None, ge=0.0, le=1.0)
+
     #: Ancien verdict de cadrage, produit par l'annotateur mono-rayon
     #: supprimé. Conservé comme trace, **non probant** : la cascade ne s'en
     #: sert plus, seul un cadrage calculé fait foi.

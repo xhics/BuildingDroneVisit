@@ -137,7 +137,18 @@ def candidates_from(source: str, images: list) -> list[CaptureCandidate]:
     Les dimensions annoncées ne sont pas recopiées comme mesurées : elles
     n'existeront qu'après acquisition d'un fichier.
     """
+    from .acquisition_request import PROVIDER_RESOLUTIONS
     from .schemas.acquisition import capture_identity
+
+    # Les noms de résolution appartiennent à **chaque** source : les valeurs
+    # Mapillary étaient écrites en dur pour toutes, si bien qu'un candidat
+    # KartaView annonçait `thumb_2048` — que sa table ne sait pas traduire.
+    # On dérive donc de la table déclarée, seule autorité sur le vocabulaire
+    # d'un fournisseur.
+    table = PROVIDER_RESOLUTIONS.get(source, {})
+    provider_names = set(table.values())
+    plan_names = set(table)
+    default_resolution = table.get("full_available") or table.get("2048")
 
     candidates: list[CaptureCandidate] = []
     for image in images:
@@ -166,13 +177,11 @@ def candidates_from(source: str, images: list) -> list[CaptureCandidate]:
                 # ressemble à un secret ou à une URL.
                 request_spec={
                     "provider_id": provider_id,
-                    "resolution": "thumb_2048",
+                    "resolution": default_resolution,
                 },
-                # `thumb_256` existe à l'API et n'était pas déclaré : un plan
-                # demandant un aperçu était refusé faute de l'avoir dit.
-                available_resolutions=sorted(
-                    {"thumb_256", "thumb_2048", "256", "2048"}
-                ),
+                # Le vocabulaire du plan **et** celui du fournisseur : un plan
+                # demandant « 256 » était refusé faute d'avoir déclaré les deux.
+                available_resolutions=sorted(provider_names | plan_names),
             )
         )
     return candidates

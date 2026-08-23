@@ -85,6 +85,76 @@ def _stage_source(asset: Asset) -> tuple[list[Subject], str | None]:
     return [], None
 
 
+def _framing(
+    asset: Asset,
+    building_wkt: str | None,
+    policy: PipelinePolicy,
+) -> tuple[bool | None, str | None]:
+    """L'empreinte cible entre-t-elle dans le champ, d'après la **mesure** ?
+
+    Position, cap et empreinte sont mesurés ; l'avis d'un classifieur sur une
+    vignette compressée est inféré. Quand les trois existent, le cadrage
+    tranche donc avant le modèle.
+
+    `visibility.assess` compare le cap au point de l'empreinte **le plus
+    proche**, non au centroïde : de près, une façade peut remplir l'image
+    alors que le centroïde est sorti du champ.
+
+    Retourne `(True | False, motif)`, ou `(None, None)` quand une des mesures
+    manque — auquel cas on ne conclut pas.
+    """
+    if building_wkt is None:
+        return None, None
+    if asset.camera_lat is None or asset.camera_lon is None:
+        return None, None
+    if asset.heading_deg is None or not asset.heading_is_measured:
+        # Un cap que nous avons nous-mêmes dirigé vers l'empreinte ne prouve
+        # rien sur le contenu : il ne fait que répéter notre intention.
+        return None, None
+
+    from .visibility import assess
+
+    try:
+        verdict = assess(
+            asset.camera_lat,
+            asset.camera_lon,
+            asset.heading_deg,
+            building_wkt,
+            half_fov_deg=policy.geometry.half_fov_deg,
+        )
+    except Exception:  # géométrie illisible : on ne conclut pas
+        return None, None
+
+    if verdict.visible:
+        return True, f"empreinte cadrée par un cap mesuré ({verdict.reason})"
+    return False, f"empreinte hors du champ d'un cap mesuré ({verdict.reason})"
+
+
+def _framing_strength(
+    asset: Asset,
+    building_wkt: str | None,
+    policy: PipelinePolicy,
+) -> float | None:
+    """Force continue du cadrage, conservée à côté du verdict booléen."""
+    if building_wkt is None or asset.camera_lat is None or asset.camera_lon is None:
+        return None
+    if asset.heading_deg is None or not asset.heading_is_measured:
+        return None
+
+    from .visibility import assess
+
+    try:
+        return assess(
+            asset.camera_lat,
+            asset.camera_lon,
+            asset.heading_deg,
+            building_wkt,
+            half_fov_deg=policy.geometry.half_fov_deg,
+        ).framing_strength
+    except Exception:
+        return None
+
+
 def _stage_geometry(asset: Asset, front_azimuth: float | None) -> tuple[list[Subject], ViewSector, str | None]:
     """Étape 2 — ce que la géométrie établit.
 
@@ -145,6 +215,8 @@ def _target_visibility(
     asset: Asset,
     model_contains_building: bool | None,
     target_in_fov: bool,
+    framed: bool | None = None,
+    framing_reason: str | None = None,
 ) -> tuple[bool | None, str | None]:
     """Le bâtiment **cible** est-il visible, et sur quelle preuve ?
 
@@ -182,10 +254,37 @@ def _target_visibility(
     if asset.occluded_by:
         return False, f"masqué par {asset.occluded_by}"
 
+    # --- Le cadrage mesuré passe avant le modèle -------------------------
+    #
+    # Mesuré sur le corpus pilote, contre 26 décisions humaines :
+    #
+    #   classifieur seul            rappel  26 %   précision 38 %
+    #   cadrage géométrique mesuré  rappel 100 %   précision 71 %
+    #
+    # Un classifieur à 26 % de rappel qui dit « non » énonce son état de
+    # repos, pas une observation. Une empreinte hors du champ d'un cap
+    # mesuré, elle, est une mesure : c'est elle qui a le droit d'exclure.
+    if framed is False:
+        return False, framing_reason or "empreinte hors du champ d'un cap mesuré"
+
+    if framed is True:
+        # Une personne qui a regardé sans conclure n'est pas contredite par
+        # une déduction : après un `unresolved` humain, le cadrage peut
+        # constater, jamais établir.
+        if reviewed_undecided:
+            return None, (
+                "revue humaine non conclusive : le cadrage mesuré ne peut pas "
+                "établir ce qu'une lecture directe a refusé d'établir"
+            )
+        # Le cadrage établit que la cible est dans l'image. L'identité reste
+        # une question distincte, traitée plus bas.
+        return True, framing_reason or "empreinte cadrée par un cap mesuré"
+
     if model_contains_building is False:
-        # Le modèle affirme qu'aucun bâtiment n'est visible : viser la bonne
-        # direction n'y change rien.
-        return False, "aucun bâtiment détecté par le modèle"
+        # Sans cadrage mesuré, l'avis du modèle ne suffit pas à **prouver**
+        # l'absence : on ne conclut pas, et la revue tranchera. Le traiter
+        # comme une preuve retirait 271 assets jamais regardés par personne.
+        return None, "aucun bâtiment détecté par le modèle : à établir"
 
     if model_contains_building is None:
         return None, "contenu non évalué"
@@ -217,8 +316,14 @@ def classify(
     classifier=None,  # noqa: ANN001
     front_azimuth: float | None = None,
     policy: PipelinePolicy = DEFAULT_POLICY,
+    building_wkt: str | None = None,
 ) -> CascadeReport:
-    """Applique la cascade à chaque asset, en place."""
+    """Applique la cascade à chaque asset, en place.
+
+    `building_wkt` est l'empreinte confirmée du bâtiment cible. Fournie, elle
+    active le test de cadrage mesuré, qui prime sur le classifieur. Absente,
+    la cascade retombe sur le comportement antérieur.
+    """
     report = CascadeReport(total=len(assets))
 
     for index, asset in enumerate(assets):
@@ -279,18 +384,44 @@ def classify(
         # conservé comme trace historique, non comme preuve. Seul un cadrage
         # réellement calculé dit que la cible entre dans l'image — et le corpus
         # n'en compte aujourd'hui aucun.
-        framed = asset.target_in_frame_fraction
-        target_in_fov = bool(framed and framed > 0 and asset.heading_is_measured)
-        target, evidence = _target_visibility(asset, model_contains, target_in_fov)
+        frame_fraction = asset.target_in_frame_fraction
+        target_in_fov = bool(
+            frame_fraction and frame_fraction > 0 and asset.heading_is_measured
+        )
+        framed, framing_reason = _framing(asset, building_wkt, policy)
+        framing_strength = _framing_strength(asset, building_wkt, policy)
+        if framing_reason:
+            methods.append("geometry:framing")
+            report.by_stage["framing"] = report.by_stage.get("framing", 0) + 1
+        target, evidence = _target_visibility(
+            asset, model_contains, target_in_fov, framed, framing_reason
+        )
         contains = model_contains
 
         # Étape 5 — ce qui doit passer devant un humain.
         review = ReviewStatus.NEEDS_REVIEW
         decisive_uncertain = [s for s in uncertain if s in DECISIVE_SUBJECTS]
         blocked_by_occlusion = bool(asset.occluded_by) and contains
+        # Une cible non établie est précisément ce qu'une revue tranche. Sans
+        # cette condition, un asset dont la visibilité reste inconnue était
+        # « accepté automatiquement » et n'entrait dans aucune file : 113 vues
+        # du corpus pilote n'étaient ni exploitées ni jamais soumises à
+        # personne. Accepter automatiquement ne peut pas signifier « clore une
+        # question sans y répondre ».
+        # Distinguer « rien n'a été évalué » de « évalué, non concluant ».
+        # Sans contenu mesuré ni modèle, il n'y a pas de question ouverte à
+        # soumettre : c'est l'état antérieur du corpus, pas une indécision.
+        # En revanche, un modèle qui a répondu sans établir la cible laisse
+        # une question ouverte — et c'est une revue qui la tranche.
+        target_undecided = (
+            target is None
+            and not asset.has_been_reviewed
+            and (model_contains is not None or framed is not None)
+        )
         if (
             not decisive_uncertain
             and not blocked_by_occlusion
+            and not target_undecided
             and (confidence is None or confidence >= policy.model.review_confidence_floor)
             and (subjects or asset.sees_building is not None)
         ):
@@ -315,6 +446,7 @@ def classify(
         assets[index] = asset.model_copy(
             update={
                 "subjects": deduped,
+                "framing_strength": framing_strength,
                 "view_sector": sector,
                 "classification_confidence": confidence,
                 "classification_method": "+".join(methods) if methods else None,

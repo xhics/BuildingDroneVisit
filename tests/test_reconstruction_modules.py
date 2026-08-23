@@ -16,10 +16,14 @@ from hotel_pipeline.reconstruction_plan import ReconstructionPlanner, publish_pl
 from hotel_pipeline.view_graph import ViewGraphBuilder, generate_mask_set
 from hotel_pipeline.workspace import Workspace
 from hotel_pipeline.schemas.reconstruction import (
+    Criticality,
     ReconstructionConsensusReport,
     ReconstructionInputManifest,
     ReconstructionPlan,
     ReconstructionRun,
+    ReconstructionTarget,
+    ReconstructionTargetKind,
+    SupportType,
     ViewGraphManifest,
     ViewGraphNode,
     ViewGraphReport,
@@ -227,12 +231,25 @@ def test_reconstruction_run_publishes_and_loads(tmp_path: Path):
 
     input_manifest = ReconstructionInputManifest(
         reconstruction_input_id="input-1",
+        hotel_id="test-hotel",
         asset_manifest_digest="a" * 64,
         spatial_manifest_digest="b" * 64,
         site_manifest_digest="c" * 64,
         coverage_digest="d" * 64,
         router_decision_digest="e" * 64,
         selected_asset_ids=["asset-1"],
+        targets=[
+            ReconstructionTarget(
+                target_id="FACADE_PRIMARY",
+                kind=ReconstructionTargetKind.SURFACE,
+                criticality=Criticality.MUST_SHOW,
+                allowed_support=[
+                    SupportType.MEASURED_PHOTO,
+                    SupportType.MULTIVIEW_RECONSTRUCTED,
+                    SupportType.FEEDFORWARD_INFERRED,
+                ],
+            ),
+        ],
     )
 
     runner = ReconstructionRunner(workspace)
@@ -399,11 +416,8 @@ def test_geo_aligner_publishes_alignment(tmp_path: Path):
     workspace.create()
 
     aligner = GeoAligner(workspace)
-    manifest = aligner.align("run-1")
-    assert manifest.alignment_id.startswith("align-run-1-")
-    path = publish_alignment(manifest, workspace)
-    assert path.exists()
-    assert path.parent.name == "alignment"
+    with pytest.raises(FileNotFoundError, match="alignement géographique refusé"):
+        aligner.align("run-1")
 
 
 # ---------------------------------------------------------------------------

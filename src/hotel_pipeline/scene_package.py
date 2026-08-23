@@ -722,7 +722,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     )
     _write_atomic(
         folder / "README.md",
-        "# Paquet 3D hybride — WelcomINNS Boucherville\n\n"
+        f"# Paquet 3D hybride — {workspace.hotel_id}\n\n"
         "Ce paquet est provider-agnostic et n'a appelé aucun service vidéo. "
         "Il décrit un volume proxy géoréférencé, les rasters LiDAR qualifiés, "
         "une orbite virtuelle et les claims interdits.\n\n"

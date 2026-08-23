@@ -26,6 +26,10 @@ from .schemas.reconstruction import ReconstructionBackend, ReconstructionRun
 from .workspace import Workspace
 
 
+class ReconstructionRefused(RuntimeError):
+    """Le backend n'a rien produit qu'on puisse tenir pour une reconstruction."""
+
+
 class ReconstructionRunner:
     """Exécute un backend de reconstruction sur un snapshot gelé."""
 
@@ -767,7 +771,11 @@ def _export_feed_forward_to_colmap(
     sparse_dir = output_dir / "sparse"
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
-    cameras = ["1 PINHOLE 800 600 400 300 800 300"]
+    # COLMAP PINHOLE : CAMERA_ID MODEL W H fx fy cx cy. Les paramètres
+    # étaient dans le désordre — cx valait 800 pour une image large de
+    # 800 px, soit un point principal au bord du capteur, et fy différait
+    # de fx sans raison. Toute reprojection en pixels s'en trouvait faussée.
+    cameras = ["1 PINHOLE 800 600 800 800 400 300"]
     images = []
     points = []
 
@@ -783,8 +791,16 @@ def _export_feed_forward_to_colmap(
             idx += 1
 
     if not images:
-        for idx, aid in enumerate(selected):
-            images.append(f"{idx} 0.5 0.5 0.5 0.5 0.0 0.0 0.0 1 {aid}")
+        # **Aucune pose de repli.** Écrire une pose identique par image —
+        # quaternion 0,5/0,5/0,5/0,5, translation nulle — faisait compter
+        # `registered_images = len(selected)` par `_parse_feed_forward_metrics`,
+        # qui ne fait que compter les lignes. Un échec complet se présentait
+        # donc comme un `registered_ratio` de 1,0 : le pire résultat possible,
+        # un succès annoncé sans reconstruction.
+        raise ReconstructionRefused(
+            "le backend feed-forward n'a produit aucune pose exploitable : "
+            "aucune reconstruction n'est écrite plutôt qu'une pose inventée"
+        )
 
     (sparse_dir / "cameras").write_text("\n".join(cameras) + "\n")
     (sparse_dir / "images").write_text("\n".join(images) + "\n")
@@ -891,8 +907,28 @@ def _run_synthetic(
                 point_id += 1
 
         up = np.array([0.0, 0.0, 1.0])
-        cameras = ["1 PINHOLE 800 600 400 300 800 300"]
+        # COLMAP PINHOLE : CAMERA_ID MODEL W H fx fy cx cy. Les paramètres
+        # étaient dans le désordre — cx valait 800 pour une image large de
+        # 800 px, soit un point principal au bord du capteur, et fy différait
+        # de fx sans raison. Toute reprojection en pixels s'en trouvait faussée.
+        width, height = 800, 600
+        fx = fy = 800.0
+        cx, cy = width / 2.0, height / 2.0
+        cameras = [f"1 PINHOLE {width} {height} {fx:.0f} {fy:.0f} {cx:.0f} {cy:.0f}"]
+
+        # Coordonnées 3D des points déjà écrits, pour pouvoir les **observer**.
+        xyz = np.array(
+            [[float(v) for v in row.split()[1:4]] for row in points]
+        )
+
         images = []
+        # Observations par point : c'est la piste (track) que COLMAP publie et
+        # que la porte de fidélité exige. Sans elle, toute mesure se réduit à
+        # reprojeter des points dans les poses qui les ont produits — une
+        # identité algébrique, vraie quel que soit le modèle, donc incapable
+        # de réfuter quoi que ce soit.
+        tracks: dict[int, list[tuple[int, int]]] = {i: [] for i in range(len(points))}
+
         for idx, aid in enumerate(selected):
             angle = 2 * np.pi * idx / n
             x = 10.0 * np.cos(angle)
@@ -903,16 +939,60 @@ def _run_synthetic(
             f = f / np.linalg.norm(f)
             s = np.cross(f, up)
             s = s / np.linalg.norm(s)
-            u = np.cross(s, f)
-            R = np.column_stack([s, u, -f])
+            # Base **droitière** : `u = f × s`, non `s × f`. Avec l'autre
+            # ordre, det(R) = −1 : la matrice est une réflexion, qu'aucun
+            # quaternion ne représente. Elle s'écrivait quand même, et sa
+            # relecture rendait une rotation **différente** — d'où des
+            # résidus de 270 px là où la reconstruction était exacte.
+            u = np.cross(f, s)
+            # Matrice **monde vers caméra** : vecteurs de base en lignes, non
+            # en colonnes. En colonnes, on écrivait la transposée et la scène
+            # tombait derrière l'objectif. L'axe optique de COLMAP est +Z.
+            R = np.vstack([s, u, f])
             qw, qx, qy, qz = _quaternion_from_rotation_matrix(R)
             t = -R @ C
             tx, ty, tz = float(t[0]), float(t[1]), float(t[2])
-            images.append(f"{idx} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {tx:.6f} {ty:.6f} {tz:.6f} 1 {aid}")
+            images.append(
+                f"{idx} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} "
+                f"{tx:.6f} {ty:.6f} {tz:.6f} 1 {aid}"
+            )
+
+            # Ligne 2 du couple COLMAP : X Y POINT3D_ID répétés. On projette
+            # réellement, et l'on ne retient que ce qui tombe devant l'objectif
+            # et dans le cadre — un point derrière la caméra ne s'observe pas.
+            cam = (R @ xyz.T).T + t
+            depth = cam[:, 2]
+            visible = depth > 1e-6
+            u_px = np.full(len(xyz), np.nan)
+            v_px = np.full(len(xyz), np.nan)
+            safe = np.where(visible, depth, 1.0)
+            u_px = fx * cam[:, 0] / safe + cx
+            v_px = fy * cam[:, 1] / safe + cy
+            inside = (
+                visible
+                & (u_px >= 0) & (u_px < width)
+                & (v_px >= 0) & (v_px < height)
+            )
+
+            observations: list[str] = []
+            for point_index in np.nonzero(inside)[0]:
+                observations.append(
+                    f"{u_px[point_index]:.2f} {v_px[point_index]:.2f} {point_index}"
+                )
+                tracks[int(point_index)].append((idx, len(observations) - 1))
+            images.append(" ".join(observations))
+
+        # `points3D` porte la piste en queue de ligne : ID X Y Z R G B ERROR
+        # puis (IMAGE_ID, POINT2D_IDX) répétés.
+        points_with_tracks = []
+        for point_index, row in enumerate(points):
+            track = tracks.get(point_index) or []
+            suffix = " ".join(f"{image_id} {slot}" for image_id, slot in track)
+            points_with_tracks.append(f"{row} {suffix}".rstrip())
 
         (sparse_dir / "cameras").write_text("\n".join(cameras) + "\n")
         (sparse_dir / "images").write_text("\n".join(images) + "\n")
-        (sparse_dir / "points3D").write_text("\n".join(points) + "\n")
+        (sparse_dir / "points3D").write_text("\n".join(points_with_tracks) + "\n")
 
         _export_colmap_normalized(sparse_dir, run_dir, selected, by_id)
 

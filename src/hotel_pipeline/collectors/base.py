@@ -44,6 +44,13 @@ POLICIES: dict[str, SourcePolicy] = {
         attribution="© contributeurs Mapillary, CC BY-SA 4.0",
         note="licence ouverte, attribution obligatoire",
     ),
+    "kartaview": SourcePolicy(
+        "kartaview",
+        Rights.OPEN_DATA,
+        requires_assumption=False,
+        attribution="© contributeurs KartaView, CC BY-SA 4.0",
+        note="licence ouverte, attribution obligatoire",
+    ),
     "street_view": SourcePolicy(
         "street_view",
         Rights.PUBLIC_UNCLEARED,

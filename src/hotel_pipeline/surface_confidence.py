@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from shapely.geometry import Point, Polygon
 
 from .schemas.reconstruction import SurfaceConfidence, SurfaceConfidenceManifest
+from .reconstruction_consensus import resolve_model_dir
 from .workspace import Workspace
 
 
@@ -140,9 +141,7 @@ class SurfaceConfidenceBuilder:
         if not output_path:
             raise ValueError(f"run {reconstruction_run_id} sans output_path")
 
-        run_dir = Path(output_path)
-        if not run_dir.is_dir():
-            run_dir = run_dir.parent
+        run_dir = resolve_model_dir(output_path)
         norm = run_dir / "normalized"
 
         centers, headings = _parse_images_txt(norm / "images")

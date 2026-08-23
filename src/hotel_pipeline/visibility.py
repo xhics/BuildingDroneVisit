@@ -37,6 +37,24 @@ class Visibility:
     offset_deg: float
     reason: str
 
+    @property
+    def framing_strength(self) -> float:
+        """Force continue du cadrage, dans [0, 1].
+
+        `visible` est un booléen : une cible à 44,9° et une à 45,1° du cap y
+        deviennent « oui » et « non », et plus rien en aval ne sait qu'elles
+        étaient presque identiques. Le seuil garde son rôle — il faut bien
+        trancher — mais la grandeur qu'il a mesurée ne doit pas disparaître
+        avec lui.
+
+        1,0 sur l'axe optique, décroissant jusqu'à 0 au bord du champ.
+        """
+        if not self.visible:
+            return 0.0
+        if HALF_FOV_DEG <= 0:
+            return 0.0
+        return float(max(0.0, min(1.0, 1.0 - self.offset_deg / HALF_FOV_DEG)))
+
 
 def bearing_deg(from_lat: float, from_lon: float, to_lat: float, to_lon: float) -> float:
     """Azimut géographique, 0° au nord, sens horaire."""

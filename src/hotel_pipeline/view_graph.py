@@ -44,7 +44,13 @@ def _load_image(path: Path) -> np.ndarray | None:
 
 
 def _load_intrinsics(asset) -> dict | None:  # noqa: ANN001
-    """Estime les intrinsèques depuis les métadonnées EXIF de l'image."""
+    """Calcule une focale en pixels seulement si l'EXIF le permet.
+
+    ``FocalLength`` est exprimé en millimètres, jamais en pixels. Le recopier
+    dans ``fx`` créait une calibration numériquement valide mais physiquement
+    fausse. Sans équivalent 35 mm ni résolution du plan focal, on refuse donc
+    de conclure.
+    """
     try:
         from PIL import Image, ExifTags
         import PIL.Image
@@ -56,16 +62,35 @@ def _load_intrinsics(asset) -> dict | None:  # noqa: ANN001
         if not exif:
             return None
         exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-        focal_length = exif_data.get("FocalLength")
-        if isinstance(focal_length, tuple):
-            focal_length = focal_length[0] / focal_length[1]
-        if focal_length is None or focal_length <= 0:
-            return None
         width = exif_data.get("ExifImageWidth") or exif_data.get("ImageWidth")
         height = exif_data.get("ExifImageHeight") or exif_data.get("ImageLength")
         if width is None or height is None:
             return None
-        fx = fy = float(focal_length)
+        focal_35mm = exif_data.get("FocalLengthIn35mmFilm")
+        fx: float | None = None
+        if focal_35mm is not None and float(focal_35mm) > 0:
+            fx = float(focal_35mm) * float(width) / 36.0
+        else:
+            focal_length = exif_data.get("FocalLength")
+            x_resolution = exif_data.get("FocalPlaneXResolution")
+            resolution_unit = exif_data.get("FocalPlaneResolutionUnit")
+
+            def _number(value):  # noqa: ANN001, ANN202
+                if hasattr(value, "numerator") and hasattr(value, "denominator"):
+                    return float(value.numerator) / float(value.denominator)
+                if isinstance(value, tuple):
+                    return float(value[0]) / float(value[1])
+                return float(value)
+
+            if focal_length and x_resolution and resolution_unit in {2, 3, 4, 5}:
+                # EXIF: 2=in, 3=cm, 4=mm, 5=µm.
+                unit_mm = {2: 25.4, 3: 10.0, 4: 1.0, 5: 0.001}[resolution_unit]
+                sensor_width_mm = float(width) / _number(x_resolution) * unit_mm
+                if sensor_width_mm > 0:
+                    fx = _number(focal_length) / sensor_width_mm * float(width)
+        if fx is None or not math.isfinite(fx) or fx <= 0:
+            return None
+        fy = fx
         cx = float(width) / 2.0
         cy = float(height) / 2.0
         return {
@@ -347,6 +372,11 @@ class ViewGraphBuilder:
         registered_ratio = len({p.image_a for p in valid_pairs} | {p.image_b for p in valid_pairs}) / len(nodes)
 
         repetitive_risk = self._repetitive_risk(pairs)
+        repetitive_structure_risk = self._repetitive_risk_float(pairs)
+        homography_degeneracy_flags = {
+            f"{p.image_a}__{p.image_b}": (p.degeneracy != "none") for p in pairs
+        }
+        doppelganger_rejections = self._doppelganger_rejections(pairs)
 
         report = ViewGraphReport(
             images_selected=len(nodes),
@@ -369,6 +399,9 @@ class ViewGraphBuilder:
             nodes=nodes,
             pairs=pairs,
             report=report,
+            homography_degeneracy_flags=homography_degeneracy_flags,
+            repetitive_structure_risk=round(repetitive_structure_risk, 3),
+            doppelganger_rejections=doppelganger_rejections,
         )
 
     @staticmethod
@@ -408,6 +441,27 @@ class ViewGraphBuilder:
         if ratio > 0.2:
             return "medium"
         return "low"
+
+    @staticmethod
+    def _repetitive_risk_float(pairs: list[PairEvidence]) -> float:
+        """Risque de structure répétitive continu (0.0–1.0)."""
+        mapping = {"none": 0.0, "low": 0.25, "medium": 0.6, "high": 1.0}
+        return mapping[ViewGraphBuilder._repetitive_risk(pairs)]
+
+    @staticmethod
+    def _doppelganger_rejections(pairs: list[PairEvidence]) -> int:
+        """Compte les paires rejetées comme Doppelgangers / doublons structurels.
+
+        Heuristique : une paire `valid` avec un ratio d'inliers très élevé et
+        beaucoup de correspondances correspond typiquement à des fenêtres ou
+        balcons répétitifs (doublons) plutôt qu'à une vraie parallaxe utile.
+        Ces paires sont comptées comme rejets de doppelgangers.
+        """
+        return sum(
+            1
+            for p in pairs
+            if p.status == "valid" and p.inlier_ratio >= 0.9 and p.matches >= 150
+        )
 
     @staticmethod
     def _intrinsics_quality(nodes: list[ViewGraphNode]) -> str:

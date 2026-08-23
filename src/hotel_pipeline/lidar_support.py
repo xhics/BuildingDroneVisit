@@ -15,8 +15,11 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
+from .logging import get_logger
 from .schemas.reconstruction import AlignmentAnchor, ReconstructionInputManifest
 from .workspace import Workspace
+
+log = get_logger("lidar-support")
 
 
 class LiDARSupportReport(BaseModel):
@@ -299,8 +302,139 @@ def publish_lidar_report(report: LiDARSupportReport, workspace: Workspace) -> Pa
     return output_path
 
 
+def _as_polygon(footprint: Any):  # noqa: ANN202
+    """Accepte un Polygon shapely ou un WKT."""
+    if isinstance(footprint, str):
+        try:
+            from shapely import wkt as shapely_wkt
+
+            return shapely_wkt.loads(footprint)
+        except Exception:
+            return None
+    return footprint
+
+
+def _obstacle_heights_from_points(
+    points: np.ndarray,
+    classification: np.ndarray | None,
+    obstacle_footprints: dict[str, Any],
+) -> dict[str, dict[str, float | str | int]]:
+    """Calcule la hauteur par obstacle depuis un nuage de points.
+
+    Pour chaque obstacle (empreinte), `ground_z` vient du percentile bas (sol /
+    DTM), `top_z` vient du percentile haut des points de surface. La hauteur est
+    `top_z - ground_z`. Jamais inventée : un obstacle sans points reste absent.
+
+    Args:
+        points: (N, 3) XYZ.
+        classification: (N,) classes LAS si disponibles (2 = sol, 1/2/5/6 =
+            surface), sinon None (classification par hauteur).
+        obstacle_footprints: feature_id -> Polygon shapely ou WKT.
+
+    Returns:
+        {feature_id: {'height_m', 'ground_m', 'quality', 'point_count'}}.
+    """
+    results: dict[str, dict[str, float | str | int]] = {}
+    if len(points) == 0:
+        return results
+
+    z = points[:, 2]
+    for feature_id, footprint in obstacle_footprints.items():
+        poly = _as_polygon(footprint)
+        if poly is None or not getattr(poly, "is_valid", False) or poly.is_empty:
+            continue
+        try:
+            from shapely.geometry import Point
+
+            mask = np.array(
+                [poly.contains(Point(x, y)) for x, y in points[:, :2]],
+                dtype=bool,
+            )
+        except Exception:
+            continue
+        if not np.any(mask):
+            continue
+
+        z_in = z[mask]
+        if classification is not None:
+            cls = classification[mask]
+            ground = z_in[np.isin(cls, (2,))]
+            surface = z_in[np.isin(cls, (1, 2, 5, 6))]
+        else:
+            ground = z_in
+            surface = z_in
+        if len(surface) == 0:
+            continue
+
+        ground_z = float(np.percentile(ground, 5)) if len(ground) else float(np.min(z_in))
+        top_z = float(np.percentile(surface, 95))
+        height_m = max(0.0, top_z - ground_z)
+        count = int(mask.sum())
+        quality = "high" if count >= 50 else ("medium" if count >= 10 else "low")
+        results[feature_id] = {
+            "height_m": round(height_m, 2),
+            "ground_m": round(ground_z, 2),
+            "quality": quality,
+            "point_count": count,
+        }
+    return results
+
+
+def extract_obstacle_heights_from_lidar(
+    workspace: Workspace,
+    obstacle_footprints: dict[str, Any],
+) -> dict[str, dict[str, float | str | int]]:
+    """Hauteurs par obstacle depuis les fichiers LiDAR du workspace (P4.2).
+
+    `ground_z` depuis le sol/DTM, `top_z` depuis les points de surface classés ;
+    hauteur = top_z - ground_z. Renvoie un dict par feature_id. Aucune hauteur
+    n'est inventée : sans points LiDAR pour un obstacle, il reste absent.
+    """
+    lidar_files = _find_lidar_files(workspace)
+    if not lidar_files:
+        return {}
+
+    aggregated: dict[str, list[dict]] = {}
+    for laz_path in lidar_files:
+        try:
+            import laspy
+
+            with laspy.open(str(laz_path)) as reader:
+                pc = reader.read()
+            xyz = np.column_stack([
+                np.asarray(pc.x, dtype=np.float64),
+                np.asarray(pc.y, dtype=np.float64),
+                np.asarray(pc.z, dtype=np.float64),
+            ])
+            cls = None
+            try:
+                cls = np.asarray(pc.classification, dtype=np.int64)
+            except Exception:
+                cls = None
+        except Exception as exc:  # noqa: BLE001 — LAS illisible ou laspy absent
+            log.warning("obstacle heights : LAS illisible %s : %s", laz_path, exc)
+            continue
+
+        per_tile = _obstacle_heights_from_points(xyz, cls, obstacle_footprints)
+        for fid, vals in per_tile.items():
+            aggregated.setdefault(fid, []).append(vals)
+
+    # Agrège les tuiles : moyenne des hauteurs, max des points.
+    out: dict[str, dict[str, float | str | int]] = {}
+    for fid, vals in aggregated.items():
+        out[fid] = {
+            "height_m": round(float(np.mean([v["height_m"] for v in vals])), 2),
+            "ground_m": round(float(np.mean([v["ground_m"] for v in vals])), 2),
+            "quality": max((v["quality"] for v in vals), key=lambda q: {"low": 0, "medium": 1, "high": 2}[q]),
+            "point_count": sum(int(v["point_count"]) for v in vals),
+        }
+    return out
+
+
 __all__ = [
     "LiDARSupportReport",
     "LiDARSupportAnalyzer",
     "publish_lidar_report",
+    "extract_obstacle_heights_from_lidar",
+    "_obstacle_heights_from_points",
 ]

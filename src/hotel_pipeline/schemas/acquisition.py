@@ -1390,6 +1390,10 @@ class IdentityStrategy(StrEnum):
 #: l'un écraserait l'autre.
 IDENTITY_STRATEGIES: dict[str, IdentityStrategy] = {
     "mapillary": IdentityStrategy.PROVIDER_IMAGE,
+    # KartaView rend des images planes existant telles quelles, comme
+    # Mapillary : leur adjoindre un cadrage fabriquerait une identité qui ne
+    # correspond à rien.
+    "kartaview": IdentityStrategy.PROVIDER_IMAGE,
     "commons": IdentityStrategy.PROVIDER_IMAGE,
     "flickr": IdentityStrategy.PROVIDER_IMAGE,
     "website": IdentityStrategy.PROVIDER_IMAGE,

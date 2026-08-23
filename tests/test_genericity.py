@@ -53,10 +53,18 @@ class TestPropertyProfile:
         assert "Hôtel WelcomINNS" in terms
         assert "Welcom Inns" in terms
 
-    def test_competitor_terms_are_full_names(self, profile):
-        """Exclure le jeton « Mortagne » disqualifiait l'hôtel lui-même."""
-        assert profile.excluded_terms() == ["Hôtel Mortagne"]
-        assert all(" " in term for term in profile.excluded_terms())
+    def test_competitor_terms_are_specific(self, profile):
+        """Exclure le jeton « Mortagne » disqualifiait l'hôtel lui-même.
+
+        La règle porte sur la **spécificité**, non sur le nombre de mots : un
+        nom composé — « Hôtel Mortagne », « Tetra Tech » — ne se confond avec
+        rien, et une raison sociale distinctive d'un seul mot non plus. Ce qui
+        reste proscrit, c'est le jeton banal qu'un autre nom peut contenir.
+        """
+        terms = profile.excluded_terms()
+        assert "Hôtel Mortagne" in terms
+        for term in terms:
+            assert " " in term or len(term) >= 6
 
     def test_footprint_derived_from_rooms_and_levels(self, profile):
         low, high = profile.footprint_range_m2()

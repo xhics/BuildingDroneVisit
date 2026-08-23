@@ -479,6 +479,11 @@ def build(
             _facet_digests(policy) if policy is not None else {}
         ),
         **{name: digests.get(name) for name in _PLAN_DIGEST_FIELDS},
+        # Adresse du manifeste planifié — non une empreinte, d'où sa place
+        # hors de `_PLAN_DIGEST_FIELDS`. Sans elle, la relecture retombait sur
+        # le manifeste courant et refusait tout plan bâti sur une découverte
+        # ciblée, écrite hors de `01_sources/`.
+        candidate_manifest_ref=digests.get("candidate_manifest_ref"),
     )
 
     report = _report(plan, candidates, evaluations, demands)

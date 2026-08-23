@@ -8,22 +8,46 @@ from pathlib import Path
 import pytest
 
 from hotel_pipeline.schemas.reconstruction import (
+    Criticality,
     ReconstructionInputManifest,
     ReconstructionSelection,
     ReconstructionSelectionManifest,
+    ReconstructionTarget,
+    ReconstructionTargetKind,
+    SupportType,
 )
 from hotel_pipeline.workspace import Workspace
 
 
-def test_reconstruction_input_manifest_round_trips():
-    manifest = ReconstructionInputManifest(
+def _manifest(**overrides):
+    base = dict(
         reconstruction_input_id="recon-test-20260101T000000Z",
+        hotel_id="test-hotel",
         asset_manifest_digest="a" * 64,
         spatial_manifest_digest="b" * 64,
         site_manifest_digest="c" * 64,
         coverage_digest="d" * 64,
         router_decision_digest="e" * 64,
         selected_asset_ids=["asset-1", "asset-2"],
+        targets=[
+            ReconstructionTarget(
+                target_id="FACADE_PRIMARY",
+                kind=ReconstructionTargetKind.SURFACE,
+                criticality=Criticality.MUST_SHOW,
+                allowed_support=[
+                    SupportType.MEASURED_PHOTO,
+                    SupportType.MULTIVIEW_RECONSTRUCTED,
+                    SupportType.FEEDFORWARD_INFERRED,
+                ],
+            ),
+        ],
+    )
+    base.update(overrides)
+    return ReconstructionInputManifest(**base)
+
+
+def test_reconstruction_input_manifest_round_trips():
+    manifest = _manifest(
         excluded_asset_ids=["asset-3"],
         selection_reasons={"asset-3": "droits non clarifiés"},
         mask_set_digest="f" * 64,
@@ -32,23 +56,45 @@ def test_reconstruction_input_manifest_round_trips():
     payload = manifest.model_dump(mode="json")
     recovered = ReconstructionInputManifest.model_validate(payload)
     assert recovered.reconstruction_input_id == manifest.reconstruction_input_id
+    assert recovered.hotel_id == "test-hotel"
     assert recovered.selected_asset_ids == ["asset-1", "asset-2"]
     assert recovered.excluded_asset_ids == ["asset-3"]
     assert recovered.selection_reasons == {"asset-3": "droits non clarifiés"}
     assert recovered.allowed_backends == ["colmap_incremental", "gluemap"]
+    assert recovered.targets[0].criticality == Criticality.MUST_SHOW
 
 
 def test_reconstruction_input_rejects_overlap():
     with pytest.raises(ValueError, match="présents à la fois dans selected et excluded"):
-        ReconstructionInputManifest(
-            reconstruction_input_id="recon-test",
-            asset_manifest_digest="a" * 64,
-            spatial_manifest_digest="b" * 64,
-            site_manifest_digest="c" * 64,
-            coverage_digest="d" * 64,
-            router_decision_digest="e" * 64,
+        _manifest(
             selected_asset_ids=["asset-1"],
             excluded_asset_ids=["asset-1", "asset-2"],
+        )
+
+
+def test_reconstruction_input_schema_version_is_one():
+    manifest = _manifest()
+    assert manifest.contract_version == 1
+
+
+def test_reconstruction_input_default_backend():
+    manifest = _manifest()
+    assert manifest.allowed_backends == ["colmap_incremental"]
+
+
+def test_reconstruction_input_asset_target_support_must_reference_known_targets():
+    with pytest.raises(Exception):
+        _manifest(
+            asset_target_support=[
+                {
+                    "asset_id": "asset-1",
+                    "target_id": "MISSING",
+                    "support_role": "primary",
+                    "coverage_fraction": 1.0,
+                    "quality_score": 0.9,
+                    "reconstruction_role": "photo_geometry",
+                }
+            ]
         )
 
 
@@ -64,32 +110,6 @@ def test_reconstruction_selection_manifest_requires_selected():
                 )
             ],
         )
-
-
-def test_reconstruction_input_schema_version_is_one():
-    manifest = ReconstructionInputManifest(
-        reconstruction_input_id="recon-test",
-        asset_manifest_digest="a" * 64,
-        spatial_manifest_digest="b" * 64,
-        site_manifest_digest="c" * 64,
-        coverage_digest="d" * 64,
-        router_decision_digest="e" * 64,
-        selected_asset_ids=["asset-1"],
-    )
-    assert manifest.contract_version == 1
-
-
-def test_reconstruction_input_default_backend():
-    manifest = ReconstructionInputManifest(
-        reconstruction_input_id="recon-test",
-        asset_manifest_digest="a" * 64,
-        spatial_manifest_digest="b" * 64,
-        site_manifest_digest="c" * 64,
-        coverage_digest="d" * 64,
-        router_decision_digest="e" * 64,
-        selected_asset_ids=["asset-1"],
-    )
-    assert manifest.allowed_backends == ["colmap_incremental"]
 
 
 def test_prepare_input_requires_workspace(tmp_path):

@@ -69,7 +69,10 @@ def collect_sources(
     policy=None,  # noqa: ANN001 — PipelinePolicy, import différé
 ) -> tuple[list[CollectedImage], list[SourceReport]]:
     """Interroge chaque source configurée, sans jamais bloquer sur une absence."""
-    from .collectors import commons, flickr, mapillary, places, streetview, tripadvisor, website
+    from .collectors import (
+        commons, flickr, kartaview, mapillary, places, streetview,
+        tripadvisor, website,
+    )
     from .schemas.policy import DEFAULT_POLICY
 
     policy = policy or DEFAULT_POLICY
@@ -96,6 +99,7 @@ def collect_sources(
         "street_view",
         lambda: streetview.collect(lat, lon, building_wkt=building_wkt, policy=policy),
     )
+    attempt("kartaview", lambda: kartaview.collect(lat, lon, radius_m))
     attempt("commons", lambda: commons.collect(lat, lon, radius_m))
     attempt("flickr", lambda: flickr.collect(lat, lon, radius_m))
     if place_query:
@@ -114,6 +118,7 @@ SOURCE_KEYS: dict[str, str | None] = {
     "places": "GOOGLE_PLACES_API_KEY",
     "tripadvisor": "TRIPADVISOR_API_KEY",
     "flickr": "FLICKR_API_KEY",
+    "kartaview": None,
     "commons": None,
     "website": None,
 }

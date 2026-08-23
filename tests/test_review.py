@@ -16,6 +16,7 @@ from hotel_pipeline import review
 from hotel_pipeline.classify_cascade import classify
 from hotel_pipeline.roles import role_for
 from hotel_pipeline.schemas import (
+    PropertyMatchStatus,
     Asset,
     ClusterRole,
     PipelinePolicy,
@@ -147,13 +148,32 @@ def test_a_never_reviewed_asset_can_still_be_accepted_automatically(tmp_path) ->
 
     S'y fier seul ferait passer chaque image jamais examinée pour une revue
     sans conclusion, et plus aucune acceptation automatique n'existerait.
+
+    L'acceptation suppose que la cible soit établie : ici l'appartenance est
+    acquise, donc la cascade conclut sans qu'une personne intervienne.
     """
-    assets = [asset(tmp_path)]
+    assets = [asset(tmp_path, property_match_status=PropertyMatchStatus.MATCH)]
     assert not assets[0].has_been_reviewed
 
     classify(assets, classifier=None, policy=policy())
 
     assert assets[0].review_status is ReviewStatus.AUTOMATIC_ACCEPTED
+
+
+def test_an_unestablished_target_is_sent_to_review_not_accepted(tmp_path) -> None:
+    """« Bâtiment présent, identité non établie » est une question ouverte.
+
+    L'accepter automatiquement clôturait la question sans y répondre : sur le
+    corpus pilote, 113 vues sortaient ainsi de toute file, ni exploitées ni
+    jamais soumises à personne.
+    """
+    assets = [asset(tmp_path)]
+    assert assets[0].property_match_status is not PropertyMatchStatus.MATCH
+
+    classify(assets, classifier=None, policy=policy())
+
+    assert assets[0].target_building_visible is None
+    assert assets[0].review_status is ReviewStatus.NEEDS_REVIEW
 
 
 # --- effet sur les rôles ----------------------------------------------------

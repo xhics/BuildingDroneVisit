@@ -587,8 +587,11 @@ def parallax_utility(bearing_delta_deg: float, baseline_m: float, policy) -> flo
     high = policy.parallax_preferred_max_deg
 
     if bearing_delta_deg < low:
-        # Montée linéaire : peu de profondeur, mais du recouvrement.
-        return round(max(bearing_delta_deg / low, 0.0) * 0.8, 4) if low else 0.0
+        # Montée linéaire jusqu'à la plage préférée. La rampe atteint 1.0 en
+        # `low` : un palier à 0.8 y créait un saut de 0,2, si bien que 14,99°
+        # et 15,00° se classaient très différemment alors que l'écart est du
+        # bruit de mesure.
+        return round(max(bearing_delta_deg / low, 0.0), 4) if low else 0.0
     if bearing_delta_deg <= high:
         return 1.0
 

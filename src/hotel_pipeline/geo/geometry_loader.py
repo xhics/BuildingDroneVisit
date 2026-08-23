@@ -24,9 +24,18 @@ from pathlib import Path
 
 from ..logging import get_logger
 from ..schemas.geometry import (
-    GEOGRAPHIC_CRS,
-    PROJECTED_CRS,
+    AccessStatus,
+    CaptureFeasibilityAssessment,
     CaptureGeometryManifest,
+    FeasibilityDetail,
+    FeasibilityStatus,
+    GEOGRAPHIC_CRS,
+    GeometryResolutionStatus,
+    GeometryRole,
+    PROJECTED_CRS,
+    ReachabilityStatus,
+    RoadAccessGraph,
+    RoadSegment,
 )
 
 log = get_logger("geometry-loader")
@@ -109,3 +118,107 @@ def bind_legacy(payload: dict, spatial_reference) -> CaptureGeometryManifest:  #
         LEGACY_WORKING_CRS, bound["spatial_context_digest"],
     )
     return CaptureGeometryManifest.model_validate(bound)
+
+
+# ---------------------------------------------------------------------------
+# P4.1 — Graphe d'accessibilité routière
+# ---------------------------------------------------------------------------
+
+
+def build_road_access_graph(workspace, spatial_reference=None) -> RoadAccessGraph:  # noqa: ANN001
+    """Construit le `RoadAccessGraph` depuis le manifeste géométrique du site.
+
+    Les tronçons proviennent des `ResolvedGeometry` de rôle ACCESS_ROAD /
+    ROAD_CANDIDATE (avec leur WKT projeté) et des `RoadCorridor` adjacents.
+    Les évaluations de faisabilité sont laissées vides : elles sont produites
+    par l'étape P4 une fois la première reconstruction mesurée.
+    """
+    from ..workspace import Workspace
+
+    if not isinstance(workspace, Workspace):
+        raise TypeError("build_road_access_graph attend un Workspace")
+
+    segments: list[RoadSegment] = []
+    geometry_path = workspace.path("06_geo", "capture_geometry.json")
+    manifest: CaptureGeometryManifest | None = None
+    if geometry_path.is_file():
+        try:
+            manifest, _ = load_capture_geometry(geometry_path, spatial_reference)
+        except Exception as exc:  # noqa: BLE001 — manifeste absent ou illisible
+            log.warning("graphe routier : manifeste géométrique illisible : %s", exc)
+            manifest = None
+
+    if manifest is not None:
+        road_roles = {GeometryRole.ACCESS_ROAD, GeometryRole.ROAD_CANDIDATE}
+        for geom in manifest.geometries:
+            if (
+                geom.role in road_roles
+                and geom.resolution_status is GeometryResolutionStatus.RESOLVED
+                and geom.projected_wkt
+            ):
+                segments.append(RoadSegment(
+                    feature_id=geom.feature_id,
+                    geometry_wkt=geom.projected_wkt,
+                    access_status=AccessStatus.UNKNOWN,
+                    reachability_status=ReachabilityStatus.UNKNOWN,
+                ))
+        for corridor in manifest.corridors:
+            segments.append(RoadSegment(
+                feature_id=corridor.feature_id,
+                geometry_wkt="",
+                access_status=corridor.access_status,
+                camera_candidate=corridor.admissible_for_building,
+                streetview_candidate=corridor.admissible_for_building,
+            ))
+        # Déduplique par feature_id (la géométrie résolue prime sur le corridor).
+        by_id: dict[str, RoadSegment] = {}
+        for seg in segments:
+            by_id.setdefault(seg.feature_id, seg)
+        segments = list(by_id.values())
+
+    return RoadAccessGraph(hotel_id=workspace.hotel_id, road_segments=segments)
+
+
+def build_capture_feasibility_assessment(
+    target_id: str,
+    *,
+    remote_public: FeasibilityDetail | None = None,
+    owner_assisted: FeasibilityDetail | None = None,
+    professional_onsite: FeasibilityDetail | None = None,
+    physically_impossible: FeasibilityDetail | None = None,
+    evidence: list[str] | None = None,
+) -> CaptureFeasibilityAssessment:
+    """Assemble une `CaptureFeasibilityAssessment` et déduit le statut global.
+
+    La chaîne de priorité : physiquement impossible > introuvable à distance >
+    capture propriétaire requise > faisable. La preuve d'impossibilité prime
+    toujours (le pipeline s'arrête honnêtement sur un MUST_SHOW impossible).
+    """
+    remote_public = remote_public or FeasibilityDetail()
+    owner_assisted = owner_assisted or FeasibilityDetail()
+    professional_onsite = professional_onsite or FeasibilityDetail()
+    physically_impossible = physically_impossible or FeasibilityDetail()
+    evidence = evidence or []
+
+    if physically_impossible.status is FeasibilityStatus.INFEASIBLE_PROVEN:
+        status = FeasibilityStatus.INFEASIBLE_PROVEN
+    elif remote_public.status is FeasibilityStatus.FEASIBLE:
+        status = FeasibilityStatus.FEASIBLE
+    elif remote_public.status is FeasibilityStatus.NOT_FOUND_REMOTELY:
+        status = FeasibilityStatus.NOT_FOUND_REMOTELY
+    elif owner_assisted.status is FeasibilityStatus.OWNER_CAPTURE_REQUIRED:
+        status = FeasibilityStatus.OWNER_CAPTURE_REQUIRED
+    elif professional_onsite.status is FeasibilityStatus.FEASIBLE:
+        status = FeasibilityStatus.FEASIBLE
+    else:
+        status = FeasibilityStatus.UNKNOWN
+
+    return CaptureFeasibilityAssessment(
+        target_id=target_id,
+        status=status,
+        remote_public=remote_public,
+        owner_assisted=owner_assisted,
+        professional_onsite=professional_onsite,
+        physically_impossible=physically_impossible,
+        evidence=evidence,
+    )

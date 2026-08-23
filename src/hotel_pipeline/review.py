@@ -348,6 +348,37 @@ def manifest_digest(assets: list[Asset]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _by_reconstruction_value(selected: list[Asset]) -> list[Asset]:
+    """Ordonne la file par ce qu'une décision débloquerait réellement.
+
+    Une file plate fait payer le même prix à toutes les vues. Or elles ne
+    valent pas la même chose : un secteur qu'aucune vue confirmée ne couvre
+    manque entièrement à la reconstruction, tandis qu'un secteur déjà pourvu
+    n'y gagne qu'une redondance.
+
+    Trois critères, dans cet ordre :
+
+    1. **rareté du secteur** — les secteurs les moins représentés d'abord,
+       car ce sont les façades qu'on ne peut pas reconstruire du tout ;
+    2. **score `building` du modèle** — signal faible, donc employé à
+       *classer*, jamais à exclure : au sein d'un secteur, il place devant
+       les vues les plus prometteuses ;
+    3. **identifiant** — pour que deux exécutions donnent le même ordre.
+    """
+    from collections import Counter
+
+    per_sector = Counter(a.view_sector.value for a in selected)
+
+    def key(asset: Asset) -> tuple:
+        return (
+            per_sector[asset.view_sector.value],
+            -float((asset.subject_scores or {}).get("building", 0.0)),
+            asset.id,
+        )
+
+    return sorted(selected, key=key)
+
+
 def build_queue(  # noqa: ANN001
     assets: list[Asset], name: str, policy, visibility: dict | None = None
 ) -> ReviewQueue:
@@ -364,7 +395,7 @@ def build_queue(  # noqa: ANN001
             f"file inconnue : {name!r} ; disponibles : {sorted(QUEUES)}"
         )
     description, selector = QUEUES[name]
-    selected = selector(assets, policy)
+    selected = _by_reconstruction_value(selector(assets, policy))
 
     queue = ReviewQueue(
         name=name,

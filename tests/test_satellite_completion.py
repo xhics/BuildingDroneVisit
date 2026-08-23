@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.hotel_pipeline.geo.satellite_completion import (
+from hotel_pipeline.geo.satellite_completion import (
     ORTHOPHOTO_CMM_EXAMPLE,
     SyntheticSource,
     analyze_facade_in_orthophoto,
@@ -88,7 +88,7 @@ def test_merge_preserves_measured_over_synthetic():
         "FACADE_REAR": {"appearance_union_fraction": 0.0, "appearance_coverage": "none"},
     }
 
-    from src.hotel_pipeline.geo.satellite_completion import SyntheticCompletion
+    from hotel_pipeline.geo.satellite_completion import SyntheticCompletion
 
     synthetics = [
         SyntheticCompletion(
@@ -123,7 +123,7 @@ def test_blind_facade_upgraded_to_partial_with_synthetic():
         "FACADE_REAR": {"appearance_union_fraction": 0.0, "appearance_coverage": "none"},
     }
 
-    from src.hotel_pipeline.geo.satellite_completion import SyntheticCompletion
+    from hotel_pipeline.geo.satellite_completion import SyntheticCompletion
 
     synthetics = [
         SyntheticCompletion(

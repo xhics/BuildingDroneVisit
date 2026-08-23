@@ -57,6 +57,11 @@ def profile(**overrides) -> PropertyProfile:
 #: publiés conservent celle de leur époque : ils n'ont pas été produits avec la
 #: politique d'aujourd'hui, et le prétendre serait faux.
 PILOT_POLICY_DIGESTS = {
+    "66926f449f686c73": (
+        "avec subject_prompt, absence_prompts et les seuils de prominence — "
+        "la lecture pixel décrivait un motel de banlieue en dur ; portée à la "
+        "politique, elle se redécrit pour un autre site sans éditer le code"
+    ),
     "a4564b71ddeec56e": "avant les seuils de secteur et de séparation",
     "9275a7e32eeb0431": "avec sector_observer_half_width_deg et viewpoint_separation_m",
     "18422c85a67d09fe": "avec la section coverage — cibles de couverture",

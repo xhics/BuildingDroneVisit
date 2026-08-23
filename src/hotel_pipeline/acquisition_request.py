@@ -46,6 +46,24 @@ PROVIDER_RESOLUTIONS: dict[str, dict[str, str]] = {
         # que 2048 vaut chez l'un ne vaut pas chez l'autre.
         "full_available": "thumb_2048",
     },
+    "kartaview": {
+        # KartaView ne paramètre pas la taille : elle publie trois variantes
+        # de fichier distinctes. `proc` est l'image traitée en pleine taille
+        # (2592×1944 à 3808×2144 mesurés sur le pilote), `lth` une grande
+        # vignette, `th` une petite. On traduit donc vers la variante, et la
+        # collecte a déjà choisi l'URL correspondante.
+        "256": "th",
+        "2048": "proc",
+        "full_available": "proc",
+    },
+    "tripadvisor": {
+        # La Content API publie des tailles nommées (`thumbnail`, `small`,
+        # `medium`, `large`, `original`) et le collecteur retient déjà la plus
+        # grande utile. On traduit vers ces noms, sans en inventer.
+        "256": "thumbnail",
+        "2048": "large",
+        "full_available": "original",
+    },
     "street_view": {
         "256": "256x256",
         # Pas de « 2048 » : l'API Static plafonne à 640 px, et le premier
@@ -62,6 +80,14 @@ PROVIDER_RESOLUTIONS: dict[str, dict[str, str]] = {
 PROVIDER_MAX_PIXELS: dict[str, int] = {
     "street_view": 640,
     "mapillary": 2048,
+    # Constaté sur le pilote : 2592×1944 à 3808×2144 selon la caméra du
+    # contributeur. On retient la plus petite pleine taille observée, faute
+    # de garantie du fournisseur.
+    "kartaview": 2592,
+    # TripAdvisor sert `original` à la taille déposée par le voyageur : elle
+    # varie et n'est pas garantie. La valeur reste à constater sur les
+    # réponses réelles ; en attendant, on n'en promet pas plus que `large`.
+    "tripadvisor": 1024,
 }
 
 

@@ -84,6 +84,8 @@ class AcquireReport:
 #: pas : inventer une URL reviendrait à deviner le protocole d'un fournisseur.
 RESOLVERS: dict[str, str] = {
     "mapillary": "thumb_2048_url rendu par l'API Graph, à la demande",
+    "kartaview": "fiche du cliché redemandée à l'API v2.0, variante choisie",
+    "tripadvisor": "URL de taille rendue par la Content API, à la demande",
     "street_view": "endpoint image, reconstruit depuis le cadrage demandé",
 }
 
@@ -114,6 +116,22 @@ def resolve_url(source: str, request_spec: dict[str, str]) -> str:
         raise AcquisitionRefused(
             "candidat sans `provider_id` : l'adresse ne peut pas être reconstruite"
         )
+
+    if source == "tripadvisor":
+        from .collectors.tripadvisor import photo_url
+
+        try:
+            return photo_url(provider_id, request_spec.get("resolution", "original"))
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise AcquisitionRefused(str(exc)) from exc
+
+    if source == "kartaview":
+        from .collectors.kartaview import photo_url
+
+        try:
+            return photo_url(provider_id, request_spec.get("resolution", "proc"))
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise AcquisitionRefused(str(exc)) from exc
 
     from .collectors.mapillary import thumbnail_url
 

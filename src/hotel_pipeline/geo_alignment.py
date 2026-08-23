@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from shapely.geometry import Polygon, shape
 
 from .schemas.reconstruction import AlignmentAnchor, GeoAlignmentManifest
+from .reconstruction_consensus import resolve_model_dir
 from .workspace import Workspace
 
 
@@ -26,14 +27,35 @@ from .workspace import Workspace
 # ---------------------------------------------------------------------------
 
 
+def _is_pose_line(line: str) -> bool:
+    """Une ligne de pose finit par `CAMERA_ID NAME` ; une ligne d'observations
+    n'est faite que de nombres."""
+    parts = line.split()
+    if len(parts) < 10:
+        return False
+    try:
+        float(parts[-1])
+    except ValueError:
+        return True
+    return False
+
+
 def _load_colmap_camera_centers(run_dir: Path) -> dict[str, np.ndarray]:
     images_file = run_dir / "normalized" / "images"
     if not images_file.is_file():
         return {}
+    # COLMAP écrit **deux** lignes par image : la pose, puis les
+    # observations « X Y POINT3D_ID … ». Lire toutes les lignes prenait ces
+    # observations pour des poses — autant de caméras fantômes.
+    _lines = [
+        line for line in images_file.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if any(not _is_pose_line(line) for line in _lines):
+        _lines = _lines[::2]
+
     centers: dict[str, np.ndarray] = {}
-    for line in images_file.read_text().splitlines():
-        if line.startswith("#") or not line.strip():
-            continue
+    for line in _lines:
         parts = line.split()
         if len(parts) < 9:
             continue
@@ -121,20 +143,9 @@ class GeoAligner:
         # Charger les centres de caméra de la reconstruction
         run_json_path = self.workspace.path("07_reconstruction", "runs", f"{reconstruction_run_id}.json")
         if not run_json_path.is_file():
-            # Fallback MVP : alignement synthétique quand le run n'existe pas
-            return GeoAlignmentManifest(
-                alignment_id=alignment_id,
-                source_reconstruction_id=reconstruction_run_id,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                scale=1.0,
-                rotation=np.eye(3).tolist(),
-                translation={"x": 0.0, "y": 0.0, "z": 0.0},
-                horizontal_crs=self._working_crs(),
-                vertical_reference=self._vertical_reference(),
-                footprint_error_m=0.5,
-                roof_height_error_m=0.3,
-                alignment_rmse_m=round((0.5**2 + 0.3**2) ** 0.5, 3),
-                anchors=[a.value for a in anchors],
+            raise FileNotFoundError(
+                f"run de reconstruction introuvable : {run_json_path}; "
+                "alignement géographique refusé"
             )
 
         run_data = json.loads(run_json_path.read_text("utf-8"))
@@ -142,9 +153,7 @@ class GeoAligner:
         if not output_path:
             raise ValueError(f"run {reconstruction_run_id} sans output_path")
 
-        run_dir = Path(output_path)
-        if not run_dir.is_dir():
-            run_dir = run_dir.parent
+        run_dir = resolve_model_dir(output_path)
 
         normalized_dir = run_dir / "normalized"
         if not normalized_dir.is_dir():

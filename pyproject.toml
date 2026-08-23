@@ -45,6 +45,14 @@ geo = [
     "scipy>=1.11",         # triangulation TIN et recherche du plus proche voisin
 ]
 
+# Reconstruction sparse et localisation 2D-3D. HLoc/LightGlue reste installé
+# depuis le clone officiel figé dans l'image GPU ; ces deux roues suffisent à
+# relire ses artefacts et à exécuter un PnP sans fallback de pose.
+sfm = [
+    "pycolmap>=3.11,<4",
+    "h5py>=3.10",
+]
+
 # Poste local Mac Intel uniquement. torch 2.2.2 est la dernière version
 # compilée pour x86_64 macOS et exige NumPy 1, tandis qu'OpenCV 5 et tifffile
 # exigent NumPy 2 : sans ces bornes, chaque installation recasse l'autre.
