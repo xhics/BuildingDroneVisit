@@ -1,0 +1,37 @@
+# Tests CPU à chaque poussée. La couche vision et le GPU restent hors CI :
+# les modèles pèsent des centaines de mégaoctets et les runners publics n'ont
+# pas de carte. Ce que cette chaîne garantit, c'est que le pipeline s'importe
+# et que sa logique tient sans la couche apprise — ce que les imports différés
+# du dépôt rendent possible.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Le module s'importe sans la couche vision
+        run: python -c "import hotel_pipeline.cli"
+
+      - name: Suite complète
+        run: python -m pytest -q --maxfail=5
+        env:
+          PYTHONPATH: src

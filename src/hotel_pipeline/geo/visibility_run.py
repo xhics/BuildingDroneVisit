@@ -301,7 +301,9 @@ def run_assessment(
         )
         visibility.assessments.append(assessment)
         _tally(report, asset, assessment)
-        framing = _framing(asset, assessment, settings)
+        framing = _framing(
+            asset, assessment, settings, getattr(policy.collection, "image_fov_deg", None)
+        )
         visibility.framings.append(framing)
         if framing.horizontal_computable:
             report.framing_computable += 1
@@ -457,18 +459,30 @@ def _tally(report: RunReport, asset, assessment) -> None:  # noqa: ANN001
                     )
 
 
-def _framing(asset, assessment, settings):  # noqa: ANN001
+def _framing(asset, assessment, settings, declared_fov_deg=None):  # noqa: ANN001
     """Cadrage d'un asset, si ses paramètres le permettent.
 
-    Street View rend un panorama : le cadrage demandé est connu. Mapillary rend
-    une image dont les intrinsèques ne figurent pas au manifeste — la largeur y
-    reste donc inconnue, faute de champ de vision.
+    Le champ retenu à l'acquisition est le meilleur : il décrit ce qui a été
+    demandé au fournisseur pour cette image précise. Il est rarement conservé —
+    mesuré sur ce pilote, huit assets sur trois cent quarante-neuf le portent,
+    et le cadrage restait incalculable pour tous les autres.
+
+    À défaut, le champ déclaré par la politique de collecte prend le relais.
+    Ce n'est pas la même chose : l'un décrit cette image, l'autre décrit la
+    consigne appliquée au lot. La distinction est portée par
+    `parameters_source`, pour qu'un cadrage supposé ne se lise jamais comme un
+    cadrage relevé.
     """
     source = None
     fov = None
     if asset.acquisition is not None:
         fov = asset.acquisition.requested_fov_deg
-        source = "acquisition_provenance"
+        if fov is not None:
+            source = "acquisition_provenance"
+
+    if fov is None and declared_fov_deg:
+        fov = float(declared_fov_deg)
+        source = "collection_policy"
 
     return engine.frame_target(
         f"vis-{asset.id}", asset.id, assessment.span_start_deg,

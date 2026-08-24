@@ -122,6 +122,10 @@ class FacadeCoverage:
             "facade_id": self.facade_id,
             "appearance_coverage": self.appearance_coverage,
             "appearance_union_fraction": round(self.appearance_union_fraction, 3),
+            # Le nombre de points échantillonnés est proportionnel à la
+            # longueur du mur : il sert de poids pour agréger les façades sans
+            # traiter un pignon de six mètres comme une façade de trente.
+            "sampled": self.sampled,
             "geometric_support_coverage": self.geometric_support_coverage,
             "geometric_support_fraction": round(self.geometric_support_fraction, 3),
             "union_fraction": round(self.union_fraction, 3),

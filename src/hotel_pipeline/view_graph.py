@@ -27,7 +27,10 @@ from .schemas.reconstruction import (
     ViewGraphNode,
     ViewGraphReport,
 )
+from .logging import get_logger
 from .workspace import Workspace
+
+log = get_logger("view-graph")
 
 
 # ---------------------------------------------------------------------------
@@ -97,9 +100,57 @@ def _load_intrinsics(asset) -> dict | None:  # noqa: ANN001
             "fx": fx, "fy": fy, "cx": cx, "cy": cy,
             "width": int(width), "height": int(height),
             "distortion": None,
+            "source": "exif",
         }
     except Exception:
         return None
+
+
+#: Largeur minimale, en pixels, d'une image dont on accepte de déduire une
+#: focale. En deçà, ce n'est pas une prise de vue mais une vignette ou un
+#: marqueur.
+MIN_CALIBRATABLE_PX = 64
+
+
+def _intrinsics_from_fov(asset, fov_deg: float | None) -> dict | None:  # noqa: ANN001
+    """Focale dérivée du champ déclaré, faute d'EXIF.
+
+    Les vues de rue sont des **recadrages de panoramas** : leur EXIF est
+    dépouillé, mais le champ retenu au recadrage est connu de la politique de
+    collecte. Mesuré sur ce pilote, aucune des trois cent quarante-neuf images
+    ne porte de focale EXIF, alors que toutes ont des dimensions et un champ
+    déclaré.
+
+    Ce n'est pas une mesure de l'appareil : c'est le champ qu'on a demandé au
+    fournisseur. La distinction est portée par `source`, pour qu'un calibrage
+    déclaré ne se lise jamais comme un calibrage relevé.
+    """
+    if not fov_deg or fov_deg <= 0 or fov_deg >= 180:
+        return None
+    width = getattr(asset, "width", None)
+    height = getattr(asset, "height", None)
+    if not width or not height:
+        return None
+    # Une vignette de quelques pixels n'est pas une prise de vue : le corpus
+    # porte des marqueurs de report en 1×1, dont on tirerait une focale d'un
+    # pixel. Aucune calibration ne se déduit d'une image qu'on ne peut pas voir.
+    if int(width) < MIN_CALIBRATABLE_PX or int(height) < MIN_CALIBRATABLE_PX:
+        return None
+
+    # Le champ déclaré est horizontal : c'est la largeur qui le porte.
+    fx = float(width) / (2.0 * math.tan(math.radians(float(fov_deg)) / 2.0))
+    if not math.isfinite(fx) or fx <= 0:
+        return None
+    return {
+        "fx": fx,
+        "fy": fx,
+        "cx": float(width) / 2.0,
+        "cy": float(height) / 2.0,
+        "width": int(width),
+        "height": int(height),
+        "distortion": None,
+        "source": "declared_fov",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +280,64 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+#: Écart relatif toléré entre deux focales pour les tenir pour comparables.
+#: Au-delà, la paire mêle deux appareils trop différents pour qu'une focale
+#: moyenne décrive l'un ou l'autre.
+FOCAL_AGREEMENT = 0.25
+
+#: Part du support de l'essentielle qu'une homographie doit atteindre pour
+#: que la scène soit tenue pour plane. Seuil usuel des travaux SfM.
+PLANARITY_RATIO = 0.85
+
+
+def _camera_matrix(
+    intrinsics_a: dict | None, intrinsics_b: dict | None, shape
+) -> "np.ndarray | None":  # noqa: ANN001
+    """Matrice caméra commune à une paire, ou `None` si rien ne l'atteste.
+
+    Une seule matrice sert les deux vues : `findEssentialMat` n'en accepte
+    qu'une. Ce n'est donc licite que si les deux focales concordent — deux
+    appareils très différents ne partagent pas de calibration, et en inventer
+    une moyenne ferait pire que ne rien supposer.
+    """
+    if intrinsics_a is None or intrinsics_b is None:
+        return None
+
+    fx_a, fx_b = intrinsics_a.get("fx"), intrinsics_b.get("fx")
+    if not fx_a or not fx_b:
+        return None
+    if abs(fx_a - fx_b) / max(fx_a, fx_b) > FOCAL_AGREEMENT:
+        return None
+
+    fx = (float(fx_a) + float(fx_b)) * 0.5
+    fy = (float(intrinsics_a.get("fy", fx_a)) + float(intrinsics_b.get("fy", fx_b))) * 0.5
+    height, width = shape[:2]
+    cx = (float(intrinsics_a.get("cx", width / 2)) + float(intrinsics_b.get("cx", width / 2))) * 0.5
+    cy = (float(intrinsics_a.get("cy", height / 2)) + float(intrinsics_b.get("cy", height / 2))) * 0.5
+    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def _planarity(
+    src_pts: "np.ndarray", dst_pts: "np.ndarray", inlier_mask, inliers: int
+) -> str:  # noqa: ANN001
+    """Décide si la paire est dégénérée, en comparant deux modèles.
+
+    Une façade plate se laisse décrire par une homographie aussi bien que par
+    une essentielle : c'est le signe d'une scène plane, où la triangulation
+    est mal conditionnée. Le test compare donc les deux supports au lieu de
+    lire un taux d'inliers, qui ne dit que la qualité de l'appariement.
+    """
+    if inliers < 8:
+        return "none"
+    try:
+        _homography, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
+    except cv2.error:
+        return "none"
+    if mask is None:
+        return "none"
+    return "planar" if int(mask.ravel().sum()) >= PLANARITY_RATIO * inliers else "none"
+
+
 def _match_pair(
     asset_a: Any,
     asset_b: Any,
@@ -237,8 +346,15 @@ def _match_pair(
     *,
     max_features: int = 2048,
     detector: str = "orb",
+    intrinsics_a: dict | None = None,
+    intrinsics_b: dict | None = None,
 ) -> PairEvidence:
-    """Match deux images et vérifie géométriquement."""
+    """Match deux images et vérifie géométriquement.
+
+    Les intrinsèques, quand elles sont connues, changent la nature du test :
+    calibré, il rend une pose ; non calibré, il atteste seulement que les
+    points s'accordent sur une géométrie épipolaire.
+    """
     if detector == "sift":
         detector_obj = cv2.SIFT_create(nfeatures=max_features)
         norm_type = cv2.NORM_L2
@@ -283,8 +399,31 @@ def _match_pair(
     degeneracy = "none"
 
     if len(matches) >= 8:
-        E, mask = cv2.findEssentialMat(src_pts, dst_pts, method=cv2.RANSAC, prob=0.999, threshold=3.0)
-        if E is not None and mask is not None:
+        # La matrice essentielle n'a de sens qu'en coordonnées normalisées.
+        # Appelée sans `cameraMatrix`, OpenCV suppose une focale de 1 et un
+        # centre optique en (0, 0) — alors que les points sont en pixels. Ce
+        # qui sortait n'était donc pas une matrice essentielle mais une
+        # fondamentale, et la pose qu'on en tirait était fausse.
+        #
+        # Deux régimes, dits comme tels : calibré quand l'EXIF donne une
+        # focale, non calibré sinon. Dans le second cas on estime une
+        # fondamentale, qui vérifie l'appariement sans prétendre à une pose.
+        camera_matrix = _camera_matrix(intrinsics_a, intrinsics_b, img_a.shape)
+        if camera_matrix is not None:
+            model, mask = cv2.findEssentialMat(
+                src_pts,
+                dst_pts,
+                cameraMatrix=camera_matrix,
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=1.5,
+            )
+        else:
+            model, mask = cv2.findFundamentalMat(
+                src_pts, dst_pts, cv2.FM_RANSAC, 3.0, 0.999
+            )
+
+        if model is not None and mask is not None:
             inlier_mask = mask.ravel() == 1
             inliers = int(inlier_mask.sum())
             inlier_ratio = inliers / len(matches)
@@ -293,20 +432,32 @@ def _match_pair(
                 status = "valid"
                 overlap = min(1.0, inlier_ratio * 2.0)
 
-                # Récupérer pose relative (si possible)
-                try:
-                    _, R, t, _ = cv2.recoverPose(E, src_pts[inlier_mask], dst_pts[inlier_mask])
-                    relative_pose = {
-                        "R": R.tolist(),
-                        "t": t.flatten().tolist(),
-                        "inliers": inliers,
-                    }
-                except cv2.error:
-                    pass
+                # Une pose relative n'est récupérable que d'une essentielle :
+                # sans intrinsèques, l'appariement est attesté mais la
+                # géométrie relative reste indéterminée, et on le dit.
+                if camera_matrix is not None:
+                    try:
+                        _, R, t, _ = cv2.recoverPose(
+                            model,
+                            src_pts[inlier_mask],
+                            dst_pts[inlier_mask],
+                            cameraMatrix=camera_matrix,
+                        )
+                        relative_pose = {
+                            "R": R.tolist(),
+                            "t": t.flatten().tolist(),
+                            "inliers": inliers,
+                            "calibrated": True,
+                        }
+                    except cv2.error:
+                        pass
 
-                # Détecter dégénérescence
-                if inlier_ratio > 0.8 and len(matches) > 100:
-                    degeneracy = "planar"
+                # Dégénérescence planaire : c'est l'homographie qui la décide,
+                # non un taux d'inliers élevé. Deux vues d'une façade plate
+                # s'expliquent aussi bien par une homographie que par une
+                # essentielle — un taux d'inliers fort dit seulement que
+                # l'appariement est bon.
+                degeneracy = _planarity(src_pts, dst_pts, inlier_mask, inliers)
 
     return PairEvidence(
         image_a=asset_a.id,
@@ -327,13 +478,38 @@ def _match_pair(
 # ---------------------------------------------------------------------------
 
 
+def _policy_fov(workspace: Workspace) -> float | None:
+    """Champ de vision déclaré par la politique de collecte, s'il l'est."""
+    path = workspace.path("00_manifest", "pipeline_policy.json")
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    found = (payload.get("collection") or {}).get("image_fov_deg")
+    return float(found) if found else None
+
+
 class ViewGraphBuilder:
     """Construit un ViewGraphManifest depuis un ReconstructionInputManifest."""
 
-    def __init__(self, workspace: Workspace, *, max_features: int = 2048, detector: str = "orb"):
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        max_features: int = 2048,
+        detector: str = "orb",
+        declared_fov_deg: float | None = None,
+    ):
         self.workspace = workspace
         self.max_features = max_features
         self.detector = detector
+        self.declared_fov_deg = (
+            declared_fov_deg
+            if declared_fov_deg is not None
+            else _policy_fov(workspace)
+        )
 
     def build(self, input_manifest: ReconstructionInputManifest) -> ViewGraphManifest:
         from .schemas import AssetManifest
@@ -342,10 +518,27 @@ class ViewGraphBuilder:
         )
         by_id = {a.id: a for a in assets.assets}
 
+        # La résolution des intrinsèques est partagée entre le rapport et la
+        # vérification géométrique : rapporter `None` pour une image dont on a
+        # bel et bien dérivé une focale ferait mentir le manifeste sur ce qui
+        # a servi à calculer les poses.
+        intrinsics: dict[str, dict | None] = {}
+
+        def _intrinsics_of(asset_id: str) -> dict | None:
+            if asset_id not in intrinsics:
+                asset = by_id[asset_id]
+                # L'EXIF d'abord : c'est une mesure. Le champ déclaré ensuite,
+                # qui n'en est pas une mais vaut mieux qu'aucune calibration.
+                found = _load_intrinsics(asset)
+                if found is None:
+                    found = _intrinsics_from_fov(asset, self.declared_fov_deg)
+                intrinsics[asset_id] = found
+            return intrinsics[asset_id]
+
         nodes = [
             ViewGraphNode(
                 asset_id=aid,
-                intrinsics=_load_intrinsics(by_id[aid]),
+                intrinsics=_intrinsics_of(aid),
                 quality_score=by_id[aid].quality_score or 0.0,
             )
             for aid in input_manifest.selected_asset_ids
@@ -357,11 +550,32 @@ class ViewGraphBuilder:
         candidates = _retrieval_candidates(input_manifest, self.workspace)
         pairs: list[PairEvidence] = []
 
+        # `_intrinsics_of` mémorise : une image apparaît dans des dizaines de
+        # paires, et rouvrir son EXIF à chaque fois coûtait autant que le
+        # reste de la vérification.
         for a_id, b_id, _ in candidates:
             if a_id not in by_id or b_id not in by_id:
                 continue
-            pair = _match_pair(by_id[a_id], by_id[b_id], self.workspace, None, max_features=self.max_features, detector=self.detector)
+            pair = _match_pair(
+                by_id[a_id],
+                by_id[b_id],
+                self.workspace,
+                None,
+                max_features=self.max_features,
+                detector=self.detector,
+                intrinsics_a=_intrinsics_of(a_id),
+                intrinsics_b=_intrinsics_of(b_id),
+            )
             pairs.append(pair)
+
+        calibrated = sum(
+            1 for p in pairs if (p.relative_pose or {}).get("calibrated")
+        )
+        log.info(
+            "graphe de vue : %d paire(s), %d avec pose calibrée",
+            len(pairs),
+            calibrated,
+        )
 
         valid_pairs = [p for p in pairs if p.status == "valid"]
         largest_component = self._largest_component(nodes, valid_pairs)

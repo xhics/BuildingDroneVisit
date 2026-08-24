@@ -919,16 +919,40 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     
     # Couverture du bâtiment = union des mesures de façades, pas un littéral.
     # Sans façades mesurées, on recule à "partial" (cas d'absence de données).
-    facade_fractions = [
-        facade_coverage.get(kind, {}).get("appearance_union_fraction", 0.0)
-        for kind in ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR")
+    # Couverture du bâtiment : moyenne des façades **pondérée par leur
+    # longueur**, non le maximum. Le maximum laissait une seule façade
+    # complète marquer le bâtiment entier comme couvert — un motel photographié
+    # de face passait ainsi pour intégralement observé, ses trois autres murs
+    # n'ayant jamais été vus.
+    #
+    # Le poids vient du nombre de points échantillonnés, proportionnel à la
+    # longueur du mur : un pignon de six mètres ne pèse pas autant qu'une
+    # façade de trente.
+    kinds = ("FACADE_PRIMARY", "FACADE_LEFT", "FACADE_RIGHT", "FACADE_REAR")
+    measured = [
+        (
+            facade_coverage.get(kind, {}).get("appearance_union_fraction", 0.0),
+            facade_coverage.get(kind, {}).get("sampled", 0) or 0,
+        )
+        for kind in kinds
+        if kind in facade_coverage
     ]
-    if facade_fractions and any(f > 0.0 for f in facade_fractions):
-        # Union approximée : le max des fractions individuelles majore la vraie union.
-        # (la vrai union nécessiterait de croiser tous les rayons, ce qui est coûteux).
-        building_union = max(facade_fractions)
+    total_weight = sum(weight for _fraction, weight in measured)
+    if total_weight > 0:
+        building_union = sum(
+            fraction * weight for fraction, weight in measured
+        ) / total_weight
+    elif measured:
+        # Sans poids disponible, la moyenne simple : elle reste plus honnête
+        # que le maximum, qui ne décrit qu'un seul mur.
+        building_union = sum(f for f, _w in measured) / len(measured)
     else:
         building_union = 0.0
+
+    # Le mur le moins couvert est rapporté à part : une moyenne acceptable peut
+    # masquer une façade entièrement aveugle, et c'est elle qui décide si un
+    # plan large est réalisable.
+    worst_facade = min((f for f, _w in measured), default=0.0)
     building_coverage = (
         "full" if building_union >= 0.9
         else "none" if building_union <= 0.0

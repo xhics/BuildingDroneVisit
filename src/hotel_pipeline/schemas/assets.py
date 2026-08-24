@@ -333,6 +333,23 @@ class Asset(BaseModel):
     camera_lat: float | None = Field(default=None, ge=-90, le=90)
     camera_lon: float | None = Field(default=None, ge=-180, le=180)
 
+    #: Cap recalculé par le fournisseur depuis la structure de sa séquence,
+    #: quand il en publie un. Mesuré sur ce pilote, il diffère du cap déclaré
+    #: de huit à vingt-deux degrés, et **rapproche** systématiquement la vue de
+    #: la direction réelle du bâtiment : l'écart au sujet passe de 35,4° à
+    #: 13,8° sur la vue la plus proche.
+    #:
+    #: Conservé à côté de `heading_deg`, non à sa place. Les deux ne disent pas
+    #: la même chose — l'un est ce que l'appareil a enregistré, l'autre ce que
+    #: le fournisseur en déduit — et écraser le premier effacerait la trace de
+    #: ce qui a été mesuré au profit de ce qui a été calculé.
+    computed_heading_deg: float | None = Field(default=None, ge=0, lt=360)
+
+    #: Séquence d'acquisition du fournisseur : les images d'un même parcours.
+    #: Elle sert à retrouver les vues voisines non téléchargées, et à savoir
+    #: quelles prises partagent une trajectoire — donc une corrélation d'erreur.
+    sequence_id: str | None = None
+
     #: Texte lu sur l'image par OCR, conservé comme preuve du statut
     #: d'appartenance plutôt que comme simple verdict.
     sign_text: str | None = None

@@ -21,6 +21,10 @@ from .schemas.reconstruction import AlignmentAnchor, GeoAlignmentManifest
 from .reconstruction_consensus import resolve_model_dir
 from .workspace import Workspace
 
+from .logging import get_logger
+
+log = get_logger("geo-alignment")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +42,89 @@ def _is_pose_line(line: str) -> bool:
     except ValueError:
         return True
     return False
+
+
+#: Nombre minimal de correspondances caméra↔GPS pour estimer une Sim(3).
+#: Trois suffisent mathématiquement ; en exiger six laisse à RANSAC de quoi
+#: écarter les pires relevés sans tomber sous le minimum.
+MIN_GPS_CORRESPONDENCES = 6
+
+#: Résidu, en mètres, au-delà duquel une correspondance est tenue pour
+#: aberrante. Les relevés de rue sont bons à quelques mètres ; un écart de
+#: quinze mètres ne s'explique plus par l'imprécision du GPS.
+GPS_INLIER_M = 15.0
+
+#: Tirages RANSAC. Le modèle a sept degrés de liberté et se calcule vite ;
+#: deux cents essais couvrent largement les proportions d'aberrants observées.
+RANSAC_TRIALS = 200
+
+
+def _camera_gps(workspace: Workspace) -> dict[str, tuple[float, float]]:
+    """Position relevée de chaque prise de vue, par identifiant d'image.
+
+    Ce sont les coordonnées que la source déclare — pas une mesure du site.
+    Elles portent l'imprécision d'un GPS de roulage, ce que la robustesse de
+    l'estimation prend en charge.
+    """
+    manifest = workspace.path("00_manifest", "asset_manifest.json")
+    if not manifest.is_file():
+        return {}
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+    found: dict[str, tuple[float, float]] = {}
+    for asset in payload.get("assets", []):
+        lat, lon = asset.get("camera_lat"), asset.get("camera_lon")
+        if lat is None or lon is None:
+            continue
+        identifier = asset.get("id")
+        if not identifier:
+            continue
+        found[str(identifier)] = (float(lat), float(lon))
+        local = asset.get("local_path")
+        if local:
+            # Les centres COLMAP sont indexés par nom de fichier : la même
+            # position doit être trouvable par les deux clés.
+            found[Path(str(local)).stem] = (float(lat), float(lon))
+    return found
+
+
+def _robust_sim3(
+    source: np.ndarray, target: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    """Sim(3) estimée sous RANSAC, avec le masque des correspondances retenues.
+
+    Un seul relevé GPS aberrant — un panorama mal géocodé, une reprise de
+    position en tunnel — suffirait à faire pivoter toute la scène. Le modèle
+    est donc tiré sur des triplets, puis réajusté sur ses seuls inliers.
+    """
+    from .geometry_align import umeyama_sim3
+
+    count = len(source)
+    best_inliers = np.zeros(count, dtype=bool)
+    rng = np.random.default_rng(0)
+
+    for _trial in range(RANSAC_TRIALS):
+        pick = rng.choice(count, size=3, replace=False)
+        rotation, translation, scale = umeyama_sim3(source[pick], target[pick])
+        residual = np.linalg.norm(
+            (scale * (rotation @ source.T)).T + translation - target, axis=1
+        )
+        inliers = residual < GPS_INLIER_M
+        if inliers.sum() > best_inliers.sum():
+            best_inliers = inliers
+
+    if best_inliers.sum() < 3:
+        # Aucun consensus : l'identité, dite comme telle, vaut mieux qu'une
+        # rotation tirée d'un tirage malheureux.
+        return np.eye(3), np.zeros(3), 1.0, best_inliers
+
+    rotation, translation, scale = umeyama_sim3(
+        source[best_inliers], target[best_inliers]
+    )
+    return rotation, translation, scale, best_inliers
 
 
 def _load_colmap_camera_centers(run_dir: Path) -> dict[str, np.ndarray]:
@@ -175,20 +262,71 @@ class GeoAligner:
 
         footprint_centroid, footprint_size, footprint_width, footprint_height = _footprint_stats(footprint)
 
-        # Échelle : on rapproche la taille XY de la reconstruction de l'empreinte
-        scale = footprint_size / max(recon_xy_spread, 1e-6)
-        scale = max(scale, 1e-6)
+        # Premier choix : les positions relevées des prises de vue. Elles
+        # donnent une correspondance point à point, donc une rotation et une
+        # échelle **mesurées**. Comparer une étendue de nuage à une taille
+        # d'emprise ne donnait qu'un ordre de grandeur, et supposait les axes
+        # déjà alignés — ce que rien n'attestait.
+        gps = _camera_gps(self.workspace)
+        source_pts, target_pts, matched = [], [], []
+        if gps:
+            from pyproj import Transformer
 
-        # Rotation : identité (axes supposés alignés)
-        R = np.eye(3).tolist()
+            to_projected = Transformer.from_crs(
+                "EPSG:4326", self._working_crs(), always_xy=True
+            )
+            for name, centre in centers.items():
+                found = gps.get(name)
+                if found is None:
+                    continue
+                east, north = to_projected.transform(found[1], found[0])
+                source_pts.append(centre)
+                target_pts.append([east, north, centre[2]])
+                matched.append(name)
 
-        # Translation XY : centrer la reconstruction sur l'empreinte
-        t_xy = footprint_centroid - scale * recon_centroid[:2]
-        t_z = 0.0
+        alignment_method = "footprint_extent"
+        inlier_count = 0
+        if len(source_pts) >= MIN_GPS_CORRESPONDENCES:
+            rotation, translation, scale_est, inliers = _robust_sim3(
+                np.asarray(source_pts, dtype=np.float64),
+                np.asarray(target_pts, dtype=np.float64),
+            )
+            inlier_count = int(inliers.sum())
+            if inlier_count >= 3:
+                alignment_method = "camera_gps_sim3"
+                R = rotation.tolist()
+                scale = float(scale_est)
+                t_xy = np.asarray(translation[:2], dtype=np.float64)
+                t_z = float(translation[2])
+                log.info(
+                    "alignement Sim(3) sur %d/%d position(s) de caméra, "
+                    "échelle %.4f",
+                    inlier_count,
+                    len(source_pts),
+                    scale,
+                )
 
-        # Ancrage Z via LiDAR si disponible
+        if alignment_method == "footprint_extent":
+            # Repli assumé : sans positions exploitables, on retombe sur la
+            # comparaison d'étendues. Elle ne mesure ni rotation ni position,
+            # et le rapport doit le dire plutôt que de laisser croire à une
+            # géométrie établie.
+            log.warning(
+                "aucune correspondance GPS exploitable (%d appariée(s)) : "
+                "alignement approximatif, rotation supposée identité",
+                len(source_pts),
+            )
+            scale = footprint_size / max(recon_xy_spread, 1e-6)
+            scale = max(scale, 1e-6)
+            R = np.eye(3).tolist()
+            t_xy = footprint_centroid - scale * recon_centroid[:2]
+            t_z = 0.0
+
+        # Ancrage Z via LiDAR si disponible. Il ne s'applique qu'au repli :
+        # une Sim(3) estimée porte déjà sa composante verticale, et l'écraser
+        # reviendrait à défaire ce qui vient d'être mesuré.
         lidar_roof_z = _load_lidar_roof_height(self.workspace)
-        if lidar_roof_z is not None:
+        if lidar_roof_z is not None and alignment_method == "footprint_extent":
             t_z = lidar_roof_z - recon_z_median
 
         t = [float(t_xy[0]), float(t_xy[1]), float(t_z)]

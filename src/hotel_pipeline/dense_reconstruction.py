@@ -35,16 +35,93 @@ class DenseReconstructionResult(BaseModel):
     finished_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+def admission_for(
+    workspace: Workspace, reconstruction_run_id: str
+):  # noqa: ANN201
+    """Juge le sparse d'un run, avec ce que le workspace sait déjà de lui.
+
+    La carte d'observation, quand elle existe, apporte la couverture réelle
+    des façades — mesure qu'aucun rapport de solve ne contient. Son absence ne
+    bloque pas : le contrôle est alors dit non concluant.
+    """
+    from .dense_admission import evaluate
+
+    run_path = workspace.path(
+        "07_reconstruction", "runs", f"{reconstruction_run_id}.json"
+    )
+    if not run_path.is_file():
+        return None
+    try:
+        data = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    registered = int(data.get("registered_images") or 0)
+    component = int(
+        data.get("largest_component") or data.get("largest_connected_component") or 0
+    )
+    if not registered:
+        return None
+    if not component:
+        # Sans mesure de composante, on ne peut pas supposer la connexité :
+        # la traiter comme totale ferait passer un solve fragmenté.
+        component = registered
+
+    triangulable = None
+    map_path = workspace.path("06_geo", "observation_map.json")
+    if map_path.is_file():
+        try:
+            triangulable = float(
+                json.loads(map_path.read_text(encoding="utf-8"))[
+                    "triangulable_fraction"
+                ]
+            )
+        except (OSError, ValueError, KeyError):
+            triangulable = None
+
+    reprojection = data.get("mean_reprojection_error")
+    return evaluate(
+        registered_images=registered,
+        largest_component=component,
+        triangulable_fraction=triangulable,
+        reprojection_px=float(reprojection) if reprojection else None,
+    )
+
+
 def run_dense_reconstruction(
     workspace: Workspace,
     reconstruction_run_id: str,
     *,
     backend: ReconstructionBackend = ReconstructionBackend.BRUSH,
+    force: bool = False,
 ) -> DenseReconstructionResult:
-    """Exécute la reconstruction dense sur le run sélectionné."""
+    """Exécute la reconstruction dense sur le run sélectionné.
+
+    Le sparse est d'abord jugé admissible : lancer le dense sur un solve
+    fragmenté produit un maillage troué dont on cherche ensuite la cause dans
+    le dense, alors qu'elle vient du sparse. `force` outrepasse ce contrôle,
+    et le résultat porte alors la trace de ce qui a été franchi.
+    """
     result_id = (
         f"dense-{backend.value}-{reconstruction_run_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     )
+
+    verdict = admission_for(workspace, reconstruction_run_id)
+    if verdict is not None and not verdict.admitted and not force:
+        blocking = ", ".join(check.name for check in verdict.blocking)
+        remedies = " ; ".join(
+            check.remedy for check in verdict.blocking if check.remedy
+        )
+        return DenseReconstructionResult(
+            result_id=result_id,
+            reconstruction_run_id=reconstruction_run_id,
+            backend=backend.value,
+            status="refused",
+            error=(
+                f"sparse non admissible au dense ({blocking})"
+                + (f" — {remedies}" if remedies else "")
+            ),
+        )
 
     if backend is ReconstructionBackend.BRUSH:
         return _run_brush(workspace, reconstruction_run_id, result_id)

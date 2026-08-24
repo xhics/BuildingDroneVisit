@@ -405,6 +405,10 @@ class RoofRidge:
     end: np.ndarray
     angle_deg: float
     kind: str
+    #: Indices des deux pans dont l'intersection produit cette arête. Ils
+    #: disent quelles arêtes se rencontrent : deux arêtes partageant un pan
+    #: sont voisines sur le toit, ce qu'aucune mesure de longueur ne révèle.
+    plane_indices: tuple[int, int] = (-1, -1)
 
     @property
     def length_m(self) -> float:
@@ -489,6 +493,7 @@ def ridges(decomposition: RoofDecomposition) -> list[RoofRidge]:
             end = point + direction * float(t.max())
 
             ridge = RoofRidge(
+                plane_indices=(i, j),
                 start=start,
                 end=end,
                 angle_deg=angle,
