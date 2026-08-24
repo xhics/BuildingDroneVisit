@@ -114,6 +114,36 @@ class TestProvenanceReachesDisk:
         )
         assert report["files"] == 2
 
+    def test_dedup_publie_une_preuve_robuste_courante(self, project, tmp_path):
+        from hotel_pipeline.dedup_levels import robust_input_digest
+        from hotel_pipeline.lot1b_coverage import (
+            DedupRobustnessEvidence,
+            _robust_dedup_is_current,
+        )
+
+        policy = write_policy(tmp_path)
+        install_policy(project, policy)
+        result = runner.invoke(app, ["assets", "dedup", project])
+        assert result.exit_code == 0, result.stdout
+
+        workspace = Workspace(project)
+        evidence = DedupRobustnessEvidence.model_validate_json(
+            workspace.path(
+                "01_sources", "dedup_robustness_report.json"
+            ).read_text("utf-8")
+        )
+        manifest = workspace.read_assets()
+        assert manifest is not None
+        assert evidence.robust_input_digest == robust_input_digest(manifest.assets)
+        assert evidence.asset_manifest_sha256 == __import__("hashlib").sha256(
+            workspace.assets_path.read_bytes()
+        ).hexdigest()
+        assert evidence.production_used is True
+        assert evidence.crop_regression_passed is True
+        assert evidence.watermark_regression_passed is True
+        assert evidence.distinct_regression_passed is True
+        assert _robust_dedup_is_current(workspace, policy) is True
+
 
 class TestPolicyOnDiskChangesTheOutcome:
     """La preuve que la politique n'est pas décorative."""

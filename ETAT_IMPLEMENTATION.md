@@ -1,12 +1,74 @@
 # État d'implémentation — BuildingDroneVisit
 
-**Photographie vérifiée :** 17 août 2026
-**Jalon stable observé :** `49b5f0f` + livrables locaux non commités en validation
+**Photographie vérifiée :** 24 août 2026
+**Jalon observé :** `81fab59` + préparation démo locale
 **Pilote :** WelcomINNS Boucherville
 
 Ce document répond à la question « qu'est-ce qui fonctionne réellement
 aujourd'hui ? ». Il ne remplace ni la destination décrite par le plan directeur,
 ni les preuves stockées dans `work/<hotel>/`.
+
+## Mise à jour du 24 août — démonstration
+
+Le parcours de démonstration est maintenant distinct du verdict Phase 1 :
+
+- `hotel-pipeline demo prepare <hotel>` republie la scène, le viewer et un
+  manifeste de présentation ;
+- `hotel-pipeline viewer build|open <hotel>` rend le viewer reproductible et
+  traçable, sans CDN ni serveur ;
+- le pilote courant est `DEMO_READY`, avec 96 frames, un score de fidélité de
+  0,9028 et un conditionnement fort sur 78,1 % du plan ;
+- captation finale et clearance des droits sont explicitement différées après
+  acceptation de la démonstration ;
+- la Phase 1 reste `NEEDS_AUTHORIZED_CAPTURE` et n'est jamais remplacée par le
+  statut de démonstration ;
+- ALIKED + LightGlue produit 37/55 poses brutes mais seulement 14/55 dans le
+  noyau géographiquement cohérent ; G5 reste refusé ;
+- le corpus courant contient 349 assets, 283 photographies uniques et 217
+  points de vue après réexécution de la déduplication ;
+- G1 passe désormais sur le corpus courant : 35 417 paires robustes ont été
+  évaluées et les régressions recadrage/filigrane sont validées ;
+- la politique 1.4.0 est entièrement matérialisée, sans changement de son
+  empreinte effective ;
+- validation finale du nouvel ensemble : 2 505 tests passés, avec un seul
+  avertissement de dépréciation Pydantic/NumPy non bloquant.
+
+### Scène canonique et géométrie conditionnée
+
+La commande `hotel-pipeline conditioning scene-build <hotel>` est maintenant
+le point de publication de la géométrie de démonstration. Elle produit :
+
+- `conditioned_scene.json`, source canonique consommée par le viewer ;
+- `topology_audit.json`, audit d'incidence des arêtes et du support ;
+- `geometry_benchmark.json`, comparaison figée avant/après ;
+- `architectural_observations.json`, registre image avec poses et provenance.
+
+Sur WelcomINNS, la publication courante mesure :
+
+- **2/2 bâtiments étanches et supportés** : aucune arête ouverte ou
+  non-manifold, une composante connexe et un volume positif ;
+- **76 couronnes LiDAR** décrites par six anneaux de douze secteurs ; le viewer
+  ne reconstruit plus des cônes verts depuis un rayon unique ;
+- **792 observations image** enregistrées : 544 arêtes de toiture, 240
+  membres linéaires candidats, 6 panneaux/ouvertures candidats et 2 enseignes ;
+  **75 sont éligibles** à une triangulation multivue et **0 géométrie 3D
+  n'est créée** sans validation ;
+- poses validées : 18,18 % dans le run d'anchor-localization courant ; cette
+  limite empêche toujours de promouvoir les observations image en reconstruction
+  mesurée globale.
+
+Ce premier solveur ferme une coque logique et conserve la toiture LiDAR dense
+comme calque mesuré. Pour cette extrusion monotone 2,5D, l'absence
+d'auto-intersection est garantie par construction. Il ne remplace pas encore
+les pans par un solveur global de type PolyFit/City3D. Le détecteur OpenCV
+hors ligne produit des formes 2D candidates ; Grounding DINO et SAM 2 sont
+déclarés `not_installed`, donc aucune forme n'est revendiquée comme panneau,
+poutre ou ouverture confirmée sans validation sémantique.
+
+Le détail opérateur et les formulations autorisées pour la présentation vivent
+dans `DEMO_WELCOMINNS.md`. Les sections historiques ci-dessous restent utiles
+pour comprendre la construction du Lot 1B, mais les valeurs datées du 17 août
+ne constituent plus l'état courant.
 
 Statuts :
 
@@ -35,7 +97,7 @@ Statuts :
 | Contexte et contraintes caméra | livré | manifestes canoniques produits sous `coverage/` |
 | Router | livré pour B/D | décision Path D publiée ; Path A/C restent hors contrat |
 | Paquet 3D provider-agnostic | livré comme proxy | OBJ, rasters, orbite virtuelle, prompts et verdict Phase 1 |
-| SfM et reconstruction | hors lot courant | Lot 2 non commencé |
+| SfM et reconstruction | diagnostic réel, G5 refusé | ALIKED + LightGlue mesuré ; noyau cohérent insuffisant |
 | Orchestrateur Phase 1 | livré pour le Lot 1B | étape `lot1b` déléguant aux contrats modernes |
 
 **Conclusion :** les mécanismes du Lot 1B sont avancés, mais sa définition de
@@ -52,8 +114,8 @@ l'accès et la campagne de sources — dont aucun n'est un défaut de code.
 
 | Mesure | Valeur |
 |---|---:|
-| Assets | 338 |
-| `context_lock` | 301 |
+| Assets | 349 |
+| `context_lock` | 312 |
 | `photo_geometry` | 15 |
 | `reference_only` | 16 |
 | `identity_evidence` | 5 |
@@ -61,7 +123,7 @@ l'accès et la campagne de sources — dont aucun n'est un défaut de code.
 | Droits `open_data` | 189 |
 | Droits `public_uncleared` | 134 |
 | Droits `unknown` | 12 |
-| Assets positionnés | 313 |
+| Points de vue indépendants | 217 |
 | Fichiers sur disque | 609, pour 123 Mo |
 | Images ≥ 640 px | 596 |
 | Images ≥ 1920 px | 449 |

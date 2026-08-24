@@ -1,5 +1,9 @@
 # RunPod — reconstruction de forme, sans gaspiller
 
+Pour la chaîne Grounding DINO + SAM 2 utilisée par le viewer, voir
+[`SEMANTIC_GPU.md`](SEMANTIC_GPU.md). Le présent document concerne le PoC de
+forme VGGT/MapAnything, qui est un flux distinct.
+
 ## La réponse courte sur le coût
 
 **Oui, tu ne paies que ce que tu allumes.** Trois choses à retenir :

@@ -92,6 +92,128 @@ class HeightMeasurement:
         }
 
 
+def _vectorized_grid_surface(
+    values: np.ndarray,
+    polygon,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Découpe une grille sur le contour vectoriel exact de l'emprise.
+
+    Les anciennes surfaces ne gardaient que les centres de cellule situés dans
+    le bâtiment. Leur bord suivait donc la maille en escalier et restait en
+    retrait des murs. Ici, chaque cellule est intersectée avec le polygone
+    régularisé : l'intérieur conserve la résolution du raster, tandis que le
+    bord partage exactement les arêtes XY de l'emprise.
+    """
+    from scipy.ndimage import map_coordinates
+    from shapely.geometry import Polygon
+    from shapely.ops import triangulate
+
+    rows, cols = values.shape
+    if len(x_edges) != cols + 1 or len(y_edges) != rows + 1:
+        raise ValueError("les arêtes de grille ne correspondent pas aux valeurs")
+    if cols < 1 or rows < 1:
+        return None
+
+    dx = float(x_edges[1] - x_edges[0])
+    dy = float(y_edges[1] - y_edges[0])
+    if abs(dx) <= 1e-12 or abs(dy) <= 1e-12:
+        return None
+
+    vertices: list[list[float]] = []
+    faces: list[list[int]] = []
+    vertex_lookup: dict[tuple[float, float], int] = {}
+
+    def vertex(x: float, y: float) -> int:
+        key = (round(float(x), 9), round(float(y), 9))
+        found = vertex_lookup.get(key)
+        if found is not None:
+            return found
+        # Les valeurs sont portées par les centres de cellule. Les coordonnées
+        # continues de scipy sont donc décalées d'une demi-cellule par rapport
+        # aux arêtes utilisées pour découper le contour.
+        col = (float(x) - float(x_edges[0])) / dx - 0.5
+        row = (float(y) - float(y_edges[0])) / dy - 0.5
+        height = float(
+            map_coordinates(
+                values,
+                np.asarray([[row], [col]], dtype=np.float64),
+                order=1,
+                mode="nearest",
+            )[0]
+        )
+        index = len(vertices)
+        vertex_lookup[key] = index
+        vertices.append([float(x), float(y), height])
+        return index
+
+    def add_triangle(coords) -> None:  # noqa: ANN001
+        indices = [vertex(float(x), float(y)) for x, y in coords]
+        if len(set(indices)) != 3:
+            return
+        a, b, c = (np.asarray(vertices[index][:2]) for index in indices)
+        if abs(float(np.cross(b - a, c - a))) <= 1e-10:
+            return
+        faces.append(indices)
+
+    for row in range(rows):
+        for col in range(cols):
+            corners = [
+                (float(x_edges[col]), float(y_edges[row])),
+                (float(x_edges[col + 1]), float(y_edges[row])),
+                (float(x_edges[col + 1]), float(y_edges[row + 1])),
+                (float(x_edges[col]), float(y_edges[row + 1])),
+            ]
+            cell = Polygon(corners)
+            if not polygon.intersects(cell):
+                continue
+            if polygon.covers(cell):
+                indices = [vertex(x, y) for x, y in corners]
+                heights = [vertices[index][2] for index in indices]
+                # Aux ruptures, la diagonale relie les deux coins les plus
+                # proches en altitude. La marche reste nette sans ouvrir le
+                # toit, comme dans l'ancienne grille intérieure.
+                if (
+                    max(heights) - min(heights) > ROOF_STEP_BREAK_M
+                    and abs(heights[0] - heights[2])
+                    > abs(heights[1] - heights[3])
+                ):
+                    faces.extend(
+                        [
+                            [indices[0], indices[1], indices[3]],
+                            [indices[1], indices[2], indices[3]],
+                        ]
+                    )
+                else:
+                    faces.extend(
+                        [
+                            [indices[0], indices[1], indices[2]],
+                            [indices[0], indices[2], indices[3]],
+                        ]
+                    )
+                continue
+            clipped = polygon.intersection(cell)
+            if clipped.is_empty or clipped.area <= 1e-10:
+                continue
+            pieces = (
+                [clipped]
+                if clipped.geom_type == "Polygon"
+                else [part for part in clipped.geoms if part.geom_type == "Polygon"]
+            )
+            for piece in pieces:
+                # L'intersection d'une cellule et d'une emprise peut être
+                # concave. Shapely propose une Delaunay, puis ce filtre conserve
+                # seulement les triangles réellement couverts par la pièce.
+                for triangle in triangulate(piece):
+                    if piece.covers(triangle):
+                        add_triangle(list(triangle.exterior.coords)[:-1])
+
+    if not faces:
+        return None
+    return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int32)
+
+
 def measure_footprint(
     raster, footprint: np.ndarray, feature_id: str
 ) -> HeightMeasurement | None:
@@ -197,70 +319,19 @@ def build_roof_surface(
         _, nearest = distance_transform_edt(~valid, return_indices=True)
         filled = filled[tuple(nearest)]
 
-    # Une cellule reste exclue si elle sort du polygone : l'interpolation
-    # prolonge la mesure à l'intérieur du bâti, jamais au-delà de son emprise.
-    from rasterio.features import geometry_mask
-
-    inside = geometry_mask(
-        [polygon.__geo_interface__],
-        out_shape=band.shape,
-        transform=transform,
-        invert=True,
+    # Les cellules sont conservées à leur résolution native puis découpées sur
+    # le polygone vectoriel. Le bord du maillage rejoint ainsi exactement les
+    # murs, au lieu de suivre les centres de pixels en escalier.
+    sampled = filled[::step, ::step]
+    x_edges = np.asarray(
+        [(transform * (col * step, 0))[0] for col in range(sampled.shape[1] + 1)],
+        dtype=np.float64,
     )
-
-    index = np.full(((rows + step - 1) // step, (cols + step - 1) // step), -1)
-    vertices: list[list[float]] = []
-
-    for gi, row in enumerate(range(0, rows, step)):
-        for gj, col in enumerate(range(0, cols, step)):
-            if not inside[row, col]:
-                continue
-            value = filled[row, col]
-            if not np.isfinite(value) or value <= MIN_HEIGHT_M:
-                continue
-            x, y = transform * (col + 0.5, row + 0.5)
-            index[gi, gj] = len(vertices)
-            vertices.append([float(x), float(y), float(value)])
-
-    if len(vertices) < 8:
-        return None
-
-    # Le toit doit rester **fermé** : une cellule écartée laisse un trou par
-    # lequel on voit l'intérieur du volume, et le rendu montrait alors une
-    # cuvette bordée de dents. Un premier essai supprimait les quadrilatères
-    # enjambant un décrochement — vingt-trois pour cent de l'emprise se
-    # retrouvait à découvert.
-    #
-    # Le décrochement est donc traité par la diagonale de découpe, non par une
-    # suppression : couper le quadrilatère selon les deux coins de même niveau
-    # garde la surface continue tout en plaquant la marche contre le mur.
-    faces: list[list[int]] = []
-    heights = np.asarray([v[2] for v in vertices], dtype=np.float64)
-    for gi in range(index.shape[0] - 1):
-        for gj in range(index.shape[1] - 1):
-            a, b = index[gi, gj], index[gi, gj + 1]
-            c, d = index[gi + 1, gj + 1], index[gi + 1, gj]
-            if min(a, b, c, d) < 0:
-                continue
-            corners = heights[[a, b, c, d]]
-            if float(corners.max() - corners.min()) > ROOF_STEP_BREAK_M:
-                # Diagonale choisie pour que chaque triangle reste le plus plan
-                # possible : celle dont les extrémités sont les plus proches en
-                # altitude. Aplatir la cellule au niveau bas a été essayé et
-                # écarté — cela rouvrait le toit sous la marche.
-                if abs(heights[a] - heights[c]) <= abs(heights[b] - heights[d]):
-                    faces.append([a, b, c])
-                    faces.append([a, c, d])
-                else:
-                    faces.append([a, b, d])
-                    faces.append([b, c, d])
-                continue
-            faces.append([a, b, c])
-            faces.append([a, c, d])
-
-    if not faces:
-        return None
-    return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int32)
+    y_edges = np.asarray(
+        [(transform * (0, row * step))[1] for row in range(sampled.shape[0] + 1)],
+        dtype=np.float64,
+    )
+    return _vectorized_grid_surface(sampled, polygon, x_edges, y_edges)
 
 
 def apply_laz_heights(scene, laz_path) -> dict:
@@ -629,46 +700,9 @@ def build_roof_surface_from_cloud(
         _, nearest = distance_transform_edt(~filled, return_indices=True)
         grid = grid[tuple(nearest)]
 
-    centres_x = minx + (np.arange(cols) + 0.5) * cell_m
-    centres_y = miny + (np.arange(rows) + 0.5) * cell_m
-    mesh_x, mesh_y = np.meshgrid(centres_x, centres_y)
-    covered = shapely.contains_xy(polygon, mesh_x, mesh_y)
-
-    index = np.full((rows, cols), -1)
-    vertices: list[list[float]] = []
-    for r in range(rows):
-        for c in range(cols):
-            if not covered[r, c] or not np.isfinite(grid[r, c]):
-                continue
-            index[r, c] = len(vertices)
-            vertices.append([float(mesh_x[r, c]), float(mesh_y[r, c]), float(grid[r, c])])
-
-    if len(vertices) < 8:
-        return None
-
-    heights = np.asarray([v[2] for v in vertices], dtype=np.float64)
-    faces: list[list[int]] = []
-    for r in range(rows - 1):
-        for c in range(cols - 1):
-            a, b = index[r, c], index[r, c + 1]
-            d, e = index[r + 1, c + 1], index[r + 1, c]
-            if min(a, b, d, e) < 0:
-                continue
-            corners = heights[[a, b, d, e]]
-            if float(corners.max() - corners.min()) > ROOF_STEP_BREAK_M:
-                if abs(heights[a] - heights[d]) <= abs(heights[b] - heights[e]):
-                    faces.append([a, b, d])
-                    faces.append([a, d, e])
-                else:
-                    faces.append([a, b, e])
-                    faces.append([b, d, e])
-                continue
-            faces.append([a, b, d])
-            faces.append([a, d, e])
-
-    if not faces:
-        return None
-    return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int32)
+    x_edges = minx + np.arange(cols + 1, dtype=np.float64) * cell_m
+    y_edges = miny + np.arange(rows + 1, dtype=np.float64) * cell_m
+    return _vectorized_grid_surface(grid, polygon, x_edges, y_edges)
 
 
 #: Maille de toiture au premier plan, en mètres. C'est la finesse que le nuage

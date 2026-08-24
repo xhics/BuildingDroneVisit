@@ -75,6 +75,13 @@ vision-macos-intel = [
 # OCR par service, uniquement en repli si EasyOCR est indisponible.
 vision-cloud = ["google-cloud-vision>=3.7"]
 
+# Détection ouverte CPU/GPU via l'API officielle Hugging Face. SAM 2 reste
+# dans l'image GPU Linux : sa version courante exige torch>=2.5.1 et ne doit
+# pas forcer la mise à niveau du verrou Mac Intel torch==2.2.2.
+semantic-vision = [
+    "transformers>=4.40,<5",
+]
+
 [project.scripts]
 hotel-pipeline = "hotel_pipeline.cli:app"
 

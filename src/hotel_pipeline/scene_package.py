@@ -34,7 +34,7 @@ from .schemas.scene import (
     VirtualCameraPath,
 )
 
-SCENE_EXPORTER_VERSION = "hybrid-1.2.1"
+SCENE_EXPORTER_VERSION = "hybrid-1.3.0"
 
 
 def _sha256(path: Path) -> str:
@@ -426,6 +426,7 @@ def _phase1_blocking_reasons(
     coverage: dict, checks: list[GateCheck], *, duplicate_files: int | None,
     asset_count: int, duplicate_robust: bool, exterior_count: int,
     geometry_with_quality: int, geometry_count: int, independent_viewpoints: int,
+    g5_reason: str = "G5 absent : aucune reconstruction SfM/LightGlue/pycolmap mesurée",
 ) -> list[str]:
     """Traduit les gates en motifs sans contredire un gate déjà franchi."""
     reasons = list(coverage.get("blocking_reasons") or [])
@@ -444,24 +445,95 @@ def _phase1_blocking_reasons(
         )
     reasons.extend([
         f"G4 échoue avec {independent_viewpoints} point de vue indépendant",
-        "G5 absent : aucune reconstruction SfM/LightGlue/pycolmap mesurée",
+        g5_reason,
         "validation Blender non exécutée",
         "revue humaine finale absente",
     ])
     return list(dict.fromkeys(reasons))
 
 
+def _g5_result(payload: dict) -> bool | None:
+    """Relit les différentes formes historiques d'une décision G5."""
+    if isinstance(payload.get("g5_passed"), bool):
+        return bool(payload["g5_passed"])
+    direct = payload.get("g5")
+    if isinstance(direct, dict) and isinstance(direct.get("passed"), bool):
+        return bool(direct["passed"])
+    validation = payload.get("geometry_validation")
+    if isinstance(validation, dict):
+        g5 = validation.get("g5")
+        if isinstance(g5, dict) and isinstance(g5.get("passed"), bool):
+            return bool(g5["passed"])
+    return None
+
+
 def _has_reconstruction(workspace) -> tuple[bool, dict]:  # noqa: ANN001
-    """Vérifie si une reconstruction Lot 2 est disponible."""
+    """Vérifie une décision G5, pas la simple présence d'un répertoire.
+
+    Un run synthétique terminé ou un lancement COLMAP échoué est un diagnostic,
+    jamais une reconstruction photo-first disponible. L'ancienne détection les
+    confondait parce qu'elle comptait tous les JSON de ``runs/``.
+    """
     reconstruction_dir = workspace.path("07_reconstruction")
     selected_dir = reconstruction_dir / "selected"
     if selected_dir.is_dir() and any(selected_dir.iterdir()):
-        return True, {"type": "selected", "path": str(selected_dir)}
+        for name in ("decision.json", "validation.json", "geometry_validation.json"):
+            decision = selected_dir / name
+            if not decision.is_file():
+                continue
+            payload = _json(decision)
+            passed = _g5_result(payload)
+            if passed is not None:
+                return passed, {
+                    "type": "selected",
+                    "path": str(selected_dir),
+                    "decision": str(decision),
+                    "decision_sha256": _sha256(decision),
+                    "g5_passed": passed,
+                }
+
+    decisions = sorted(
+        workspace.path("05_colmap").glob("**/decision.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for decision in decisions:
+        payload = _json(decision)
+        passed = _g5_result(payload)
+        if passed is None:
+            continue
+        g5 = payload.get("geometry_validation", {}).get("g5", {})
+        return passed, {
+            "type": "validated_diagnostic",
+            "decision": str(decision),
+            "decision_sha256": _sha256(decision),
+            "g5_passed": passed,
+            "validated_registration_rate": g5.get("validated_registration_rate"),
+            "required_registration_rate": g5.get("required_registration_rate"),
+            "refusal_reasons": g5.get("refusal_reasons", []),
+        }
+
     runs_dir = reconstruction_dir / "runs"
     if runs_dir.is_dir():
-        completed = [p for p in runs_dir.glob("*.json") if p.is_file()]
-        if completed:
-            return True, {"type": "runs", "count": len(completed)}
+        runs = [_json(path) for path in runs_dir.glob("*.json") if path.is_file()]
+        if runs:
+            return False, {
+                "type": "unvalidated_runs",
+                "count": len(runs),
+                "completed_real_runs": sum(
+                    1
+                    for run in runs
+                    if run.get("status") == "completed"
+                    and run.get("backend") not in (None, "synthetic")
+                ),
+                "synthetic_runs": sum(
+                    1 for run in runs if run.get("backend") == "synthetic"
+                ),
+                "failed_runs": sum(
+                    1 for run in runs if run.get("status") == "failed"
+                ),
+                "g5_passed": False,
+            }
     return False, {}
 
 
@@ -518,6 +590,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         raise FileNotFoundError("décision Router citée par la couverture absente")
 
     has_recon, recon_info = _has_reconstruction(workspace)
+    duplicate_path = workspace.path("01_sources", "duplicate_report.json")
 
     inputs = {
         "site_manifest": _sha256(workspace.site_path),
@@ -535,8 +608,21 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
             {"contract_version": 1, "exporter_version": SCENE_EXPORTER_VERSION}
         ),
     }
-    if has_recon:
-        inputs["reconstruction"] = recon_info.get("type", "unknown")
+    # G1 lit ces deux productions. Sans leurs empreintes, une preuve robuste
+    # nouvellement publiée pouvait continuer à pointer vers un paquet mis en
+    # cache dont le verdict disait encore « unverified ».
+    if duplicate_path.is_file():
+        inputs["duplicate_report"] = _sha256(duplicate_path)
+    robust_evidence_path = workspace.path(
+        "01_sources", "dedup_robustness_report.json"
+    )
+    if robust_evidence_path.is_file():
+        inputs["dedup_robustness"] = _sha256(robust_evidence_path)
+    if recon_info:
+        inputs["reconstruction_diagnostic"] = (
+            recon_info.get("decision_sha256")
+            or digest_of(recon_info)
+        )
     package_id = digest_of(inputs)
     final_folder = workspace.path("08_composite", f"scene_package_{package_id}")
     if (final_folder / "scene.json").is_file():
@@ -754,7 +840,6 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     geometry_with_quality = [
         asset for asset in geometry_assets if asset.quality_score is not None
     ]
-    duplicate_path = workspace.path("01_sources", "duplicate_report.json")
     duplicate_files = None
     duplicate_robust = False
     if duplicate_path.is_file():
@@ -827,9 +912,25 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
                 else GateState.FAILED
             ),
             evidence=(
-                [f"Lot 2 exécuté : {recon_info.get('type')}"]
+                [
+                    "G5 validé par décision mesurée : "
+                    f"{recon_info.get('decision', recon_info.get('type'))}"
+                ]
                 if has_recon
-                else ["Lot 2 non exécuté ; aucun rapport hloc/LightGlue/pycolmap"]
+                else (
+                    [
+                        "G5 mesuré mais refusé : taux validé "
+                        f"{recon_info.get('validated_registration_rate')!r}, "
+                        "seuil "
+                        f"{recon_info.get('required_registration_rate')!r}; "
+                        f"décision {recon_info.get('decision')}"
+                    ]
+                    if recon_info.get("type") == "validated_diagnostic"
+                    else [
+                        "aucune décision G5 positive ; "
+                        f"diagnostic {recon_info or 'absent'}"
+                    ]
+                )
             ),
         ),
         GateCheck(gate_id="inspectable", requirement="environnement 3D inspectable", state=GateState.PASSED, evidence=["environment.obj"]),
@@ -849,6 +950,15 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         geometry_with_quality=len(geometry_with_quality),
         geometry_count=len(geometry_assets),
         independent_viewpoints=independent_viewpoints,
+        g5_reason=(
+            "G5 échoue : taux d'enregistrement validé "
+            f"{recon_info.get('validated_registration_rate'):.1%} sous le seuil "
+            f"{recon_info.get('required_registration_rate'):.0%}"
+            if recon_info.get("type") == "validated_diagnostic"
+            and isinstance(recon_info.get("validated_registration_rate"), (int, float))
+            and isinstance(recon_info.get("required_registration_rate"), (int, float))
+            else "G5 absent : aucune décision SfM positive mesurée"
+        ),
     )
 
     verdict = Phase1Verdict(

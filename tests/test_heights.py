@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -195,6 +196,41 @@ def test_le_toit_suit_le_relief_reel(tmp_path: Path) -> None:
 
     assert vertices[:, 2].min() == pytest.approx(8.0, abs=0.3)
     assert vertices[:, 2].max() == pytest.approx(12.0, abs=0.3)
+
+
+def test_le_contour_du_toit_rejoint_exactement_l_emprise_vectorielle(
+    tmp_path: Path,
+) -> None:
+    """Le bord ne doit plus suivre les centres de pixels en escalier."""
+    from shapely.geometry import Point, Polygon
+
+    footprint = np.array(
+        [[38.2, 41.3], [62.7, 43.1], [59.4, 61.8], [40.1, 58.9]],
+        dtype=np.float64,
+    )
+    path = _raster(tmp_path, _flat(9.0))
+
+    with rasterio.open(path) as raster:
+        vertices, faces = build_roof_surface(raster, footprint)
+
+    counts: Counter[tuple[int, int]] = Counter()
+    for face in faces:
+        counts.update(
+            tuple(sorted((int(face[index]), int(face[(index + 1) % 3]))))
+            for index in range(3)
+        )
+    boundary_vertices = {
+        index
+        for edge, owners in counts.items()
+        if owners == 1
+        for index in edge
+    }
+    outline = Polygon(footprint).boundary
+    assert boundary_vertices
+    assert max(
+        outline.distance(Point(vertices[index, :2]))
+        for index in boundary_vertices
+    ) < 1e-7
 
 
 def test_la_mesure_porte_sa_provenance(tmp_path: Path) -> None:

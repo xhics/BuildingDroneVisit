@@ -19,7 +19,7 @@ désormais classés à part, sur leur signature géométrique.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -83,6 +83,10 @@ class CanopyObject:
     height_m: float
     footprint_m2: float
     points: int
+    #: Enveloppe mesurée du houppier, par anneaux horizontaux. Chaque point
+    #: est exprimé dans le CRS de travail (x, y) et relativement au sol (z).
+    #: Elle reste vide pour le mobilier vertical.
+    envelope: list[list[tuple[float, float, float]]] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -92,7 +96,83 @@ class CanopyObject:
             "height_m": round(self.height_m, 2),
             "footprint_m2": round(self.footprint_m2, 1),
             "points": self.points,
+            "envelope": [
+                [[round(x, 2), round(y, 2), round(z, 2)] for x, y, z in ring]
+                for ring in self.envelope
+            ],
         }
+
+
+def _crown_envelope(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    heights: np.ndarray,
+    centre: tuple[float, float],
+    radius_m: float,
+    top_m: float,
+    *,
+    sides: int = 12,
+    levels: int = 6,
+) -> list[list[tuple[float, float, float]]]:
+    """Mesure une enveloppe radiale robuste dans le nuage d'une couronne.
+
+    Un rayon unique efface toute la distribution des retours et force ensuite
+    le viewer à inventer un cône. Ici, chaque tranche de hauteur conserve son
+    extension par secteur angulaire. Les secteurs lacunaires sont complétés
+    par la médiane de la tranche, puis lissés circulairement : on bouche les
+    trous du LiDAR sans changer le sommet, la base ni l'asymétrie mesurée.
+    """
+    if xs.size < 8 or top_m <= 0.0 or radius_m <= 0.0:
+        return []
+
+    cx, cy = centre
+    dx, dy = xs - cx, ys - cy
+    radial = np.hypot(dx, dy)
+    angles = np.mod(np.arctan2(dy, dx), 2.0 * np.pi)
+    sectors = np.floor(angles / (2.0 * np.pi / sides)).astype(np.int64)
+    sectors = np.clip(sectors, 0, sides - 1)
+
+    low = max(float(np.percentile(heights, 8)), 0.05 * top_m)
+    high = max(float(np.percentile(heights, 95)), low + 0.05)
+    z_levels = np.linspace(low, high, levels)
+    band = max((high - low) / max(levels - 1, 1) * 0.75, 0.45)
+    rings: list[list[tuple[float, float, float]]] = []
+
+    for z in z_levels:
+        selected = np.abs(heights - z) <= band
+        if selected.sum() < 4:
+            # La tranche la plus proche est préférée à un profil synthétique.
+            nearest = np.argsort(np.abs(heights - z))[: min(16, heights.size)]
+            selected = np.zeros(heights.size, dtype=bool)
+            selected[nearest] = True
+
+        local = radial[selected]
+        fallback = float(np.percentile(local, 75)) if local.size else radius_m * 0.5
+        values = np.full(sides, fallback, dtype=np.float64)
+        for sector in range(sides):
+            sector_values = radial[selected & (sectors == sector)]
+            if sector_values.size:
+                values[sector] = float(np.percentile(sector_values, 85))
+
+        # Un filtre [1, 2, 1] respecte mieux une silhouette qu'une moyenne
+        # globale, tout en supprimant les pointes dues à un retour isolé.
+        values = (
+            np.roll(values, 1) + 2.0 * values + np.roll(values, -1)
+        ) / 4.0
+        values = np.clip(values, radius_m * 0.12, radius_m * 1.35)
+
+        ring: list[tuple[float, float, float]] = []
+        for sector, value in enumerate(values):
+            angle = 2.0 * np.pi * sector / sides
+            ring.append(
+                (
+                    float(cx + value * np.cos(angle)),
+                    float(cy + value * np.sin(angle)),
+                    float(z),
+                )
+            )
+        rings.append(ring)
+    return rings
 
 
 def _classify(
@@ -273,14 +353,20 @@ def segment(
         # Le rayon est plafonné par la hauteur : un bassin large mais bas
         # décrivait un volume trapu qui écrasait visuellement ses voisins.
         limit = MAX_RADIUS_RATIO.get(kind, 0.55) * top
+        bounded_radius = min(radius, max(limit, resolution_m))
         objects.append(
             CanopyObject(
                 kind=kind,
                 centre=centre,
-                radius_m=min(radius, max(limit, resolution_m)),
+                radius_m=bounded_radius,
                 height_m=top,
                 footprint_m2=footprint,
                 points=int(selected.sum()),
+                envelope=(
+                    _crown_envelope(px, py, ph, centre, bounded_radius, top)
+                    if kind != "poteau"
+                    else []
+                ),
             )
         )
 

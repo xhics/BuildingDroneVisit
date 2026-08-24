@@ -89,6 +89,10 @@ class VegetationPatch:
     #: Allure déduite des images au sol : conique, etale, colonnaire, arbustif.
     #: `None` tant qu'aucune vue n'a été lue — le rendu pose alors un cylindre.
     shape: str | None = None
+    #: Anneaux LiDAR du houppier. Préférés au profil d'allure lorsqu'ils
+    #: existent : l'image peut qualifier la forme, mais ne remplace pas la
+    #: distribution 3D mesurée.
+    envelope: list[list[tuple[float, float, float]]] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -98,6 +102,10 @@ class VegetationPatch:
             "radius_m": round(self.radius_m, 2),
             "height_m": round(self.height_m, 2),
             "points": self.points,
+            "envelope": [
+                [[round(x, 2), round(y, 2), round(z, 2)] for x, y, z in ring]
+                for ring in self.envelope
+            ],
         }
 
 
@@ -398,6 +406,7 @@ def extract_vegetation(
                 radius_m=item.radius_m,
                 height_m=item.height_m,
                 points=item.points,
+                envelope=item.envelope,
             )
         )
 

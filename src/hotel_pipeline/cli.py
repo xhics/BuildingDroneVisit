@@ -171,6 +171,14 @@ def status(hotel_id: str = typer.Argument(...)) -> None:
     typer.echo(f"hôtel   : {manifest.hotel_id}")
     typer.echo(f"adresse : {manifest.address}")
     typer.echo(f"statut  : {manifest.status.value if manifest.status else 'en cours'}")
+    demo_manifest = Workspace(hotel_id).read_json(
+        "11_conditioning/demo_manifest.json"
+    )
+    if isinstance(demo_manifest, dict):
+        typer.echo(
+            f"démo    : {demo_manifest.get('status', 'état inconnu')} "
+            "(portée distincte de la Phase 1)"
+        )
     typer.echo("")
 
     for name in STEP_ORDER:
@@ -2138,6 +2146,42 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
 
     roles = assign(manifest.assets, context.policy)
     workspace.write_assets(manifest)
+
+    # La preuve robuste doit décrire le manifeste effectivement publié. Avant
+    # ce câblage, la commande exécutait bien les comparaisons crop-resistant,
+    # mais laissait sur disque une preuve d'un ancien corpus : G1 restait donc
+    # « unverified » après un run pourtant réussi.
+    if context.policy.dedup.robust_crop_hash_enabled:
+        import hashlib
+
+        from .lot1b_coverage import DedupRobustnessEvidence
+        from .policy_facets import Facet, facet_digest
+        from .provenance import policy_digest
+
+        regression = dedup_levels.robust_regression(
+            context.policy.dedup.robust_region_cutoff
+        )
+        evidence = DedupRobustnessEvidence(
+            asset_manifest_sha256=hashlib.sha256(
+                workspace.assets_path.read_bytes()
+            ).hexdigest(),
+            robust_input_digest=dedup_levels.robust_input_digest(manifest.assets),
+            algorithm="imagehash-crop-resistant-v1",
+            policy_digest=policy_digest(context.policy),
+            dedup_policy_digest=facet_digest(
+                context.policy, Facet.DEDUPLICATION
+            ),
+            production_used=True,
+            candidate_pairs=report.robust_candidate_pairs,
+            matched_pairs=report.robust_matched_pairs,
+            crop_regression_passed=regression["crop"],
+            watermark_regression_passed=regression["watermark"],
+            distinct_regression_passed=regression["distinct_rejected"],
+        )
+        workspace.write_json(
+            "01_sources/dedup_robustness_report.json",
+            evidence.model_dump(mode="json"),
+        )
     workspace.write_report("01_sources/duplicate_report.json", report, context, production="DuplicateReport")
     workspace.write_report("01_sources/roles_report.json", roles, context)
 
@@ -2148,6 +2192,12 @@ def assets_dedup(hotel_id: str = typer.Argument(...)) -> None:
         f"  rôles : {report.canonical} canonique(s), "
         f"{report.overlap} recouvrement, {report.inactive} inactif(s)"
     )
+    if context.policy.dedup.robust_crop_hash_enabled:
+        typer.echo(
+            "  robuste : "
+            f"{report.robust_candidate_pairs} paire(s) candidate(s), "
+            f"{report.robust_matched_pairs} correspondance(s), régressions validées"
+        )
     typer.echo(f"  rôles : {roles.counts}")
     typer.echo("")
     for family, counts in sorted(report.by_source_family.items()):
@@ -6649,6 +6699,123 @@ def scene_build(hotel_id: str = typer.Argument(...)) -> None:
     )
 
 
+viewer_app = typer.Typer(
+    no_args_is_help=True,
+    help="Viewer 3D autonome pour inspection et démonstration locale.",
+)
+app.add_typer(viewer_app, name="viewer")
+
+
+@viewer_app.command("build")
+def viewer_build(hotel_id: str = typer.Argument(...)) -> None:
+    """Construit le HTML autonome et son manifeste de provenance."""
+    from .viewer import build
+
+    workspace = Workspace(hotel_id)
+    try:
+        outputs = build(workspace)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.secho(f"{OK} viewer 3D de démonstration publié", fg=typer.colors.GREEN)
+    typer.echo(f"  html       {outputs.html}")
+    typer.echo(f"  payload    {outputs.payload}")
+    typer.echo(f"  provenance {outputs.manifest}")
+
+
+@viewer_app.command("open")
+def viewer_open(
+    hotel_id: str = typer.Argument(...),
+    launch: bool = typer.Option(
+        True,
+        "--launch/--no-launch",
+        help="Ouvrir le navigateur ; --no-launch vérifie seulement le parcours.",
+    ),
+) -> None:
+    """Ouvre le viewer ; le construit d'abord s'il manque."""
+    from .viewer import build, open_in_browser
+
+    workspace = Workspace(hotel_id)
+    path = workspace.path("11_conditioning", "viewer.html")
+    if not path.is_file():
+        try:
+            path = build(workspace).html
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+    typer.echo(f"  {path.resolve().as_uri()}")
+    if launch:
+        opened = open_in_browser(path)
+        typer.secho(
+            f"{OK} ouverture demandée au navigateur"
+            if opened
+            else f"{KO} navigateur non lancé ; ouvrez l'URL ci-dessus",
+            fg=typer.colors.GREEN if opened else typer.colors.YELLOW,
+        )
+    else:
+        typer.secho(f"{OK} viewer prêt", fg=typer.colors.GREEN)
+
+
+demo_app = typer.Typer(
+    no_args_is_help=True,
+    help="Prépare une démo sans modifier les Gates de production.",
+)
+app.add_typer(demo_app, name="demo")
+
+
+def _print_demo(report: dict) -> None:
+    colour = (
+        typer.colors.GREEN
+        if report.get("status") == "DEMO_READY"
+        else typer.colors.YELLOW
+    )
+    typer.secho(f"  {report.get('status')}", fg=colour, bold=True)
+    typer.echo(
+        f"  Phase 1 formelle : {report.get('formal_phase1_status')} "
+        "(non remplacée)"
+    )
+    for check in report.get("checks", []):
+        mark = OK if check.get("state") == "passed" else KO
+        typer.echo(f"  {mark} {check.get('label')}: {check.get('evidence')}")
+    typer.secho(
+        "  différé après acceptation : captation finale et clearance des droits",
+        fg=typer.colors.YELLOW,
+    )
+
+
+@demo_app.command("status")
+def demo_status(hotel_id: str = typer.Argument(...)) -> None:
+    """Affiche la capacité de présentation, séparée de la Phase 1."""
+    from .demo import assess
+
+    _print_demo(assess(Workspace(hotel_id)))
+
+
+@demo_app.command("prepare")
+def demo_prepare(
+    hotel_id: str = typer.Argument(...),
+    launch: bool = typer.Option(
+        False,
+        "--launch/--no-launch",
+        help="Ouvrir le viewer après publication.",
+    ),
+) -> None:
+    """Republie la scène, le viewer et le manifeste de démo."""
+    from .demo import prepare
+    from .viewer import open_in_browser
+
+    workspace = Workspace(hotel_id)
+    try:
+        report = prepare(workspace)
+    except (FileNotFoundError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    _print_demo(report)
+    typer.echo(f"  manifeste : {report['manifest']}")
+    if launch:
+        open_in_browser(workspace.path("11_conditioning", "viewer.html"))
+
+
 def _candidate_manifest_reference(workspace, path: Path) -> str:  # noqa: ANN001
     """Référence portable et confinée du manifeste réellement planifié."""
     resolved = Path(path).resolve()
@@ -7492,6 +7659,276 @@ def conditioning_audit(
         )
 
 
+@conditioning_app.command("scene-build")
+def conditioning_scene_build(hotel_id: str = typer.Argument(...)) -> None:
+    """Publie la scène canonique, son audit topologique et le viewer."""
+    from .conditioning.canonical import build as build_canonical
+    from .viewer import build as build_viewer
+
+    workspace = Workspace(hotel_id)
+    try:
+        outputs = build_canonical(workspace)
+        viewer = build_viewer(workspace)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    topology = json.loads(outputs["topology"].read_text("utf-8"))
+    scene = json.loads(outputs["scene"].read_text("utf-8"))
+    typer.secho(f"{OK} scène conditionnée canonique publiée", fg=typer.colors.GREEN)
+    typer.echo(
+        f"  bâtiments  {scene['summary']['watertight_buildings']}/"
+        f"{scene['summary']['buildings']} étanches"
+    )
+    typer.echo(
+        f"  arbres      {scene['summary']['vegetation']} enveloppes "
+        f"({scene['summary']['vegetation_source']})"
+    )
+    typer.echo(
+        f"  images      {scene['summary']['image_observations']['observations']} "
+        "observation(s), aucune géométrie 3D inventée"
+    )
+    semantic_surfaces = scene["summary"].get("semantic_surfaces", {})
+    if semantic_surfaces:
+        typer.echo(
+            f"  surfaces IA {semantic_surfaces.get('accepted_surfaces', 0)} "
+            "surface(s) contrainte(s) par points 3D mesurés"
+        )
+    typer.echo(f"  audit       {outputs['topology']}")
+    typer.echo(f"  benchmark   {outputs['benchmark']}")
+    typer.echo(f"  viewer      {viewer.html}")
+    if not topology.get("all_supported"):
+        typer.secho(
+            "  au moins un volume reste sans support topologique validé",
+            fg=typer.colors.YELLOW,
+        )
+
+
+@conditioning_app.command("semantic-detect")
+def conditioning_semantic_detect(
+    hotel_id: str = typer.Argument(...),
+    limit: int = typer.Option(2, "--limit", min=1, help="Nombre de vues validées."),
+    device: str = typer.Option(
+        "auto", "--device", help="Accélérateur : auto, cuda ou cpu."
+    ),
+    model_id: str = typer.Option(
+        "IDEA-Research/grounding-dino-tiny", "--model-id", help="Modèle Hugging Face."
+    ),
+    download_model: bool = typer.Option(
+        False,
+        "--download-model/--cache-only",
+        help="Autorise explicitement le téléchargement des poids publics.",
+    ),
+    threshold: float = typer.Option(0.28, "--threshold", min=0.0, max=1.0),
+    text_threshold: float = typer.Option(
+        0.25, "--text-threshold", min=0.0, max=1.0
+    ),
+    prompt: str | None = typer.Option(
+        None,
+        "--prompt",
+        help="Vocabulaire Grounding DINO; le profil architectural reste le défaut.",
+    ),
+    segmentation: str = typer.Option(
+        "auto", "--segmentation", help="Contour : auto, sam2 ou grabcut."
+    ),
+    sam2_checkpoint: Path | None = typer.Option(
+        None, "--sam2-checkpoint", help="Checkpoint SAM 2.1 local."
+    ),
+) -> None:
+    """Détecte les objets architecturaux dans les vues à pose validée."""
+    from .conditioning.semantic_detection import (
+        DEFAULT_PROMPT,
+        SemanticModelUnavailable,
+        run as run_semantic_detection,
+    )
+
+    workspace = Workspace(hotel_id)
+    try:
+        path, payload = run_semantic_detection(
+            workspace,
+            limit=limit,
+            allow_download=download_model,
+            model_id=model_id,
+            threshold=threshold,
+            text_threshold=text_threshold,
+            prompt=prompt or DEFAULT_PROMPT,
+            device=device,
+            segmentation=segmentation,
+            sam2_checkpoint=sam2_checkpoint,
+        )
+    except (OSError, RuntimeError, ValueError, SemanticModelUnavailable) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    summary = payload["summary"]
+    typer.secho(f"{OK} observations sémantiques publiées", fg=typer.colors.GREEN)
+    typer.echo(f"  device       {payload['device']}")
+    typer.echo(f"  images       {summary['images']}")
+    typer.echo(f"  observations {summary['observations']}")
+    typer.echo(f"  segmentées    {summary['segmented']}")
+    typer.echo(f"  backend      {payload['segmentation_backend']}")
+    typer.echo("  géométrie 3D  0 (triangulation multi-vues requise)")
+    typer.echo(f"  sortie       {path}")
+
+
+@conditioning_app.command("semantic-link")
+def conditioning_semantic_link(
+    hotel_id: str = typer.Argument(...),
+    min_shared_tracks: int = typer.Option(
+        3,
+        "--min-shared-tracks",
+        min=1,
+        help="Pistes COLMAP communes minimales pour accepter une paire.",
+    ),
+    min_overlap: float = typer.Option(
+        0.12,
+        "--min-overlap",
+        min=0.0,
+        max=1.0,
+        help="Part minimale du plus petit support COLMAP partagee.",
+    ),
+) -> None:
+    """Relie les masques entre vues par leurs pistes COLMAP mesurees."""
+    from .conditioning.semantic_correspondence import (
+        SemanticCorrespondenceUnavailable,
+        run as run_semantic_correspondence,
+    )
+
+    workspace = Workspace(hotel_id)
+    try:
+        path, payload = run_semantic_correspondence(
+            workspace,
+            min_shared_tracks=min_shared_tracks,
+            min_overlap=min_overlap,
+        )
+    except (
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        SemanticCorrespondenceUnavailable,
+    ) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    summary = payload["summary"]
+    typer.secho(f"{OK} correspondances semantiques publiees", fg=typer.colors.GREEN)
+    typer.echo(f"  images COLMAP  {summary['resolved_colmap_images']}")
+    typer.echo(f"  paires         {summary['accepted_pairs']}/{summary['candidate_pairs']}")
+    typer.echo(f"  instances      {summary['multiview_instances']}")
+    typer.echo(f"  pistes mesurees {summary['shared_measured_tracks']}")
+    typer.echo("  geometrie 3D   0 (enregistrement vertical requis)")
+    typer.echo(f"  sortie         {path}")
+
+
+@conditioning_app.command("register-colmap-lidar")
+def conditioning_register_colmap_lidar(
+    hotel_id: str = typer.Argument(...),
+) -> None:
+    """Audite la translation du noyau COLMAP vers le LiDAR qualifie."""
+    from .conditioning.vertical_registration import (
+        VerticalRegistrationUnavailable,
+        run as run_vertical_registration,
+    )
+
+    workspace = Workspace(hotel_id)
+    try:
+        path, payload = run_vertical_registration(workspace)
+    except (
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        VerticalRegistrationUnavailable,
+    ) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    metrics = payload["metrics"]["holdout"]
+    marker = OK if payload["status"] == "accepted" else "!"
+    colour = typer.colors.GREEN if payload["status"] == "accepted" else typer.colors.YELLOW
+    typer.secho(
+        f"{marker} enregistrement COLMAP/LiDAR {payload['status']}", fg=colour
+    )
+    typer.echo(
+        f"  translation   {payload['hypothesis']['translation_projected_m']} m"
+    )
+    typer.echo(
+        f"  controle      mediane {metrics['median_m']:.3f} m, "
+        f"P90 {metrics['p90_m']:.3f} m"
+    )
+    typer.echo(
+        f"  appui <= 1 m  {100 * metrics['support_fraction_1m']:.1f} %"
+    )
+    typer.echo("  scene         inchangee")
+    for reason in payload["refusal_reasons"]:
+        typer.echo(f"  refus         {reason}")
+    typer.echo(f"  sortie        {path}")
+
+
+@conditioning_app.command("semantic-register")
+def conditioning_semantic_register(
+    hotel_id: str = typer.Argument(...),
+) -> None:
+    """Projette les supports COLMAP mesures dans le repere local de scene."""
+    from .conditioning.semantic_registered_support import (
+        SemanticSupportRegistrationUnavailable,
+        run as run_semantic_support_registration,
+    )
+
+    workspace = Workspace(hotel_id)
+    try:
+        path, payload = run_semantic_support_registration(workspace)
+    except (
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        SemanticSupportRegistrationUnavailable,
+    ) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    summary = payload["summary"]
+    typer.secho(f"{OK} supports semantiques enregistres", fg=typer.colors.GREEN)
+    typer.echo(f"  instances     {summary['registered_instances']}")
+    typer.echo(f"  mono-vue      {summary.get('single_view_candidates', 0)} candidat(s)")
+    typer.echo(f"  points uniques {summary['unique_registered_points']}")
+    typer.echo("  surfaces 3D   0 (reconstruction contrainte requise)")
+    typer.echo(f"  sortie        {path}")
+
+
+@conditioning_app.command("semantic-surface")
+def conditioning_semantic_surface(
+    hotel_id: str = typer.Argument(...),
+) -> None:
+    """Reconstruit les seules surfaces planes qui passent le holdout."""
+    from .conditioning.semantic_surface import (
+        SemanticSurfaceUnavailable,
+        run as run_semantic_surface,
+    )
+
+    workspace = Workspace(hotel_id)
+    try:
+        path, payload = run_semantic_surface(workspace)
+    except (
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        SemanticSurfaceUnavailable,
+    ) as exc:
+        typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    summary = payload["summary"]
+    typer.secho(f"{OK} audit des surfaces semantiques termine", fg=typer.colors.GREEN)
+    typer.echo(f"  auditees      {summary['audited_instances']}")
+    typer.echo(f"  acceptees     {summary['accepted_surfaces']}")
+    typer.echo(f"  refusees      {summary['refused_instances']}")
+    typer.echo(f"  sortie        {path}")
+
+
 @conditioning_app.command("render")
 def conditioning_render(
     hotel_id: str = typer.Argument(...),
@@ -7548,6 +7985,18 @@ def conditioning_render(
         typer.secho(f"{KO} {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
+    # L'emprise doit être définitive avant de découper la toiture LiDAR : si on
+    # redresse les murs après coup, le bord raster et le contour vectoriel ne
+    # peuvent plus partager leurs arêtes.
+    from .conditioning.regularize import apply_to_scene as _regularize_scene
+
+    squared = _regularize_scene(scene)
+    if squared.get("regularized"):
+        typer.echo(
+            f"  emprises redressées : {squared['regularized']} volume(s), "
+            f"écart max {squared['max_shift_m']} m"
+        )
+
     if measured_heights:
         ndsm = find_ndsm(workspace)
         if ndsm is None:
@@ -7583,18 +8032,6 @@ def conditioning_render(
                 f"  volumes retenus : {len(occlusion.kept)} sur "
                 f"{len(occlusion.verdicts)} — {len(occlusion.dropped)} "
                 "n'occulte(nt) jamais la cible"
-            )
-
-        # Les emprises sont redressées avant toute extrusion : un mur
-        # d'équerre porte un toit d'équerre, et corriger après coup obligerait
-        # à rejouer la segmentation en pans.
-        from .conditioning.regularize import apply_to_scene as _regularize_scene
-
-        squared = _regularize_scene(scene)
-        if squared.get("regularized"):
-            typer.echo(
-                f"  emprises redressées : {squared['regularized']} volume(s), "
-                f"écart max {squared['max_shift_m']} m"
             )
 
         # Les volumes que le nDSM ne couvre pas reçoivent une toiture
@@ -8349,6 +8786,7 @@ def geo_ridge_match(
 
     scene = load_scene(geometry_path)
     select_occluders(scene)
+    regularize_scene(scene)
     heights_module.apply_measured_heights(scene, heights_module.find_ndsm(workspace))
     tiles = heights_module.find_laz_tiles(workspace)
     heights_module.apply_laz_heights(scene, tiles)
@@ -8359,7 +8797,6 @@ def geo_ridge_match(
         typer.secho(f"{KO} aucun nuage LiDAR exploitable", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     ground_z = float(np.median(window.z[window.classification == 2]))
-    regularize_scene(scene)
     heights_module.apply_cloud_roofs(scene, tiles, ground_z)
     segment_roofs(scene, tiles, ground_z)
 

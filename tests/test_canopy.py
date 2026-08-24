@@ -138,8 +138,31 @@ def test_chaque_objet_porte_sa_mesure() -> None:
         "height_m",
         "footprint_m2",
         "points",
+        "envelope",
     }
     assert payload["points"] > 0
+    assert len(payload["envelope"]) >= 4
+    assert all(len(ring) >= 8 for ring in payload["envelope"])
+
+
+def test_enveloppe_conserve_une_couronne_asymetrique() -> None:
+    """Le viewer doit recevoir une forme mesurée, pas un rayon à extruder."""
+    rng = np.random.default_rng(17)
+    count = 900
+    angle = rng.uniform(0, 2 * np.pi, count)
+    radius = np.where(np.cos(angle) > 0, 5.0, 2.2) * np.sqrt(
+        rng.uniform(0, 1, count)
+    )
+    xs = radius * np.cos(angle)
+    ys = radius * np.sin(angle)
+    zs = 9.0 * (1.0 - 0.35 * radius / 5.0) * rng.uniform(0.75, 1.0, count)
+
+    crown = next(o for o in segment(xs, ys, zs) if o.kind == "couronne")
+    middle = crown.envelope[len(crown.envelope) // 2]
+    east = max(point[0] for point in middle) - crown.centre[0]
+    west = crown.centre[0] - min(point[0] for point in middle)
+
+    assert east > west * 1.2
 
 
 def test_un_arbuste_n_est_pas_plus_large_qu_un_grand_arbre() -> None:
