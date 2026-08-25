@@ -20,6 +20,7 @@ import numpy as np
 from ..workspace import Workspace
 from .observations import build as build_observations
 from .solid import audit, closed_solid
+from .viewpoint import optimal_camera
 
 CONTRACT_VERSION = 1
 
@@ -461,20 +462,9 @@ def viewer_payload(scene: dict) -> dict:
     else:
         centre_x = centre_y = 0.0
         target_distance = 150.0
-    camera = {
-        "focus": [round(centre_x, 3), round(centre_y, 3), round(height * 0.30, 3)],
-        "target_distance_m": round(target_distance, 3),
-        "context_distance_m": round(max(150.0, target_distance * 2.4), 3),
-        "azimuth_deg": 210.0,
-        "altitude_deg": 26.0,
-        "facade_azimuth_deg": 210.0,
-        "facade_altitude_deg": 1.0,
-        "source": "target_building_bounds",
-    }
     payload = {
         "hotel": scene.get("hotel_id"),
         "centre": scene.get("coordinate_system", {}).get("origin"),
-        "camera": camera,
         "volumes": [
             {
                 "id": item.get("feature_id"),
@@ -536,4 +526,8 @@ def viewer_payload(scene: dict) -> dict:
     }
     from .facade_grammar import enrich
 
-    return enrich(payload)
+    payload = enrich(payload)
+    # L'azimut de caméra est dérivé de la géométrie et de la grammaire de façade
+    # (et, après fusion photo, de la couverture mesurée) : jamais figé.
+    payload["camera"] = optimal_camera(payload)
+    return payload

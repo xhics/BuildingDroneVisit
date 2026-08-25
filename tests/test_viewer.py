@@ -44,7 +44,17 @@ def test_viewer_migre_le_payload_historique_et_devient_reproductible(
     stored = json.loads(outputs.payload.read_text("utf-8"))
     manifest = json.loads(outputs.manifest.read_text("utf-8"))
 
-    assert stored == payload
+    # Le payload historique est préservé ; le viewer y ajoute une caméra dérivée
+    # (jamais figée) à partir de la géométrie / de la couverture mesurée.
+    for key, value in payload.items():
+        assert stored.get(key) == value, key
+    assert "camera" in stored
+    assert stored["camera"]["source"] in (
+        "target_building_bounds",
+        "facade_grammar_entrance",
+        "measured_coverage_optimization",
+    )
+    assert 0.0 <= float(stored["camera"]["azimuth_deg"]) < 360.0
     assert "MODE DÉMONSTRATION" in outputs.html.read_text("utf-8")
     assert "facadeHeight(o.c)-.12" in outputs.html.read_text("utf-8")
     assert "obs:false,plan:false,ridge:false" in outputs.html.read_text("utf-8")

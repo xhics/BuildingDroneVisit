@@ -105,6 +105,18 @@ class TexelSupport:
             return "vue_unique"
         return "accorde"
 
+    @property
+    def is_observed(self) -> bool:
+        """Un texel n'atteste une couleur que si les vues qui le voient s'accordent.
+
+        Une vue unique suffit (pas de désaccord possible) ; dès que deux vues
+        divergent au-delà du seuil, le texel reste non observé : on refuse de
+        fabriquer une couleur, le proxy prend le relais.
+        """
+        if self.contributing == 0:
+            return False
+        return self.disagreement < DISAGREEMENT_LEVEL
+
 
 @dataclass
 class Orthofacade:
@@ -128,7 +140,7 @@ class Orthofacade:
     def observed_fraction(self) -> float:
         if not self.support:
             return 0.0
-        return sum(1 for t in self.support if t.contributing) / len(self.support)
+        return sum(1 for t in self.support if t.is_observed) / len(self.support)
 
     def as_dict(self) -> dict:
         counts = self.by_status()
@@ -186,6 +198,12 @@ def rectify(
     dont les pixels décrivent le moins de mètres. Les autres ne sont pas
     jetées — elles servent à mesurer le désaccord, qui dit si les poses sont
     compatibles.
+
+    Le désaccord n'est pas cosmétique : une vue à meilleure incidence mais
+    traversée par un arbre, une voiture ou une personne l'emporterait sur une
+    vue dégagée. Aussi, dès que deux vues divergent au-delà du seuil, le texel
+    n'atteste aucune couleur — le proxy prend le relais plutôt que de coller un
+    objet mobile sur le mur.
     """
     cols = max(int(round(plane.length_m / texel_m)), 1)
     rows = max(int(round(plane.height_m / texel_m)), 1)
@@ -236,7 +254,16 @@ def rectify(
             screen, depth = camera.project(points)
             if screen is None:
                 continue
+            # Incidence calculée par texel : un grand mur vu de près a des
+            # angles et des distances très différents d'une extrémité à l'autre.
+            to_cam = np.asarray(camera.position, dtype=np.float64) - points
+            span_v = np.linalg.norm(to_cam, axis=1)
+            span_safe = np.maximum(span_v, 1e-6)
+            cosine_v = (to_cam @ plane.normal) / span_safe
+            incidence_v = np.degrees(np.arccos(np.clip(cosine_v, -1.0, 1.0)))
             for col in range(cols):
+                if incidence_v[col] > MAX_INCIDENCE_DEG:
+                    continue
                 x, y = screen[col]
                 if not (0 <= x < image.shape[1] and 0 <= y < image.shape[0]):
                     continue
@@ -249,22 +276,28 @@ def rectify(
                 samples.setdefault(slot, []).append(colour)
                 texel = found.support[slot]
                 texel.contributing += 1
-                if incidence < (texel.best_incidence_deg or math.inf):
-                    texel.best_incidence_deg = incidence
-                    texel.best_distance_m = span
+                inc = float(incidence_v[col])
+                if inc < (texel.best_incidence_deg or math.inf):
+                    texel.best_incidence_deg = inc
+                    texel.best_distance_m = float(span_v[col])
                     texel.best_asset = asset_id
-                if incidence < best_incidence[row, col]:
-                    best_incidence[row, col] = incidence
+                if inc < best_incidence[row, col]:
+                    best_incidence[row, col] = inc
                     canvas[row, col] = colour
 
     # Le désaccord se mesure sur les texels vus par plusieurs images : c'est
-    # là, et seulement là, que la compatibilité des poses est testable.
+    # là, et seulement là, que la compatibilité des poses est testable. Un
+    # désaccord franc signale une pose fausse, un objet mobile ou un
+    # décrochement — on n'en fait pas une couleur de façade.
     for slot, colours in samples.items():
         if len(colours) < 2:
             continue
-        found.support[slot].disagreement = float(
-            np.mean(np.std(np.asarray(colours), axis=0))
-        )
+        texel = found.support[slot]
+        texel.disagreement = float(np.mean(np.std(np.asarray(colours), axis=0)))
+        if texel.disagreement >= DISAGREEMENT_LEVEL:
+            # Vue en désaccord : on ne fabrique aucune tuile, le proxy reste.
+            row, col = divmod(slot, cols)
+            canvas[row, col] = 0.0
 
     found.image = canvas.astype(np.uint8) if used else None
     found.provenance = {

@@ -19,8 +19,17 @@ def test_canonical_class_maps_architectural_vocabulary() -> None:
     assert canonical_class("structural beam") == "beam"
     assert canonical_class("hotel entrance door") == "door"
     assert canonical_class("road sign") == "road_sign"
+    assert canonical_class("traffic sign") == "road_sign"
     assert canonical_class("evergreen tree") == "tree_evergreen"
     assert canonical_class("deciduous tree") == "tree_deciduous"
+    assert canonical_class("parked car") == "car"
+    assert canonical_class("delivery truck") == "truck"
+    assert canonical_class("city bus") == "bus"
+    assert canonical_class("pedestrian") == "person"
+    assert canonical_class("bicycle") == "bicycle"
+    assert canonical_class("roadside bush") == "bush"
+    assert canonical_class("garden fence") == "fence"
+    assert canonical_class("utility pole") == "pole"
     assert canonical_class("unknown fixture") == "architectural_object"
 
 

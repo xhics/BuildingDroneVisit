@@ -300,8 +300,13 @@ def build(workspace: Workspace) -> ViewerOutputs:
     if shape_audit_path.is_file():
         payload["feed_forward_shape"] = _read_json(shape_audit_path)
     from .conditioning.facade_texture import build as build_facade_textures
+    from .conditioning.viewpoint import optimal_camera
 
     build_facade_textures(workspace, payload)
+    # L'azimut de caméra est dérivé de la couverture photographique mesurée de
+    # chaque face (et non figé) : le viewer cadre la face la mieux observée, en
+    # privilégiant la face d'entrée pour la vue héro.
+    payload["camera"] = optimal_camera(payload)
     payload_path = workspace.write_json(
         "11_conditioning/viewer_payload.json", payload
     )

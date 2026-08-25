@@ -142,6 +142,33 @@ class TestSupport:
         found = rectify(plane, views)
         assert found.by_status().get("desaccord", 0) > 0
 
+    def test_disagreeing_views_are_never_fabricated(self):
+        """Une vue plus directe mais traversée par un objet ne doit pas l'emporter.
+
+        Deux vues en désaccord franc (ici noir vs blanc) signalent une pose
+        fausse ou un objet mobile : aucune tuile n'est écrite, le proxy reste.
+        """
+        plane = _wall()
+        views = [
+            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5))),
+            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5))),
+        ]
+        found = rectify(plane, views)
+        for texel in found.support:
+            if texel.contributing >= 2:
+                assert not texel.is_observed
+        assert found.observed_fraction == 0.0
+
+    def test_agreeing_views_stay_observed(self):
+        plane = _wall()
+        views = [
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
+            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5))),
+        ]
+        found = rectify(plane, views)
+        assert found.observed_fraction > 0.5
+        assert all(t.is_observed for t in found.support if t.contributing >= 2)
+
     def test_a_visibility_mask_excludes_non_building_pixels(self):
         mask = np.zeros((480, 640), dtype=bool)
         found = rectify(_wall(), [("A", _image(), _Camera(), mask)])

@@ -26,9 +26,11 @@ DEFAULT_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
 DEFAULT_SAM2_CHECKPOINT = "/workspace/.cache/sam2/sam2.1_hiera_large.pt"
 DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 DEFAULT_PROMPT = (
-    "hotel building. hotel sign. road sign. entrance door. window. canopy. "
+    "hotel building. hotel sign. road sign. traffic sign. entrance door. window. canopy. "
     "structural beam. support column. lamp post. air conditioning unit. "
-    "balcony. gutter. deciduous tree. evergreen tree."
+    "balcony. gutter. deciduous tree. evergreen tree. "
+    "car. truck. bus. person. bicycle. bush. hedge. fence. pole. "
+    "mobiliary. chair. table. trash can. flower pot."
 )
 
 
@@ -147,6 +149,16 @@ def canonical_class(label: str) -> str:
         (("air conditioning", "air conditioner", "hvac"), "hvac_unit"),
         (("balcony",), "balcony"),
         (("gutter",), "gutter"),
+        (("car", "vehicle", "automobile"), "car"),
+        (("truck", "lorry", "van"), "truck"),
+        (("person", "pedestrian", "man", "woman"), "person"),
+        (("bicycle", "bike"), "bicycle"),
+        (("bush", "shrub", "hedge"), "bush"),
+        (("bus",), "bus"),
+        (("fence", "railing"), "fence"),
+        (("pole", "pylon"), "pole"),
+        (("mobiliary", "chair", "table", "trash", "bench"), "mobiliary"),
+        (("flower", "planter", "pot"), "flower_pot"),
     )
     for needles, found in rules:
         if any(needle in value for needle in needles):
