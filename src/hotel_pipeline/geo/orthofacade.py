@@ -205,7 +205,9 @@ def rectify(
     us = (np.arange(cols) + 0.5) * texel_m
     vs = (np.arange(rows) + 0.5) * texel_m
 
-    for asset_id, image, camera in views:
+    for view in views:
+        asset_id, image, camera = view[:3]
+        visibility_mask = view[3] if len(view) >= 4 else None
         # Incidence : l'angle entre la normale du mur et la direction de vue.
         # Elle ne dépend pas du texel, à cette distance.
         centre = plane.point(plane.length_m * 0.5, plane.height_m * 0.5)
@@ -239,6 +241,8 @@ def rectify(
                 if not (0 <= x < image.shape[1] and 0 <= y < image.shape[0]):
                     continue
                 if depth is not None and depth[col] <= 0.5:
+                    continue
+                if visibility_mask is not None and not visibility_mask[int(y), int(x)]:
                     continue
                 colour = image[int(y), int(x)].astype(np.float64)
                 slot = row * cols + col

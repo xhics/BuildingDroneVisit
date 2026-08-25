@@ -153,7 +153,8 @@ def _vectorized_grid_surface(
         if len(set(indices)) != 3:
             return
         a, b, c = (np.asarray(vertices[index][:2]) for index in indices)
-        if abs(float(np.cross(b - a, c - a))) <= 1e-10:
+        cross_2d = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if abs(cross_2d) <= 1e-10:
             return
         faces.append(indices)
 

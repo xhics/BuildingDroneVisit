@@ -118,6 +118,42 @@ def _resolve_bearing(asset_id: str, by_id: dict) -> float | None:
         return None
 
 
+def _portable_image_path(
+    raw_path: str,
+    asset_id: str,
+    *,
+    workspace_root: Path,
+    by_id: dict,
+    by_name: dict[str, Path],
+) -> Path:
+    """Résout une image après déplacement du workspace vers une autre machine."""
+    path = Path(raw_path)
+    if path.is_file():
+        return path
+
+    parts = path.parts
+    if "02_images" in parts:
+        relative = Path(*parts[parts.index("02_images") :])
+        candidate = workspace_root / relative
+        if candidate.is_file():
+            return candidate
+
+    asset = by_id.get(asset_id)
+    if asset is None:
+        for token in asset_id.split("_")[1:]:
+            if len(token) < 10:
+                continue
+            asset = next((item for key, item in by_id.items() if token in key), None)
+            if asset is not None:
+                break
+    if asset and asset.get("local_path"):
+        candidate = workspace_root / str(asset["local_path"])
+        if candidate.is_file():
+            return candidate
+
+    return by_name.get(path.name, path)
+
+
 def build(
     screening_path: Path,
     asset_manifest_path: Path,
@@ -130,6 +166,13 @@ def build(
     screening = json.loads(Path(screening_path).read_text(encoding="utf-8"))
     manifest = json.loads(Path(asset_manifest_path).read_text(encoding="utf-8"))
     by_id = {a["id"]: a for a in manifest.get("assets", [])}
+    workspace_root = Path(asset_manifest_path).resolve().parent.parent
+    images_root = workspace_root / "02_images"
+    by_name = {
+        path.name: path
+        for path in images_root.rglob("*")
+        if path.is_file()
+    } if images_root.is_dir() else {}
 
     rejected = {"identite": 0, "score": 0, "resolution": 0, "redondance": 0}
     candidates: list[ShapeImage] = []
@@ -142,7 +185,13 @@ def build(
         if score < min_reference_score:
             rejected["score"] += 1
             continue
-        path = Path(entry["path"])
+        path = _portable_image_path(
+            str(entry["path"]),
+            str(entry["asset_id"]),
+            workspace_root=workspace_root,
+            by_id=by_id,
+            by_name=by_name,
+        )
         try:
             with Image.open(path) as raw:
                 side = int(min(raw.size))

@@ -1,0 +1,51 @@
+{
+  "contract_version": 1,
+  "kind": "input",
+  "validated_at": "2026-08-24T20:57:22.999541+00:00",
+  "status": "passed",
+  "checks": [
+    {
+      "check_id": "manifest",
+      "passed": true,
+      "evidence": "runpod\\bundle\\shape_input.json"
+    },
+    {
+      "check_id": "image_count",
+      "passed": true,
+      "evidence": "12 image(s), minimum 8"
+    },
+    {
+      "check_id": "placed_views",
+      "passed": true,
+      "evidence": "9 vue(s) placee(s), minimum 6"
+    },
+    {
+      "check_id": "angular_span",
+      "passed": true,
+      "evidence": "135.4 deg, minimum 120 deg"
+    },
+    {
+      "check_id": "usage_scope",
+      "passed": true,
+      "evidence": "{\"acknowledgement_required\": \"ACK_REFERENCE_ONLY=1\", \"contains_reference_only_sources\": true, \"production_eligible\": false, \"scope\": \"experimental_demo_only\"}"
+    },
+    {
+      "check_id": "readable_images",
+      "passed": true,
+      "evidence": "12/12"
+    },
+    {
+      "check_id": "image_integrity",
+      "passed": true,
+      "evidence": "12/12"
+    },
+    {
+      "check_id": "unique_images",
+      "passed": true,
+      "evidence": "12/12"
+    }
+  ],
+  "details": {
+    "hotel_id": "welcominns-boucherville"
+  }
+}

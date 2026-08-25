@@ -142,6 +142,12 @@ class TestSupport:
         found = rectify(plane, views)
         assert found.by_status().get("desaccord", 0) > 0
 
+    def test_a_visibility_mask_excludes_non_building_pixels(self):
+        mask = np.zeros((480, 640), dtype=bool)
+        found = rectify(_wall(), [("A", _image(), _Camera(), mask)])
+
+        assert found.observed_fraction == 0.0
+
 
 class TestReport:
     def test_report_carries_its_caveats(self):

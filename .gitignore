@@ -20,6 +20,14 @@ venv/
 *.egg-info/
 .pytest_cache/
 
+# Artefacts GPU locaux et simulations RunPod (volumineux, reproductibles)
+runpod/results/
+runpod/bundle-candidate/
+runpod/dry-run-check/
+runpod/welcominns-runpod-upload.tar.gz
+welcominns-workspace.tar.gz
+welcominns-workspace.tar.gz.part-*
+
 # macOS
 .DS_Store
 

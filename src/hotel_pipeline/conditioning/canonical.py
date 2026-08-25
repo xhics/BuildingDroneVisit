@@ -447,9 +447,34 @@ def build(workspace: Workspace) -> dict[str, Path]:
 def viewer_payload(scene: dict) -> dict:
     """Adapte le contrat canonique au viewer autonome, sans autre autorité."""
     buildings = scene.get("buildings", [])
-    return {
+    target = next((item for item in buildings if item.get("target")), None)
+    target = target or (buildings[0] if buildings else None)
+    footprint = (target or {}).get("footprint") or []
+    xs = [float(point[0]) for point in footprint if len(point) >= 2]
+    ys = [float(point[1]) for point in footprint if len(point) >= 2]
+    height = float((target or {}).get("height_m") or 8.0)
+    if xs and ys:
+        centre_x = (min(xs) + max(xs)) / 2.0
+        centre_y = (min(ys) + max(ys)) / 2.0
+        diagonal = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        target_distance = max(35.0, min(220.0, diagonal * 1.15))
+    else:
+        centre_x = centre_y = 0.0
+        target_distance = 150.0
+    camera = {
+        "focus": [round(centre_x, 3), round(centre_y, 3), round(height * 0.30, 3)],
+        "target_distance_m": round(target_distance, 3),
+        "context_distance_m": round(max(150.0, target_distance * 2.4), 3),
+        "azimuth_deg": 210.0,
+        "altitude_deg": 26.0,
+        "facade_azimuth_deg": 210.0,
+        "facade_altitude_deg": 1.0,
+        "source": "target_building_bounds",
+    }
+    payload = {
         "hotel": scene.get("hotel_id"),
         "centre": scene.get("coordinate_system", {}).get("origin"),
+        "camera": camera,
         "volumes": [
             {
                 "id": item.get("feature_id"),
@@ -509,3 +534,6 @@ def viewer_payload(scene: dict) -> dict:
         },
         "source_scene": "11_conditioning/conditioned_scene.json",
     }
+    from .facade_grammar import enrich
+
+    return enrich(payload)

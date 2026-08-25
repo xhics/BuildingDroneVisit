@@ -155,3 +155,32 @@ def test_l_etendue_angulaire_ignore_les_images_non_placees(tmp_path: Path) -> No
     )
     assert len(lot.placed) == 2
     assert lot.angular_span() == pytest.approx(90.0)
+
+
+def test_un_chemin_absolu_d_une_autre_machine_est_relocalise(tmp_path: Path) -> None:
+    workspace = tmp_path / "work" / "hotel-test"
+    (workspace / "02_images" / "recrops").mkdir(parents=True)
+    image = _image(workspace / "02_images" / "recrops", "facade.jpg")
+    screening = workspace / "09_confidence" / "identity_screening.json"
+    manifest = workspace / "00_manifest" / "asset_manifest.json"
+    screening.parent.mkdir(parents=True)
+    manifest.parent.mkdir(parents=True)
+    screening.write_text(
+        json.dumps({"assets": [{
+            "asset_id": "facade",
+            "status": "match",
+            "reference_score": 0.7,
+            "path": "/Users/old/work/hotel-test/02_images/recrops/facade.jpg",
+        }]}),
+        encoding="utf-8",
+    )
+    manifest.write_text(
+        json.dumps({"hotel_id": "hotel-test", "assets": [{
+            "id": "facade", "bearing_from_building_deg": 42.0,
+        }]}),
+        encoding="utf-8",
+    )
+
+    result = build(screening, manifest)
+
+    assert result.images[0].path == image

@@ -12,6 +12,7 @@ minute, le temps de téléversement est du temps payé.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -50,6 +51,14 @@ def main() -> int:
         existing.unlink()
 
     total = 0
+    payload = lot.as_dict()
+    payload["usage_policy"] = {
+        "scope": "experimental_demo_only",
+        "production_eligible": False,
+        "contains_reference_only_sources": True,
+        "acknowledgement_required": "ACK_REFERENCE_ONLY=1",
+    }
+    copied: list[dict] = []
     for index, image in enumerate(lot.images):
         # Le nom porte l'azimut : le recalage ultérieur en a besoin, et un
         # dossier trié par angle se relit sans consulter le manifeste.
@@ -57,12 +66,26 @@ def main() -> int:
         target = images_dir / f"{index:02d}_{bearing}deg_{image.path.name}"
         shutil.copy2(image.path, target)
         total += target.stat().st_size
+        item = payload["images"][index]
+        item.pop("path")
+        try:
+            item["source_path"] = image.path.resolve().relative_to(
+                workspace.root.resolve()
+            ).as_posix()
+        except ValueError:
+            # Ne jamais inclure un chemin absolu de la machine de préparation
+            # dans le paquet portable.
+            item["source_path"] = image.path.name
+        item["path"] = target.relative_to(args.out).as_posix()
+        item["bytes"] = target.stat().st_size
+        item["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
+        copied.append(item)
 
     (args.out / "shape_input.json").write_text(
-        json.dumps(lot.as_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    print(f"{len(lot.images)} image(s), {total / 1e6:.1f} Mo → {args.out}")
+    print(f"{len(lot.images)} image(s), {total / 1e6:.1f} Mo -> {args.out}")
     print(f"  {len(lot.placed)} placée(s), arc {lot.angular_span():.0f}°")
     print(f"  écartées : {lot.rejected}")
     return 0

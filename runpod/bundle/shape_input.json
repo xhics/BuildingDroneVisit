@@ -1,124 +1,145 @@
 {
   "hotel_id": "welcominns-boucherville",
-  "built_at": "2026-08-22T12:59:15.982342+00:00",
-  "count": 15,
-  "placed": 11,
-  "angular_span_deg": 220.8,
+  "built_at": "2026-08-24T20:57:22.062042+00:00",
+  "count": 12,
+  "placed": 9,
+  "angular_span_deg": 135.4,
   "rejected": {
-    "identite": 130,
-    "score": 13,
+    "identite": 664,
+    "score": 1,
     "resolution": 0,
-    "redondance": 5
+    "redondance": 7
   },
   "images": [
     {
       "asset_id": "TGT3_maxG0Dq_By4X7v_10h_52f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/TGT3_maxG0Dq_By4X7v_10h_52f.jpg",
       "bearing_deg": null,
       "reference_score": 0.665,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/TGT3_maxG0Dq_By4X7v_10h_52f.jpg",
+      "path": "images/00_xxxdeg_TGT3_maxG0Dq_By4X7v_10h_52f.jpg",
+      "bytes": 70746,
+      "sha256": "aac4e2cde68ecac367e26e1a41cce7ca8dc82f9e753c96db1a965ab5bceebb6b"
     },
     {
       "asset_id": "SECT225_zj6pG6EOemMZ7d_54h_51f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/SECT225_zj6pG6EOemMZ7d_54h_51f.jpg",
       "bearing_deg": 233.9,
       "reference_score": 0.567,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/SECT225_zj6pG6EOemMZ7d_54h_51f.jpg",
+      "path": "images/01_234deg_SECT225_zj6pG6EOemMZ7d_54h_51f.jpg",
+      "bytes": 86209,
+      "sha256": "4ea6569aa511e72ab47f2513790649c8e338a4f0f127edb82141f0491af1764a"
     },
     {
       "asset_id": "TGT1_xCjK0LAEp93GSP_19h_55f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/TGT1_xCjK0LAEp93GSP_19h_55f.jpg",
       "bearing_deg": 199.0,
       "reference_score": 0.53,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/TGT1_xCjK0LAEp93GSP_19h_55f.jpg",
+      "path": "images/02_199deg_TGT1_xCjK0LAEp93GSP_19h_55f.jpg",
+      "bytes": 74507,
+      "sha256": "75b53f30ad53578311a4bea9a3efdc12d933b1710e77d792f1a086cff61f97e7"
     },
     {
-      "asset_id": "FACADE_RIGHT_CAoSFkNJSE0wb2_86h_65f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/FACADE_RIGHT_CAoSFkNJSE0wb2_86h_65f.jpg",
-      "bearing_deg": 298.6,
-      "reference_score": 0.385,
-      "min_side": 640
+      "asset_id": "mapillary-260896760446256",
+      "bearing_deg": 223.3,
+      "reference_score": 0.443,
+      "min_side": 1536,
+      "source_path": "02_images/reference_only/mapillary/260896760446256.jpg",
+      "path": "images/03_223deg_260896760446256.jpg",
+      "bytes": 332708,
+      "sha256": "0952db30ec6efd9a0cde7a63870109efaadf854e929bbe9758d9efe92e4d4844"
     },
     {
       "asset_id": "TGT0_iS7UVa47KbcSpR_66h_44f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/TGT0_iS7UVa47KbcSpR_66h_44f.jpg",
       "bearing_deg": 246.3,
       "reference_score": 0.329,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/TGT0_iS7UVa47KbcSpR_66h_44f.jpg",
+      "path": "images/04_246deg_TGT0_iS7UVa47KbcSpR_66h_44f.jpg",
+      "bytes": 89906,
+      "sha256": "7a5b911bb4a096278bb8242c7d1bd5bff6a8f22be44397e00f07b68d4df456df"
     },
     {
-      "asset_id": "FACADE_LEFT_VSETSJEDAol6GE_44h_75f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/FACADE_LEFT_VSETSJEDAol6GE_44h_75f.jpg",
-      "bearing_deg": 217.3,
-      "reference_score": 0.271,
-      "min_side": 640
+      "asset_id": "953028436073012",
+      "bearing_deg": null,
+      "reference_score": 0.278,
+      "min_side": 1536,
+      "source_path": "02_images/reference_only/mapillary/953028436073012.jpg",
+      "path": "images/05_xxxdeg_953028436073012.jpg",
+      "bytes": 580139,
+      "sha256": "6b1669005b7efdf74480190ef7f2dae3159b217a1cc23c47cbd259cb15c48ae0"
     },
     {
       "asset_id": "SECT180_ndKAPY2huyiMo6_28h_56f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/SECT180_ndKAPY2huyiMo6_28h_56f.jpg",
       "bearing_deg": 208.2,
       "reference_score": 0.244,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/SECT180_ndKAPY2huyiMo6_28h_56f.jpg",
+      "path": "images/06_208deg_SECT180_ndKAPY2huyiMo6_28h_56f.jpg",
+      "bytes": 65005,
+      "sha256": "be598be84f4cb780537d98ebdb4455db40b53fa8cff5c4d5f571b91cd57e2850"
     },
     {
-      "asset_id": "1371510450143256",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/reference_only/mapillary/1371510450143256.jpg",
-      "bearing_deg": null,
+      "asset_id": "street_view-YA3Sv80wdPDHGpdMX7xoTA",
+      "bearing_deg": 298.7,
+      "reference_score": 0.244,
+      "min_side": 640,
+      "source_path": "02_images/reference_only/street_view/YA3Sv80wdPDHGpdMX7xoTA.jpg",
+      "path": "images/07_299deg_YA3Sv80wdPDHGpdMX7xoTA.jpg",
+      "bytes": 82513,
+      "sha256": "c4668d91caa81ae3e5801c50a5e41d319e24ef249d92915b1476c043fa6f4859"
+    },
+    {
+      "asset_id": "mapillary-1371510450143256",
+      "bearing_deg": 163.3,
       "reference_score": 0.229,
-      "min_side": 1536
+      "min_side": 1536,
+      "source_path": "02_images/reference_only/mapillary/1371510450143256.jpg",
+      "path": "images/08_163deg_1371510450143256.jpg",
+      "bytes": 829887,
+      "sha256": "2ce9e5421f4ec1d66e13441d18b786f54fc06e49341539b02d66edcfe1f9d05d"
     },
     {
       "asset_id": "SECT135_dBcwCO-cw-PCB6_357h_45f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/SECT135_dBcwCO-cw-PCB6_357h_45f.jpg",
       "bearing_deg": 177.1,
       "reference_score": 0.217,
-      "min_side": 640
+      "min_side": 640,
+      "source_path": "02_images/recrops/SECT135_dBcwCO-cw-PCB6_357h_45f.jpg",
+      "path": "images/09_177deg_SECT135_dBcwCO-cw-PCB6_357h_45f.jpg",
+      "bytes": 99087,
+      "sha256": "0bff485651ab69576a09e799a51fbca764539a8df86c9fa7fdd1aa2520feb3d4"
     },
     {
-      "asset_id": "FACADE_RIGHT_Av1a4D15qmdUlC_223h_31f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/FACADE_RIGHT_Av1a4D15qmdUlC_223h_31f.jpg",
-      "bearing_deg": 24.3,
-      "reference_score": 0.176,
-      "min_side": 640
-    },
-    {
-      "asset_id": "TGT2_9Rq6aeLy4mY7ax_75h_37f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/TGT2_9Rq6aeLy4mY7ax_75h_37f.jpg",
-      "bearing_deg": 255.4,
-      "reference_score": 0.174,
-      "min_side": 640
-    },
-    {
-      "asset_id": "1344146889590964",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/reference_only/mapillary/1344146889590964.jpg",
+      "asset_id": "1591690464926350",
       "bearing_deg": null,
-      "reference_score": 0.138,
-      "min_side": 1536
+      "reference_score": 0.165,
+      "min_side": 1536,
+      "source_path": "02_images/reference_only/mapillary/1591690464926350.jpg",
+      "path": "images/10_xxxdeg_1591690464926350.jpg",
+      "bytes": 518688,
+      "sha256": "80cc09debc75e473bd4eb1b1f86c60ea1749bad3bae9bf0c72d473ecd67e0855"
     },
     {
-      "asset_id": "FACADE_RIGHT_ikazdhDsiAnqR6_143h_18f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/FACADE_RIGHT_ikazdhDsiAnqR6_143h_18f.jpg",
-      "bearing_deg": 323.8,
-      "reference_score": 0.134,
-      "min_side": 640
-    },
-    {
-      "asset_id": "FACADE_PRIMARY_uy3cDE1sR0Hbsj_1h_30f",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/recrops/FACADE_PRIMARY_uy3cDE1sR0Hbsj_1h_30f.jpg",
-      "bearing_deg": 163.5,
-      "reference_score": 0.119,
-      "min_side": 640
-    },
-    {
-      "asset_id": "1119227939221649",
-      "path": "/Users/Hicham/Development/BuildingDroneVisit/work/welcominns-boucherville/02_images/reference_only/mapillary/1119227939221649.jpg",
-      "bearing_deg": null,
-      "reference_score": 0.103,
-      "min_side": 1536
+      "asset_id": "street_view-maxG0Dq_By4X7ves4g-jrg",
+      "bearing_deg": 190.3,
+      "reference_score": 0.146,
+      "min_side": 640,
+      "source_path": "02_images/reference_only/street_view/maxG0Dq_By4X7ves4g-jrg.jpg",
+      "path": "images/11_190deg_maxG0Dq_By4X7ves4g-jrg.jpg",
+      "bytes": 61751,
+      "sha256": "6d37e250d94253168b15ed1370579e5b332277afc01b8f58d8029e7b1a4230fc"
     }
   ],
   "caveats": [
     "l'identité de chaque image est établie par le dépistage : une photographie du bâtiment voisin fausserait la forme reconstruite",
     "une reconstruction feed-forward sort dans un repère arbitraire ; elle doit être recalée sur l'emprise géoréférencée avant tout usage métrique"
-  ]
+  ],
+  "usage_policy": {
+    "scope": "experimental_demo_only",
+    "production_eligible": false,
+    "contains_reference_only_sources": true,
+    "acknowledgement_required": "ACK_REFERENCE_ONLY=1"
+  }
 }

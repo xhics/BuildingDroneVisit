@@ -182,6 +182,16 @@ def test_scene_canonique_ne_promeut_aucune_observation_en_3d(
 
     payload = viewer_payload(scene)
     assert payload["counts"]["watertight_buildings"] == 1
+    assert payload["camera"] == {
+        "focus": [5.0, 3.0, 2.4],
+        "target_distance_m": 35.0,
+        "context_distance_m": 150.0,
+        "azimuth_deg": 210.0,
+        "altitude_deg": 26.0,
+        "facade_azimuth_deg": 210.0,
+        "facade_altitude_deg": 1.0,
+        "source": "target_building_bounds",
+    }
     assert len(payload["vegetation"][0]["rings"]) == 6
     assert payload["semantic"]["run_id"] == "semantic-test"
     assert payload["semantic_multiview"]["run_id"] == "semantic-links-test"

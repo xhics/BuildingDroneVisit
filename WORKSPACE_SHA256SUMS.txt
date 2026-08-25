@@ -1,0 +1,2 @@
+84ff1cad6c240100608abb5f0b1c7cbfb2f4cc2af22449d1e0494ce40acbb198  /tmp/buildingdrone-transfer.X6ehzQ/welcominns-workspace.tar.gz.part-aa
+bad98f15253f9b1e10222a811a52b0db6a1c702a6857e7770349b56e4c16b1a2  /tmp/buildingdrone-transfer.X6ehzQ/welcominns-workspace.tar.gz.part-ab

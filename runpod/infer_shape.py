@@ -49,12 +49,18 @@ def _write_ply(path: Path, points, colours=None) -> None:
 def run_vggt(image_paths: list[Path], out_dir: Path) -> dict:
     import numpy as np
     import torch
-    from PIL import Image
     from vggt.models.vggt import VGGT
     from vggt.utils.load_fn import load_and_preprocess_images
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA requis pour le lot RunPod")
+    device = "cuda"
+    dtype = (
+        torch.bfloat16
+        if torch.cuda.get_device_capability()[0] >= 8
+        else torch.float16
+    )
 
     model = VGGT.from_pretrained("facebook/VGGT-1B").to(device).eval()
     images = load_and_preprocess_images([str(p) for p in image_paths]).to(device)
@@ -62,7 +68,16 @@ def run_vggt(image_paths: list[Path], out_dir: Path) -> dict:
     with torch.no_grad(), torch.autocast(device_type=device, dtype=dtype):
         predictions = model(images)
 
-    points = predictions["world_points"].float().cpu().numpy().reshape(-1, 3)
+    world_points = predictions["world_points"].float().cpu().numpy()
+    points = world_points.reshape(-1, 3)
+    model_images = predictions["images"].float().cpu().numpy()
+    if model_images.ndim == 5:
+        model_images = model_images[0]
+    colours = np.clip(
+        np.transpose(model_images, (0, 2, 3, 1)).reshape(-1, 3) * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
     confidence = (
         predictions["world_points_conf"].float().cpu().numpy().reshape(-1)
         if "world_points_conf" in predictions
@@ -71,37 +86,107 @@ def run_vggt(image_paths: list[Path], out_dir: Path) -> dict:
 
     # Un nuage feed-forward porte beaucoup de points de faible confiance —
     # ciel, chaussée, arrière-plan lointain. Les garder noierait la façade.
+    finite = np.isfinite(points).all(axis=1)
+    keep = finite
     if confidence is not None:
-        keep = confidence >= float(np.percentile(confidence, 50))
-        points = points[keep]
+        finite_confidence = np.isfinite(confidence)
+        keep &= finite_confidence
+        if finite_confidence.any():
+            threshold = float(np.percentile(confidence[finite_confidence], 50))
+            keep &= confidence >= threshold
+        else:
+            keep &= False
+    points_before_filter = int(len(points))
+    nonfinite_removed = int((~finite).sum())
+    points = points[keep]
+    colours = colours[keep]
 
-    _write_ply(out_dir / "shape.ply", points)
+    _write_ply(out_dir / "shape.ply", points, colours)
+    extrinsics, intrinsics = pose_encoding_to_extri_intri(
+        predictions["pose_enc"], images.shape[-2:]
+    )
+    extrinsics = extrinsics.float().cpu().numpy()[0]
+    intrinsics = intrinsics.float().cpu().numpy()[0]
+    (out_dir / "cameras.json").write_text(
+        json.dumps(
+            {
+                "convention": "opencv_camera_from_world",
+                "image_size_hw": list(images.shape[-2:]),
+                "cameras": [
+                    {
+                        "image": image_paths[index].name,
+                        "extrinsic": extrinsics[index].tolist(),
+                        "intrinsic": intrinsics[index].tolist(),
+                    }
+                    for index in range(len(image_paths))
+                ],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return {
         "backend": "vggt",
         "device": device,
         "images": len(image_paths),
         "points": int(len(points)),
+        "points_before_filter": points_before_filter,
+        "nonfinite_removed": nonfinite_removed,
+        "confidence_percentile": 50,
+        "camera_file": "cameras.json",
     }
 
 
 def run_mapanything(image_paths: list[Path], out_dir: Path) -> dict:
     import numpy as np
     import torch
-    from mapanything.model import MapAnything
+    from mapanything.models import MapAnything
+    from mapanything.utils.image import load_images
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA requis pour le lot RunPod")
+    device = "cuda"
     model = MapAnything.from_pretrained("facebook/map-anything").to(device).eval()
+    views = load_images([str(path) for path in image_paths])
 
     with torch.no_grad():
-        result = model.run([str(p) for p in image_paths])
+        predictions = model.infer(
+            views,
+            memory_efficient_inference=True,
+            minibatch_size=1,
+            use_amp=True,
+            amp_dtype="bf16",
+            apply_mask=True,
+            mask_edges=True,
+            apply_confidence_mask=True,
+            confidence_percentile=50,
+        )
 
-    points = np.asarray(result["points3d"]).reshape(-1, 3)
+    point_sets = []
+    for prediction in predictions:
+        value = prediction["pts3d"]
+        if torch.is_tensor(value):
+            value = value.detach().float().cpu().numpy()
+        points_for_view = np.asarray(value).reshape(-1, 3)
+        point_sets.append(points_for_view)
+    points = np.concatenate(point_sets, axis=0)
+    points_before_filter = int(len(points))
+    finite = np.isfinite(points).all(axis=1)
+    # MapAnything encode les pixels masqués par [0, 0, 0]. Les exporter
+    # fabrique un énorme point artificiel à l'origine et peut masquer une
+    # géométrie par ailleurs exploitable.
+    nonzero = np.linalg.norm(points, axis=1) > 1e-8
+    keep = finite & nonzero
+    points = points[keep]
     _write_ply(out_dir / "shape.ply", points)
     return {
         "backend": "mapanything",
         "device": device,
         "images": len(image_paths),
         "points": int(len(points)),
+        "points_before_filter": points_before_filter,
+        "nonfinite_removed": int((~finite).sum()),
+        "masked_zero_removed": int((finite & ~nonzero).sum()),
     }
 
 

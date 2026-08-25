@@ -55,14 +55,31 @@ def test_viewer_migre_le_payload_historique_et_devient_reproductible(
     assert "Points SfM recalés" in outputs.html.read_text("utf-8")
     assert "Hypothèses linéaires mono-vue" in outputs.html.read_text("utf-8")
     assert "supports IA/SfM" in outputs.html.read_text("utf-8")
+    assert "1</kbd> bâtiment" in outputs.html.read_text("utf-8")
+    assert "CAMERA.focus||TARGET.focus" in outputs.html.read_text("utf-8")
+    assert "focus[0]+Math.cos(az)" in outputs.html.read_text("utf-8")
+    assert "ui-hidden" in outputs.html.read_text("utf-8")
     assert "Surfaces 3D contraintes" in outputs.html.read_text("utf-8")
-    assert "?.65:f.k==='veg'?.92:1" in outputs.html.read_text("utf-8")
+    assert "f.k==='veg'?.28:f.k==='pole'?.58:1" in outputs.html.read_text("utf-8")
+    assert "show={roof:true,vol:true,veg:false" in outputs.html.read_text("utf-8")
+    assert "Ressemblance structurelle" in outputs.html.read_text("utf-8")
+    assert "FAÇADE" in outputs.html.read_text("utf-8")
+    assert "Données techniques" in outputs.html.read_text("utf-8")
+    assert "sitePlane()" in outputs.html.read_text("utf-8")
     assert ":.82" not in outputs.html.read_text("utf-8")
     assert manifest["mode"] == "demo"
     assert manifest["payload_current"] is True
     assert manifest["formal_phase1_status"] == "not_overridden"
     assert manifest["payload"]["sha256"] == hashlib.sha256(
         outputs.payload.read_bytes()
+    ).hexdigest()
+    facade_audit = workspace.path(
+        "11_conditioning", "facade_similarity_audit.json"
+    )
+    assert facade_audit.is_file()
+    assert manifest["facade_similarity"]["photometric_claim"] is False
+    assert manifest["facade_similarity"]["sha256"] == hashlib.sha256(
+        facade_audit.read_bytes()
     ).hexdigest()
 
 
@@ -85,6 +102,34 @@ def test_viewer_peut_partir_du_obj_canonique(tmp_path: Path) -> None:
     payload = json.loads(outputs.payload.read_text("utf-8"))
     assert len(payload["mesh"]["vertices"]) == 3
     assert payload["mesh"]["faces"] == [[0, 1, 2]]
+
+
+def test_viewer_affiche_un_solveur_gpu_refuse_sans_injecter_sa_geometrie(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    legacy = workspace.path("11_conditioning", "viewer.html")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        '<script>const PAYLOAD = {"hotel":"hotel-test"};\n\nconst cv = 1;</script>',
+        "utf-8",
+    )
+    workspace.write_json(
+        "11_conditioning/feed_forward_shape_audit.json",
+        {"status": "rejected", "viewer_integration": False},
+    )
+
+    outputs = build(workspace)
+    payload = json.loads(outputs.payload.read_text("utf-8"))
+    html = outputs.html.read_text("utf-8")
+
+    assert payload["feed_forward_shape"]["status"] == "rejected"
+    assert "Forme GPU multi-vues" in html
+    assert "refusée (2/2)" in html
+    assert "nuages fragmentés" in html
+    assert "max-height:calc(100vh - 28px)" in html
+    assert "#legend{right:14px;top:14px" in html
+    assert "Orthofaçades photographiques sur masse LiDAR" in html
 
 
 def test_viewer_signale_un_payload_devenu_perime(tmp_path: Path) -> None:

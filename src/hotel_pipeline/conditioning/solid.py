@@ -88,7 +88,8 @@ def closed_solid(
         if len(indices) != 3:
             continue
         a, b, c = ring[indices]
-        if np.cross(b - a, c - a) < 0:
+        cross_2d = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if cross_2d < 0:
             indices[1], indices[2] = indices[2], indices[1]
         roof_triangles.append(indices)
     if not roof_triangles:
