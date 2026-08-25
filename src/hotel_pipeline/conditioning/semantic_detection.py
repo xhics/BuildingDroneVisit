@@ -29,7 +29,14 @@ DEFAULT_PROMPT = (
     "hotel building. hotel sign. road sign. traffic sign. entrance door. window. canopy. "
     "structural beam. support column. lamp post. air conditioning unit. "
     "balcony. gutter. deciduous tree. evergreen tree. "
-    "car. truck. bus. person. bicycle. bush. hedge. fence. pole. "
+    "car. truck. bus. person. bicycle. bush. hedge. fence. pole. planter. "
+    "mobiliary. chair. table. trash can. flower pot."
+)
+TEXTURE_PROMPT = (
+    "hotel building. hotel sign. road sign. traffic sign. entrance door. window. canopy. "
+    "structural beam. support column. lamp post. air conditioning unit. "
+    "balcony. gutter. deciduous tree. evergreen tree. "
+    "car. truck. bus. person. bicycle. bush. hedge. fence. pole. planter. "
     "mobiliary. chair. table. trash can. flower pot."
 )
 
@@ -245,8 +252,8 @@ def mask_to_polygon(
     import cv2
 
     mask = np.asarray(binary, dtype=np.uint8) * 255
-    contours, _hierarchy = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    contours, hierarchy = cv2.findContours(
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
         return None
@@ -256,12 +263,14 @@ def mask_to_polygon(
         return None
     epsilon = max(1.5, 0.006 * cv2.arcLength(contour, True))
     polygon = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+    has_holes = bool(hierarchy is not None and hierarchy[0, 0, 3] >= 0)
     payload: dict[str, object] = {
         "type": "polygon",
         "points": polygon.astype(float).tolist(),
         "area_px2": round(area, 1),
         "method": method,
         "confidence_role": "approximate_extent",
+        "has_holes": has_holes,
     }
     if score is not None:
         payload["mask_score"] = round(float(score), 5)
@@ -420,21 +429,28 @@ def _write_previews(
 def run(
     workspace: Workspace,
     *,
+    purpose: str = "observation",
     limit: int = 2,
     allow_download: bool = False,
     model_id: str = DEFAULT_MODEL_ID,
-    prompt: str = DEFAULT_PROMPT,
+    prompt: str | None = None,
     threshold: float = 0.28,
     text_threshold: float = 0.25,
     device: str = "auto",
     segmentation: str = "auto",
     sam2_checkpoint: Path | None = None,
 ) -> tuple[Path, dict]:
-    """Exécute le modèle sur les seules vues d'identité et pose validées."""
-    images = select_validated_images(workspace, limit=limit)
+    """Exécute le modèle sur les vues sélectionnées selon le purpose."""
+    if purpose == "texture":
+        images = _select_colmap_images(workspace)
+        effective_prompt = prompt if prompt is not None else TEXTURE_PROMPT
+    else:
+        images = select_validated_images(workspace, limit=limit)
+        effective_prompt = prompt if prompt is not None else DEFAULT_PROMPT
+
     if not images:
         raise SemanticModelUnavailable(
-            "aucune image ne combine identité positive et pose validée"
+            "aucune image ne correspond au purpose demandé"
         )
     selected_device = resolve_device(device)
     backend = GroundingDinoBackend(
@@ -462,13 +478,20 @@ def run(
     )
     observations: list[dict] = []
     started = time.monotonic()
+    mask_root = None
+    if purpose == "texture":
+        generated_at = datetime.now(timezone.utc)
+        run_id = f"texture-{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
+        mask_root = workspace.path("11_conditioning", "texture_view_masks", run_id)
+        mask_root.mkdir(parents=True, exist_ok=True)
+
     for selected in images:
         pil_image = Image.open(selected.path).convert("RGB")
         cv_image = np.asarray(pil_image)[:, :, ::-1].copy()
         if sam_backend is not None:
             sam_backend.set_image(np.asarray(pil_image).copy())
         detections = backend.detect(
-            pil_image, prompt, threshold=threshold, text_threshold=text_threshold
+            pil_image, effective_prompt, threshold=threshold, text_threshold=text_threshold
         )
         for index, detection in enumerate(detections):
             mask = (
@@ -476,30 +499,37 @@ def run(
                 if sam_backend is not None
                 else box_guided_mask(cv_image, detection["box_xyxy"])
             )
-            observations.append(
-                {
-                    "observation_id": f"grounding-dino-{selected.asset_id}-{index:03d}",
-                    "asset_id": selected.asset_id,
-                    "class": canonical_class(detection["label"]),
-                    "raw_label": detection["label"],
-                    "geometry_2d": {
-                        "type": "box",
-                        "xyxy": detection["box_xyxy"],
-                    },
-                    "segmentation_2d": mask,
-                    "detector": "grounding_dino_transformers",
-                    "detector_model": model_id,
-                    "detector_score": detection["score"],
-                    "pose_status": "validated",
-                    "pose_evidence_class": selected.pose_evidence_class,
-                    "provenance_class": "SEMANTICALLY_CONSTRAINED",
-                    "geometry_3d": None,
-                    "triangulation_status": "blocked",
-                    "blockers": [
-                        "cross-view instance correspondence not established"
-                    ],
-                }
-            )
+            observation = {
+                "observation_id": f"grounding-dino-{selected.asset_id}-{index:03d}",
+                "asset_id": selected.asset_id,
+                "class": canonical_class(detection["label"]),
+                "raw_label": detection["label"],
+                "geometry_2d": {
+                    "type": "box",
+                    "xyxy": detection["box_xyxy"],
+                },
+                "segmentation_2d": mask,
+                "detector": "grounding_dino_transformers",
+                "detector_model": model_id,
+                "detector_score": detection["score"],
+                "pose_status": "validated",
+                "pose_evidence_class": getattr(selected, "pose_evidence_class", "anchor_measured"),
+                "provenance_class": "SEMANTICALLY_CONSTRAINED",
+                "geometry_3d": None,
+                "triangulation_status": "blocked",
+                "blockers": [
+                    "cross-view instance correspondence not established"
+                ],
+            }
+            observations.append(observation)
+
+            if purpose == "texture" and mask_root is not None and mask is not None:
+                asset_dir = mask_root / selected.asset_id
+                asset_dir.mkdir(parents=True, exist_ok=True)
+                mask_path = asset_dir / f"{observation['observation_id']}.png"
+                mask_img = Image.fromarray(mask["points"] if isinstance(mask, dict) else mask)
+                mask_img.save(mask_path)
+
     generated_at = datetime.now(timezone.utc)
     run_id = f"semantic-{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
     previews = _write_previews(workspace, images, observations, run_id)
@@ -511,7 +541,7 @@ def run(
         "backend": "grounding_dino_transformers",
         "model_id": model_id,
         "device": selected_device,
-        "prompt": prompt,
+        "prompt": effective_prompt,
         "threshold": threshold,
         "text_threshold": text_threshold,
         "segmentation_backend": segmentation_method,
@@ -522,7 +552,7 @@ def run(
                 "asset_id": item.asset_id,
                 "path": str(item.path.relative_to(workspace.root)),
                 "sha256": _digest(item.path),
-                "pose_evidence_class": item.pose_evidence_class,
+                "pose_evidence_class": getattr(item, "pose_evidence_class", "anchor_measured"),
             }
             for item in images
         ],
@@ -539,7 +569,105 @@ def run(
     run_relative = f"11_conditioning/semantic_runs/{run_id}.json"
     payload["versioned_artifact"] = run_relative
     workspace.write_json(run_relative, payload)
+
+    if purpose == "texture":
+        texture_payload = {
+            "contract_version": 1,
+            "run_id": run_id,
+            "hotel_id": workspace.hotel_id,
+            "generated_at": generated_at.isoformat(),
+            "purpose": "texture",
+            "views": [],
+            "inputs": payload["inputs"],
+            "summary": payload["summary"],
+        }
+        view_index: dict[str, dict] = {}
+        for obs in observations:
+            aid = str(obs["asset_id"])
+            if aid not in view_index:
+                view_index[aid] = {
+                    "asset_id": aid,
+                    "image_path": str(next(
+                        (i.path for i in images if i.asset_id == aid), ""
+                    )),
+                    "building_polygon": [],
+                    "occluders_polygon": [],
+                    "fidelity": "polygon_no_holes",
+                    "classes_present": [],
+                    "sign_regions": [],
+                    "width": 0,
+                    "height": 0,
+                    "raster": "",
+                }
+            view = view_index[aid]
+            cls = obs["class"]
+            view["classes_present"].append(cls)
+            seg = obs.get("segmentation_2d")
+            if cls == "building" and seg:
+                view["building_polygon"] = seg.get("points", [])
+                view["width"] = seg.get("width", view["width"])
+                view["height"] = seg.get("height", view["height"])
+                if seg.get("has_holes"):
+                    view["fidelity"] = "polygon_with_occluders"
+            elif cls in {"car", "truck", "bus", "person", "bicycle", "bush", "hedge",
+                         "fence", "pole", "planter", "mobiliary", "flower_pot",
+                         "tree_evergreen", "tree_deciduous"} and seg:
+                if not view["occluders_polygon"]:
+                    view["occluders_polygon"] = seg.get("points", [])
+                if seg.get("has_holes"):
+                    view["fidelity"] = "polygon_with_occluders"
+            elif cls in {"sign", "logo"} and seg:
+                view["sign_regions"].append({
+                    "class": cls,
+                    "points": seg.get("points", []),
+                    "decision": "pending",
+                })
+        texture_payload["views"] = list(view_index.values())
+        tex_path = workspace.path("11_conditioning", "texture_view_masks.json")
+        workspace.write_json(tex_path, texture_payload)
+        return tex_path, texture_payload
+
     path = workspace.write_json(
         "11_conditioning/semantic_observations.json", payload
     )
     return path, payload
+
+
+def _select_colmap_images(workspace: Workspace) -> list[SelectedImage]:
+    """Sélectionne toutes les vues du modèle COLMAP d'ancre."""
+    try:
+        import pycolmap
+    except ImportError:
+        return []
+    correspondence_path = workspace.path("11_conditioning", "semantic_correspondences.json")
+    if not correspondence_path.is_file():
+        return []
+    correspondence = _read(correspondence_path)
+    anchor_path = workspace.root / correspondence["sources"]["anchor_model_manifest"]
+    if not anchor_path.is_file():
+        return []
+    anchor = _read(anchor_path)
+    from .semantic_correspondence import _resolve_model_path
+    model_path = _resolve_model_path(workspace, anchor_path, anchor)
+    if not model_path or not model_path.is_dir():
+        return []
+    try:
+        reconstruction = pycolmap.Reconstruction(str(model_path))
+    except Exception:
+        return []
+
+    selected: list[SelectedImage] = []
+    for img in reconstruction.images.values():
+        name = Path(img.name).stem
+        candidates = list(workspace.path("07_reconstruction").rglob(f"*{name}*"))
+        if not candidates:
+            candidates = list(workspace.path("00_manifest").rglob(f"*{name}*"))
+        path = candidates[0] if candidates else None
+        if path is None or not path.is_file():
+            continue
+        selected.append(SelectedImage(
+            asset_id=name,
+            path=path,
+            pose_evidence_class="anchor_measured",
+        ))
+    return selected

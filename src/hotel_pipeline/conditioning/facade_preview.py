@@ -95,7 +95,7 @@ def _faces(payload: dict, *, include_vegetation: bool = False) -> list[dict]:
     for feature in payload.get("facade_features") or []:
         vertices = feature.get("vertices") or []
         texture = textures.get(feature.get("edge_index"))
-        covered = texture and texture.get("supplemental_reference") and feature.get("kind") in {"window", "band"}
+        covered = texture and texture.get("covered_by_photo")
         if len(vertices) >= 3 and not covered:
             faces.append({"vertices": vertices, "kind": str(feature.get("kind") or "target")})
     for vegetation in ((payload.get("vegetation") or []) if include_vegetation else []):
@@ -141,7 +141,6 @@ def render(
     altitude_deg: float = 1.0,
     width: int = 960,
     height: int = 540,
-    distance_factor: float = 0.62,
     texture_root: Path | None = None,
 ) -> Image.Image:
     palette = dict(PALETTE)
@@ -171,7 +170,7 @@ def render(
 
     camera = payload.get("camera") or {}
     focus = [float(value) for value in camera.get("focus") or [0.0, 0.0, 5.0]]
-    distance = float(camera.get("target_distance_m") or 120.0) * distance_factor
+    distance = float(camera.get("target_distance_m") or 120.0)
     eye, forward, right, up = _basis(focus, azimuth_deg, altitude_deg, distance)
     focal = height_hi * 0.5 / math.tan(math.pi / 6)
 

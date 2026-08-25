@@ -6,9 +6,8 @@ est choisi par un algorithme à partir de la géométrie mesurée et de la
 de façade visible qui porte réellement une texture (et non un proxy), tout en
 favorisant légèrement la face d'entrée pour la vue « héro ».
 
-Tout est dérivé des données du payload ; aucune valeur magique (ex. 210°)
-n'est écrite en dur. En l'absence de couverture mesurée, on retombe sur la
-face d'entrée / principale déduite de la grammaire de façade.
+Convention d'azimut : 0° = +X (est), sens antihoraire. Identique à
+`viewer.js` et `facade_preview`.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ def _edges(ring: list[list[float]]) -> list[_Edge]:
             continue
         tangent = (dx / length, dy / length)
         outward = (tangent[1], -tangent[0]) if ccw else (-tangent[1], tangent[0])
-        bearing = math.degrees(math.atan2(outward[0], outward[1])) % 360.0
+        bearing = math.degrees(math.atan2(outward[1], outward[0])) % 360.0
         found.append(_Edge(index, length, bearing, 0.0))
     return found
 
@@ -64,12 +63,11 @@ def _coverage_by_edge(payload: dict) -> dict[int, float]:
         disagreement = float(texture.get("disagreement_fraction") or 0.0)
         if edge_index < 0 or observed <= 0.0:
             continue
-        # Une face en désaccord inter-vues est moins fiable à montrer.
         coverage[edge_index] = observed * (1.0 - min(0.5, disagreement))
     return coverage
 
 
-def _geometry(payload: dict) -> tuple[list[_Edge], float, float, float]:
+def _geometry(payload: dict) -> tuple[list[_Edge], float, float, tuple[float, float]]:
     target = next(
         (volume for volume in payload.get("volumes") or [] if volume.get("target")),
         None,
@@ -91,7 +89,7 @@ def _geometry(payload: dict) -> tuple[list[_Edge], float, float, float]:
     coverage = _coverage_by_edge(payload)
     for edge in edges:
         object.__setattr__(edge, "coverage", coverage.get(edge.index, 0.0))
-    return edges, height, target_distance, target_distance, (centre_x, centre_y)
+    return edges, height, target_distance, (centre_x, centre_y)
 
 
 def _grammar_priority_edges(payload: dict) -> list[int]:
@@ -102,7 +100,6 @@ def _grammar_priority_edges(payload: dict) -> list[int]:
         if isinstance(value, int) and value >= 0:
             priority.append(value)
     priority.extend(grammar.get("facade_edges") or [])
-    # dédupliquer en conservant l'ordre
     seen: set[int] = set()
     return [edge for edge in priority if not (edge in seen or seen.add(edge))]
 
@@ -148,14 +145,13 @@ def optimal_camera(payload: dict) -> dict:
     Renvoie un dictionnaire ``camera`` complet et traçable. En l'absence de
     couverture photographique, l'azimut retombe sur la face d'entrée / principale.
     """
-    edges, height, target_distance, _span, (centre_x, centre_y) = _geometry(payload)
+    edges, height, target_distance, (centre_x, centre_y) = _geometry(payload)
     priority = _grammar_priority_edges(payload)
 
     if edges and any(edge.coverage > 0.0 for edge in edges):
         azimuth = _best_azimuth(edges, priority)
-        source = "measured_coverage_optimization"
+        source = "measured_coverage"
     elif priority:
-        # Aucune texture : cadrer la face d'entrée déduite de la grammaire.
         by_index = {edge.index: edge for edge in edges}
         leading = next((by_index.get(index) for index in priority if index in by_index), None)
         azimuth = leading.bearing_deg if leading else 0.0
@@ -176,6 +172,9 @@ def optimal_camera(payload: dict) -> dict:
         "facade_azimuth_deg": round(azimuth, 1),
         "facade_altitude_deg": round(facade_altitude, 1),
         "source": source,
+        "evidence_rank": "measured_coverage" if source == "measured_coverage" else (
+            "semantically_constrained" if source == "facade_grammar_entrance" else "inferred_grammar"
+        ),
     }
 
 

@@ -41,21 +41,16 @@ class Prism:
 
     feature_id: str
     role: str
-    #: Sommets du contour extérieur, en CRS projeté, sens quelconque.
     footprint: np.ndarray
     height_m: float
     height_assumed: bool
     height_source: str
     is_target: bool
-    #: Toit mesuré : (m, 3) sommets d'une surface triangulée, en CRS projeté.
-    #: Vide tant qu'aucun nDSM ne couvre l'emprise — le toit est alors fermé
-    #: par une approximation dont la carte de confiance tient compte.
     roof_vertices: np.ndarray | None = None
     roof_faces: np.ndarray | None = None
-    #: Relief des murs relevé dans le nuage, quand il l'a été.
     facade_relief: object | None = None
-    #: Décomposition de la toiture en pans, quand elle a été segmentée.
     roof_planes: object | None = None
+    geometry_simplification: dict | None = None
 
     @property
     def roof_measured(self) -> bool:
@@ -128,16 +123,34 @@ class ConditioningScene:
         }
 
 
-def _polygon_of(entry: dict) -> Polygon | None:
+def _polygon_of(entry: dict) -> tuple[Polygon | None, dict | None]:
     raw = entry.get("projected_wkt")
     if not raw:
-        return None
+        return None, None
     geom = shapely_wkt.loads(raw)
+    simplification: dict | None = None
     if geom.geom_type == "MultiPolygon":
+        parts_dropped = len(geom.geoms) - 1
+        area_before = sum(g.area for g in geom.geoms)
         geom = max(geom.geoms, key=lambda g: g.area)
+        area_after = geom.area
+        simplification = {
+            "rule": "MultiPolygon -> max(area)",
+            "parts_dropped": parts_dropped,
+            "holes_dropped": 0,
+            "area_dropped_m2": round(float(area_before - area_after), 2),
+        }
     if geom.geom_type != "Polygon" or geom.is_empty:
-        return None
-    return geom
+        return None, simplification
+    if len(geom.interiors) > 0 and not simplification:
+        holes_dropped = len(geom.interiors)
+        simplification = {
+            "rule": "interior rings ignored",
+            "parts_dropped": 0,
+            "holes_dropped": holes_dropped,
+            "area_dropped_m2": round(float(sum(g.area for g in geom.interiors)), 2),
+        }
+    return geom, simplification
 
 
 def _prism_of(entry: dict) -> Prism | None:
@@ -151,7 +164,7 @@ def _prism_of(entry: dict) -> Prism | None:
             entry.get("resolution_status"),
         )
         return None
-    poly = _polygon_of(entry)
+    poly, simplification = _polygon_of(entry)
     if poly is None:
         return None
 
@@ -173,6 +186,7 @@ def _prism_of(entry: dict) -> Prism | None:
         height_assumed=assumed,
         height_source=source,
         is_target=role in TARGET_ROLES,
+        geometry_simplification=simplification,
     )
 
 
@@ -210,6 +224,9 @@ def load_scene(capture_geometry_path: Path) -> ConditioningScene:
             "site_manifest_digest": payload.get("site_manifest_digest"),
             "policy_digest": payload.get("policy_digest"),
             "assumed_height_rule": ASSUMED_HEIGHT_M,
+            "geometry_simplifications": [
+                p.geometry_simplification for p in prisms if p.geometry_simplification
+            ],
         },
     )
     log.info(

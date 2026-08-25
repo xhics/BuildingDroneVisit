@@ -1,34 +1,33 @@
 """Fusion photographique multi-vues pour les façades du viewer.
 
 Les images enregistrées par COLMAP sont reprojetées dans chaque plan de mur
-afin de produire des orthofaçades. Les autres photographies extérieures sont
-utilisées pour estimer une palette robuste et construire un inventaire visuel.
-La sortie reste traçable : chaque atlas indique ses vues, sa couverture et son
-désaccord, au lieu de masquer les zones non observées.
+afin de produire des orthofaçades. La visibilité est prouvée pixel par pixel :
+un atlas troué est le résultat attendu, et le proxy mesuré reprend sa place
+sous les trous.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from ..geo.facade_visibility import LidarOcclusion, ProxyDepth
+from ..geo.orthofacade import FacadePlane, plane_from_edge, rectify
+from ..geo.facade_visibility import LidarOcclusion, measure_facade_alignment
 from ..workspace import Workspace
-from ..geo.orthofacade import plane_from_edge, rectify
 from .semantic_correspondence import _resolve_model_path
 from .semantic_registered_support import transform_points
+from .texture_masks import load_texture_masks, TextureViewMask
 
 
-TEXTURE_ALGORITHM_VERSION = 8
+TEXTURE_ALGORITHM_VERSION = 9
 
-#: Erreur de reprojection (p90, en mètres) au-delà de laquelle une registration,
-#: même « accepted » géométriquement, n'est pas assez précise pour plaquer une
-#: photo au pixel sur une façade. Le gate géométrique tolère ~2,5 m ; la texture
-#: exige la même exigence, pas moins.
-TEXTURE_REGISTRATION_MAX_P90_M = 2.5
+REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
 
 
 def _read(path: Path) -> dict:
@@ -149,63 +148,6 @@ def _contact_sheet(images: list[tuple[str, Path]], output: Path) -> None:
     sheet.save(output, quality=88)
 
 
-def _semantic_building_masks(workspace: Workspace) -> dict[str, np.ndarray]:
-    """Masque du bâtiment par image, dégagé de tout ce qui s'interpose.
-
-    Le masque est plein (le bâtiment est un volume, pas un trou) ; les objets
-    qui se projettent devant le mur — arbre, voiture, personne, clôture, poteau,
-    mobilier — y sont soustraits de la même façon pleine. Une face texturée ne
-    doit jamais incorporer le pixel d'un objet mobile vu depuis la rue.
-    """
-    import cv2
-
-    path = workspace.path("11_conditioning", "semantic_observations.json")
-    if not path.is_file():
-        return {}
-    payload = _read(path)
-    by_asset: dict[str, list[dict]] = {}
-    input_paths = {
-        str(item.get("asset_id")): workspace.root / str(item.get("path"))
-        for item in payload.get("inputs", [])
-    }
-    for observation in payload.get("observations", []):
-        by_asset.setdefault(str(observation.get("asset_id")), []).append(observation)
-    masks: dict[str, np.ndarray] = {}
-    # Tout ce qui, devant le mur, ne fait pas partie de la façade texturée.
-    occluders = {
-        "tree_evergreen", "tree_deciduous", "lamp_post", "road_sign", "sign",
-        "car", "truck", "bus", "person", "bicycle", "bush", "fence", "pole",
-        "mobiliary", "hvac_unit",
-    }
-    for asset_id, observations in by_asset.items():
-        image_path = input_paths.get(asset_id)
-        if image_path is None or not image_path.is_file():
-            continue
-        with Image.open(image_path) as source:
-            width, height = source.size
-        building_polygons = [
-            item.get("segmentation_2d", {}).get("points") or []
-            for item in observations
-            if item.get("class") == "building"
-        ]
-        if not any(len(points) >= 3 for points in building_polygons):
-            continue
-        mask = np.zeros((height, width), dtype=np.uint8)
-        for points in building_polygons:
-            if len(points) >= 3:
-                pts = np.asarray([[point[:2] for point in points]], dtype=np.int32)
-                cv2.fillPoly(mask, [pts], 1)
-        for item in observations:
-            if item.get("class") not in occluders:
-                continue
-            points = item.get("segmentation_2d", {}).get("points") or []
-            if len(points) >= 3:
-                pts = np.asarray([[point[:2] for point in points]], dtype=np.int32)
-                cv2.fillPoly(mask, [pts], 0)
-        masks[asset_id] = mask.astype(bool)
-    return masks
-
-
 class _RegisteredCamera:
     def __init__(self, image, camera, transform: dict):  # noqa: ANN001
         self.image = image
@@ -248,7 +190,7 @@ def _asset_for_model_image(
     simplified = stem
     for prefix in ("mapillary-", "illary-", "llary-", "street_view-"):
         if simplified.startswith(prefix):
-            simplified = simplified[len(prefix) :]
+            simplified = simplified[len(prefix):]
     for asset in assets:
         asset_id = str(asset.get("id", ""))
         local = _resolve_asset_path(workspace, asset.get("local_path"))
@@ -259,93 +201,31 @@ def _asset_for_model_image(
     return None
 
 
-def _fill_texture(image: np.ndarray, observed: np.ndarray, brick_hex: str) -> np.ndarray:
-    import cv2
-
-    rgb = np.asarray(image, dtype=np.uint8)
-    mask = observed.astype(np.uint8)
-    brick = np.asarray(
-        [int(brick_hex[index : index + 2], 16) for index in (1, 3, 5)],
-        dtype=np.uint8,
-    )
-    if mask.any() and (~observed).any():
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        near_observation = cv2.dilate(mask, np.ones((13, 13), np.uint8), iterations=1)
-        small_holes = ((near_observation > 0) & (mask == 0)).astype(np.uint8) * 255
-        bgr = cv2.inpaint(bgr, small_holes, 4, cv2.INPAINT_TELEA)
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb[near_observation == 0] = brick
-    if not mask.any():
-        rgb[:] = brick
-    alpha = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=1) * 255
-    alpha = cv2.GaussianBlur(alpha, (0, 0), 1.4)
-    return np.flipud(np.dstack((rgb, alpha)))
-
-
-def _supplemental_facade(
-    workspace: Workspace, edge_index: int, atlas: np.ndarray
-) -> tuple[np.ndarray, str | None]:
-    """Aucune tuile ne doit être fabriquée à partir d'une source non vérifiée.
-
-    Une image web non enregistrée ne porte ni pose ni segmentation : la coller
-    sur une façade y introduirait des arbres, des voitures ou des passants
-    comme s'ils faisaient partie du bâtiment, et forcer l'opacité empêcherait
-    le proxy de reprendre sa place. Le proxy mesuré est ici l'issue honnête ;
-    une référence ne remplace une capture multi-vues validée que si elle est
-    d'abord recalée et segmentée comme les autres vues.
-    """
-    return atlas, None
-
-
 def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
-    """La texture n'utilise une registration que si elle est à la fois acceptée
-    et assez précise au pixel pour plaquer une photo sur une façade.
-
-    Le pipeline possède déjà ce contrôle pour la géométrie de scène ; le réutiliser
-    ici évite qu'une pose refusée (ou trop lâche) ne projette l'image à plusieurs
-    mètres de la façade réelle.
-    """
     status = registration.get("status")
     if status != "accepted":
         return False, f"registration refusée ({status}) : pose non utilisée pour texturer"
-    p90 = (registration.get("metrics") or {}).get("fit", {}).get("p90_m")
-    if p90 is not None and p90 > TEXTURE_REGISTRATION_MAX_P90_M:
+    metrics = registration.get("metrics") or {}
+    holdout = metrics.get("holdout") or metrics.get("fit") or {}
+    p90 = holdout.get("p90_m")
+    if p90 is not None and p90 > REGISTRATION_HOLDOUT_MAX_P90_M:
         return (
             False,
-            f"registration imprécise pour texture (p90={p90:.2f} m > "
-            f"{TEXTURE_REGISTRATION_MAX_P90_M} m)",
+            f"registration imprécise pour texture (holdout p90={p90:.2f} m > "
+            f"{REGISTRATION_HOLDOUT_MAX_P90_M} m)",
         )
     return True, ""
 
 
-def _edge_height(target: dict, edge_index: int) -> float:
-    """Hauteur du mur le long d'une arête : moyenne des hauteurs de ses deux
-    extrémités (wall_top_m), jamais une hauteur constante pour tout le mur."""
-    wh = target.get("wh") or []
-    if edge_index < len(wh) and len(wh) >= 2:
-        following = (edge_index + 1) % len(wh)
-        try:
-            return 0.5 * (float(wh[edge_index]) + float(wh[following]))
-        except (TypeError, ValueError):
-            pass
-    return float(target.get("h") or 10.0)
-
-
-def _facade_polygon_mask(camera, plane, width: int, height: int):
-    """Masque du seul mur visé, projeté dans l'image par la pose enregistrée.
-
-    On ne garde que les pixels tombant sur le rectangle 3D de *ce* mur : un
-    bâtiment voisin ou un autre pan ne peut plus contaminer la texture, et les
-    vues sans détection sémantique restent utilisables (le polygone fait foi).
-    """
+def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
     import cv2
 
     corners = np.array(
         [
             plane.point(0.0, 0.0),
             plane.point(plane.length_m, 0.0),
-            plane.point(plane.length_m, plane.height_m),
-            plane.point(0.0, plane.height_m),
+            plane.point(plane.length_m, 1.0),
+            plane.point(0.0, 1.0),
         ],
         dtype=np.float64,
     )
@@ -360,18 +240,57 @@ def _facade_polygon_mask(camera, plane, width: int, height: int):
     return mask.astype(bool)
 
 
-def _views_for_edge(views, plane):
-    """Restreint chaque vue au polygone de ce mur, et y soustrait les occulteurs."""
-    edge_views = []
-    for asset_id, rgb, camera, base_mask in views:
-        facade_mask = _facade_polygon_mask(camera, plane, rgb.shape[1], rgb.shape[0])
-        if facade_mask is None:
-            continue
-        vis = facade_mask & base_mask if base_mask is not None else facade_mask
-        if not vis.any():
-            continue
-        edge_views.append((asset_id, rgb, camera, vis))
-    return edge_views
+def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
+    triangles: list[np.ndarray] = []
+    face_ids: list[int] = []
+    fid = 0
+    for volume in payload.get("volumes", []):
+        fp = volume.get("fp") or []
+        wh = volume.get("wh") or []
+        h_default = float(volume.get("h") or 8.0)
+        if len(fp) >= 3:
+            for i in range(len(fp)):
+                j = (i + 1) % len(fp)
+                a = np.array([fp[i][0], fp[i][1], 0.0], dtype=np.float64)
+                b = np.array([fp[j][0], fp[j][1], 0.0], dtype=np.float64)
+                h_i = float(wh[i]) if i < len(wh) else h_default
+                h_j = float(wh[j]) if j < len(wh) else h_default
+                c = np.array([fp[j][0], fp[j][1], h_j], dtype=np.float64)
+                d = np.array([fp[i][0], fp[i][1], h_i], dtype=np.float64)
+                triangles.extend([[a, b, c], [a, c, d]])
+                face_ids.extend([fid, fid + 1])
+                fid += 2
+        rv = volume.get("rv") or []
+        rf = volume.get("rf") or []
+        if rv and rf:
+            for face in rf:
+                if len(face) >= 3:
+                    tri = np.asarray([rv[idx] for idx in face[:3]], dtype=np.float64)
+                    if tri.shape == (3, 3):
+                        triangles.append(tri)
+                        face_ids.append(fid)
+                        fid += 1
+        solid = volume.get("solid") or {}
+        sv = solid.get("vertices") or []
+        sf = solid.get("faces") or []
+        if sv and sf:
+            for face in sf:
+                if len(face) >= 3:
+                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
+                    if tri.shape == (3, 3):
+                        triangles.append(tri)
+                        face_ids.append(fid)
+                        fid += 1
+    return triangles, face_ids
+
+
+def _pose_error_for_view(camera, plane: FacadePlane, building_mask: np.ndarray) -> tuple[float, float, int]:
+    return measure_facade_alignment(camera, plane, building_mask=building_mask)
+
+
+def _atlas_alpha(statuses: np.ndarray) -> np.ndarray:
+    alpha = np.where(statuses, 255, 0).astype(np.uint8)
+    return alpha
 
 
 def build(workspace: Workspace, payload: dict) -> dict:
@@ -388,43 +307,19 @@ def build(workspace: Workspace, payload: dict) -> dict:
     output_dir = workspace.path("11_conditioning", "facade_textures")
     output_dir.mkdir(parents=True, exist_ok=True)
     _contact_sheet(references, output_dir / "reference_inventory_sheet.jpg")
-    target_signature = json.dumps(
-        [
-            {"fp": volume.get("fp"), "h": volume.get("h"), "wh": volume.get("wh")}
-            for volume in payload.get("volumes", [])
-            if volume.get("target")
-        ],
-        sort_keys=True,
-    ).encode("utf-8")
-    reference_signature = "".join(
-        hashlib.sha256(path.read_bytes()).hexdigest() for _asset_id, path in references
-    ).encode("ascii")
-    input_digest = hashlib.sha256(
-        asset_manifest_path.read_bytes()
-        + registration_path.read_bytes()
-        + correspondence_path.read_bytes()
-        + target_signature
-        + reference_signature
-        + str(TEXTURE_ALGORITHM_VERSION).encode("ascii")
-        + (
-            workspace.path("11_conditioning", "semantic_observations.json").read_bytes()
-            if workspace.path("11_conditioning", "semantic_observations.json").is_file()
-            else b""
-        )
-    ).hexdigest()
-    audit_path = workspace.path("11_conditioning", "facade_texture_audit.json")
-    if audit_path.is_file():
-        cached = _read(audit_path)
-        cached_textures = cached.get("textures") or []
-        if cached.get("input_digest") == input_digest and cached_textures and all(
-            (workspace.path("11_conditioning") / item["path"]).is_file()
-            for item in cached_textures
-        ):
-            payload["facade_textures"] = cached_textures
-            payload["appearance_profile"] = cached.get("appearance") or appearance
-            payload["reference_fusion"] = cached
-            return cached
 
+    target = next((volume for volume in payload.get("volumes", []) if volume.get("target")), None)
+    if not target:
+        return {"status": "unavailable", "reason": "no target volume"}
+
+    fp = target.get("fp") or []
+    wh = target.get("wh") or []
+    if len(fp) < 3:
+        return {"status": "unavailable", "reason": "target footprint too small"}
+
+    model_files_digest = b""
+    selection_path = None
+    model_path = None
     try:
         import pycolmap
         from pyproj import Transformer
@@ -448,10 +343,78 @@ def build(workspace: Workspace, payload: dict) -> dict:
         selection = _read(selection_path)
         model_path = _resolve_model_path(workspace, anchor_path, anchor)
         reconstruction = pycolmap.Reconstruction(str(model_path))
+
+        model_files = [
+            model_path / "cameras" / "cameras.txt",
+            model_path / "images" / "images.txt",
+            model_path / "points3D" / "points3D.txt",
+        ]
+        for p in model_files:
+            if p.is_file():
+                model_files_digest += p.read_bytes()
     except (ImportError, KeyError, OSError, ValueError) as exc:
         result = {"status": "unavailable", "reason": str(exc), "appearance": appearance}
         payload["appearance_profile"] = appearance
         return result
+
+    target_signature = json.dumps(
+        [{"fp": target.get("fp"), "h": target.get("h"), "wh": target.get("wh")}],
+        sort_keys=True,
+    ).encode("utf-8")
+    reference_signature = "".join(
+        hashlib.sha256(path.read_bytes()).hexdigest() for _asset_id, path in references
+    ).encode("ascii")
+    selection_digest = selection_path.read_bytes() if selection_path and selection_path.is_file() else b""
+    anchor_digest = anchor_path.read_bytes() if anchor_path and anchor_path.is_file() else b""
+    texture_masks = load_texture_masks(workspace)
+    masks_digest = json.dumps(
+        {k: v.fidelity for k, v in texture_masks.items()},
+        sort_keys=True,
+    ).encode("utf-8")
+
+    policy_thresholds = json.dumps(
+        {
+            "TEXEL_M_FACADE": 0.12,
+            "MIN_PIXELS_PER_M": 2.0,
+            "MAX_INCIDENCE_DEG": 65,
+            "PROXY_DEPTH_TOLERANCE_M": 0.25,
+            "LIDAR_CLASSES": [3, 4, 5],
+            "LIDAR_OCCLUSION_MARGIN_M": 1.5,
+            "POSE_MAX_ERROR_M": 0.5,
+            "REGISTRATION_HOLDOUT_MAX_P90_M": 3.0,
+            "MAD_OUTLIER_K": 2.5,
+            "MIN_INLIERS_FOR_CONSENSUS": 2,
+            "MAX_INLIER_SPREAD_DE": 12,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    input_digest = hashlib.sha256(
+        asset_manifest_path.read_bytes()
+        + registration_path.read_bytes()
+        + correspondence_path.read_bytes()
+        + target_signature
+        + reference_signature
+        + model_files_digest
+        + selection_digest
+        + anchor_digest
+        + masks_digest
+        + policy_thresholds
+        + str(TEXTURE_ALGORITHM_VERSION).encode("ascii")
+    ).hexdigest()
+
+    audit_path = workspace.path("11_conditioning", "facade_texture_audit.json")
+    if audit_path.is_file():
+        cached = _read(audit_path)
+        cached_textures = cached.get("textures") or []
+        if cached.get("input_digest") == input_digest and cached_textures and all(
+            (workspace.path("11_conditioning") / item["path"]).is_file()
+            for item in cached_textures
+        ):
+            payload["facade_textures"] = cached_textures
+            payload["appearance_profile"] = cached.get("appearance") or appearance
+            payload["reference_fusion"] = cached
+            return cached
 
     sim3 = selection["metrics"]["sim3"]
     origin_xy = Transformer.from_crs(
@@ -473,9 +436,10 @@ def build(workspace: Workspace, payload: dict) -> dict:
         ),
     }
 
-    views = []
-    view_ids = []
-    semantic_masks = _semantic_building_masks(workspace)
+    views: list[tuple] = []
+    view_ids: list[str] = []
+    triangles, face_ids = _build_triangles_from_payload(payload)
+
     for model_image in reconstruction.images.values():
         resolved = _asset_for_model_image(workspace, asset_manifest.get("assets", []), model_image.name)
         if resolved is None:
@@ -488,82 +452,185 @@ def build(workspace: Workspace, payload: dict) -> dict:
         camera = _RegisteredCamera(
             model_image, reconstruction.cameras[model_image.camera_id], transform
         )
-        # Toute vue résolue est conservée : le masque sémantique (s'il existe)
-        # sert d'occulteur, mais le polygone de façade projeté borne la vue même
-        # sans détection. On ne jette plus les poses COLMAP valides.
-        views.append((asset_id, rgb, camera, semantic_masks.get(asset_id)))
+        mask_info = texture_masks.get(asset_id)
+        building_mask = mask_info.building if mask_info else None
+        occluder_mask = mask_info.occluders if mask_info else None
+
+        proxy = ProxyDepth.render(camera, triangles, face_ids, rgb.shape[1], rgb.shape[0])
+        laz_path = workspace.path("06_geo", "site.laz")
+        laz_occ = LidarOcclusion.from_window(
+            None,
+            camera,
+            transform["scene_origin_xyz"],
+            camera.f,
+            rgb.shape[1],
+            rgb.shape[0],
+        )
+        if laz_path.is_file():
+            from .laz_cache import read_window
+            centre = tuple(float(v) for v in transform["scene_origin_xyz"][:2])
+            window = read_window(laz_path, centre, 80.0)
+            laz_occ = LidarOcclusion.from_window(
+                window, camera, transform["scene_origin_xyz"], camera.f,
+                rgb.shape[1], rgb.shape[0],
+            )
+
+        combined_mask = building_mask
+        if occluder_mask is not None and combined_mask is not None:
+            combined_mask = combined_mask & ~occluder_mask
+        elif occluder_mask is not None:
+            combined_mask = ~occluder_mask
+
+        views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ))
         view_ids.append(asset_id)
 
-    target = next((volume for volume in payload.get("volumes", []) if volume.get("target")), None)
+    ring = fp
+    signed_area = 0.5 * sum(
+        ring[index][0] * ring[(index + 1) % len(ring)][1]
+        - ring[(index + 1) % len(ring)][0] * ring[index][1]
+        for index in range(len(ring))
+    )
+    outward_factor = 1.0 if signed_area >= 0 else -1.0
+
     textures = []
-    if target and len(target.get("fp", [])) >= 3 and views:
-        ring = target["fp"]
-        signed_area = 0.5 * sum(
-            ring[index][0] * ring[(index + 1) % len(ring)][1]
-            - ring[(index + 1) % len(ring)][0] * ring[index][1]
-            for index in range(len(ring))
+    status_images = []
+    for edge_index, start in enumerate(ring):
+        end = ring[(edge_index + 1) % len(ring)]
+        length = float(np.hypot(end[0] - start[0], end[1] - start[1]))
+        if length < 5.0:
+            continue
+
+        wh_len = len(wh)
+        start_h = float(wh[edge_index]) if edge_index < wh_len else float(target.get("h") or 8.0)
+        end_h = float(wh[(edge_index + 1) % wh_len]) if (edge_index + 1) % max(wh_len, 1) < wh_len else float(target.get("h") or 8.0)
+
+        plane = plane_from_edge(
+            np.asarray([start[0], start[1], 0.0]),
+            np.asarray([end[0], end[1], 0.0]),
+            max(start_h, end_h),
+            f"EDGE_{edge_index:02d}",
+            top_z_start_m=start_h,
+            top_z_end_m=end_h,
         )
-        outward_factor = 1.0 if signed_area >= 0 else -1.0
-        for edge_index, start in enumerate(ring):
-            end = ring[(edge_index + 1) % len(ring)]
-            length = float(np.hypot(end[0] - start[0], end[1] - start[1]))
-            if length < 5.0:
+        plane.normal *= outward_factor
+
+        edge_views = []
+        for asset_id, rgb, camera, combined_mask, proxy, laz_occ in views:
+            facade_mask = _facade_polygon_mask(camera, plane, rgb.shape[1], rgb.shape[0])
+            if facade_mask is None:
                 continue
-            plane = plane_from_edge(
-                np.asarray([start[0], start[1], 0.0]),
-                np.asarray([end[0], end[1], 0.0]),
-                _edge_height(target, edge_index),
-                f"EDGE_{edge_index:02d}",
-            )
-            plane.normal *= outward_factor
-            edge_views = _views_for_edge(views, plane)
-            if not edge_views:
+            vis = facade_mask & combined_mask if combined_mask is not None else facade_mask
+            if not vis.any():
                 continue
-            ortho = rectify(plane, edge_views, texel_m=0.12)
-            if ortho.image is None or ortho.observed_fraction < 0.01:
+            pose_px, pose_m, cols_used = _pose_error_for_view(camera, plane, combined_mask if combined_mask is not None else facade_mask)
+            if pose_m > 0.5:
                 continue
-            observed = np.asarray([item.is_observed for item in ortho.support]).reshape(
-                ortho.height_px, ortho.width_px
-            )
-            atlas = _fill_texture(ortho.image, observed, appearance["brick"])
-            atlas, supplemental_reference = _supplemental_facade(
-                workspace, edge_index, atlas
-            )
-            image = Image.fromarray(atlas, "RGBA")
-            if image.width > 2048:
-                image.thumbnail((2048, 512))
-            name = f"edge_{edge_index:02d}.png"
-            image.save(output_dir / name, optimize=True)
-            report = ortho.as_dict()
-            textures.append(
-                {
-                    "edge_index": edge_index,
-                    "path": f"facade_textures/{name}",
-                    "width": image.width,
-                    "height": image.height,
-                    "observed_fraction": report["observed_fraction"],
-                    "disagreement_fraction": report["disagreement_fraction"],
-                    "views_used": report["provenance"].get("views_used", 0),
-                    "supplemental_reference": supplemental_reference,
-                }
-            )
+            edge_views.append((asset_id, rgb, camera, vis, proxy, laz_occ, pose_m))
+
+        if not edge_views:
+            continue
+
+        ortho = rectify(plane, edge_views, texel_m=0.12)
+        if ortho.image is None or ortho.observed_fraction < 0.01:
+            continue
+
+        observed = np.asarray([item.is_observed for item in ortho.support]).reshape(
+            ortho.height_px, ortho.width_px
+        )
+        rgb_atlas = np.zeros((ortho.height_px, ortho.width_px, 3), dtype=np.uint8)
+        rgb_atlas[observed] = ortho.image[observed]
+        alpha = _atlas_alpha(observed)
+        atlas = np.dstack((rgb_atlas, alpha))
+        atlas = np.flipud(atlas)
+
+        name = f"edge_{edge_index:02d}.png"
+        image = Image.fromarray(atlas, "RGBA")
+        if image.width > 2048:
+            image.thumbnail((2048, 512))
+        image.save(output_dir / name, optimize=True)
+
+        status_name = f"edge_{edge_index:02d}_status.png"
+        status_arr = np.zeros((ortho.height_px, ortho.width_px, 3), dtype=np.uint8)
+        status_colours = {
+            "OBSERVED_CONSENSUS": (82, 184, 92),
+            "OBSERVED_SINGLE": (120, 200, 130),
+            "REJECTED_DISAGREEMENT": (220, 90, 90),
+            "REJECTED_OCCLUDED": (255, 159, 67),
+            "REJECTED_SEMANTIC": (255, 176, 0),
+            "REJECTED_POSE": (220, 90, 220),
+            "REJECTED_RESOLUTION": (150, 150, 150),
+            "non_observe": (30, 30, 30),
+            "desaccord": (180, 80, 80),
+            "vue_unique": (100, 160, 100),
+            "accorde": (60, 120, 60),
+        }
+        for row in range(ortho.height_px):
+            for col in range(ortho.width_px):
+                texel = ortho.support[row * ortho.width_px + col]
+                status_arr[row, col] = status_colours.get(texel.status, (50, 50, 50))
+        status_img = Image.fromarray(np.flipud(status_arr), "RGB")
+        if status_img.width > 2048:
+            status_img.thumbnail((2048, 512))
+        status_img.save(output_dir / status_name, optimize=True)
+        status_images.append(status_name)
+
+        report = ortho.as_dict()
+        textures.append(
+            {
+                "edge_index": edge_index,
+                "path": f"facade_textures/{name}",
+                "status_path": f"facade_textures/{status_name}",
+                "width": image.width,
+                "height": image.height,
+                "observed_fraction": report["observed_fraction"],
+                "disagreement_fraction": report["disagreement_fraction"],
+                "views_used": report["provenance"].get("views_used", 0),
+                "top_z_start_m": start_h,
+                "top_z_end_m": end_h,
+                "by_status": report.get("by_status", {}),
+                "rejection_counts": report.get("provenance", {}).get("rejection_counts", {}),
+            }
+        )
 
     result = {
         "status": "ready" if textures else "unavailable",
         "input_digest": input_digest,
-        "method": "registered multi-view orthofacade with best-incidence fusion",
+        "method": "visibility-aware registered multi-view orthofacade",
         "registered_images_used": len(views),
         "registered_asset_ids": sorted(view_ids),
         "reference_images_catalogued": len(references),
         "textures": textures,
         "appearance": appearance,
         "contact_sheet": "facade_textures/reference_inventory_sheet.jpg",
+        "status_images": status_images,
     }
     payload["facade_textures"] = textures
     payload["appearance_profile"] = appearance
     payload["reference_fusion"] = result
+
+    _apply_feature_coverage(payload, textures)
     workspace.write_json("11_conditioning/facade_texture_audit.json", result)
     return result
+
+
+def _apply_feature_coverage(payload: dict, textures: list[dict]) -> None:
+    textures_by_edge = {item["edge_index"]: item for item in textures}
+    for feature in payload.get("facade_features") or []:
+        edge_index = feature.get("edge_index")
+        if edge_index is None:
+            continue
+        texture = textures_by_edge.get(edge_index)
+        if texture is None:
+            feature["texture_coverage"] = 0.0
+            feature["covered_by_photo"] = False
+            continue
+        vertices = feature.get("vertices") or []
+        if len(vertices) < 3:
+            feature["texture_coverage"] = 0.0
+            feature["covered_by_photo"] = False
+            continue
+        feature["texture_coverage"] = 0.0
+        feature["covered_by_photo"] = False
 
 
 __all__ = ["build"]
