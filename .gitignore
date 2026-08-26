@@ -1,5 +1,5 @@
 # Secrets — jamais committés (plan directeur §6)
-
+.env
 id_ed25519
 id_ed25519.pub
 runpod_gen
