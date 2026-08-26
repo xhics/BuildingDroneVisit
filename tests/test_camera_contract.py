@@ -471,6 +471,31 @@ def test_p20_le_zbuffer_projette_via_la_meme_canonical_camera() -> None:
     assert np.allclose(depth_contract, depth_render)
 
 
+def test_distorted_pixel_round_trips_through_unique_camera_ray() -> None:
+    camera = CanonicalCamera(
+        "SIMPLE_RADIAL", 1200, 800, [900.0, 600.0, 400.0, 0.18],
+        translation=np.array([2.0, -3.0, 1.0]),
+    )
+    pixel = np.array([1040.0, 690.0])
+    ray = camera.ray_from_pixel(*pixel, world=False)
+    point_camera = ray * (12.0 / ray[2])
+    world = camera.R.T @ (point_camera - camera.t)
+    projected, _ = camera.project(world[None, :])
+    np.testing.assert_allclose(projected[0], pixel, atol=1e-5)
+
+
+def test_exif_axis_rotation_transforms_translation_and_preserves_centre() -> None:
+    camera = CanonicalCamera(
+        "PINHOLE", 800, 600, [700.0, 710.0, 400.0, 300.0],
+        translation=np.array([4.0, -2.0, 7.0]),
+    )
+    transform = np.array([[0.0, -1.0, 600.0], [1.0, 0.0, 0.0]])
+    adapted = camera.adapt_to(transform, 600, 800)
+    np.testing.assert_allclose(adapted.position(), camera.position(), atol=1e-12)
+    q3 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    np.testing.assert_allclose(adapted.t, q3 @ camera.t)
+
+
 def test_p20_le_contrat_survit_a_la_serialisation_viewer() -> None:
     contract = CanonicalCamera(
         "SIMPLE_RADIAL",

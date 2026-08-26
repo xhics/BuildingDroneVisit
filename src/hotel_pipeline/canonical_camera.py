@@ -198,6 +198,50 @@ class CanonicalCamera:
         v = fy * vd + cy
         return np.column_stack([u, v]), depth
 
+    def undistort_pixel(self, u: float, v: float, *, iterations: int = 12) -> tuple[float, float]:
+        """Return undistorted normalized coordinates for one physical pixel."""
+        fx, fy = self.focal
+        cx, cy = self.principal
+        target_x, target_y = (float(u) - cx) / fx, (float(v) - cy) / fy
+        x, y = target_x, target_y
+        for _ in range(iterations):
+            distorted_x, distorted_y = self._distort(np.array([x]), np.array([y]))
+            error = np.array([target_x - distorted_x[0], target_y - distorted_y[0]])
+            if float(np.linalg.norm(error)) < 1e-12:
+                break
+            eps = 1e-7
+            dx_x, dx_y = self._distort(np.array([x + eps]), np.array([y]))
+            dy_x, dy_y = self._distort(np.array([x]), np.array([y + eps]))
+            jacobian = np.array([
+                [(dx_x[0] - distorted_x[0]) / eps, (dy_x[0] - distorted_x[0]) / eps],
+                [(dx_y[0] - distorted_y[0]) / eps, (dy_y[0] - distorted_y[0]) / eps],
+            ])
+            try:
+                delta = np.linalg.solve(jacobian, error)
+            except np.linalg.LinAlgError:
+                break
+            x += float(delta[0])
+            y += float(delta[1])
+        return x, y
+
+    def ray_from_pixel(self, u: float, v: float, *, world: bool = True) -> np.ndarray:
+        """Unique distortion-aware unprojection path used by every renderer."""
+        x, y = self.undistort_pixel(u, v)
+        ray = np.array([x, y, 1.0], dtype=np.float64)
+        ray /= np.linalg.norm(ray)
+        if world:
+            ray = self.R.T @ ray
+            ray /= np.linalg.norm(ray)
+        return ray
+
+    def unproject(self, u: float, v: float, depth: float) -> np.ndarray:
+        """Unproject a pixel at camera-space Z depth into world coordinates."""
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        x, y = self.undistort_pixel(u, v)
+        camera_point = np.array([x * depth, y * depth, depth], dtype=np.float64)
+        return self.R.T @ (camera_point - self.t)
+
     def position(self) -> np.ndarray:
         """Centre optique dans le monde : −Rᵀ t."""
         return -self.R.T @ self.t
@@ -286,17 +330,17 @@ class CanonicalCamera:
                 new_params[f_index] = max(fx_new, fy_new)
                 new_params[cx_index] = cx_new
                 new_params[cy_index] = cy_new
+            q3 = np.block([
+                [q, np.zeros((2, 1))],
+                [np.zeros((1, 2)), np.ones((1, 1))],
+            ])
             adapted = CanonicalCamera(
                 self.model,
                 new_width or int(round(abs(float(linear[0, 1])) * self.height + abs(float(linear[0, 0])) * self.width)),
                 new_height or int(round(abs(float(linear[1, 0])) * self.width + abs(float(linear[1, 1])) * self.height)),
                 new_params,
-                np.block([
-                    [q, np.zeros((2, 1))],
-                    [np.zeros((1, 2)), np.ones((1, 1))],
-                ])
-                @ self.R,
-                self.t.copy(),
+                q3 @ self.R,
+                q3 @ self.t,
                 self.near_m,
                 self.far_m,
                 self.camera_id,

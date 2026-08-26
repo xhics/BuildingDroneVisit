@@ -142,6 +142,24 @@ def segment_intersects_mesh(start: np.ndarray, end: np.ndarray, triangles: np.nd
     return False
 
 
+def capsule_intersects_mesh(
+    start: np.ndarray, end: np.ndarray, triangles: np.ndarray, radius_m: float,
+) -> bool:
+    """Conservative swept-volume test for a finite-radius camera/drone."""
+    if radius_m < 0:
+        raise ValueError("radius_m must be non-negative")
+    start, end = np.asarray(start, float), np.asarray(end, float)
+    if segment_intersects_mesh(start, end, triangles):
+        return True
+    length = float(np.linalg.norm(end - start))
+    step = max(radius_m * 0.5, 0.02)
+    count = max(2, int(math.ceil(length / step)) + 1)
+    return any(
+        distance_to_mesh(start + t * (end - start), triangles) <= radius_m
+        for t in np.linspace(0.0, 1.0, count)
+    )
+
+
 def yaw_pitch_quaternion(yaw_deg: float, pitch_deg: float) -> tuple[float, float, float, float]:
     """Camera orientation quaternion in xyzw convention (roll=0)."""
     yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
@@ -183,7 +201,7 @@ def _visible_fraction_from_points(
         return 0.0, 1.0, 0.0
 
     reconstructed = len(visible_pts) / len(points)
-    unknown = 0.0  # pas de carte de densité au MVP
+    unknown = max(0.0, 1.0 - reconstructed)
     return reconstructed, unknown, reconstructed
 
 
@@ -235,9 +253,9 @@ class CameraFeasibilityEvaluator:
         scene_distance = distance_to_mesh(np.asarray(position_local_m, dtype=float), triangles)
         collision = bool(scene_distance <= safety_radius_m)
         if previous_position_local_m is not None:
-            collision = collision or segment_intersects_mesh(
+            collision = collision or capsule_intersects_mesh(
                 np.asarray(previous_position_local_m, dtype=float),
-                np.asarray(position_local_m, dtype=float), triangles,
+                np.asarray(position_local_m, dtype=float), triangles, safety_radius_m,
             )
         distance_violation = False
 

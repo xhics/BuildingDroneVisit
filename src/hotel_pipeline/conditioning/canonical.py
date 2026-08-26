@@ -114,28 +114,37 @@ def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
     embarqué permet de le vérifier à chaque étape.
     """
     from .build_canonical import build_canonical_building_mesh
-    from .roof_planes import segment  # noqa: F401 - segmentation amont déjà faite
+    from .canonical_mesh import CanonicalSceneMesh
 
     footprint = np.asarray(item.get("fp", []), dtype=np.float64)
     wall_top = np.asarray(
         item.get("wh") or [float(item.get("h", 8.0))] * len(footprint),
         dtype=np.float64,
     )
-    mesh = build_canonical_building_mesh(
-        footprint,
-        top_heights=wall_top,
-        terrain=terrain,
-    )
+    canonical_payload = item.get("solid") or item.get("solid_mesh")
+    if canonical_payload:
+        mesh = CanonicalSceneMesh.from_dict(canonical_payload)
+    else:
+        mesh = build_canonical_building_mesh(
+            footprint,
+            top_heights=wall_top,
+            terrain=terrain,
+            interiors=[np.asarray(ring, dtype=float) for ring in item.get("interiors", [])],
+        )
+        if item.get("rv") and item.get("rf"):
+            measured_vertices = np.asarray(item["rv"], dtype=float)
+            measured_faces = np.asarray(item["rf"], dtype=int)
+            keep = np.asarray([kind != "roof" for kind in mesh.face_kind], dtype=bool)
+            offset = len(mesh.vertices)
+            mesh = CanonicalSceneMesh(
+                np.vstack([mesh.vertices, measured_vertices]),
+                np.vstack([mesh.faces[keep], measured_faces + offset]),
+                [kind for kind, good in zip(mesh.face_kind, keep) if good]
+                + ["roof"] * len(measured_faces),
+                mesh.records,
+            ).weld_vertices()
     mesh.feature_id = item.get("id")
     topology = mesh.audit()
-    roof = None
-    if item.get("rv") and item.get("rf"):
-        roof = {
-            "vertices": item["rv"],
-            "faces": item["rf"],
-            "provenance_class": "LIDAR_MEASURED",
-            "role": "measured_detail_overlay",
-        }
     payload = {
         "feature_id": item.get("id"),
         "target": bool(item.get("target")),
@@ -154,7 +163,7 @@ def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
         "solid_mesh": {**mesh.as_dict(), "feature_id": item.get("id")},
         "mesh_digest": mesh.mesh_digest(),
         "topology": topology,
-        "roof_surface": roof,
+        "roof_surface": None,
         "provenance_class": (
             "OCCLUDED_INFERRED" if item.get("assumed") else "LIDAR_MEASURED"
         ),
@@ -435,6 +444,17 @@ def build(workspace: Workspace) -> dict[str, Path]:
                 else "semantic planar surface audit is absent"
             ),
         ],
+    }
+    from ..reality_gate import assess_canonical_scene
+
+    assessments = assess_canonical_scene(payload)
+    payload["reality_gate"] = {
+        subject_id: {
+            "score": assessment.score,
+            "level": assessment.level.value,
+            "failed_evidence": list(assessment.failed_evidence),
+        }
+        for subject_id, assessment in assessments.items()
     }
     scene_path = workspace.write_json("11_conditioning/conditioned_scene.json", payload)
     topology_path = workspace.write_json(

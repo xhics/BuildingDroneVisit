@@ -141,7 +141,10 @@ def _resample_path(points: list[Waypoint], count: int) -> list[Waypoint]:
 
     cumulative = [0.0]
     for a, b in zip(points, points[1:]):
-        cumulative.append(cumulative[-1] + math.dist((a.east_m, a.north_m), (b.east_m, b.north_m)))
+        cumulative.append(cumulative[-1] + math.dist(
+            (a.east_m, a.north_m, a.altitude_m),
+            (b.east_m, b.north_m, b.altitude_m),
+        ))
     total = cumulative[-1]
     if total <= 0:
         return [points[0]] * count

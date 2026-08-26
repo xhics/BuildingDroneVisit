@@ -158,6 +158,23 @@
         }
         window.droneGroundHeight = groundHeight;
         window.droneTopHeight = topHeight;
+
+        // Sol mesuré **sous chaque pose**, et non une fois pour tout le site.
+        // Un datum unique suppose un terrain plat : sur un relief marqué (une
+        // falaise, par exemple) il place la caméra sous la roche, qui filme
+        // alors l'envers du maillage. Les poses sans mesure retombent sur le
+        // datum global.
+        if (waypoints.length) {
+          try {
+            const along = waypoints.map((w) => Cesium.Cartographic.fromDegrees(w.lon, w.lat));
+            const sampledPath = await viewer.scene.sampleHeightMostDetailed(along);
+            window.droneGroundPerPose = sampledPath.map((c) =>
+              c && Number.isFinite(c.height) ? c.height : groundHeight
+            );
+          } catch (e) {
+            window.droneGroundPerPose = null;
+          }
+        }
         window.droneReady = true;
       } catch (err) {
         window.droneError = String(err && err.message ? err.message : err);
@@ -191,9 +208,12 @@
 
     window.droneSeek = async function (index, timeoutMs) {
       const w = waypoints[index];
-      // `agl` = hauteur au-dessus du sol ; le référentiel absolu est ajouté
-      // ici à partir de la mesure faite sur les tuiles.
-      const height = window.droneGroundHeight + w.agl;
+      // `agl` = hauteur au-dessus du sol, mesuré sous cette pose précise.
+      const localGround =
+        window.droneGroundPerPose && Number.isFinite(window.droneGroundPerPose[index])
+          ? window.droneGroundPerPose[index]
+          : window.droneGroundHeight;
+      const height = localGround + w.agl;
       viewer.camera.setView({
         destination: Cesium.Cartesian3.fromDegrees(w.lon, w.lat, height),
         orientation: {

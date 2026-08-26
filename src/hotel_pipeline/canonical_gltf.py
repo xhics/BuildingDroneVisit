@@ -31,9 +31,24 @@ def triangle_provenance(payload: dict) -> list[dict]:
     records: list[dict] = []
     for vi, volume in enumerate(payload.get("volumes", [])):
         mesh = volume.get("solid") or volume.get("solid_mesh") or {}
+        kinds = mesh.get("face_kind") or ["wall"] * len(mesh.get("faces") or [])
+        building_id = str(volume.get("building_id") or volume.get("feature_id") or f"building-{vi}")
+        part_id = str(volume.get("part_id") or "main")
         for face_index, face in enumerate(mesh.get("faces") or []):
+            kind = kinds[face_index] if face_index < len(kinds) else "unknown"
+            surface_type = {
+                "wall": SurfaceType.FACADE,
+                "roof": SurfaceType.ROOF,
+                "roof_step": SurfaceType.ROOF,
+                "base": SurfaceType.TERRAIN,
+            }.get(kind, SurfaceType.UNKNOWN)
             for _ in range(1, len(face)-1):
-                records.append(_evidence(volume, triangle_id=len(records), surface_id=f"volume-{vi}-face-{face_index}", surface_type=SurfaceType.FACADE))
+                records.append(_evidence(
+                    volume,
+                    triangle_id=len(records),
+                    surface_id=f"{building_id}/{part_id}/{kind}/{face_index}",
+                    surface_type=surface_type,
+                ))
     terrain = payload.get("terrain") or {}
     for face_index, face in enumerate(terrain.get("faces") or []):
         for _ in range(1, len(face)-1):

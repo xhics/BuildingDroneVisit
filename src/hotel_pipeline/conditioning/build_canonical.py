@@ -297,3 +297,29 @@ def build_canonical_building_mesh(
     welded.records = records
     welded.hole_records = hole_records
     return welded
+
+
+def attach_canonical_meshes(scene, terrain=None) -> list[dict]:  # noqa: ANN001
+    """Attach the authoritative mesh once, preserving roof planes and courtyards."""
+    attached: list[dict] = []
+    for prism in scene.prisms:
+        top = prism.height_m
+        if prism.roof_vertices is not None and len(prism.roof_vertices):
+            top = np.asarray(prism.roof_vertices, dtype=float)[:, 2].max()
+        prism.canonical_mesh = build_canonical_building_mesh(
+            prism.footprint,
+            top_heights=float(top),
+            terrain=terrain,
+            roof_decomposition=prism.roof_planes,
+            interiors=list(getattr(prism, "interior_rings", [])),
+        )
+        prism.canonical_mesh.feature_id = prism.feature_id
+        attached.append({
+            "feature_id": prism.feature_id,
+            "mesh_digest": prism.canonical_mesh.mesh_digest(),
+            "faces": len(prism.canonical_mesh.faces),
+        })
+    return attached
+
+
+__all__ = ["attach_canonical_meshes", "build_canonical_building_mesh"]

@@ -67,47 +67,94 @@ def _detect_scale(address: str, places_key: str | None) -> tuple[float, float, f
     return radius_scale, altitude_scale, diagonal
 
 
-def _regenerate_from_render(
-    args, geocoded: dict, frames_dir: Path, maneuvers: list, out_dir: Path, label: str
+def _restyle_flight(
+    args, geocoded: dict, rendered: Path, out_dir: Path, label: str
 ) -> list[Path]:  # noqa: ANN001
-    """Régénère chaque plan par l'IA à partir des images rendues en 3D.
+    """Retexture le vol rendu en préservant sa géométrie, tronçon par tronçon.
 
-    Le rendu 3D fixe la trajectoire, la géométrie et le cadrage ; le
-    générateur fournit ce que le moteur 3D ne sait pas produire — flou de
-    mouvement, matière photographique, lumière. Lève :class:`SogniCliError`
-    au premier plan en échec plutôt que de continuer à facturer.
+    La régénération libre (Ref2VA) échouait ici : ne contraignant aucune
+    image, le modèle reconstruisait le bâtiment à sa façon en cours de plan.
+    Le conditionnement ControlNet contraint **chaque** image, si bien que le
+    générateur ne peut plus agir que sur la matière — lumière, reflets, flou
+    de mouvement — que le moteur 3D ne sait pas produire.
+
+    Le vol est découpé avant traitement : LTX v2v ne traite que des plans
+    courts.
     """
-    from .aerial_journey import build_aerial_prompt, select_segments, total_cost_hint
     from .production_plan import TIMES_OF_DAY
-    from .sogni_cli import generate_from_references
+    from .sogni_cli import MAX_V2V_SECONDS, restyle_video, split_video
 
-    frames = sorted(frames_dir.glob("frame_*.png"))
-    segments = select_segments(
-        frames, maneuvers,
-        segment_seconds=args.ai_segment_seconds, source_fps=args.render_3d_fps,
-    )
-    if not segments:
-        return []
-
+    chunks = split_video(rendered, out_dir / f"tronçons_{label}", chunk_seconds=MAX_V2V_SECONDS)
     look = TIMES_OF_DAY.get(args.time_of_day)
     establishment = geocoded["formatted_address"].split(",")[0]
-    print(f"  {label} : {total_cost_hint(segments)} — facturé…")
 
+    # Nommer l'établissement et décrire ses matériaux pèse autant que le
+    # conditionnement : à prompt générique, le modèle produit *un* bâtiment du
+    # même genre plutôt que *celui-là*. La description vient du classement
+    # visuel des photos réelles quand il est disponible.
+    materials = _describe_materials(args, geocoded, out_dir)
+    prompt = (
+        f"{establishment}, vue aérienne réelle filmée au drone. "
+        "Conserver exactement l'architecture, la silhouette et les matériaux du "
+        f"bâtiment de la vidéo source{materials}. Ne rien ajouter ni retirer à "
+        "sa structure. "
+        f"{look.look_fr if look else 'lumière naturelle directionnelle'}. "
+        "Rendu photographique de caméra : flou de mouvement naturel, profondeur "
+        "de champ, reflets et matières réalistes, grain fin."
+    )
+
+    print(
+        f"  {label} : {len(chunks)} tronçon(s) retexturés "
+        f"({args.control_mode}, force {args.control_strength}) — facturé…"
+    )
     produced: list[Path] = []
-    for index, segment in enumerate(segments):
-        prompt = build_aerial_prompt(
-            segment, establishment_fr=establishment,
-            time_of_day_fr=look.look_fr if look else "",
-        )
+    for index, chunk in enumerate(chunks):
         produced.append(
-            generate_from_references(
-                segment.frames, prompt,
+            restyle_video(
+                chunk, prompt,
                 out_path=out_dir / f"ia_{label}_{index:02d}.mp4",
-                duration_s=segment.duration_s,
+                control=args.control_mode, control_strength=args.control_strength,
             )
         )
-        print(f"    plan {index + 1}/{len(segments)} ({segment.name_fr})", flush=True)
+        print(f"    tronçon {index + 1}/{len(chunks)}", flush=True)
     return produced
+
+
+def _possessive(name: str) -> str:
+    from .interior_journey import possessive_fr
+
+    return possessive_fr(name)
+
+
+def _describe_materials(args, geocoded: dict, out_dir: Path) -> str:  # noqa: ANN001
+    """Description de la façade, tirée d'une vraie photo de l'établissement.
+
+    Le conditionnement structurel impose la forme, pas la matière : sans
+    mention explicite de la brique, de la pierre ou du cuivre, le modèle
+    choisit lui-même et produit un bâtiment plausible mais différent. On
+    reprend donc la photo d'extérieur déjà téléchargée et sa description.
+    """
+    sources = out_dir / "sources"
+    if not sources.exists():
+        return ""
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if not openai_key:
+        return ""
+
+    from .hotel_sources import HotelSourceError, SourcePhoto, classify_photos
+
+    photos = [SourcePhoto(p) for p in sorted(sources.glob("*.jpg"))[:4]]
+    if not photos:
+        return ""
+    try:
+        classify_photos(photos, openai_key)
+    except HotelSourceError:
+        return ""
+
+    for photo in photos:
+        if photo.category == "exterieur" and photo.description_fr:
+            return f" — {photo.description_fr.rstrip('.').lower()}"
+    return ""
 
 
 def _interior_stops(args, geocoded: dict, out_dir: Path) -> list:  # noqa: ANN001
@@ -335,17 +382,22 @@ def _render_traverse(
     aerial_before = [legs["avant"]]
     aerial_after = [legs["apres"]]
     if args.ai_final:
-        try:
-            aerial_before = _regenerate_from_render(
-                args, geocoded, out_dir / "vol_avant_frames", before, out_dir, "avant"
-            ) or aerial_before
-            aerial_after = _regenerate_from_render(
-                args, geocoded, out_dir / "vol_apres_frames", after, out_dir, "apres"
-            ) or aerial_after
-        except SogniCliError as exc:
-            print(f"Régénération IA échouée : {exc}", file=sys.stderr)
-            print("  (les rendus 3D restent disponibles)", file=sys.stderr)
-            return 1
+        # Un plan en échec ne doit pas emporter la série : les plans déjà
+        # produits sont facturés, et le rendu 3D reste un repli exploitable.
+        # On dégrade cette partie-là, sans interrompre le reste.
+        for key in ("avant", "apres"):
+            try:
+                produced = _restyle_flight(
+                    args, geocoded, legs[key], out_dir, key
+                )
+            except SogniCliError as exc:
+                print(f"  plan(s) « {key} » en échec : {exc}", file=sys.stderr)
+                print("  -> repli sur le rendu 3D pour cette partie", file=sys.stderr)
+                continue
+            if produced and key == "avant":
+                aerial_before = produced
+            elif produced:
+                aerial_after = produced
 
     try:
         final = concat_videos(
@@ -459,10 +511,31 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--control-mode",
+        default="canny",
+        choices=["depth", "canny", "detailer"],
+        help=(
+            "Conditionnement structurel de la retexturation (défaut: depth). "
+            "'depth' impose les volumes, 'canny' les contours, 'detailer' préserve "
+            "tout sans changer le style. C'est ce qui empêche le modèle de "
+            "reconstruire le bâtiment à sa façon."
+        ),
+    )
+    parser.add_argument(
+        "--control-strength",
+        type=float,
+        default=0.95,
+        help=(
+            "Force du conditionnement (défaut: 0.85). Plus haut, le modèle colle à "
+            "la géométrie source ; plus bas, il réinterprète — sous 0.6 il commence "
+            "à s'écarter du bâtiment réel."
+        ),
+    )
+    parser.add_argument(
         "--ai-segment-seconds",
         type=int,
-        default=10,
-        help="Durée de chaque plan régénéré (défaut: 10 s ; le modèle accepte 6 à 15)",
+        default=15,
+        help="Durée des tronçons envoyés à la retexturation (défaut: 15 s, maximum LTX v2v)",
     )
     parser.add_argument(
         "--interior-seconds",

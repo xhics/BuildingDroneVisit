@@ -563,6 +563,11 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     coverage_path = workspace.path("coverage", "coverage_report.json")
     constraints_path = workspace.path("coverage", "camera_constraints.json")
     confidence_path = workspace.path("coverage", "zone_confidence.geojson")
+    canonical_scene_path = workspace.path("11_conditioning", "conditioned_scene.json")
+    if not canonical_scene_path.is_file():
+        raise FileNotFoundError(
+            "conditioned_scene.json absent: production packaging refuses legacy extrusion"
+        )
     capture = _json(capture_path)
     coverage = _json(coverage_path)
     constraints = _json(constraints_path)
@@ -611,6 +616,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         "coverage_report": _sha256(coverage_path),
         "camera_constraints": _sha256(constraints_path),
         "zone_confidence": _sha256(confidence_path),
+        "canonical_scene": _sha256(canonical_scene_path),
         "router_decision": _sha256(router_path),
         "dtm": dtm.sha256,
         "dsm_roof": roof.sha256,
@@ -652,6 +658,11 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         raise ValueError(f"staging antérieur à examiner avant reprise : {folder}")
     folder.mkdir(parents=True, exist_ok=False)
 
+    from .canonical_gltf import export_canonical_gltf
+
+    export_canonical_gltf(_json(canonical_scene_path), folder / "canonical_scene.gltf")
+
+    # Legacy/debug only; no production consumer references this proxy.
     obj_path = folder / "environment.obj"
     _write_atomic(obj_path, _extruded_obj(polygon, 0.0, float(height_m)))
     _write_atomic(
@@ -765,7 +776,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         "contract_version": 1,
         "real_provider_call_performed": False,
         "generation_goal": "prévisualisation promotionnelle d'un volume hôtelier hybride",
-        "required_inputs": ["environment.obj", "camera_path.json", "zone_confidence.geojson"],
+        "required_inputs": ["canonical_scene.gltf", "camera_path.json", "zone_confidence.geojson"],
         "positive_constraints": [
             "conserver exactement la silhouette et les proportions du mesh fourni",
             "conserver le contexte spatial ; ne déplacer ni routes ni bâtiments voisins",
@@ -814,7 +825,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         "# Exécuter dans Blender: blender --background --python blender_import.py\n"
         "import bpy\nfrom pathlib import Path\n"
         "root = Path(__file__).resolve().parent\n"
-        "bpy.ops.wm.obj_import(filepath=str(root / 'environment.obj'))\n"
+        "bpy.ops.import_scene.gltf(filepath=str(root / 'canonical_scene.gltf'))\n"
         "bpy.ops.wm.save_as_mainfile(filepath=str(root / 'environment.blend'))\n",
     )
     _write_atomic(
@@ -825,7 +836,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         "une orbite virtuelle et les claims interdits.\n\n"
         "## Utilisation\n\n"
         "- Lire `scene.json` avant tout autre fichier.\n"
-        "- Importer `environment.obj` dans un outil 3D, ou exécuter "
+        "- Importer `canonical_scene.gltf` dans un outil 3D, ou exécuter "
         "`blender --background --python blender_import.py`.\n"
         "- Fournir `camera_path.json` et `video_prompts.json` au connecteur "
         "vidéo choisi.\n"
@@ -944,7 +955,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
                 )
             ),
         ),
-        GateCheck(gate_id="inspectable", requirement="environnement 3D inspectable", state=GateState.PASSED, evidence=["environment.obj"]),
+        GateCheck(gate_id="inspectable", requirement="environnement 3D canonique inspectable", state=GateState.PASSED, evidence=["canonical_scene.gltf"]),
         GateCheck(gate_id="alignment", requirement="géoréférencement documenté", state=GateState.PASSED, evidence=[dtm.crs_horizontal, str(dtm.crs_vertical)]),
         GateCheck(gate_id="critical_objects", requirement="objets critiques établis", state=GateState.FAILED, evidence=coverage.get("unresolved_objects") or ["état inconnu"]),
         GateCheck(gate_id="current_entrance", requirement="entrée actuelle distinguée", state=GateState.FAILED, evidence=["ENTRANCE_MAIN_CURRENT unresolved"]),
@@ -988,6 +999,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
     )
 
     files = [
+        _package_file(folder, "canonical_scene.gltf", "canonical_scene_mesh", EvidenceClass.MEASURED, ["11_conditioning/conditioned_scene.json"]),
         _package_file(folder, "environment.obj", "building_volume", EvidenceClass.PROXY, ["BUILDING_MAIN", "ndsm"]),
         _package_file(folder, "environment.mtl", "proxy_materials", EvidenceClass.PROXY, ["camera_constraints.json"]),
         _package_file(folder, "dtm.tif", "terrain", EvidenceClass.INFERRED, [dtm.artifact_id]),
@@ -997,7 +1009,7 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         _package_file(folder, "camera_constraints.json", "camera_constraints", EvidenceClass.INFERRED, ["coverage/camera_constraints.json"]),
         _package_file(folder, "camera_path.json", "virtual_camera_path", EvidenceClass.PROXY, ["BUILDING_MAIN", "pipeline_policy.collection.image_fov_deg"]),
         _package_file(folder, "video_prompts.json", "video_prompt_contract", EvidenceClass.PROXY, ["camera_constraints.json", "zone_confidence.geojson"]),
-        _package_file(folder, "blender_import.py", "blender_import", EvidenceClass.PROXY, ["environment.obj"]),
+        _package_file(folder, "blender_import.py", "blender_import", EvidenceClass.PROXY, ["canonical_scene.gltf"]),
         _package_file(folder, "README.md", "integration_guide", EvidenceClass.PROXY, ["scene.json", "phase1_verdict.json"]),
         _package_file(folder, "phase1_verdict.json", "phase1_verdict", EvidenceClass.INFERRED, [router_name, "coverage/coverage_report.json"]),
     ]

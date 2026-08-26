@@ -5,6 +5,8 @@ id_ed25519.pub
 runpod_gen
 runpod_gen.pub
 
+.mp4
+
 # Espaces de travail et artefacts
 work/
 *.tmp

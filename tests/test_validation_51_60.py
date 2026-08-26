@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from hotel_pipeline.camera_feasibility import distance_to_mesh, segment_intersects_mesh
+from hotel_pipeline.camera_feasibility import capsule_intersects_mesh, distance_to_mesh, segment_intersects_mesh
 from hotel_pipeline.dense_holdout_renderer import rasterize_canonical_mesh, silhouette_iou
 from hotel_pipeline.geo.facade_visibility import local_facade_reprojection_gate
 from hotel_pipeline.sparse_reprojection import load_points_by_id
@@ -52,6 +52,13 @@ def test_mesh_clearance_is_translation_invariant():
 def test_path_crossing_a_wall_collides():
     wall = np.array([[0, -2, -2], [0, 2, -2], [0, 0, 2]], float)
     assert segment_intersects_mesh(np.array([-1, 0, 0.0]), np.array([1, 0, 0.0]), np.array([wall]))
+
+
+def test_camera_capsule_rejects_near_miss_without_centreline_intersection():
+    wall = np.array([[0, -2, -2], [0, 2, -2], [0, 0, 2]], float)
+    start, end = np.array([-1, 0.2, 2.2]), np.array([1, 0.2, 2.2])
+    assert not segment_intersects_mesh(start, end, np.array([wall]))
+    assert capsule_intersects_mesh(start, end, np.array([wall]), 0.35)
 
 
 def test_local_facade_failure_cannot_hide_in_global_score():

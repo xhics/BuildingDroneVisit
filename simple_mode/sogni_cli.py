@@ -56,6 +56,13 @@ DEFAULT_CHAIN_KEYFRAMES = 6
 
 DEFAULT_TIMEOUT_S = 600
 
+#: La génération par références (Ref2VA) est nettement plus lente que les
+#: clips de transition : mesuré à 9-10 minutes par plan de 10 s, ce qui
+#: heurtait le délai de 600 s et faisait échouer le 4ᵉ plan d'une série
+#: après trois réussites. Large marge pour absorber la variabilité du réseau
+#: de calcul.
+REFERENCE_TIMEOUT_S = 2400
+
 
 class SogniCliError(RuntimeError):
     """L'appel à `sogni-agent` a échoué, ou l'outil est introuvable."""
@@ -253,7 +260,7 @@ def generate_from_references(
     video_model: str = REFERENCE_VIDEO_MODEL,
     width: int = 1344,
     height: int = 768,
-    timeout: int = DEFAULT_TIMEOUT_S,
+    timeout: int = REFERENCE_TIMEOUT_S,
 ) -> Path:
     """Génère un plan à partir d'un **jeu de références**, sans image imposée.
 
@@ -302,6 +309,151 @@ def generate_from_references(
         )
         raise SogniCliError(
             f"génération par références échouée (code {result.returncode}) — "
+            f"détail dans {log_path} :\n{(result.stderr or result.stdout)[-1500:]}"
+        )
+    return out_path
+
+
+#: Modèle LTX 2.5 vidéo-vers-vidéo, qui accepte le conditionnement ControlNet.
+V2V_MODEL = "ltx25-v2v"
+
+#: Force du conditionnement structurel. Sogni recommande 0.85 pour
+#: ``depth``/``canny``, mais l'essai sur le Château Frontenac a montré qu'à
+#: cette valeur le modèle produit *un* château, pas *ce* château. À 0.95 avec
+#: ``canny``, brique, toitures et tourelles sont conservées.
+DEFAULT_CONTROL_STRENGTH = 0.95
+
+#: ``canny`` (contours) plutôt que ``depth`` (volumes) : la profondeur ne
+#: transmet que la masse, si bien que le modèle réinvente le style. Les
+#: contours portent le dessin des tourelles, les lignes de toiture et le
+#: rythme des fenêtres — c'est-à-dire l'identité du bâtiment.
+DEFAULT_CONTROL_MODE = "canny"
+
+
+#: LTX v2v traite des plans courts ; au-delà le worker refuse ou tronque.
+#: On découpe donc le vol rendu avant de le retexturer, puis on recolle.
+MAX_V2V_SECONDS = 15
+
+
+def _video_duration_s(path: str | Path) -> float | None:
+    """Durée d'une vidéo, via ffprobe ; ``None`` si elle n'est pas lisible."""
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        return None
+    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe"))
+    if not Path(ffprobe).exists():
+        ffprobe = "ffprobe"
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        return float(result.stdout.strip()) if result.returncode == 0 else None
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def split_video(
+    source: str | Path, out_dir: str | Path, *, chunk_seconds: int = MAX_V2V_SECONDS
+) -> list[Path]:
+    """Découpe une vidéo en tronçons de durée fixe, sans ré-encoder l'image.
+
+    Le découpage se fait sur les images-clés (``-c copy``) : rapide et sans
+    perte, au prix de tronçons dont la durée exacte peut varier de quelques
+    dixièmes de seconde.
+    """
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is None:
+        raise SogniCliError("ffmpeg introuvable — requis pour découper la vidéo")
+
+    source = Path(source)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / f"{source.stem}_%03d.mp4"
+
+    command = [
+        ffmpeg, "-y", "-v", "error", "-i", str(source),
+        "-c", "copy", "-map", "0",
+        "-segment_time", str(chunk_seconds), "-f", "segment",
+        "-reset_timestamps", "1", str(pattern),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    chunks = sorted(out_dir.glob(f"{source.stem}_*.mp4"))
+    if result.returncode != 0 or not chunks:
+        raise SogniCliError(f"découpage échoué :\n{result.stderr[-1000:]}")
+    return chunks
+
+
+def restyle_video(
+    source_video: str | Path,
+    prompt: str,
+    *,
+    out_path: str | Path,
+    control: str = DEFAULT_CONTROL_MODE,
+    control_strength: float = DEFAULT_CONTROL_STRENGTH,
+    appearance_image: str | Path | None = None,
+    duration_s: int | None = None,
+    video_model: str = V2V_MODEL,
+    timeout: int = REFERENCE_TIMEOUT_S,
+) -> Path:
+    """Retexture une vidéo **sans toucher à sa géométrie**.
+
+    C'est la réponse au décrochage observé en génération libre : là où
+    ``flf2v`` ne fixe que deux images et ``r2v`` aucune, le conditionnement
+    ControlNet contraint **chaque** image du plan. Le modèle ne peut alors
+    plus reconstruire le sujet à sa façon — il n'a la main que sur la
+    matière : lumière, reflets, flou de mouvement, grain.
+
+    ``control`` : ``depth`` (volumes), ``canny`` (contours) ou ``detailer``
+    (préservation maximale, sans changement de style). ``control_strength``
+    règle le compromis fidélité / liberté.
+    """
+    sogni_agent = _find_sogni_agent()
+    if sogni_agent is None:
+        raise SogniCliError(
+            "sogni-agent introuvable. Installer avec : "
+            "npm install -g @sogni-ai/sogni-creative-agent-skill@latest"
+        )
+    source_video = Path(source_video)
+    if not source_video.exists():
+        raise SogniCliError(f"vidéo source introuvable : {source_video}")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        sogni_agent, "--video", "--workflow", "v2v", "-m", video_model,
+        "--ref-video", str(source_video),
+        "--controlnet-name", control,
+        "--controlnet-strength", str(control_strength),
+    ]
+    # Photo réelle du sujet. Le conditionnement structurel n'impose que la
+    # forme : sans référence d'apparence, le modèle invente les matériaux et
+    # produit un bâtiment du bon genre mais pas le bon. La doc LTX 2.5 décrit
+    # `--ref` comme la « subject appearance » aux côtés de `--ref-video`.
+    if appearance_image is not None:
+        appearance_image = Path(appearance_image)
+        if not appearance_image.exists():
+            raise SogniCliError(f"image d'apparence introuvable : {appearance_image}")
+        command += ["--ref", str(appearance_image)]
+    # Sans durée explicite, le worker retombe sur sa valeur par défaut et
+    # tronque : mesuré à 5 s de sortie pour 13 s de source.
+    if duration_s is None:
+        duration_s = _video_duration_s(source_video)
+    if duration_s:
+        command += ["--duration", str(round(duration_s))]
+    command += ["-o", str(out_path), "--json", prompt]
+    result = _run(command, timeout=timeout, env={**os.environ})
+    if result.returncode != 0 or not out_path.exists():
+        log_path = out_path.with_suffix(".log")
+        log_path.write_text(
+            f"COMMAND: {command}\nRETURNCODE: {result.returncode}\n\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n",
+            encoding="utf-8",
+        )
+        raise SogniCliError(
+            f"retexturation v2v échouée (code {result.returncode}) — "
             f"détail dans {log_path} :\n{(result.stderr or result.stdout)[-1500:]}"
         )
     return out_path

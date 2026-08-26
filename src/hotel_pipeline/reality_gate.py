@@ -230,10 +230,50 @@ def validate_camera_path_reality(
     return not reasons, tuple(reasons)
 
 
+def assess_canonical_scene(
+    scene: dict, measured_evidence: dict[str, dict] | None = None,
+) -> dict[str, RealityAssessment]:
+    """Measure every canonical volume from real artifacts, failing closed.
+
+    ``measured_evidence`` is keyed by feature/building id and must contain
+    renderer/reprojection/LiDAR measurements. Missing metrics stay ``None``;
+    they are never replaced with optimistic defaults.
+    """
+    evidence = measured_evidence or {}
+    assessments: dict[str, RealityAssessment] = {}
+    for index, building in enumerate(scene.get("buildings", scene.get("volumes", []))):
+        subject_id = str(building.get("feature_id") or building.get("id") or f"building-{index}")
+        row = evidence.get(subject_id, {})
+        topology = building.get("topology") or {}
+        provenance = (
+            building.get("triangle_provenance")
+            or building.get("source_ids")
+            or ([building.get("provenance_class")] if building.get("provenance_class") else [])
+        )
+        measured_fraction = float(row.get("measured_geometry_fraction", 0.0))
+        inferred_fraction = float(row.get("inferred_geometry_fraction", max(0.0, 1.0 - measured_fraction)))
+        metrics = RealityMetrics(
+            geometry_rmse_m=row.get("geometry_rmse_m"),
+            reprojection_p90_px=row.get("reprojection_p90_px"),
+            silhouette_iou=row.get("silhouette_iou"),
+            lidar_rmse_m=row.get("lidar_rmse_m"),
+            roof_topology_valid=topology.get("watertight") if topology else None,
+            terrain_contact_valid=row.get("terrain_contact_valid"),
+            occlusion_ordering_valid=row.get("occlusion_ordering_valid"),
+            manifold=(topology.get("non_manifold_edges") == 0) if "non_manifold_edges" in topology else None,
+            provenance_complete=bool(provenance),
+            measured_geometry_fraction=measured_fraction,
+            inferred_geometry_fraction=inferred_fraction,
+            texture_coverage=float(row.get("texture_coverage", 0.0)),
+        )
+        assessments[subject_id] = assess_reality(metrics)
+    return assessments
+
+
 __all__ = [
     "CanonicalSurfaceIdentity", "GeometryUncertainty", "MaterialAppearance",
     "PathSurfaceObservation", "PoseUncertainty", "RealityAssessment", "RealityMetrics",
-    "SiteStructure", "TemporalConflict", "TemporalSource", "assess_reality",
+    "SiteStructure", "TemporalConflict", "TemporalSource", "assess_canonical_scene", "assess_reality",
     "resolve_material_appearance", "temporal_conflicts", "validate_camera_path_reality",
     "validate_surface_assignments", "visible_fraction",
 ]

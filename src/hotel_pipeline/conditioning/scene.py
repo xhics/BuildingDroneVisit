@@ -52,6 +52,7 @@ class Prism:
     height_assumed: bool
     height_source: str
     is_target: bool
+    interior_rings: list[np.ndarray] = field(default_factory=list)
     roof_vertices: np.ndarray | None = None
     roof_faces: np.ndarray | None = None
     facade_relief: object | None = None
@@ -186,7 +187,7 @@ def _polygons_of(entry: dict) -> tuple[list[Polygon], dict | None]:
         simplification = {
             "rule": "MultiPolygon -> scene graph building parts",
             "parts_kept": len(parts),
-            "holes_dropped": sum(len(g.interiors) for g in parts),
+            "holes_preserved": sum(len(g.interiors) for g in parts),
             "area_dropped_m2": 0.0,
         }
     elif isinstance(geom, Polygon) and not geom.is_empty:
@@ -195,21 +196,14 @@ def _polygons_of(entry: dict) -> tuple[list[Polygon], dict | None]:
     if not parts:
         return [], simplification
 
-    kept: list[Polygon] = []
-    for part in parts:
-        if len(part.interiors) > 0 and not simplification:
-            simplification = {
-                "rule": "interior rings ignored",
-                "parts_dropped": 0,
-                "holes_dropped": len(part.interiors),
-                "area_dropped_m2": round(
-                    float(sum(g.area for g in part.interiors)), 2
-                ),
-            }
-        exterior_only = Polygon(part.exterior)
-        if not exterior_only.is_empty:
-            kept.append(exterior_only)
-    return kept, simplification
+    if any(part.interiors for part in parts) and not simplification:
+        simplification = {
+            "rule": "interior rings preserved",
+            "parts_dropped": 0,
+            "holes_preserved": sum(len(part.interiors) for part in parts),
+            "area_dropped_m2": 0.0,
+        }
+    return parts, simplification
 
 
 def _prisms_of(entry: dict) -> list[Prism]:
@@ -253,6 +247,10 @@ def _prisms_of(entry: dict) -> list[Prism]:
                 # Seule la partie principale porte la cible : la trajectoire
                 # ne doit pas orbiter autour d'une annexe.
                 is_target=(role in TARGET_ROLES) and not secondary,
+                interior_rings=[
+                    np.asarray(ring.coords[:-1], dtype=np.float64)
+                    for ring in poly.interiors
+                ],
                 geometry_simplification=simplification if index == 0 else None,
                 parent_building_id=feature_id if secondary else None,
                 part_index=index,

@@ -228,49 +228,27 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
 
 
 def _build_triangles_with_edges(payload: dict) -> tuple[list[np.ndarray], list[int], dict[str, list[int]]]:
+    """Read only authoritative canonical meshes; never re-extrude payload fields."""
     triangles: list[np.ndarray] = []
     face_ids: list[int] = []
     edge_face_ids: dict[str, list[int]] = {}
     fid = 0
     for volume_index, volume in enumerate(payload.get("volumes", [])):
-        fp = volume.get("fp") or []
-        wh = volume.get("wh") or []
-        h_default = float(volume.get("h") or 8.0)
-        if len(fp) >= 3:
-            for i in range(len(fp)):
-                j = (i + 1) % len(fp)
-                a = np.array([fp[i][0], fp[i][1], 0.0], dtype=np.float64)
-                b = np.array([fp[j][0], fp[j][1], 0.0], dtype=np.float64)
-                h_i = float(wh[i]) if i < len(wh) else h_default
-                h_j = float(wh[j]) if j < len(wh) else h_default
-                c = np.array([fp[j][0], fp[j][1], h_j], dtype=np.float64)
-                d = np.array([fp[i][0], fp[i][1], h_i], dtype=np.float64)
-                triangles.extend([[a, b, c], [a, c, d]])
-                face_ids.extend([fid, fid + 1])
-                key = f"{volume_index}:{i}"
-                edge_face_ids[key] = [fid, fid + 1]
-                fid += 2
-        rv = volume.get("rv") or []
-        rf = volume.get("rf") or []
-        if rv and rf:
-            for face in rf:
-                if len(face) >= 3:
-                    tri = np.asarray([rv[idx] for idx in face[:3]], dtype=np.float64)
-                    if tri.shape == (3, 3):
-                        triangles.append(tri)
-                        face_ids.append(fid)
-                        fid += 1
         solid = volume.get("solid") or {}
         sv = solid.get("vertices") or []
         sf = solid.get("faces") or []
-        if sv and sf:
-            for face in sf:
-                if len(face) >= 3:
-                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
-                    if tri.shape == (3, 3):
-                        triangles.append(tri)
-                        face_ids.append(fid)
-                        fid += 1
+        kinds = solid.get("face_kind") or ["wall"] * len(sf)
+        if not sv or not sf:
+            raise ValueError(f"volume {volume_index} has no canonical solid mesh")
+        for face_index, face in enumerate(sf):
+            tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
+            if tri.shape != (3, 3):
+                continue
+            triangles.append(tri)
+            face_ids.append(fid)
+            if face_index < len(kinds) and kinds[face_index] == "wall":
+                edge_face_ids.setdefault(f"{volume_index}:walls", []).append(fid)
+            fid += 1
     return triangles, face_ids, edge_face_ids
 
 
@@ -489,7 +467,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
         plane = plane_from_edge(np.asarray([start[0], start[1], 0.0]), np.asarray([end[0], end[1], 0.0]), max(start_h, end_h), f"EDGE_{edge_index:02d}", top_z_start_m=start_h, top_z_end_m=end_h)
         plane.normal *= outward_factor
 
-        edge_key = f"{target_volume_index}:{edge_index}" if target_volume_index is not None else None
+        edge_key = f"{target_volume_index}:walls" if target_volume_index is not None else None
         facade_face_ids = set(edge_face_ids.get(edge_key, [])) if edge_key else None
 
         edge_views = []

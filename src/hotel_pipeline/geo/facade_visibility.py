@@ -136,8 +136,6 @@ class ProxyDepth:
                     polygon = clip_polygon_to_image(screen, width, height)
                     if len(polygon) < 3:
                         continue
-                    fx, fy = _focal_of(camera)
-                    cx, cy = _principal_of(camera)
                     plane_point_cam = piece[0]
                     plane_normal_cam = np.cross(piece[1] - piece[0], piece[2] - piece[0])
                     norm_len = float(np.linalg.norm(plane_normal_cam))
@@ -202,11 +200,11 @@ class ProxyDepth:
             # Profondeur exacte par rayon en espace caméra : le pixel définit
             # la droite (xn, yn, 1) ; son intersection avec le plan du
             # triangle donne le Z perspective-exact.
-            rays_cam = np.column_stack([
-                (gx.ravel() - cx) / fx,
-                (gy.ravel() - cy) / fy,
-                np.ones(gx.ravel().size),
+            rays_world = np.asarray([
+                camera.ray_from_pixel(u, v) for u, v in zip(gx.ravel(), gy.ravel())
             ])
+            rays_cam = rays_world @ camera.R.T
+            rays_cam /= np.maximum(rays_cam[:, 2:3], 1e-12)
             denom = rays_cam @ plane_normal_cam
             safe_denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
             z_pixels = (denom_const / safe_denom).reshape(gx.shape)
