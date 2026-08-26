@@ -295,6 +295,7 @@ def test_p25_rectify_consomme_registeredview_et_rejette_locculte() -> None:
         asset_id="vue-1",
         camera=camera,
         image=image,
+        semantic_mask=np.ones((camera.height, camera.width), dtype=bool),
         proxy_depth=proxy,
     )
 
