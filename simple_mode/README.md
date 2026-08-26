@@ -133,6 +133,58 @@ python -m simple_mode.video "adresse" --max-keyframes 28  # plus d'images de ré
 défaut s'applique sans mise à l'échelle — comportement dégradé, pas une
 erreur bloquante.
 
+### Vrai vol de drone : `--render-3d` (Cesium + tuiles 3D Google)
+
+**C'est la voie qui applique réellement la trajectoire.** La voie Sogni
+ci-dessous ne transmet au modèle que deux photos et un prompt : la
+trajectoire calculée n'y est jamais utilisée, et le modèle invente tout
+l'intermédiaire entre une vue satellite verticale et une photo de rue —
+d'où des éléments qui apparaissent en cours de plan. Aucun prompt ne
+corrige ça : on ne peut pas dériver une vue oblique de drone d'une image
+satellite.
+
+Ici, chaque waypoint devient une pose de caméra géoréférencée dans CesiumJS,
+qui diffuse les tuiles 3D photoréalistes de Google (2500+ villes). Rendu
+**déterministe**, géométrie **mesurée**, et aucun coût de génération IA.
+
+```bash
+pip install playwright && python -m playwright install chromium
+winget install --id Gyan.FFmpeg
+
+python -m simple_mode.video "adresse" --render-3d
+python -m simple_mode.video "adresse" --render-3d \
+  --render-3d-duration 20 --render-3d-fps 24 --render-3d-size 1920x1080
+```
+
+Sortie : `video_out/flight_3d.mp4`. La clé `GOOGLE_MAPS_API_KEY` doit avoir
+accès à l'API Map Tiles — vérifier par un `HTTP 200` sur
+`https://tile.googleapis.com/v1/3dtiles/root.json?key=...`.
+
+#### Trois pièges rencontrés, et leur correctif
+
+1. **Référentiel d'altitude.** Cesium attend une hauteur au-dessus de
+   l'ellipsoïde WGS84 ; l'API Google Elevation renvoie une altitude
+   au-dessus du géoïde. L'écart atteint ~33 m à Mountain View — assez pour
+   transformer un vol rasant en vue d'horizon. Le sol est donc mesuré
+   directement sur les tuiles rendues (`sampleHeightMostDetailed`), après
+   quelques images de chauffe : échantillonner trop tôt donne une valeur
+   instable (15 m d'écart observés d'une exécution à l'autre).
+2. **Enveloppe de vol.** Ces tuiles sont reconstruites depuis des prises de
+   vue aériennes : nettes de loin et d'en haut, elles s'effondrent de près
+   (arbres informes, façades délavées). Mesuré : net à 45 m d'altitude /
+   55 m de distance, inexploitable à 27 m / 15 m. D'où `MIN_ALTITUDE_M` et
+   `MIN_RADIUS_M` dans `cesium_render.py`, qui bornent l'enveloppe sans
+   déformer la figure. Ces bornes couvrent aussi les altitudes négatives que
+   le chaînage peut produire.
+3. **WebGL logiciel.** En headless sans GPU, une boucle de rendu continue
+   sature le processus et fait expirer les captures. La scène est donc en
+   rendu à la demande (`requestRenderMode`), avec un délai de capture relevé.
+
+**Limite connue : pas d'intérieur.** Les tuiles 3D ne modélisent que
+l'extérieur. Traverser une façade montrerait le maillage vu de l'envers,
+c'est-à-dire du vide. L'effet de traversée du bâtiment doit rester une passe
+séparée (IA ou transition stylisée), pas un waypoint qui entre dans le bâti.
+
 ### Génération réelle : `--generate-sogni` (chaîne de clips MiniMax H3)
 
 Le schéma REST brut est confirmé (`sogni_client.py`), mais `referenceImageUrls`

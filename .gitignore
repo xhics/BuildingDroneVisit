@@ -41,3 +41,6 @@ welcominns-workspace.tar.gz.part-*
 /out.illustration.png
 simple_mode/out*
 video_out/
+video_out_3d/
+# Images intermédiaires du rendu Cesium (volumineuses, régénérables)
+*_frames/
