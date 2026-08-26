@@ -254,10 +254,32 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
 
 
 def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
+    """Triangles du textureur : lus dans le maillage canonique, jamais refaits.
+
+    Chaque volume porte son `solid` — l'instance canonique partagée avec le
+    renderer, la collision et l'export. L'extrusion locale de l'emprise et
+    la nappe `rv/rf` ne sont plus des sources : elles doublaient les
+    surfaces et divergeaient du maillage rendu. Le repli historique ne sert
+    qu'aux payloads antérieurs au contrat canonique.
+    """
     triangles: list[np.ndarray] = []
     face_ids: list[int] = []
     fid = 0
     for volume in payload.get("volumes", []):
+        solid = volume.get("solid") or {}
+        sv = solid.get("vertices") or []
+        sf = solid.get("faces") or []
+        if sv and sf:
+            for face in sf:
+                if len(face) >= 3:
+                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
+                    if tri.shape == (3, 3):
+                        triangles.append(tri)
+                        face_ids.append(fid)
+                        fid += 1
+            continue
+
+        # Repli legacy : payload sans maillage canonique.
         fp = volume.get("fp") or []
         wh = volume.get("wh") or []
         h_default = float(volume.get("h") or 8.0)
@@ -279,17 +301,6 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
             for face in rf:
                 if len(face) >= 3:
                     tri = np.asarray([rv[idx] for idx in face[:3]], dtype=np.float64)
-                    if tri.shape == (3, 3):
-                        triangles.append(tri)
-                        face_ids.append(fid)
-                        fid += 1
-        solid = volume.get("solid") or {}
-        sv = solid.get("vertices") or []
-        sf = solid.get("faces") or []
-        if sv and sf:
-            for face in sf:
-                if len(face) >= 3:
-                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
                     if tri.shape == (3, 3):
                         triangles.append(tri)
                         face_ids.append(fid)

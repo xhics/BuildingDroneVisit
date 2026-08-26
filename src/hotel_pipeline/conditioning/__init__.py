@@ -9,11 +9,14 @@ peinte d'une valeur plausible. Elle sort en `unknown` dans le masque de
 confiance, et le générateur reçoit l'autorisation explicite d'y improviser.
 """
 
+from .canonical_mesh import CanonicalSceneMesh, FootprintVertex
 from .scene import ConditioningScene, Prism, load_scene
 from .render import RenderedFrame, render_frame
 from .sequence import SequenceResult, render_sequence
 
 __all__ = [
+    "CanonicalSceneMesh",
+    "FootprintVertex",
     "ConditioningScene",
     "Prism",
     "load_scene",

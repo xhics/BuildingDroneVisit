@@ -339,11 +339,17 @@ def apply_to_scene(scene, laz_path, ground_z: float) -> dict:  # noqa: ANN001
         segmented,
         adjusted_total,
     )
+    # Passe canonique : chaque volume reçoit son maillage unique, consommé
+    # tel quel par le rendu, les textures, la collision et l'export.
+    from .build_canonical import attach_canonical_meshes
+
+    canonical = attach_canonical_meshes(scene)
     return {
         "segmented": segmented,
         "total": len(scene.prisms),
         "vertices_adjusted": adjusted_total,
         "pitched_planes": pitched_total,
+        "canonical_meshes": canonical,
     }
 
 

@@ -37,7 +37,13 @@ OBSTACLE_ROLES = frozenset({"obstacle_building"})
 
 @dataclass
 class Prism:
-    """Une emprise extrudée, et le statut de sa hauteur."""
+    """Une emprise extrudée, et le statut de sa hauteur.
+
+    Un bâtiment MultiPolygon produit plusieurs prismes : le principal porte
+    le rôle et la cible éventuelle, les volumes secondaires (ailes,
+    annexes) restent rattachés à leur bâtiment via ``parent_building_id``
+    et vivent dans le même repère projeté — plus aucun n'est jeté.
+    """
 
     feature_id: str
     role: str
@@ -51,6 +57,13 @@ class Prism:
     facade_relief: object | None = None
     roof_planes: object | None = None
     geometry_simplification: dict | None = None
+    #: Bâtiment parent pour un volume secondaire ; None sur un volume unique.
+    parent_building_id: str | None = None
+    #: Index de la partie dans le bâtiment parent (0 = principale).
+    part_index: int = 0
+    #: Maillage canonique partagé : le renderer, le textureur, la collision
+    #: et l'export consomment exactement cette instance.
+    canonical_mesh: object | None = None
 
     @property
     def roof_measured(self) -> bool:
@@ -101,6 +114,19 @@ class ConditioningScene:
     def assumed_height_count(self) -> int:
         return sum(1 for p in self.prisms if p.height_assumed)
 
+    def buildings(self) -> dict[str, list["Prism"]]:
+        """Graphe de scène Site → Building → BuildingPart.
+
+        Chaque bâtiment regroupe ses parties — principale et volumes
+        secondaires d'un MultiPolygon — dans le même repère projeté. Un
+        volume isolé forme un bâtiment à une seule partie.
+        """
+        grouped: dict[str, list[Prism]] = {}
+        for prism in self.prisms:
+            key = prism.parent_building_id or prism.feature_id
+            grouped.setdefault(key, []).append(prism)
+        return grouped
+
     def radius_m(self) -> float:
         """Rayon englobant de la cible, pour dimensionner l'orbite."""
         target = self.target
@@ -111,10 +137,14 @@ class ConditioningScene:
         return float(d.max())
 
     def summary(self) -> dict:
+        buildings = self.buildings()
+        secondary = sum(max(0, len(parts) - 1) for parts in buildings.values())
         return {
             "hotel_id": self.hotel_id,
             "crs": self.crs,
             "prism_count": len(self.prisms),
+            "building_count": len(buildings),
+            "secondary_parts": secondary,
             "target_resolved": self.target is not None,
             "assumed_height_count": self.assumed_height_count,
             "target_radius_m": round(self.radius_m(), 2),
@@ -123,50 +153,69 @@ class ConditioningScene:
         }
 
 
-def _polygon_of(entry: dict) -> tuple[Polygon | None, dict | None]:
+def _polygons_of(entry: dict) -> tuple[list[Polygon], dict | None]:
+    """Toutes les parties d'une emprise, principale d'abord.
+
+    Un MultiPolygon ne perd plus ses volumes secondaires : chaque partie
+    devient une BuildingPart rattachée au même bâtiment, dans le même
+    repère. Les trous intérieurs restent ignorés, et dit comme tel.
+    """
     raw = entry.get("projected_wkt")
     if not raw:
-        return None, None
+        return [], None
     geom = shapely_wkt.loads(raw)
     simplification: dict | None = None
+
+    parts: list[Polygon] = []
     if geom.geom_type == "MultiPolygon":
-        parts_dropped = len(geom.geoms) - 1
-        area_before = sum(g.area for g in geom.geoms)
-        geom = max(geom.geoms, key=lambda g: g.area)
-        area_after = geom.area
+        ordered = sorted(geom.geoms, key=lambda g: -g.area)
+        for part in ordered:
+            if isinstance(part, Polygon) and not part.is_empty:
+                parts.append(part)
         simplification = {
-            "rule": "MultiPolygon -> max(area)",
-            "parts_dropped": parts_dropped,
-            "holes_dropped": 0,
-            "area_dropped_m2": round(float(area_before - area_after), 2),
+            "rule": "MultiPolygon -> scene graph building parts",
+            "parts_kept": len(parts),
+            "holes_dropped": sum(len(g.interiors) for g in parts),
+            "area_dropped_m2": 0.0,
         }
-    if geom.geom_type != "Polygon" or geom.is_empty:
-        return None, simplification
-    if len(geom.interiors) > 0 and not simplification:
-        holes_dropped = len(geom.interiors)
-        simplification = {
-            "rule": "interior rings ignored",
-            "parts_dropped": 0,
-            "holes_dropped": holes_dropped,
-            "area_dropped_m2": round(float(sum(g.area for g in geom.interiors)), 2),
-        }
-    return geom, simplification
+    elif isinstance(geom, Polygon) and not geom.is_empty:
+        parts.append(geom)
+
+    if not parts:
+        return [], simplification
+
+    kept: list[Polygon] = []
+    for part in parts:
+        if len(part.interiors) > 0 and not simplification:
+            simplification = {
+                "rule": "interior rings ignored",
+                "parts_dropped": 0,
+                "holes_dropped": len(part.interiors),
+                "area_dropped_m2": round(
+                    float(sum(g.area for g in part.interiors)), 2
+                ),
+            }
+        exterior_only = Polygon(part.exterior)
+        if not exterior_only.is_empty:
+            kept.append(exterior_only)
+    return kept, simplification
 
 
-def _prism_of(entry: dict) -> Prism | None:
+def _prisms_of(entry: dict) -> list[Prism]:
+    """Une partie par volume : le bâtiment complet, pas son seul pan principal."""
     role = entry.get("role", "")
     if role not in TARGET_ROLES | OBSTACLE_ROLES:
-        return None
+        return []
     if entry.get("resolution_status") != "resolved":
         log.info(
             "volume écarté : %s est %s",
             entry.get("feature_id"),
             entry.get("resolution_status"),
         )
-        return None
-    poly, simplification = _polygon_of(entry)
-    if poly is None:
-        return None
+        return []
+    polygons, simplification = _polygons_of(entry)
+    if not polygons:
+        return []
 
     known = bool(entry.get("height_known"))
     raw_height = entry.get("height_m")
@@ -177,17 +226,33 @@ def _prism_of(entry: dict) -> Prism | None:
         height, assumed = ASSUMED_HEIGHT_M.get(role, 8.0), True
         source = f"hypothèse d'animation, rôle {role!r} — aucune hauteur mesurée"
 
-    coords = np.asarray(poly.exterior.coords[:-1], dtype=np.float64)
-    return Prism(
-        feature_id=str(entry.get("feature_id")),
-        role=role,
-        footprint=coords,
-        height_m=height,
-        height_assumed=assumed,
-        height_source=source,
-        is_target=role in TARGET_ROLES,
-        geometry_simplification=simplification,
+    feature_id = str(entry.get("feature_id"))
+    prisms: list[Prism] = []
+    for index, poly in enumerate(polygons):
+        coords = np.asarray(poly.exterior.coords[:-1], dtype=np.float64)
+        secondary = index > 0
+        prisms.append(
+            Prism(
+                feature_id=feature_id if index == 0 else f"{feature_id}#part{index}",
+                role=role,
+                footprint=coords,
+                height_m=height,
+                height_assumed=assumed,
+                height_source=source,
+                # Seule la partie principale porte la cible : la trajectoire
+                # ne doit pas orbiter autour d'une annexe.
+                is_target=(role in TARGET_ROLES) and not secondary,
+                geometry_simplification=simplification if index == 0 else None,
+                parent_building_id=feature_id if secondary else None,
+                part_index=index,
+            )
+        )
+    log.info(
+        "%s : %d partie(s) de bâtiment conservée(s)",
+        feature_id,
+        len(prisms),
     )
+    return prisms
 
 
 def load_scene(capture_geometry_path: Path) -> ConditioningScene:
@@ -195,7 +260,7 @@ def load_scene(capture_geometry_path: Path) -> ConditioningScene:
     payload = json.loads(Path(capture_geometry_path).read_text(encoding="utf-8"))
     entries = payload.get("geometries", [])
 
-    prisms = [p for p in (_prism_of(e) for e in entries) if p is not None]
+    prisms = [p for e in entries for p in _prisms_of(e)]
     if not prisms:
         raise ValueError(
             f"aucun volume exploitable dans {capture_geometry_path} — "

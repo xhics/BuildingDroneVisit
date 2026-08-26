@@ -206,10 +206,29 @@ def _lab(colour: tuple[float, float, float]) -> np.ndarray:
 
 
 def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
+    """Triangles du redressement de façade : maillage canonique uniquement.
+
+    L'orthofacade ne reconstruit plus ses propres murs : elle lit le `solid`
+    canonique partagé par tout le pipeline. Le repli extrusion + nappe `rv`
+    ne sert qu'aux payloads antérieurs au contrat.
+    """
     triangles: list[np.ndarray] = []
     face_ids: list[int] = []
     fid = 0
     for volume in payload.get("volumes", []):
+        solid = volume.get("solid") or {}
+        sv = solid.get("vertices") or []
+        sf = solid.get("faces") or []
+        if sv and sf:
+            for face in sf:
+                if len(face) >= 3:
+                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
+                    if tri.shape == (3, 3):
+                        triangles.append(tri)
+                        face_ids.append(fid)
+                        fid += 1
+            continue
+
         fp = volume.get("fp") or []
         wh = volume.get("wh") or []
         h_default = float(volume.get("h") or 8.0)
@@ -231,17 +250,6 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
             for face in rf:
                 if len(face) >= 3:
                     tri = np.asarray([rv[idx] for idx in face[:3]], dtype=np.float64)
-                    if tri.shape == (3, 3):
-                        triangles.append(tri)
-                        face_ids.append(fid)
-                        fid += 1
-        solid = volume.get("solid") or {}
-        sv = solid.get("vertices") or []
-        sf = solid.get("faces") or []
-        if sv and sf:
-            for face in sf:
-                if len(face) >= 3:
-                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
                     if tri.shape == (3, 3):
                         triangles.append(tri)
                         face_ids.append(fid)

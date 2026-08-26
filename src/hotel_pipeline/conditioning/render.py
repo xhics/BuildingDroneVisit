@@ -246,9 +246,21 @@ def _wall_heights(prism: Prism) -> np.ndarray:
 def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
     """Murs et toit d'un prisme, en triangles. Le drapeau marque le toit.
 
-    Le toit est distingué parce qu'aucune source au sol ne l'atteste : c'est la
-    surface que le masque de confiance déclasse le plus fort.
+    Le toit est distingué parce qu'aucune source au sol ne l'atteste : c'est
+    la surface que le masque de confiance déclasse le plus fort.
+
+    Depuis le maillage canonique, ce module ne construit plus rien : il lit
+    les triangles de `prism.canonical_mesh`, la même instance que le
+    textureur, la collision et l'export consomment. L'extrusion locale n'est
+    conservée que pour un prisme qui n'a pas encore reçu son maillage.
     """
+    mesh = getattr(prism, "canonical_mesh", None)
+    if mesh is not None:
+        return [
+            (mesh.vertices[face], mesh.face_kind[index] in ("roof", "roof_step"))
+            for index, face in enumerate(mesh.faces)
+        ]
+
     faces: list[tuple[np.ndarray, bool]] = []
     fp = prism.footprint
     n = len(fp)
