@@ -318,15 +318,20 @@ def _camera_path(  # noqa: PLR0913
             faces = facade_id if front_azimuth_deg is not None else None
             blind = (front_azimuth_deg is not None) and facade_coverage.get(facade_id) == "none"
             aveugles += int(blind)
+            # L'orbite est centrée sur le centroïde réel du polygone :
+            # centroid[0] pour X et centroid[1] pour Y, partout — jamais un
+            # axe mélangé ni une orbite ramenée silencieusement à l'origine.
+            centre_x = polygon.centroid.x
+            centre_y = polygon.centroid.y
             poses.append(
                 CameraPose(
                     frame=frame,
                     position_local_m=(
-                        round(radius * math.sin(angle), 4),
-                        round(radius * math.cos(angle), 4),
+                        round(centre_x + radius * math.sin(angle), 4),
+                        round(centre_y + radius * math.cos(angle), 4),
                         round(camera_z, 4),
                     ),
-                    look_at_local_m=(0.0, 0.0, round(look_z, 4)),
+                    look_at_local_m=(round(centre_x, 4), round(centre_y, 4), round(look_z, 4)),
                     azimuth_deg=round(azimuth, 4),
                     elevation_deg=elevation,
                     distance_m=round(radius, 4),

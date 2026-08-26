@@ -701,13 +701,17 @@ def _persist_texture_rasters(
 ) -> None:
     """Rasterise les masques de bâtiment avec les trous d'occulteurs.
 
-    Écrit un PNG par vue dans ``mask_root/{asset_id}/building_mask.png`` où
-    les pixels d'occulteurs (arbres, voitures, etc.) sont mis à 0,
-    préservant ainsi les trous SAM originaux.
+    Écrit un PNG par nature dans ``mask_root/{asset_id}/`` :
+    ``building_mask.png`` (bâtiment seul) et ``occluders_mask.png``
+    (occulteurs seuls), chacun accompagné de ``width``, ``height``, du
+    checksum bitwise du raster et du checksum de l'image RGB associée. Le
+    JSON polygonal devient secondaire ; ce sont ces rasters qui font foi.
     """
     if not texture_run_id:
         return
+    from .texture_masks import mask_checksum
     image_dims: dict[str, tuple[int, int]] = {}
+    image_digests: dict[str, str] = {}
     for selected in images:
         if selected.asset_id not in image_dims:
             try:
@@ -715,36 +719,39 @@ def _persist_texture_rasters(
                     image_dims[selected.asset_id] = src.size
             except OSError:
                 image_dims[selected.asset_id] = (0, 0)
+            image_digests[selected.asset_id] = _digest(selected.path)
 
     for view in views:
         asset_id = view.get("asset_id", "")
         dim = image_dims.get(asset_id, (0, 0))
         view["width"], view["height"] = dim
+        view["image_checksum"] = image_digests.get(asset_id)
+        if dim[0] > 0 and dim[1] > 0:
+            view["transform"] = {"type": "identity"}
         if dim[0] <= 0 or dim[1] <= 0:
             continue
         polygons = view.get("building_polygons") or []
         occluder_polygons = view.get("occluders_polygon") or []
         if not polygons and not occluder_polygons:
             continue
-        binary = _rasterize_polygons(polygons, dim[0], dim[1]) if polygons else None
-        if occluder_polygons:
-            occluder_mask = _rasterize_polygons([occluder_polygons], dim[0], dim[1])
-            if occluder_mask is not None:
-                if binary is None:
-                    binary = np.zeros_like(occluder_mask)
-                binary[occluder_mask] = False
-        if binary is None:
-            continue
         asset_dir = mask_root / asset_id
         asset_dir.mkdir(parents=True, exist_ok=True)
-        raster_name = "building_mask.png"
-        raster_path = asset_dir / raster_name
-        Image.fromarray((binary * 255).astype(np.uint8), mode="L").save(raster_path)
-        view["raster"] = f"texture_view_masks/{texture_run_id}/{asset_id}/{raster_name}"
-        from ..integrity_digests import mask_raster_digest
-        view["raster_digest"] = mask_raster_digest(
-            binary.astype(np.uint8), asset_id=asset_id,
-            pixel_transform=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
-            segmenter_version=str(view.get("segmenter_version") or "semantic-detection-v1"),
-        )
+        binary = _rasterize_polygons(polygons, dim[0], dim[1]) if polygons else None
+        occluder_mask = _rasterize_polygons([occluder_polygons], dim[0], dim[1]) if occluder_polygons else None
+        if binary is not None:
+            building_path = asset_dir / "building_mask.png"
+            Image.fromarray((binary * 255).astype(np.uint8), mode="L").save(building_path)
+            view["raster"] = f"texture_view_masks/{texture_run_id}/{asset_id}/building_mask.png"
+            view["building_checksum"] = mask_checksum(binary)
+            from ..integrity_digests import mask_raster_digest
+            view["raster_digest"] = mask_raster_digest(
+                binary.astype(np.uint8), asset_id=asset_id,
+                pixel_transform=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                segmenter_version=str(view.get("segmenter_version") or "semantic-detection-v1"),
+            )
+        if occluder_mask is not None:
+            occluders_path = asset_dir / "occluders_mask.png"
+            Image.fromarray((occluder_mask * 255).astype(np.uint8), mode="L").save(occluders_path)
+            view["occluders_raster"] = f"texture_view_masks/{texture_run_id}/{asset_id}/occluders_mask.png"
+            view["occluders_checksum"] = mask_checksum(occluder_mask)
 

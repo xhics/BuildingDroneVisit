@@ -64,8 +64,12 @@ def _load_run_points(reconstruction_run_id: str, workspace: Workspace) -> np.nda
     return _load_colmap_points3d(normalized_dir.parent)
 
 
-def _load_scene_triangles(workspace: Workspace) -> np.ndarray:
-    path = workspace.path("11_conditioning", "conditioned_scene.json")
+def _load_scene_triangles(workspace: Workspace | Path) -> np.ndarray:
+    path = (
+        workspace.path("11_conditioning", "conditioned_scene.json")
+        if hasattr(workspace, "path")
+        else Path(workspace) / "11_conditioning" / "conditioned_scene.json"
+    )
     if not path.is_file():
         return np.empty((0, 3, 3))
     payload = json.loads(path.read_text("utf-8"))
@@ -243,6 +247,11 @@ class CameraFeasibilityEvaluator:
         framing = visible if not distance_violation else 0.0
         overall = visible * 0.7 + framing * 0.3
 
+        # Orientation complète stockée : matrice ET quaternion. Aucune
+        # validation en aval ne reconstruit la visée à partir du yaw seul.
+        rotation = pose_rotation_matrix(yaw_deg, pitch_deg)
+        quaternion = _rotation_to_quaternion(rotation)
+
         return CameraFeasibilityField(
             pose_id=pose_id,
             position_local_m=position_local_m,
@@ -252,6 +261,8 @@ class CameraFeasibilityEvaluator:
             orientation_xyzw=yaw_pitch_quaternion(yaw_deg, pitch_deg),
             near_m=near_m,
             far_m=far_m,
+            orientation_matrix=tuple(float(v) for v in rotation.reshape(-1)),
+            orientation_quaternion=quaternion,
             visible_surface_confidence=round(visible, 3),
             unknown_fraction=round(unknown, 3),
             proxy_fraction=round(proxy, 3),
@@ -291,7 +302,7 @@ def build_validated_camera_path(
         polygon = Polygon([
             (centroid[0] - radius, centroid[1] - radius),
             (centroid[0] + radius, centroid[1] - radius),
-            (centroid[1] + radius, centroid[1] + radius),
+            (centroid[0] + radius, centroid[1] + radius),
             (centroid[0] - radius, centroid[1] + radius),
         ])
     else:
@@ -312,7 +323,7 @@ def build_validated_camera_path(
             pose_id=f"pose-{idx:03d}",
             position_local_m=pose.position_local_m,
             yaw_deg=pose.azimuth_deg,
-            pitch_deg=0.0,
+            pitch_deg=_pitch_of_pose(pose),
             fov_deg=pose.fov_horizontal_deg,
             reconstruction_run_id=reconstruction_run_id,
             previous_position_local_m=previous_position,
@@ -332,6 +343,79 @@ def build_validated_camera_path(
         derivation=derivation,
         poses=poses,
     )
+
+
+def _pitch_of_pose(pose) -> float:  # noqa: ANN001
+    """Pitch complet d'une pose, dérivé de sa géométrie position→look_at.
+
+    L'orientation n'est jamais réduite au yaw : le pitch mesuré par la
+    géométrie de la pose traverse tout le pipeline, et la matrice de
+    rotation complète reste disponible sur le champ validé.
+    """
+    look_at = getattr(pose, "look_at_local_m", None)
+    if look_at is None:
+        return 0.0
+    position = np.asarray(pose.position_local_m, dtype=np.float64)
+    target = np.asarray(look_at, dtype=np.float64)
+    delta = target - position
+    horizontal = math.hypot(delta[0], delta[1])
+    if horizontal < 1e-9:
+        return 90.0 if delta[2] > 0 else -90.0
+    return math.degrees(math.atan2(delta[2], horizontal))
+
+
+def pose_rotation_matrix(
+    yaw_deg: float, pitch_deg: float, roll_deg: float = 0.0
+) -> np.ndarray:
+    """Matrice de rotation monde→caméra (convention Z vers l'avant).
+
+    Toute validation consomme cette pose **complète** — jamais une
+    reconstruction partielle à partir du seul yaw.
+    """
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    roll = math.radians(roll_deg)
+
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    return ry @ rx @ rz
+
+
+def _rotation_to_quaternion(matrix: np.ndarray) -> tuple[float, float, float, float]:
+    """Quaternion (w, x, y, z) d'une matrice de rotation — trace maximale."""
+    m = np.asarray(matrix, dtype=np.float64)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    return (w / norm, x / norm, y / norm, z / norm)
 
 
 def publish_validated_path(path: ValidatedCameraPath, workspace: Workspace) -> Path:

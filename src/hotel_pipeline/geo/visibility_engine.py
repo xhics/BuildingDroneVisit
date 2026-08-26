@@ -47,6 +47,28 @@ SUPPORTED_SAMPLING = frozenset({"uniform_angular_cells"})
 SUPPORTED_PROJECTION = frozenset({"pinhole_tangent"})
 
 
+def mesh_occludes(bvh, origin_m, target_m) -> bool:  # noqa: ANN001
+    """Visibilité 3D exacte : raycast triangle par triangle sur le maillage.
+
+    La fin de la 2,5D : quand un BVH du maillage canonique existe, le verdict
+    d'occlusion n'est plus une intersection au sol ni une comparaison de
+    hauteurs — c'est un vrai segment start→end testé contre les triangles.
+    Un rayon sous un auvent atteint le mur derrière ; un rayon à travers le
+    toit est bloqué. Les masses végétales restent pondérées par leur
+    transmittance : elles ne décrètent jamais une occultation totale seules.
+    """
+    import numpy as np
+
+    from ..render_engine import BVH
+
+    if not isinstance(bvh, BVH):
+        raise TypeError("mesh_occludes attend un BVH construit sur le maillage canonique")
+    return bvh.occludes(
+        np.asarray(origin_m, dtype=np.float64),
+        np.asarray(target_m, dtype=np.float64),
+    )
+
+
 def check_supported(policy) -> list[str]:  # noqa: ANN001
     """Refuse une politique dont le moteur ne sait pas honorer les réglages."""
     problems = []

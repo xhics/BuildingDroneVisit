@@ -19,7 +19,6 @@ import numpy as np
 
 from ..workspace import Workspace
 from .observations import build as build_observations
-from .solid import audit, closed_solid
 from .viewpoint import optimal_camera
 
 CONTRACT_VERSION = 1
@@ -106,14 +105,29 @@ def _lidar_vegetation(workspace: Workspace) -> list[dict] | None:
     ]
 
 
-def _building(item: dict) -> dict:
+def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
+    """Publie un bâtiment depuis LE maillage canonique, et lui seulement.
+
+    L'export ne reconstruit aucune géométrie : il sérialise l'instance
+    produite par `build_canonical_building_mesh`, celle-là même que le
+    renderer rastérise et que le textureur projette. Le `mesh_digest`
+    embarqué permet de le vérifier à chaque étape.
+    """
+    from .build_canonical import build_canonical_building_mesh
+    from .roof_planes import segment  # noqa: F401 - segmentation amont déjà faite
+
     footprint = np.asarray(item.get("fp", []), dtype=np.float64)
     wall_top = np.asarray(
         item.get("wh") or [float(item.get("h", 8.0))] * len(footprint),
         dtype=np.float64,
     )
-    mesh = closed_solid(footprint, wall_top)
-    topology = audit(mesh)
+    mesh = build_canonical_building_mesh(
+        footprint,
+        top_heights=wall_top,
+        terrain=terrain,
+    )
+    mesh.feature_id = item.get("id")
+    topology = mesh.audit()
     roof = None
     if item.get("rv") and item.get("rf"):
         roof = {
@@ -122,22 +136,50 @@ def _building(item: dict) -> dict:
             "provenance_class": "LIDAR_MEASURED",
             "role": "measured_detail_overlay",
         }
-    return {
+    payload = {
         "feature_id": item.get("id"),
         "target": bool(item.get("target")),
         "footprint": np.round(footprint, 3).tolist(),
         "height_m": float(item.get("h", float(np.median(wall_top)))),
-        "wall_top_m": np.round(wall_top, 3).tolist(),
+        "wall_top_m": np.round(
+            [record.top_z for record in mesh.records], 3
+        ).tolist(),
+        "ground_z_m": np.round(
+            [record.ground_z for record in mesh.records], 3
+        ).tolist(),
         "height_assumed": bool(item.get("assumed")),
         "confidence": item.get("conf"),
-        "solid_mesh": mesh.as_dict(),
+        # Clé historique conservée : le contenu est désormais le maillage
+        # canonique unique, digest compris.
+        "solid_mesh": {**mesh.as_dict(), "feature_id": item.get("id")},
+        "mesh_digest": mesh.mesh_digest(),
         "topology": topology,
         "roof_surface": roof,
         "provenance_class": (
             "OCCLUDED_INFERRED" if item.get("assumed") else "LIDAR_MEASURED"
         ),
-        "support_rule": "closed footprint, bottom cap, shared walls and logical roof",
+        "support_rule": (
+            "canonical scene mesh shared by renderer, texturer, collision "
+            "and export; walls follow the terrain at their base"
+        ),
     }
+    return payload
+
+
+def _scene_terrain(workspace):  # noqa: ANN001
+    """Grille de terrain du site, ou None : le sol redevient plat, sans erreur."""
+    try:
+        from .scene import load_scene
+        from .terrain import find_dtm, load
+
+        geometry = workspace.path("06_geo", "capture_geometry.json")
+        dtm = find_dtm(workspace)
+        if not geometry.is_file() or dtm is None:
+            return None
+        scene = load_scene(geometry)
+        return load(dtm, scene.centre)
+    except (ImportError, OSError, ValueError):
+        return None
 
 
 def build(workspace: Workspace) -> dict[str, Path]:
@@ -175,7 +217,7 @@ def build(workspace: Workspace) -> dict[str, Path]:
         _read(semantic_surface_path) if semantic_surface_path.is_file() else None
     )
 
-    buildings = [_building(item) for item in legacy.get("volumes", [])]
+    buildings = [_building(item, terrain=_scene_terrain(workspace)) for item in legacy.get("volumes", [])]
     measured_vegetation = _lidar_vegetation(workspace)
     if measured_vegetation:
         vegetation = measured_vegetation
@@ -530,4 +572,55 @@ def viewer_payload(scene: dict) -> dict:
     # L'azimut de caméra est dérivé de la géométrie et de la grammaire de façade
     # (et, après fusion photo, de la couverture mesurée) : jamais figé.
     payload["camera"] = optimal_camera(payload)
+    # Contrat caméra : le viewer consomme la même CanonicalCamera que le
+    # z-buffer du pipeline — mêmes focales, même point principal, near/far.
+    # Aucun FOV approximatif parallèle ne subsiste côté rendu HTML.
+    payload["canonical_camera"] = _viewer_canonical_camera(
+        payload["camera"], width=1280, height=720
+    )
     return payload
+
+
+def _viewer_canonical_camera(camera: dict, width: int, height: int) -> dict:
+    """Sérialise la CanonicalCamera du viewer depuis la pose dérivée."""
+    import math
+
+    from ..canonical_camera import DEFAULT_FAR_M, DEFAULT_NEAR_M, CanonicalCamera
+
+    altitude = math.radians(float(camera.get("altitude_deg", 30.0)))
+    azimuth = math.radians(float(camera.get("azimuth_deg", 0.0)))
+    distance = float(camera.get("target_distance_m", 100.0))
+    focus = camera.get("focus") or [0.0, 0.0, 0.0]
+
+    horizontal = distance * math.cos(altitude)
+    offset = np.array([
+        float(focus[0]) + horizontal * math.sin(azimuth),
+        float(focus[1]) - horizontal * math.cos(azimuth),
+        float(focus[2]) + distance * math.sin(altitude),
+    ])
+    target = np.asarray(focus[:3], dtype=np.float64)
+
+    forward = target - offset
+    forward /= max(float(np.linalg.norm(forward)), 1e-9)
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(forward, world_up)
+    right /= max(float(np.linalg.norm(right)), 1e-9)
+    up = np.cross(right, forward)
+    # Convention COLMAP : la caméra regarde +Z, y vers le bas de l'image.
+    rotation = np.stack([right, -up, forward], axis=0)
+    translation = -rotation @ offset
+
+    fov_deg = 55.0
+    focal_px = height / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+    contract = CanonicalCamera(
+        "PINHOLE",
+        width,
+        height,
+        [focal_px, focal_px, width / 2.0, height / 2.0],
+        rotation=rotation,
+        translation=translation,
+        near_m=DEFAULT_NEAR_M,
+        far_m=DEFAULT_FAR_M,
+        camera_id="viewer-orbit",
+    )
+    return contract.as_dict()

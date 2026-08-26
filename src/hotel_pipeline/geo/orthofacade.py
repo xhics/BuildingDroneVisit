@@ -26,6 +26,8 @@ from typing import Sequence
 import numpy as np
 
 from ..logging import get_logger
+from .facade_visibility import effective_gsd_m
+from .photometric import GainBias, fit_view_normalizations
 
 log = get_logger("geo-orthofacade")
 
@@ -43,8 +45,6 @@ LIDAR_OCCLUSION_MARGIN_M = 1.5
 
 @dataclass
 class FacadePlane:
-    """Le plan métrique d'un mur, et le repère où l'orthofaçade se construit."""
-
     facade_id: str
     origin: np.ndarray
     along: np.ndarray
@@ -89,18 +89,31 @@ class FacadePlane:
         return 0.0 <= u <= self.length_m and 0.0 <= z_m <= self.top_z(u) + 1e-9
 
     def point(self, u: float, v_norm: float) -> np.ndarray:
-        """Point 3D à l'abscisse `u`, à la fraction de hauteur `v_norm` (0..1)."""
         z = float(v_norm) * self.top_z(u)
         return self.origin + self.along * u + np.array([0.0, 0.0, z])
 
     def point_legacy(self, u: float, v: float) -> np.ndarray:
-        """Point 3D à l'abscisse `u`, à la hauteur absolue `v` (compatibilité)."""
         v_norm = float(v) / max(self.height_m, 1e-6)
         return self.point(u, v_norm)
 
     @property
     def normal_deg(self) -> float:
         return math.degrees(math.atan2(self.normal[1], self.normal[0])) % 360.0
+
+
+@dataclass
+class TexelCandidate:
+    asset_id: str
+    colour_rgb: np.ndarray
+    incidence_deg: float = 0.0
+    gsd_m: float | None = None
+    weight: float = 1.0
+    sharpness: float | None = None
+    pose_confidence: float | None = None
+    view_index: int = -1
+
+    def normalised_colour(self) -> np.ndarray:
+        return np.asarray(self.colour_rgb, dtype=np.float64)[:3]
 
 
 @dataclass
@@ -115,6 +128,8 @@ class TexelSupport:
     inlier_count: int = 0
     inlier_spread_de: float = 0.0
     consensus_colour: tuple[float, float, float] | None = None
+    candidates: list[TexelCandidate] = field(default_factory=list)
+    rejected_candidates: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -146,7 +161,7 @@ class Orthofacade:
     status_map: np.ndarray | None = None
 
     def by_status(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
+        counts = {}
         for texel in self.support:
             counts[texel.status] = counts.get(texel.status, 0) + 1
         return counts
@@ -179,10 +194,8 @@ class Orthofacade:
             ),
             "provenance": self.provenance,
             "caveats": [
-                "le plan vient de l'extrusion d'une emprise, non d'un mur "
-                "relevé : un décrochement réel s'y projette de travers",
-                "un désaccord entre images signale une pose fausse, un objet "
-                "mobile ou un décrochement — il ne dit pas lequel",
+                "le plan vient de l'extrusion d'une emprise, non d'un mur releve : un decrochement reel s'y projette de travers",
+                "un desaccord entre images signale une pose fausse, un objet mobile ou un decrochement — il ne dit pas lequel",
                 "une mosaïque probatoire n'est pas une texture de production",
             ],
         }
@@ -218,11 +231,6 @@ def plane_from_edge(
     )
 
 
-def _lab_distance(a: np.ndarray, b: np.ndarray) -> float:
-    delta = a.astype(np.float64) - b.astype(np.float64)
-    return float(np.mean(np.abs(delta)))
-
-
 def _lab(colour: tuple[float, float, float]) -> np.ndarray:
     r, g, b = colour
     r, g, b = r / 255.0, g / 255.0, b / 255.0
@@ -238,11 +246,319 @@ def _lab(colour: tuple[float, float, float]) -> np.ndarray:
     return np.array([116 * y - 16, 500 * (x - y), 200 * (y - z)])
 
 
+def _ransac_seed_inliers(labs: np.ndarray) -> np.ndarray:
+    count = labs.shape[0]
+    best_pair = (0, 1)
+    best_distance = math.inf
+    for i in range(count):
+        for j in range(i + 1, count):
+            distance = float(np.mean(np.abs(labs[i] - labs[j])))
+            if distance < best_distance:
+                best_distance = distance
+                best_pair = (i, j)
+    centre = labs[list(best_pair)].mean(axis=0)
+    tolerance = max(MAD_OUTLIER_K * best_distance, 3.0)
+    keep = [index for index in range(count) if float(np.mean(np.abs(labs[index] - centre))) <= tolerance]
+    return np.asarray(sorted(set(keep + list(best_pair))), dtype=int)
+
+
+@dataclass(frozen=True)
+class FusionVerdict:
+    colour: tuple[float, float, float] | None
+    accepted: bool
+    status: str
+    inlier_count: int = 0
+    inlier_spread_de: float = 0.0
+    reason: str | None = None
+
+
+def fuse_texel_candidates(colours, weights=None):
+    colours = list(colours)
+    count = len(colours)
+    if count == 0:
+        return FusionVerdict(None, False, "REJECTED_DISAGREEMENT", 0, 0.0, "no_candidate")
+    if weights is not None and len(weights) != count:
+        raise ValueError("autant de poids que de couleurs sont requis")
+    if count == 1:
+        colour = tuple(float(c) for c in np.asarray(colours[0], dtype=np.float64)[:3])
+        return FusionVerdict(colour, True, "OBSERVED_SINGLE", 1, 0.0, None)
+
+    labs = np.stack([_lab(tuple(np.asarray(c, dtype=np.float64)[:3])) for c in colours])
+    med = np.median(labs, axis=0)
+    mad = np.median(np.abs(labs - med), axis=0) * 1.4826
+    inlier_indices = np.where(np.all(np.abs(labs - med) < MAD_OUTLIER_K * (mad + 1e-8), axis=1))[0]
+    if len(inlier_indices) < MIN_INLIERS_FOR_CONSENSUS:
+        inlier_indices = _ransac_seed_inliers(labs)
+
+    if len(inlier_indices) < MIN_INLIERS_FOR_CONSENSUS:
+        return FusionVerdict(None, False, "REJECTED_DISAGREEMENT", len(inlier_indices), float("inf"), "insufficient_inliers")
+
+    inlier_labs = labs[inlier_indices]
+    spread = float(np.mean(np.std(inlier_labs, axis=0)))
+    if spread > MAX_INLIER_SPREAD_DE:
+        return FusionVerdict(None, False, "REJECTED_DISAGREEMENT", len(inlier_indices), spread, "inlier_spread")
+
+    if weights is None:
+        consensus = np.mean([colours[i] for i in inlier_indices], axis=0)
+    else:
+        weight_values = np.asarray([max(float(weights[i]), 1e-9) for i in inlier_indices], dtype=np.float64)
+        weight_values /= weight_values.sum()
+        stacked = np.asarray([colours[i] for i in inlier_indices], dtype=np.float64)
+        consensus = (stacked * weight_values[:, None]).sum(axis=0)
+
+    consensus_tuple = tuple(float(c) for c in np.clip(consensus[:3], 0.0, 255.0))
+    return FusionVerdict(consensus_tuple, True, "OBSERVED_CONSENSUS", len(inlier_indices), spread, None)
+
+
+GSD_REFERENCE_M = TEXEL_M_FACADE / MIN_PIXELS_PER_M
+
+
+def candidate_weight(*, incidence_deg, gsd_m=None, sharpness=None, pose_confidence=None):
+    cosine = math.cos(math.radians(min(max(incidence_deg, 0.0), 89.0)))
+    weight = cosine * cosine
+    if gsd_m is not None and gsd_m > 0.0:
+        weight *= min(GSD_REFERENCE_M / gsd_m, 1.0) ** 2
+    if sharpness is not None:
+        weight *= min(max(sharpness, 0.0), 1.0)
+    if pose_confidence is not None:
+        weight *= min(max(pose_confidence, 0.0), 1.0)
+    return max(weight, 1e-6)
+
+
+def _apply_normalizations(samples, normalizations):
+    applied = []
+    for view_index, model in sorted(normalizations.items()):
+        if model.is_identity():
+            continue
+        for slot_candidates in samples.values():
+            for candidate in slot_candidates:
+                if candidate.view_index == view_index:
+                    candidate.colour_rgb = model.apply(candidate.colour_rgb)
+        applied.append(view_index)
+    return applied
+
+
+def rectify(plane, views, texel_m=TEXEL_M_FACADE, policy=None):
+    from .facade_visibility import RegisteredView
+
+    cols = max(int(round(plane.length_m / texel_m)), 1)
+    rows = max(int(round(plane.height_m / texel_m)), 1)
+    found = Orthofacade(facade_id=plane.facade_id, width_px=cols, height_px=rows)
+    found.support = [TexelSupport() for _ in range(rows * cols)]
+
+    if not views:
+        found.provenance = {"views_supplied": 0, "reason": "aucune vue fournie"}
+        return found
+
+    canvas = np.zeros((rows, cols, 3), dtype=np.float64)
+    samples = {}
+    candidates_by_view = {}
+    rejected_by_slot = {}
+    used = 0
+    skipped_resolution = 0
+    skipped_no_mask = 0
+    rejection_counts = {}
+
+    v_norms = np.linspace(0.5 / rows, 1.0 - 0.5 / rows, rows)
+    us = (np.arange(cols) + 0.5) * texel_m
+
+    for view_index, view in enumerate(views):
+        if isinstance(view, RegisteredView):
+            asset_id = view.asset_id
+            image = view.image
+            camera = view.camera
+            visibility_mask = view.semantic_mask
+            view_proxy = view.proxy_depth
+            view_lidar = view.lidar_depth
+            registered = view
+        else:
+            asset_id, image, camera = view[:3]
+            visibility_mask = view[3] if len(view) >= 4 else None
+            view_proxy = view[4] if len(view) >= 5 else None
+            view_lidar = view[5] if len(view) >= 6 else None
+            registered = None
+
+        if visibility_mask is None or not visibility_mask.any():
+            skipped_no_mask += 1
+            continue
+
+        def _camera_centre(cam):
+            found_pos = getattr(cam, "position")
+            return np.asarray(found_pos() if callable(found_pos) else found_pos, dtype=np.float64)
+
+        centre = plane.point(plane.length_m * 0.5, 0.5)
+        to_camera = _camera_centre(camera) - centre
+        span = float(np.linalg.norm(to_camera))
+        if span < 1e-6:
+            continue
+        cosine = float(np.dot(plane.normal, to_camera / span))
+        incidence = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        if incidence > MAX_INCIDENCE_DEG:
+            continue
+
+        focal = getattr(camera, "f", None)
+        if focal:
+            pixels_per_m = float(focal) / max(span, 1e-6)
+            if pixels_per_m < MIN_PIXELS_PER_M:
+                skipped_resolution += 1
+                continue
+
+        used += 1
+        view_samples = {}
+        for row, v_norm in enumerate(v_norms):
+            points = np.array([plane.point(u, v_norm) for u in us])
+            screen, depth = camera.project(points)
+            if screen is None:
+                continue
+            to_cam = _camera_centre(camera) - points
+            span_v = np.linalg.norm(to_cam, axis=1)
+            span_safe = np.maximum(span_v, 1e-6)
+            cosine_v = (to_cam @ plane.normal) / span_safe
+            incidence_v = np.degrees(np.arccos(np.clip(cosine_v, -1.0, 1.0)))
+
+            for col in range(cols):
+                x, y = screen[col]
+                ix, iy = int(round(x)), int(round(y))
+                if not (0 <= ix < image.shape[1] and 0 <= iy < image.shape[0]):
+                    continue
+                if depth is not None and depth[col] <= 0.5:
+                    continue
+                if incidence_v[col] > MAX_INCIDENCE_DEG:
+                    continue
+
+                slot = row * cols + col
+                wall_depth = float(depth[col])
+
+                gsd_m = effective_gsd_m(camera, points[col], plane.along)
+                if gsd_m is not None and gsd_m > 1.0 / MIN_PIXELS_PER_M:
+                    rejected_by_slot.setdefault(slot, []).append((asset_id, "REJECTED_RESOLUTION"))
+                    continue
+
+                if not visibility_mask[iy, ix]:
+                    rejected_by_slot.setdefault(slot, []).append((asset_id, "REJECTED_SEMANTIC"))
+                    continue
+
+                if registered is not None:
+                    if registered.occludes((ix, iy), wall_depth):
+                        rejected_by_slot.setdefault(slot, []).append((asset_id, "REJECTED_OCCLUDED"))
+                        continue
+                else:
+                    if view_proxy is not None:
+                        hit_depth, hit_fid = view_proxy.hit(ix, iy)
+                        if hit_fid is not None and hit_fid >= 0 and wall_depth > hit_depth + PROXY_DEPTH_TOLERANCE_M:
+                            rejected_by_slot.setdefault(slot, []).append((asset_id, "REJECTED_OCCLUDED"))
+                            continue
+                    if view_lidar is not None and view_lidar.valid[iy, ix]:
+                        lidar_d = float(view_lidar.depth[iy, ix])
+                        if wall_depth > lidar_d + LIDAR_OCCLUSION_MARGIN_M:
+                            rejected_by_slot.setdefault(slot, []).append((asset_id, "REJECTED_OCCLUDED"))
+                            continue
+
+                colour = image[iy, ix].astype(np.float64)
+                inc = float(incidence_v[col])
+                candidate = TexelCandidate(
+                    asset_id=asset_id,
+                    colour_rgb=colour,
+                    incidence_deg=inc,
+                    gsd_m=gsd_m,
+                    weight=candidate_weight(
+                        incidence_deg=inc,
+                        gsd_m=gsd_m,
+                        sharpness=getattr(registered, "sharpness", None) if registered else None,
+                        pose_confidence=getattr(registered, "pose_confidence", None) if registered else None,
+                    ),
+                    view_index=view_index,
+                )
+                samples.setdefault(slot, []).append(candidate)
+                view_samples[slot] = colour
+                texel = found.support[slot]
+                texel.contributing += 1
+                if inc < (texel.best_incidence_deg or math.inf):
+                    texel.best_incidence_deg = inc
+                    texel.best_distance_m = float(span_v[col])
+                    texel.best_asset = asset_id
+        if view_samples:
+            candidates_by_view[view_index] = view_samples
+
+    normalizations = fit_view_normalizations(candidates_by_view)
+    normalized_views = _apply_normalizations(samples, normalizations)
+    reference_view_index = next((index for index, model in sorted(normalizations.items()) if model.is_identity()), None)
+
+    for slot, slot_candidates in samples.items():
+        row, col = divmod(slot, cols)
+        texel = found.support[slot]
+        verdict = fuse_texel_candidates([candidate.normalised_colour() for candidate in slot_candidates], [candidate.weight for candidate in slot_candidates])
+        texel.candidates = slot_candidates
+        texel.inlier_count = verdict.inlier_count
+        texel.inlier_spread_de = verdict.inlier_spread_de
+        texel.disagreement = verdict.inlier_spread_de
+        if verdict.accepted:
+            texel.consensus_colour = verdict.colour
+            canvas[row, col] = verdict.colour
+        else:
+            texel.rejection_reason = "REJECTED_DISAGREEMENT"
+            texel.rejection_cause = verdict.reason
+            rejection_counts["REJECTED_DISAGREEMENT"] = rejection_counts.get("REJECTED_DISAGREEMENT", 0) + 1
+
+    for slot in range(rows * cols):
+        texel = found.support[slot]
+        if texel.contributing > 0:
+            continue
+        reasons = [reason for _asset, reason in rejected_by_slot.get(slot, [])]
+        if not reasons:
+            continue
+        dominant = max(set(reasons), key=reasons.count)
+        texel.rejection_reason = dominant
+        texel.rejected_candidates = rejected_by_slot.get(slot, [])
+        rejection_counts[dominant] = rejection_counts.get(dominant, 0) + 1
+
+    found.image = canvas.astype(np.uint8) if used else None
+    found.provenance = {
+        "views_supplied": len(views),
+        "views_used": used,
+        "views_too_far": skipped_resolution,
+        "views_without_building_mask": skipped_no_mask,
+        "texel_m": texel_m,
+        "min_pixels_per_m": MIN_PIXELS_PER_M,
+        "max_incidence_deg": MAX_INCIDENCE_DEG,
+        "disagreement_level": DISAGREEMENT_LEVEL,
+        "rejection_counts": rejection_counts,
+        "photometric_normalization": {
+            "algorithm": "gain_bias_median_overlap_v1",
+            "reference_view": reference_view_index,
+            "normalized_views": sorted(normalized_views),
+            "models": {str(view_index): model.as_dict() for view_index, model in sorted(normalizations.items())},
+        },
+        "fusion": {
+            "pipeline": "candidates_filter_normalize_fuse",
+            "rejection_scope": "per_candidate",
+            "robust_estimator": f"lab_median_mad_k{MAD_OUTLIER_K}_ransac_min_inliers_{MIN_INLIERS_FOR_CONSENSUS}",
+            "max_inlier_spread_de": MAX_INLIER_SPREAD_DE,
+            "weights": ["incidence", "effective_gsd", "sharpness", "pose_confidence"],
+            "consensus_written_to_atlas": True,
+        },
+    }
+    log.info("%s : %d vue(s) rectifiee(s), %.0f%% du mur observe", plane.facade_id, used, 100 * found.observed_fraction)
+    return found
+
+
 def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
-    triangles: list[np.ndarray] = []
-    face_ids: list[int] = []
+    triangles = []
+    face_ids = []
     fid = 0
     for volume in payload.get("volumes", []):
+        solid = volume.get("solid") or {}
+        sv = solid.get("vertices") or []
+        sf = solid.get("faces") or []
+        if sv and sf:
+            for face in sf:
+                if len(face) >= 3:
+                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
+                    if tri.shape == (3, 3):
+                        triangles.append(tri)
+                        face_ids.append(fid)
+                        fid += 1
+            continue
         fp = volume.get("fp") or []
         wh = volume.get("wh") or []
         h_default = float(volume.get("h") or 8.0)
@@ -268,21 +584,10 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
                         triangles.append(tri)
                         face_ids.append(fid)
                         fid += 1
-        solid = volume.get("solid") or {}
-        sv = solid.get("vertices") or []
-        sf = solid.get("faces") or []
-        if sv and sf:
-            for face in sf:
-                if len(face) >= 3:
-                    tri = np.asarray([sv[idx] for idx in face[:3]], dtype=np.float64)
-                    if tri.shape == (3, 3):
-                        triangles.append(tri)
-                        face_ids.append(fid)
-                        fid += 1
     return triangles, face_ids
 
 
-def rectify(
+def _rectify_profile_legacy(
     plane: FacadePlane,
     views: Sequence,
     texel_m: float = TEXEL_M_FACADE,
@@ -460,19 +765,8 @@ def rectify(
 
 
 __all__ = [
-    "DISAGREEMENT_LEVEL",
-    "MAX_INCIDENCE_DEG",
-    "MAX_INLIER_SPREAD_DE",
-    "MAD_OUTLIER_K",
-    "MIN_INLIERS_FOR_CONSENSUS",
-    "MIN_PIXELS_PER_M",
-    "TEXEL_M",
-    "TEXEL_M_FACADE",
-    "FacadePlane",
-    "LidarOcclusion",
-    "Orthofacade",
-    "ProxyDepth",
-    "TexelSupport",
-    "plane_from_edge",
-    "rectify",
+    "DISAGREEMENT_LEVEL", "FusionVerdict", "GSD_REFERENCE_M", "MAX_INCIDENCE_DEG",
+    "MAX_INLIER_SPREAD_DE", "MAD_OUTLIER_K", "MIN_INLIERS_FOR_CONSENSUS", "MIN_PIXELS_PER_M",
+    "TEXEL_M", "TEXEL_M_FACADE", "FacadePlane", "LidarOcclusion", "Orthofacade", "ProxyDepth",
+    "TexelCandidate", "TexelSupport", "candidate_weight", "fuse_texel_candidates", "plane_from_edge", "rectify",
 ]

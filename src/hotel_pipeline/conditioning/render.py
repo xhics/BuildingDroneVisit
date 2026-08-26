@@ -35,7 +35,14 @@ VEGETATION_CONFIDENCE = 0.35
 
 @dataclass
 class Camera:
-    """Pose de prise de vue, en CRS projeté, axe Z vers le haut."""
+    """Pose de prise de vue, en CRS projeté, axe Z vers le haut.
+
+    Depuis le contrat caméra, une pose peut porter la ``CanonicalCamera``
+    partagée avec le viewer, COLMAP et les textures : la projection passe
+    alors par les vrais intrinsèques (focales, point principal, distorsion),
+    pas par un FOV approximatif. Les deux chemins coexistent ; quand un
+    contrat existe, il fait autorité.
+    """
 
     position: np.ndarray
     target: np.ndarray
@@ -44,6 +51,23 @@ class Camera:
     height: int = 288
     near_m: float = 0.05
     far_m: float = 10_000.0
+    #: Caméra canonique du pipeline ; présente, elle remplace le FOV.
+    canonical: object | None = None
+
+    @classmethod
+    def from_canonical(cls, canonical) -> "Camera":  # noqa: ANN001
+        """Construit la pose de rendu depuis la CanonicalCamera du contrat."""
+        centre = canonical.position()
+        # La caméra regarde son axe +Z monde (R identité par convention du
+        # frustum viewer) : la cible se déduit de l'axe optique.
+        forward = canonical.R.T @ np.array([0.0, 0.0, 1.0])
+        return cls(
+            position=centre,
+            target=centre + forward,
+            width=int(canonical.width),
+            height=int(canonical.height),
+            canonical=canonical,
+        )
 
     def basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Repère caméra : avant, droite, haut.
@@ -248,9 +272,21 @@ def _wall_heights(prism: Prism) -> np.ndarray:
 def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
     """Murs et toit d'un prisme, en triangles. Le drapeau marque le toit.
 
-    Le toit est distingué parce qu'aucune source au sol ne l'atteste : c'est la
-    surface que le masque de confiance déclasse le plus fort.
+    Le toit est distingué parce qu'aucune source au sol ne l'atteste : c'est
+    la surface que le masque de confiance déclasse le plus fort.
+
+    Depuis le maillage canonique, ce module ne construit plus rien : il lit
+    les triangles de `prism.canonical_mesh`, la même instance que le
+    textureur, la collision et l'export consomment. L'extrusion locale n'est
+    conservée que pour un prisme qui n'a pas encore reçu son maillage.
     """
+    mesh = getattr(prism, "canonical_mesh", None)
+    if mesh is not None:
+        return [
+            (mesh.vertices[face], mesh.face_kind[index] in ("roof", "roof_step"))
+            for index, face in enumerate(mesh.faces)
+        ]
+
     faces: list[tuple[np.ndarray, bool]] = []
     fp = prism.footprint
     n = len(fp)
@@ -293,7 +329,10 @@ def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
             faces.append((np.stack([p0, p1, p2]), False))
             faces.append((np.stack([p0, p2, p3]), False))
 
-    # Toit mesuré : la surface réelle du nDSM remplace la fermeture inventée.
+    # Sans mesure, aucune géométrie architecturale n'est inventée : pas de
+    # cône, pas de pente fictive. Le prisme se ferme par une enveloppe
+    # minimale plate, marquée UNKNOWN côté provenance — elle borne
+    # l'occultation et sert à la collision, jamais à l'apparence.
     if prism.roof_measured:
         vertices = prism.roof_vertices
         for tri in prism.roof_faces:
@@ -305,20 +344,33 @@ def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
         # en reliant chaque arête de l'emprise au point de toit le plus proche.
         return faces
 
-    # Sans mesure, le prisme se ferme par un cône vers son centre. Ce n'est pas
-    # une observation : la carte de confiance déclasse ces faces en
-    # conséquence, via `roof_confidence`.
-    centre = fp.mean(axis=0)
-    apex = np.array([centre[0], centre[1], h])
-    for i in range(n):
-        a = fp[i]
-        b = fp[(i + 1) % n]
-        tri = np.stack([
-            np.array([a[0], a[1], h]),
-            np.array([b[0], b[1], h]),
-            apex,
-        ])
-        faces.append((tri, True))
+    from shapely.geometry import Polygon as _Polygon
+    from shapely.ops import triangulate as _triangulate
+
+    polygon = _Polygon(fp)
+    lookup = {(round(float(x), 6), round(float(y), 6)): index for index, (x, y) in enumerate(fp)}
+    for triangle in _triangulate(polygon):
+        if not polygon.covers(triangle):
+            continue
+        indices = []
+        for x, y in triangle.exterior.coords[:-1]:
+            index = lookup.get((round(float(x), 6), round(float(y), 6)))
+            if index is None:
+                indices = []
+                break
+            indices.append(index)
+        if len(indices) != 3:
+            continue
+        a, b, c = fp[indices]
+        cross_2d = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if cross_2d < 0:
+            indices.reverse()
+        faces.append((
+            np.stack([
+                np.array([fp[i][0], fp[i][1], h]) for i in indices
+            ]),
+            True,
+        ))
     return faces
 
 
@@ -394,6 +446,67 @@ def _vegetation_faces(patch) -> list[np.ndarray]:
     return faces
 
 
+def _rasterise_vegetal(
+    tri: np.ndarray,
+    camera: Camera,
+    depth: np.ndarray,
+    normal: np.ndarray,
+    silhouette: np.ndarray,
+    confidence: np.ndarray,
+    transmittance: float,
+) -> None:
+    """Inscrit un triangle végétal : derrière lui, la scène reste lisible.
+
+    Contrairement à un mur, le feuillage n'écrase pas le crédit des pixels
+    qu'il couvre : le crédit résiduel est proportionnel à sa transmittance,
+    et le z-buffer ne retient le massif que s'il est réellement plus proche.
+    """
+    screen, zcam = _project(tri, camera)
+    if np.any(zcam <= 0.05):
+        return
+    a, b, c = screen
+    area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+    if abs(area) < 1e-9:
+        return
+
+    h, w = depth.shape
+    min_x = max(int(np.floor(screen[:, 0].min())), 0)
+    max_x = min(int(np.ceil(screen[:, 0].max())), w - 1)
+    min_y = max(int(np.floor(screen[:, 1].min())), 0)
+    max_y = min(int(np.ceil(screen[:, 1].max())), h - 1)
+    if min_x > max_x or min_y > max_y:
+        return
+
+    px = np.arange(min_x, max_x + 1, dtype=np.float64) + 0.5
+    py = np.arange(min_y, max_y + 1, dtype=np.float64) + 0.5
+    dx = px - a[0]
+    dy = (py - a[1])[:, None]
+
+    inv_area = 1.0 / area
+    w0 = ((b[0] - a[0]) * dy - dx * (b[1] - a[1])) * inv_area
+    w1 = (dx * (c[1] - a[1]) - (c[0] - a[0]) * dy) * inv_area
+    w2 = 1.0 - w0 - w1
+    inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+    if not inside.any():
+        return
+
+    inv_z = w2 / zcam[0] + w1 / zcam[1] + w0 / zcam[2]
+    inv_z = np.where(np.abs(inv_z) < 1e-12, 1e-12, inv_z)
+    tri_depth = 1.0 / inv_z
+
+    rows, cols = slice(min_y, max_y + 1), slice(min_x, max_x + 1)
+    region_depth = depth[rows, cols]
+    closer = inside & (tri_depth < region_depth) & (tri_depth > 0)
+    if not closer.any():
+        return
+    region_depth[closer] = tri_depth[closer]
+    silhouette[rows, cols][closer] = 3
+    # Crédit résiduel : la façade derrière le feuillage reste pondérée par la
+    # transmittance au lieu de tomber à une valeur d'occultation totale.
+    residual = float(np.clip(VEGETATION_CONFIDENCE * transmittance + 0.02, 0.02, 1.0))
+    confidence[rows, cols][closer] = residual
+
+
 def _patch_faces(patch, terrain=None) -> list[np.ndarray]:  # noqa: ANN001
     """Triangule une plage de sol depuis son contour.
 
@@ -464,11 +577,20 @@ def _furniture_faces(item) -> list[np.ndarray]:  # noqa: ANN001
 def _project(points: np.ndarray, camera: Camera) -> tuple[np.ndarray, np.ndarray]:
     """Passe du monde à l'écran. Retourne les pixels et la profondeur.
 
+    Avec un contrat ``CanonicalCamera``, la projection est déléguée au
+    contrat — intrinsèques exacts et distorsion comprise : viewer, textures
+    et z-buffer partagent alors le même pixel pour le même point 3D. Sans
+    contrat, le chemin FOV historique subsiste.
+
     Les trois axes du repère caméra sont regroupés en une seule matrice,
     mémorisée avec la pose : un produit matriciel remplace trois produits
     scalaires et l'assemblage qui suivait. Appelée une fois par triangle,
     cette fonction faisait à elle seule vingt-huit mille `stack` par image.
     """
+    if camera.canonical is not None:
+        screen, zcam = camera.canonical.project(points)
+        return screen, zcam
+
     axes = camera.axes()
     local = (points - camera.position) @ axes
     x, y, z = local[:, 0], local[:, 1], local[:, 2]
@@ -748,13 +870,21 @@ def render_frame(
     # parfois, et le z-buffer tranche. Son crédit est délibérément bas — un
     # massif borne un encombrement, il ne décrit ni espèce ni feuillage.
     if environment is not None:
+        from .vegetation_opacity import TRANSMITTANCE_BY_CLASS
+
         for patch in environment.patches:
             if not _visible(_patch_bounds(patch), camera):
                 continue
+            # La végétation n'est plus un volume opaque : sa transmittance
+            # dégrade le crédit des pixels qu'elle couvre — une couronne
+            # semi-transparente laisse la façade partiellement visible.
+            transmittance = TRANSMITTANCE_BY_CLASS.get(
+                getattr(patch, "opacity_class", "uncertain"), 0.70
+            )
             for tri in _vegetation_faces(patch):
-                _rasterise(
+                _rasterise_vegetal(
                     tri, camera, depth, normal, silhouette, confidence,
-                    silhouette_value=3, confidence_value=VEGETATION_CONFIDENCE,
+                    transmittance,
                 )
         # Le mobilier porte sa propre silhouette : un mât devant une façade
         # occulte réellement, mais le générateur ne doit pas y peindre un

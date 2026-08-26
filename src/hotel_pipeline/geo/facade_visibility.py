@@ -66,7 +66,13 @@ class FacadeTexelCandidate:
 
 @dataclass
 class ProxyDepth:
-    """Z-buffer du proxy 3D pour une vue donnée."""
+    """Z-buffer du proxy 3D pour une vue donnée.
+
+    Convention unique du pipeline : ``depth`` est un **Z espace caméra** —
+    l'abscisse le long de l'axe optique — jamais une distance euclidienne,
+    jamais un z-buffer GPU normalisé. Toutes les comparaisons de profondeur
+    du pipeline se font dans cette même unité.
+    """
 
     width: int
     height: int
@@ -88,7 +94,22 @@ class ProxyDepth:
         face_ids: Sequence[int],
         width: int,
         height: int,
+        z_near_m: float = 0.05,
     ) -> ProxyDepth:
+        """Rastérise le proxy avec clip near-plane et découpage au bord.
+
+        Aucun sommet derrière la caméra n'atteint la projection : chaque
+        triangle est découpé en espace caméra contre z = z_near (0, 1 ou 2
+        triangles), puis le polygone écran est découpé contre le rectangle
+        image — jamais clampé.
+        """
+        from ..render_engine import (
+            clip_polygon_to_image,
+            clip_triangle_near,
+        )
+        import shapely
+
+        has_contract = hasattr(camera, "R") and hasattr(camera, "t")
         depth = np.full((height, width), np.inf, dtype=np.float64)
         face_map = np.full((height, width), -1, dtype=np.int32)
 
@@ -96,49 +117,254 @@ class ProxyDepth:
             tri = np.asarray(tri, dtype=np.float64)
             if tri.shape != (3, 3):
                 continue
-            screen, z = camera.project(tri)
-            if screen is None:
-                continue
-            xs = screen[:, 0]
-            ys = screen[:, 1]
-            x0 = int(np.floor(xs.min()))
-            x1 = int(np.ceil(xs.max()))
-            y0 = int(np.floor(ys.min()))
-            y1 = int(np.ceil(ys.max()))
-            x0 = max(0, x0)
-            y0 = max(0, y0)
-            x1 = min(width - 1, x1)
-            y1 = min(height - 1, y1)
-            if x1 < x0 or y1 < y0:
-                continue
-
-            s0, s1, s2 = screen
-            z0, z1, z2 = z
-            den = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (s1[1] - s0[1])
-            if abs(den) < 1e-8:
-                continue
-            inv_den = 1.0 / den
-
-            for py in range(y0, y1 + 1):
-                for px in range(x0, x1 + 1):
-                    p = np.array([px + 0.5, py + 0.5], dtype=np.float64)
-                    v1 = (p[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (p[1] - s0[1])
-                    v2 = (s1[0] - s0[0]) * (p[1] - s0[1]) - (p[0] - s0[0]) * (s1[1] - s0[1])
-                    u = v1 * inv_den
-                    v = v2 * inv_den
-                    w = 1.0 - u - v
-                    if u < -1e-4 or v < -1e-4 or w < -1e-4:
+            if has_contract:
+                cam_tri = tri @ camera.R.T + camera.t
+                for piece in clip_triangle_near(cam_tri, z_near_m):
+                    safe_z = np.where(np.abs(piece[:, 2]) < 1e-9, 1e-9, piece[:, 2])
+                    normalized = piece[:, :2] / safe_z[:, None]
+                    try:
+                        screen = np.asarray(
+                            camera.img_from_cam(
+                                np.column_stack([normalized, np.ones(len(piece))])
+                            ),
+                            dtype=float,
+                        ).reshape((-1, 2))
+                    except TypeError:
+                        screen = np.asarray(
+                            camera.img_from_cam(normalized), dtype=float
+                        ).reshape((-1, 2))
+                    polygon = clip_polygon_to_image(screen, width, height)
+                    if len(polygon) < 3:
                         continue
-                    if z0 > 0 and z1 > 0 and z2 > 0:
-                        inv_z = w * (1.0 / z0) + u * (1.0 / z1) + v * (1.0 / z2)
-                        z_pixel = 1.0 / inv_z
-                    else:
-                        z_pixel = w * z0 + u * z1 + v * z2
-                    if z_pixel < depth[py, px]:
-                        depth[py, px] = z_pixel
-                        face_map[py, px] = fid
+                    fx, fy = _focal_of(camera)
+                    cx, cy = _principal_of(camera)
+                    plane_point_cam = piece[0]
+                    plane_normal_cam = np.cross(piece[1] - piece[0], piece[2] - piece[0])
+                    norm_len = float(np.linalg.norm(plane_normal_cam))
+                    if norm_len < 1e-12:
+                        continue
+                    plane_normal_cam /= norm_len
+                    denom_const = float(plane_normal_cam @ plane_point_cam)
+            else:
+                # Caméra historique (duck typing ``project``) : pas d'espace
+                # caméra explicite. On saute tout triangle dont un sommet est
+                # derrière la caméra — l'explosion near-plane reste exclue —
+                # et on découpe le polygone écran au rectangle image.
+                screen, zcam = camera.project(tri)
+                if screen is None:
+                    continue
+                zcam = np.asarray(zcam, dtype=float).reshape(-1)
+                if np.any(zcam <= z_near_m):
+                    continue
+                polygon = clip_polygon_to_image(
+                    np.asarray(screen, dtype=float).reshape((-1, 2)), width, height
+                )
+                if len(polygon) < 3:
+                    continue
+
+                min_x = max(int(np.floor(polygon[:, 0].min())), 0)
+                max_x = min(int(np.ceil(polygon[:, 0].max())), width - 1)
+                min_y = max(int(np.floor(polygon[:, 1].min())), 0)
+                max_y = min(int(np.ceil(polygon[:, 1].max())), height - 1)
+                if max_x < min_x or max_y < min_y:
+                    continue
+                _fill_proxy_pixels(
+                    polygon,
+                    lambda px: _legacy_depth(camera, tri, screen, zcam, px),
+                    depth,
+                    face_map,
+                    fid,
+                    min_x,
+                    max_x,
+                    min_y,
+                    max_y,
+                    z_near_m,
+                )
+                continue
+
+            min_x = max(int(np.floor(polygon[:, 0].min())), 0)
+            max_x = min(int(np.ceil(polygon[:, 0].max())), width - 1)
+            min_y = max(int(np.floor(polygon[:, 1].min())), 0)
+            max_y = min(int(np.ceil(polygon[:, 1].max())), height - 1)
+            if max_x < min_x or max_y < min_y:
+                continue
+
+            gx, gy = np.meshgrid(
+                np.arange(min_x, max_x + 1) + 0.5,
+                np.arange(min_y, max_y + 1) + 0.5,
+            )
+            inside = shapely.contains_xy(
+                shapely.Polygon(polygon), gx.ravel(), gy.ravel()
+            ).reshape(gx.shape)
+            if not inside.any():
+                continue
+
+            # Profondeur exacte par rayon en espace caméra : le pixel définit
+            # la droite (xn, yn, 1) ; son intersection avec le plan du
+            # triangle donne le Z perspective-exact.
+            rays_cam = np.column_stack([
+                (gx.ravel() - cx) / fx,
+                (gy.ravel() - cy) / fy,
+                np.ones(gx.ravel().size),
+            ])
+            denom = rays_cam @ plane_normal_cam
+            safe_denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+            z_pixels = (denom_const / safe_denom).reshape(gx.shape)
+
+            region = depth[min_y:max_y + 1, min_x:max_x + 1]
+            closer = inside & (z_pixels > z_near_m) & (z_pixels < region)
+            if not closer.any():
+                continue
+            region[closer] = z_pixels[closer]
+            face_region = face_map[min_y:max_y + 1, min_x:max_x + 1]
+            face_region[closer] = fid
 
         return cls(width=width, height=height, depth=depth, face_id_map=face_map)
+
+
+def _legacy_ray_depth(camera, tri, pixel_xy):  # noqa: ANN001
+    """Profondeur Z par intersection rayon/triangle pour une caméra legacy.
+
+    Le rayon part de ``camera.position`` vers le centre du pixel reconstruit
+    par les vecteurs droite/haut de la caméra ; l'intersection avec le plan
+    du triangle donne le Z espace caméra (produit avec l'axe avant).
+    """
+    import numpy as np
+
+    ox, oy = pixel_xy
+    direction = (
+        camera.fwd
+        + ((ox - camera.width / 2) / camera.f) * camera.right
+        - ((oy - camera.height / 2) / camera.f) * camera.up
+    )
+    direction = np.asarray(direction, dtype=float)
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-12:
+        return None
+    direction /= norm
+    e1 = tri[1] - tri[0]
+    e2 = tri[2] - tri[0]
+    normal = np.cross(e1, e2)
+    norm_len = float(np.linalg.norm(normal))
+    if norm_len < 1e-12:
+        return None
+    normal /= norm_len
+    denom = float(direction @ normal)
+    if abs(denom) < 1e-12:
+        return None
+    t = float((tri[0] - np.asarray(camera.position)) @ normal) / denom
+    if t <= 0.0:
+        return None
+    hit = np.asarray(camera.position) + t * direction
+    return float((hit - np.asarray(camera.position)) @ camera.fwd)
+
+
+def _legacy_depth(camera, tri, screen, zcam, pixel_xy):  # noqa: ANN001
+    """Depth for both rich legacy cameras and minimal project-only cameras."""
+    if all(hasattr(camera, name) for name in ("fwd", "right", "up", "f", "width", "height")):
+        return _legacy_ray_depth(camera, tri, pixel_xy)
+    p = np.asarray(pixel_xy, dtype=float)
+    a, b, c = np.asarray(screen, dtype=float)
+    denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+    if abs(float(denom)) < 1e-12:
+        return None
+    w0 = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / denom
+    w1 = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / denom
+    w2 = 1.0 - w0 - w1
+    inv_depth = w0 / zcam[0] + w1 / zcam[1] + w2 / zcam[2]
+    return None if inv_depth <= 0 else float(1.0 / inv_depth)
+
+
+def _fill_proxy_pixels(
+    polygon,
+    depth_of_pixel,  # noqa: ANN001 - callable (px_tuple) -> float | None
+    depth,
+    face_map,
+    fid,
+    min_x,
+    max_x,
+    min_y,
+    max_y,
+    z_near_m,
+):
+    """Remplit le proxy pour une caméra legacy, pixel par pixel clippé."""
+    import shapely
+
+    gx, gy = np.meshgrid(
+        np.arange(min_x, max_x + 1) + 0.5,
+        np.arange(min_y, max_y + 1) + 0.5,
+    )
+    inside = shapely.contains_xy(
+        shapely.Polygon(polygon), gx.ravel(), gy.ravel()
+    ).reshape(gx.shape)
+    if not inside.any():
+        return
+    rows, cols = np.where(inside)
+    for row, col in zip(rows, cols):
+        value = depth_of_pixel((gx[row, col], gy[row, col]))
+        if value is None or not math.isfinite(value) or value <= z_near_m:
+            continue
+        y_index, x_index = min_y + row, min_x + col
+        if value < depth[y_index, x_index]:
+            depth[y_index, x_index] = value
+            face_map[y_index, x_index] = fid
+
+
+def _focal_of(camera):  # noqa: ANN001
+    model = str(getattr(camera, "model", "PINHOLE")).upper()
+    params = np.asarray(getattr(camera, "params", [1.0, 0.0, 0.0]), dtype=float)
+    if model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        return float(params[0]), float(params[0])
+    return float(params[0]), float(params[1])
+
+
+def _principal_of(camera):  # noqa: ANN001
+    model = str(getattr(camera, "model", "PINHOLE")).upper()
+    params = np.asarray(getattr(camera, "params", [1.0, 0.0, 0.0]), dtype=float)
+    if model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+        return float(params[1]), float(params[2])
+    return float(params[2]), float(params[3])
+
+
+@dataclass
+class RegisteredView:
+    """Une vue enregistrée : tout ce qu'une validation peut consommer.
+
+    L'image, la caméra canonique, les masques sémantiques et **les deux
+    cartes de profondeur** voyagent ensemble. Le textureur ne reconstruit
+    plus rien : il demande à cet objet ce que le pixel établit.
+
+    Les profondeurs sont toutes exprimées en Z espace caméra — la même
+    convention que ``ProxyDepth``, que ``LidarOcclusion`` et que le
+    z-buffer : aucune conversion implicite ne traîne entre modules.
+    """
+
+    asset_id: str
+    camera: object                      # CanonicalCamera ou compatible
+    image: np.ndarray | None = None
+    semantic_mask: np.ndarray | None = None
+    proxy_depth: "ProxyDepth | None" = None
+    lidar_depth: "LidarOcclusion | None" = None
+    pose_error_px: float | None = None
+
+    def occludes(self, pixel_xy: tuple[int, int], surface_z: float) -> bool:
+        """Le pixel voit-il autre chose que la surface visée ?
+
+        Comparaison strictement en Z espace caméra, tolérances distinctes
+        pour le proxy et le LiDAR ; verdict identique quelle que soit la
+        distance euclidienne du point hors axe.
+        """
+        x, y = int(pixel_xy[0]), int(pixel_xy[1])
+        proxy = self.proxy_depth
+        if proxy is not None:
+            hit_z, hit_fid = proxy.hit(x, y)
+            if hit_fid is not None and hit_fid >= 0 and surface_z > hit_z + PROXY_DEPTH_TOLERANCE_M:
+                return True
+        lidar = self.lidar_depth
+        if lidar is not None and 0 <= y < lidar.valid.shape[0] and 0 <= x < lidar.valid.shape[1]:
+            if lidar.valid[y, x] and surface_z > float(lidar.depth[y, x]) + LIDAR_OCCLUSION_MARGIN_M:
+                return True
+        return False
 
 
 @dataclass
@@ -269,42 +495,49 @@ def measure_facade_alignment(
     return median_px, error_m, len(errors_px)
 
 
+def local_projection_jacobian(camera, point_world, u_direction=None, delta_m=0.05):
+    point = np.asarray(point_world, dtype=np.float64)
+    direction_u = np.asarray(u_direction, dtype=np.float64) if u_direction is not None else np.array([1.0, 0.0, 0.0])
+    norm_u = float(np.linalg.norm(direction_u))
+    if norm_u < 1e-9:
+        return 0.0, 0.0
+    direction_u = direction_u / norm_u
+    base_screen, _ = camera.project(point[None, :])
+    if base_screen is None:
+        return 0.0, 0.0
+    base_screen = np.asarray(base_screen, dtype=np.float64).reshape(-1, 2)
+    def _pixels_per_m(delta):
+        screen, _ = camera.project((point + delta)[None, :])
+        if screen is None:
+            return 0.0
+        displacement = float(np.linalg.norm(np.asarray(screen, dtype=np.float64).reshape(-1, 2)[0] - base_screen[0]))
+        return displacement / max(delta_m, 1e-9)
+    px_per_m_u = _pixels_per_m(direction_u * delta_m)
+    px_per_m_v = _pixels_per_m(np.array([0.0, 0.0, delta_m]))
+    return px_per_m_u, px_per_m_v
+
+
+def effective_gsd_m(camera, point_world, u_direction=None, delta_m=0.05):
+    px_u, px_v = local_projection_jacobian(camera, point_world, u_direction, delta_m)
+    best = min(p for p in (px_u, px_v) if p > 0.0) if (px_u > 0 or px_v > 0) else 0.0
+    if best <= 0.0:
+        return None
+    return 1.0 / best
+
+
 def _estimate_local_gsd(camera, plane) -> float:
-    """GSD local par jacobien numérique de la projection au centre de la façade.
-
-    Remplace le calcul ponctuel par une estimation de la déformation pixel/mètre
-    dans les directions (u, z) du plan, ce qui rend le GSD insensible à un
-    déplacement artificiel du point d'échantillonnage.
-    """
-    eps = 1e-3
-    u = plane.length_m * 0.5
-    v_norm = 0.5
-    p0 = plane.point(u, v_norm)
-    p_u = plane.point(u + eps, v_norm)
-    z_abs = v_norm * plane.top_z(u)
-    dz = eps
-    v_norm_z = min(1.0, v_norm + dz / max(plane.top_z(u), 1e-6))
-    p_z = plane.point(u, v_norm_z)
-
-    pts = np.array([p0, p_u, p_z])
-    screen, _ = camera.project(pts)
-    if screen is None or screen.shape[0] < 3:
-        to_cam = np.asarray(camera.position, dtype=np.float64) - p0
-        dist = float(np.linalg.norm(to_cam))
-        focal = getattr(camera, "f", None)
-        if dist < 1e-6 or not focal:
-            return 0.12
-        return dist / max(focal, 1e-6)
-
-    dx_du = (screen[1, 0] - screen[0, 0]) / eps
-    dy_du = (screen[1, 1] - screen[0, 1]) / eps
-    dx_dz = (screen[2, 0] - screen[0, 0]) / dz
-    dy_dz = (screen[2, 1] - screen[0, 1]) / dz
-
-    jac_x = max(math.sqrt(dx_du * dx_du + dy_du * dy_du), 1e-6)
-    jac_z = max(math.sqrt(dx_dz * dx_dz + dy_dz * dy_dz), 1e-6)
-    gsd = 1.0 / min(jac_x, jac_z)
-    return max(0.005, min(gsd, 0.5))
+    centre = plane.point(plane.length_m * 0.5, 0.5)
+    gsd = effective_gsd_m(camera, centre, plane.along)
+    if gsd is not None:
+        return gsd
+    to_cam = np.asarray(camera.position, dtype=np.float64) - centre
+    dist = float(np.linalg.norm(to_cam))
+    if dist < 1e-6:
+        return 0.12
+    focal = getattr(camera, "f", None)
+    if not focal:
+        return 0.12
+    return dist / max(focal, 1e-6)
 
 
 def local_facade_reprojection_gate(
@@ -368,6 +601,8 @@ __all__ = [
     "ProxyDepth",
     "TexelStatus",
     "admit",
+    "effective_gsd_m",
+    "local_projection_jacobian",
     "measure_facade_alignment",
     "local_facade_reprojection_gate",
 ]
