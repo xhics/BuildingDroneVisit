@@ -91,6 +91,17 @@ class Prism:
         """
         return self.confidence if self.roof_measured else self.confidence * 0.35
 
+    @property
+    def roof_provenance_class(self) -> str:
+        """Ce que la géométrie du toit prétend être.
+
+        Sans toit mesuré, l'enveloppe plate est une borne de sécurité — elle
+        dit UNKNOWN, jamais une forme architecturale inventée.
+        """
+        if self.roof_measured:
+            return "LIDAR_MEASURED"
+        return "UNKNOWN_MINIMAL_ENVELOPE"
+
 
 @dataclass
 class ConditioningScene:

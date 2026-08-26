@@ -180,6 +180,7 @@ class CanonicalSceneMesh:
             raise ValueError(f"rôle de face inconnu : {sorted(unknown)}")
         self.face_kind = kinds
         self.records = list(records or [])
+        self.hole_records: list[list[FootprintVertex]] = []
         self.feature_id: str | None = None
         self.provenance_class: str | None = None
 

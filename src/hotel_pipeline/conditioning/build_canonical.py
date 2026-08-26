@@ -5,6 +5,11 @@ pieds posés sur le terrain mesuré, toiture reconstruite depuis ses plans
 quand ils le permettent, murs dérivés de la frontière du toit — jamais
 l'inverse. La soudure finale referme le volume ; l'audit compte les arêtes
 libres et doit en trouver zéro.
+
+Les cours intérieures font partie du bâtiment : les anneaux intérieurs de
+l'emprise produisent leurs propres murs — traversables par le raycast comme
+les autres — et ne sont jamais refermés par un couvercle. La triangulation
+contrainte garantit qu'aucun triangle du fond ou du toit ne recouvre la cour.
 """
 
 from __future__ import annotations
@@ -14,9 +19,11 @@ from shapely.geometry import Polygon
 
 from .canonical_mesh import (
     CanonicalSceneMesh,
+    FootprintVertex,
     WELD_TOLERANCE_M,
     footprint_records,
 )
+from .constrained_triangulation import triangulate_constrained
 from .roof_planes import RoofDecomposition
 from .roof_reconstruct import ReconstructedRoof, derive_wall_tops, reconstruct_roof
 
@@ -32,46 +39,73 @@ def _terrain_height(terrain, x: float, y: float) -> float:  # noqa: ANN001
     return value if np.isfinite(value) else 0.0
 
 
-def _bottom_cap(
-    ring: np.ndarray,
-    grounds: np.ndarray,
-    _lookup=None,  # noqa: ANN001 - paramètre historique, ignoré
-) -> tuple[list[list[int]], np.ndarray]:
-    """Fond du bâtiment : chaque sommet à son altitude de terrain.
+def _ring_records(ring: np.ndarray, terrain=None, top_z: float = 0.0):  # noqa: ANN001
+    """Records d'un anneau (extérieur ou trou), orienté CCW."""
+    records = footprint_records(ring, top_heights=top_z)
+    if terrain is not None:
+        for record in records:
+            record.ground_z = _terrain_height(terrain, record.x, record.y)
+    return records
 
-    Sur terrain incliné, aucune extrémité de mur ne flotte ni ne pénètre le
-    sol : le fond suit exactement la même nappe que les pieds des murs.
-    Les triangles sont indexés dans l'ordre du fond retourné ; le maillage
-    final les décale de sa base commune.
+
+def _cap_faces(
+    polygon: Polygon,
+    nodes: list[tuple[float, float]],
+    flip: bool = False,
+    index_offset: int = 0,
+) -> list[list[int]]:
+    """Triangles d'un couvercle par triangulation contrainte.
+
+    ``polygon`` porte trous éventuels : aucune face n'est émise dans une cour.
+    Les triangles sont indexés dans ``nodes``, décalés de ``index_offset``
+    pour pointer sur la nappe du couvercle et non sur celle du fond. ``flip``
+    retourne le sens : normale vers le bas pour le fond, vers le ciel pour
+    le toit.
     """
-    bottom_vertices = np.column_stack([ring, grounds])
     lookup = {
         (round(float(x), 6), round(float(y), 6)): index
-        for index, (x, y) in enumerate(ring)
+        for index, (x, y) in enumerate(nodes)
     }
     faces: list[list[int]] = []
-    polygon = Polygon(ring)
-    from shapely.ops import triangulate as shapely_triangulate
-
-    for triangle in shapely_triangulate(polygon):
-        if not polygon.covers(triangle):
-            continue
-        indices = []
-        for x, y in triangle.exterior.coords[:-1]:
+    for triangle in triangulate_constrained(polygon):
+        node_ids = []
+        for x, y in triangle:
             index = lookup.get((round(float(x), 6), round(float(y), 6)))
             if index is None:
-                # La triangulation de Delaunay d'un anneau ne crée pas de
-                # sommet : si elle le faisait, on abandonne ce triangle.
-                indices = []
+                node_ids = []
                 break
-            indices.append(index)
-        if len(indices) == 3:
-            a, b, c = ring[indices]
-            cross = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-            if cross < 0:
-                indices.reverse()
-            faces.append(list(indices))
-    return faces, bottom_vertices
+            node_ids.append(index)
+        if len(node_ids) != 3 or len(set(node_ids)) != 3:
+            continue
+        indices = [i + index_offset for i in node_ids]
+        a, b, c = (nodes[i] for i in node_ids)
+        cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        # Fond (flip=True) : normale vers le bas ; couvercle (flip=False) :
+        # normale vers le ciel.
+        if (cross < 0) != bool(flip):
+            indices.reverse()
+        faces.append(list(indices))
+    return faces
+
+
+def _wall_strip(
+    bottom_lookup: dict[tuple[float, float], int],
+    top_lookup: dict[tuple[float, float], int],
+    ring: list[FootprintVertex],
+) -> list[list[int]]:
+    """Quads verticaux le long d'un anneau, du pied au haut."""
+    faces: list[list[int]] = []
+    count = len(ring)
+    for i in range(count):
+        j = (i + 1) % count
+        bi = bottom_lookup[(round(float(ring[i].x), 6), round(float(ring[i].y), 6))]
+        bj = bottom_lookup[(round(float(ring[j].x), 6), round(float(ring[j].y), 6))]
+        ti = top_lookup[(round(float(ring[i].x), 6), round(float(ring[i].y), 6))]
+        tj = top_lookup[(round(float(ring[j].x), 6), round(float(ring[j].y), 6))]
+        # Le pied des murs suit le terrain : ground_z par sommet, pas un
+        # plan plat qui flotterait sur un site incliné.
+        faces.extend([[bi, bj, tj], [bi, tj, ti]])
+    return faces
 
 
 def build_canonical_building_mesh(
@@ -80,33 +114,64 @@ def build_canonical_building_mesh(
     terrain=None,  # noqa: ANN001 - TerrainGrid ou équivalent
     roof_decomposition: RoofDecomposition | None = None,
     weld_tolerance_m: float = WELD_TOLERANCE_M,
+    interiors: list[np.ndarray] | None = None,
 ) -> CanonicalSceneMesh:
     """Construit LE maillage du bâtiment — celui que tout le monde consomme.
 
     Paramètres
     ----------
     footprint :
-        Contour de l'emprise, dans n'importe quel sens CW/CCW.
+        Contour extérieur de l'emprise, dans n'importe quel sens CW/CCW.
+    interiors :
+        Anneaux intérieurs (cours, patios). Leur vide est conservé : murs
+        intérieurs générés, aucun couvercle dessus, raycast inclus.
     top_heights :
-        Hauteurs de toit par sommet, utilisées comme altitude de repli quand
-        aucun pan de toiture reconstruit ne revendique le sommet.
+        Hauteurs de toit par sommet, altitude de repli quand aucun pan de
+        toiture reconstruit ne revendique le sommet.
     terrain :
         Grille de terrain (``height_at(x, y)``) pour poser les pieds de murs.
     roof_decomposition :
         Segmentation en plans ; présente, elle commande la reconstruction.
     """
-    records = footprint_records(footprint, top_heights=top_heights)
+    from ..logging import get_logger
 
-    # Le pied du mur suit le terrain extérieur ; le niveau structurel du
-    # plancher resterait un attribut distinct, non confondu avec ce sol.
+    log = get_logger("canonical-building")
+
+    records = footprint_records(footprint, top_heights=top_heights)
     for record in records:
         record.ground_z = _terrain_height(terrain, record.x, record.y)
     grounds = np.array([record.ground_z for record in records], dtype=np.float64)
     ring = np.array([[record.x, record.y] for record in records], dtype=np.float64)
 
-    fallback_tops = np.array(
-        [record.top_z for record in records], dtype=np.float64
+    # Cours intérieures : chaque anneau devient un ruban de murs, jamais un
+    # couvercle. L'orientation normalisée CCW garde les hauteurs liées à
+    # leur sommet, où qu'ait été l'anneau fourni.
+    hole_records: list[list[FootprintVertex]] = []
+    for interior in interiors or []:
+        try:
+            hole_records.append(_ring_records(interior, terrain))
+        except ValueError:
+            log.info("anneau intérieur dégénéré ignoré")
+    hole_rings = [
+        np.array([[r.x, r.y] for r in hole], dtype=np.float64)
+        for hole in hole_records
+    ]
+    polygon_with_holes = (
+        Polygon(ring, hole_rings) if hole_rings else Polygon(ring)
     )
+    if not polygon_with_holes.is_valid:
+        polygon_with_holes = polygon_with_holes.buffer(0)
+
+    boundary_nodes: list[tuple[float, float]] = (
+        [(float(x), float(y)) for x, y in ring]
+        + [
+            (float(r.x), float(r.y))
+            for hole in hole_records
+            for r in hole
+        ]
+    )
+
+    fallback_tops = np.array([record.top_z for record in records], dtype=np.float64)
 
     roof: ReconstructedRoof | None = None
     decomposition = roof_decomposition
@@ -116,13 +181,9 @@ def build_canonical_building_mesh(
         and len(fallback_tops) >= 3
     ):
         try:
-            roof = reconstruct_roof(decomposition, Polygon(ring))
+            roof = reconstruct_roof(decomposition, polygon_with_holes)
         except (ValueError, TypeError) as exc:  # pragma: no cover - défensive
-            from ..logging import get_logger
-
-            get_logger("canonical-building").info(
-                "reconstruction du toit impossible (%s) : extrusion", exc
-            )
+            log.info("reconstruction du toit impossible (%s) : extrusion", exc)
             roof = None
 
     vertices: list[np.ndarray] = []
@@ -136,36 +197,40 @@ def build_canonical_building_mesh(
     if roof is not None and len(roof.plane_polygons) > 0:
         # Toit reconstruit : les murs dérivent de SA frontière. Chaque sommet
         # d'emprise interroge le pan propriétaire, pas le voisin le plus haut.
-        tops = derive_wall_tops(records, roof, decomposition)
-        tops = np.maximum(tops, grounds + MIN_WALL_M)
-        for record, top in zip(records, tops):
+        all_records = records + [r for hole in hole_records for r in hole]
+        tops = derive_wall_tops(all_records, roof, decomposition)
+        tops = np.maximum(tops, [r.ground_z + MIN_WALL_M for r in all_records])
+        for record, top in zip(all_records, tops):
             record.top_z = float(top)
 
-        top_indices = [add_vertex(np.array([r.x, r.y, r.top_z])) for r in records]
-        bottom_lookup: dict[tuple[float, float], int] = {}
+        bottom_nodes: dict[tuple[float, float], int] = {}
+        top_nodes: dict[tuple[float, float], int] = {}
+        for node_index, (x, y) in enumerate(boundary_nodes):
+            record = all_records[node_index]
+            bottom_nodes[(round(x, 6), round(y, 6))] = add_vertex(
+                np.array([x, y, record.ground_z])
+            )
+            top_nodes[(round(x, 6), round(y, 6))] = add_vertex(
+                np.array([x, y, record.top_z])
+            )
 
-        # Fond posé sur le terrain.
-        cap_faces, cap_bottoms = _bottom_cap(ring, grounds, {})
-        base_offset = len(vertices)
-        for point in cap_bottoms:
-            index = add_vertex(point)
-            bottom_lookup[(round(float(point[0]), 6), round(float(point[1]), 6))] = index
-        for face in cap_faces:
-            faces.append([base_offset + i for i in face])
+        # Fond posé sur le terrain, cours exclues ; normale vers le bas.
+        for face in _cap_faces(
+            polygon_with_holes, boundary_nodes, flip=True, index_offset=0
+        ):
+            faces.append(face)
             kinds.append("base")
 
-        # Murs : du pied au haut dérivé du toit, sommet pour sommet.
-        count = len(records)
-        for i in range(count):
-            j = (i + 1) % count
-            bi = bottom_lookup[(round(float(ring[i][0]), 6), round(float(ring[i][1]), 6))]
-            bj = bottom_lookup[(round(float(ring[j][0]), 6), round(float(ring[j][1]), 6))]
-            ti = top_indices[i]
-            tj = top_indices[j]
-            faces.extend([[bi, bj, tj], [bi, tj, ti]])
-            kinds.extend(["wall", "wall"])
+        # Murs extérieurs ET murs de cour : même ruban, même consommation.
+        exterior_ring = records
+        for face in _wall_strip(bottom_nodes, top_nodes, exterior_ring):
+            faces.append(face)
+            kinds.append("wall")
+        for hole in hole_records:
+            for face in _wall_strip(bottom_nodes, top_nodes, hole):
+                faces.append(face)
+                kinds.append("wall")
 
-        # Surface de toit reconstruite, sommets partagés compris.
         offset = len(vertices)
         for point in roof.vertices:
             add_vertex(point)
@@ -174,60 +239,53 @@ def build_canonical_building_mesh(
             kind = "roof" if roof.face_plane[face_index] >= 0 else "roof_step"
             kinds.append(kind)
     else:
-        # Extrusion canonique : même code pour tous les consommateurs, plus
-        # aucun extrudeur parallèle dans le pipeline.
+        # Extrusion canonique : fond contraint (cours vides), murs, couvercle
+        # plat contraint. Aucune forme architecturale inventée.
         if fallback_tops.size == 0 or not np.isfinite(fallback_tops).all():
             raise ValueError("hauteur de toit manquante : impossible de fermer")
         tops = np.maximum(fallback_tops, grounds + MIN_WALL_M)
         for record, top in zip(records, tops):
             record.top_z = float(top)
+        # Les parois de cour montent au niveau des avant-toits : la cour est
+        # un vide du volume, pas une fosse séparée.
+        eaves = float(np.max(tops))
+        for hole in hole_records:
+            for record in hole:
+                record.top_z = max(eaves, record.ground_z + MIN_WALL_M)
 
-        cap_faces, cap_bottoms = _bottom_cap(ring, grounds, {})
-        bottom_lookup: dict[tuple[float, float], int] = {}
-        for point in cap_bottoms:
-            bottom_lookup[(round(float(point[0]), 6), round(float(point[1]), 6))] = (
-                add_vertex(point)
+        all_records = records + [r for hole in hole_records for r in hole]
+        bottom_nodes: dict[tuple[float, float], int] = {}
+        for node_index, (x, y) in enumerate(boundary_nodes):
+            record = all_records[node_index]
+            bottom_nodes[(round(x, 6), round(y, 6))] = add_vertex(
+                np.array([x, y, record.ground_z])
             )
-        for face in cap_faces:
-            faces.append(list(face))
+
+        for face in _cap_faces(polygon_with_holes, boundary_nodes, flip=True):
+            faces.append(face)
             kinds.append("base")
 
-        count = len(records)
-        top_indices = [add_vertex(np.array([r.x, r.y, r.top_z])) for r in records]
-        for i in range(count):
-            j = (i + 1) % count
-            bi = bottom_lookup[(round(float(ring[i][0]), 6), round(float(ring[i][1]), 6))]
-            bj = bottom_lookup[(round(float(ring[j][0]), 6), round(float(ring[j][1]), 6))]
-            faces.extend([[bi, bj, top_indices[j]], [bi, top_indices[j], top_indices[i]]])
-            kinds.extend(["wall", "wall"])
+        top_nodes: dict[tuple[float, float], int] = {}
+        for node_index, (x, y) in enumerate(boundary_nodes):
+            record = all_records[node_index]
+            top_nodes[(round(x, 6), round(y, 6))] = add_vertex(
+                np.array([x, y, record.top_z])
+            )
 
-        # Couvercle plat : même triangulation XY que le fond.
-        top_polygon = Polygon(ring)
-        from shapely.ops import triangulate as shapely_triangulate
+        for face in _wall_strip(bottom_nodes, top_nodes, records):
+            faces.append(face)
+            kinds.append("wall")
+        for hole in hole_records:
+            for face in _wall_strip(bottom_nodes, top_nodes, hole):
+                faces.append(face)
+                kinds.append("wall")
 
-        lookup_top = {
-            (round(float(record.x), 6), round(float(record.y), 6)): index
-            for index, record in enumerate(records)
-        }
-        for triangle in shapely_triangulate(top_polygon):
-            if not top_polygon.covers(triangle):
-                continue
-            ring_positions = []
-            for x, y in triangle.exterior.coords[:-1]:
-                position = lookup_top.get((round(float(x), 6), round(float(y), 6)))
-                if position is None:
-                    ring_positions = []
-                    break
-                ring_positions.append(position)
-            if len(ring_positions) == 3:
-                pa, pb, pc = (records[position] for position in ring_positions)
-                cross = float(
-                    (pb.x - pa.x) * (pc.y - pa.y) - (pb.y - pa.y) * (pc.x - pa.x)
-                )
-                if cross < 0:
-                    ring_positions.reverse()
-                faces.append([top_indices[position] for position in ring_positions])
-                kinds.append("roof")
+        # Couvercle plat contraint : la cour reste ouverte sur le ciel.
+        for face in _cap_faces(
+            polygon_with_holes, boundary_nodes, index_offset=len(boundary_nodes)
+        ):
+            faces.append(face)
+            kinds.append("roof")
 
     mesh = CanonicalSceneMesh(
         vertices=np.asarray(vertices, dtype=np.float64) if vertices else np.zeros((0, 3)),
@@ -237,41 +295,5 @@ def build_canonical_building_mesh(
     )
     welded = mesh.weld_vertices(weld_tolerance_m)
     welded.records = records
+    welded.hole_records = hole_records
     return welded
-
-
-def attach_canonical_meshes(
-    scene,  # noqa: ANN001 - ConditioningScene
-    terrain=None,  # noqa: ANN001
-) -> dict:
-    """Donne à chaque prisme son maillage canonique, une seule fois.
-
-    Après cette passe, le renderer, le textureur, la collision et l'export
-    lisent tous `prism.canonical_mesh` : aucune extrusion locale ne subsiste.
-    """
-    built = 0
-    for prism in scene.prisms:
-        if getattr(prism, "canonical_mesh", None) is not None:
-            continue
-        try:
-            mesh = build_canonical_building_mesh(
-                prism.footprint,
-                top_heights=(
-                    np.asarray(prism.roof_vertices[:, 2])
-                    if prism.roof_measured
-                    else prism.height_m
-                ),
-                terrain=terrain,
-                roof_decomposition=getattr(prism, "roof_planes", None),
-            )
-        except (ValueError, TypeError):
-            continue
-        mesh.feature_id = prism.feature_id
-        mesh.provenance_class = "OCCLUDED_INFERRED" if prism.height_assumed else "LIDAR_MEASURED"
-        prism.canonical_mesh = mesh
-        built += 1
-    return {
-        "canonical_meshes_built": built,
-        "prisms": len(scene.prisms),
-        "digests": {p.feature_id: p.canonical_mesh.mesh_digest() for p in scene.prisms if p.canonical_mesh},
-    }

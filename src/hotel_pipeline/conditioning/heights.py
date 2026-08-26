@@ -125,7 +125,7 @@ def _vectorized_grid_surface(
     faces: list[list[int]] = []
     vertex_lookup: dict[tuple[float, float], int] = {}
 
-    def vertex(x: float, y: float) -> int:
+    def vertex(x: float, y: float) -> int | None:
         key = (round(float(x), 9), round(float(y), 9))
         found = vertex_lookup.get(key)
         if found is not None:
@@ -143,13 +143,20 @@ def _vectorized_grid_surface(
                 mode="nearest",
             )[0]
         )
+        if not np.isfinite(height):
+            # Zone UNKNOWN : trou LiDAR au-delà du seuil de comblement.
+            # Aucun sommet n'est inventé ici.
+            return None
         index = len(vertices)
         vertex_lookup[key] = index
         vertices.append([float(x), float(y), height])
         return index
 
     def add_triangle(coords) -> None:  # noqa: ANN001
-        indices = [vertex(float(x), float(y)) for x, y in coords]
+        raw = [vertex(float(x), float(y)) for x, y in coords]
+        if any(index is None for index in raw):
+            return
+        indices = [int(index) for index in raw]
         if len(set(indices)) != 3:
             return
         a, b, c = (np.asarray(vertices[index][:2]) for index in indices)
@@ -170,7 +177,10 @@ def _vectorized_grid_surface(
             if not polygon.intersects(cell):
                 continue
             if polygon.covers(cell):
-                indices = [vertex(x, y) for x, y in corners]
+                raw = [vertex(x, y) for x, y in corners]
+                if any(index is None for index in raw):
+                    continue  # coin en zone UNKNOWN : la cellule ne dit rien
+                indices = [int(index) for index in raw]
                 heights = [vertices[index][2] for index in indices]
                 # Aux ruptures, la diagonale relie les deux coins les plus
                 # proches en altitude. La marche reste nette sans ouvrir le
@@ -266,6 +276,54 @@ def measure_footprint(
     )
 
 
+#: Distance maximale de comblement des trous, en mètres. Au-delà, la cellule
+#: reste inconnue : un trou LiDAR de plusieurs mètres ne devient pas une
+#: surface continue de haute confiance.
+MAX_FILL_DISTANCE_M = 1.0
+
+
+def _gate_hole_filling(
+    valid: np.ndarray,
+    values: np.ndarray,
+    cell_m: float,
+    max_distance_m: float = MAX_FILL_DISTANCE_M,
+) -> tuple[np.ndarray, dict]:
+    """Comble les trous mesurés sous seuil ; marque le reste UNKNOWN.
+
+    Chaque cellule interpolée porte sa distance à la mesure la plus proche :
+    en deçà du seuil elle hérite d'une confiance qui décroît avec cette
+    distance, au-delà elle reste NaN et sort de la surface publiée. Retourne
+    (grille comblée, audit).
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    filled = np.array(values, dtype=np.float64, copy=True)
+    audit = {
+        "max_fill_distance_m": float(max_distance_m),
+        "filled_cells": 0,
+        "unknown_cells": 0,
+        "confidence_min": None,
+        "confidence_mean": None,
+    }
+    if bool(valid.all()):
+        return filled, audit
+
+    distances = distance_transform_edt(~valid) * cell_m
+    fillable = (~valid) & (distances <= max_distance_m)
+    unknown = (~valid) & (distances > max_distance_m)
+    _, nearest = distance_transform_edt(~valid, return_indices=True)
+    if fillable.any():
+        filled[fillable] = values[tuple(nearest[:, fillable])]
+        # Confiance décroissante avec l'éloignement à la mesure.
+        confidence = np.exp(-distances[fillable] / max(max_distance_m, 1e-6))
+        audit["filled_cells"] = int(fillable.sum())
+        audit["confidence_min"] = round(float(confidence.min()), 3)
+        audit["confidence_mean"] = round(float(confidence.mean()), 3)
+    audit["unknown_cells"] = int(unknown.sum())
+    filled[unknown] = np.nan
+    return filled, audit
+
+
 def build_roof_surface(
     raster, footprint: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -310,15 +368,17 @@ def build_roof_surface(
     # Le nDSM couvre l'emprise à quelques pour cent près — 3 % de cellules
     # manquantes sur ce pilote, dispersées. Échantillonner la grille telle
     # quelle rejetait tout quadrilatère touchant un trou, et le toit sortait
-    # dentelé, troué en son milieu. Les manques sont donc comblés par le plus
-    # proche voisin mesuré, ce qui ne crée pas de hauteur : cela prolonge la
-    # surface observée sur des lacunes de quelques décimètres.
+    # dentelé, troué en son milieu. Les manques proches d'une mesure sont
+    # comblés par le plus proche voisin, confiance dégressive ; au-delà du
+    # seuil, la cellule reste UNKNOWN et ne prétend rien mesurer.
     filled = band.astype(np.float64, copy=True)
+    fill_audit: dict = {}
     if not valid.all():
-        from scipy.ndimage import distance_transform_edt
-
-        _, nearest = distance_transform_edt(~valid, return_indices=True)
-        filled = filled[tuple(nearest)]
+        filled, fill_audit = _gate_hole_filling(
+            valid,
+            np.where(valid, band.astype(np.float64), np.nan),
+            cell_m=float(abs(transform.a)),
+        )
 
     # Les cellules sont conservées à leur résolution native puis découpées sur
     # le polygone vectoriel. Le bord du maillage rejoint ainsi exactement les
@@ -693,13 +753,22 @@ def build_roof_surface_from_cloud(
     if filled.sum() < MIN_CELLS:
         return None
 
-    # Les trous sont comblés par le plus proche voisin mesuré, comme pour le
-    # nDSM : une cellule vide au milieu d'un toit n'est pas un trou du toit.
+    # Les trous proches d'une mesure sont comblés par le plus proche voisin,
+    # confiance dégressive avec la distance ; au-delà du seuil, la cellule
+    # reste UNKNOWN — un trou LiDAR de plusieurs mètres ne devient pas une
+    # surface continue de haute confiance.
     if not filled.all():
-        from scipy.ndimage import distance_transform_edt
-
-        _, nearest = distance_transform_edt(~filled, return_indices=True)
-        grid = grid[tuple(nearest)]
+        grid, fill_audit = _gate_hole_filling(
+            filled, np.where(filled, grid, np.nan), cell_m=cell_m
+        )
+    else:
+        fill_audit = {
+            "max_fill_distance_m": MAX_FILL_DISTANCE_M,
+            "filled_cells": 0,
+            "unknown_cells": 0,
+            "confidence_min": None,
+            "confidence_mean": None,
+        }
 
     x_edges = minx + np.arange(cols + 1, dtype=np.float64) * cell_m
     y_edges = miny + np.arange(rows + 1, dtype=np.float64) * cell_m

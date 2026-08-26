@@ -572,4 +572,55 @@ def viewer_payload(scene: dict) -> dict:
     # L'azimut de caméra est dérivé de la géométrie et de la grammaire de façade
     # (et, après fusion photo, de la couverture mesurée) : jamais figé.
     payload["camera"] = optimal_camera(payload)
+    # Contrat caméra : le viewer consomme la même CanonicalCamera que le
+    # z-buffer du pipeline — mêmes focales, même point principal, near/far.
+    # Aucun FOV approximatif parallèle ne subsiste côté rendu HTML.
+    payload["canonical_camera"] = _viewer_canonical_camera(
+        payload["camera"], width=1280, height=720
+    )
     return payload
+
+
+def _viewer_canonical_camera(camera: dict, width: int, height: int) -> dict:
+    """Sérialise la CanonicalCamera du viewer depuis la pose dérivée."""
+    import math
+
+    from ..canonical_camera import DEFAULT_FAR_M, DEFAULT_NEAR_M, CanonicalCamera
+
+    altitude = math.radians(float(camera.get("altitude_deg", 30.0)))
+    azimuth = math.radians(float(camera.get("azimuth_deg", 0.0)))
+    distance = float(camera.get("target_distance_m", 100.0))
+    focus = camera.get("focus") or [0.0, 0.0, 0.0]
+
+    horizontal = distance * math.cos(altitude)
+    offset = np.array([
+        float(focus[0]) + horizontal * math.sin(azimuth),
+        float(focus[1]) - horizontal * math.cos(azimuth),
+        float(focus[2]) + distance * math.sin(altitude),
+    ])
+    target = np.asarray(focus[:3], dtype=np.float64)
+
+    forward = target - offset
+    forward /= max(float(np.linalg.norm(forward)), 1e-9)
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(forward, world_up)
+    right /= max(float(np.linalg.norm(right)), 1e-9)
+    up = np.cross(right, forward)
+    # Convention COLMAP : la caméra regarde +Z, y vers le bas de l'image.
+    rotation = np.stack([right, -up, forward], axis=0)
+    translation = -rotation @ offset
+
+    fov_deg = 55.0
+    focal_px = height / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
+    contract = CanonicalCamera(
+        "PINHOLE",
+        width,
+        height,
+        [focal_px, focal_px, width / 2.0, height / 2.0],
+        rotation=rotation,
+        translation=translation,
+        near_m=DEFAULT_NEAR_M,
+        far_m=DEFAULT_FAR_M,
+        camera_id="viewer-orbit",
+    )
+    return contract.as_dict()

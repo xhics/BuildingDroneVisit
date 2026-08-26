@@ -35,13 +35,37 @@ VEGETATION_CONFIDENCE = 0.35
 
 @dataclass
 class Camera:
-    """Pose de prise de vue, en CRS projeté, axe Z vers le haut."""
+    """Pose de prise de vue, en CRS projeté, axe Z vers le haut.
+
+    Depuis le contrat caméra, une pose peut porter la ``CanonicalCamera``
+    partagée avec le viewer, COLMAP et les textures : la projection passe
+    alors par les vrais intrinsèques (focales, point principal, distorsion),
+    pas par un FOV approximatif. Les deux chemins coexistent ; quand un
+    contrat existe, il fait autorité.
+    """
 
     position: np.ndarray
     target: np.ndarray
     fov_deg: float = 60.0
     width: int = 512
     height: int = 288
+    #: Caméra canonique du pipeline ; présente, elle remplace le FOV.
+    canonical: object | None = None
+
+    @classmethod
+    def from_canonical(cls, canonical) -> "Camera":  # noqa: ANN001
+        """Construit la pose de rendu depuis la CanonicalCamera du contrat."""
+        centre = canonical.position()
+        # La caméra regarde son axe +Z monde (R identité par convention du
+        # frustum viewer) : la cible se déduit de l'axe optique.
+        forward = canonical.R.T @ np.array([0.0, 0.0, 1.0])
+        return cls(
+            position=centre,
+            target=centre + forward,
+            width=int(canonical.width),
+            height=int(canonical.height),
+            canonical=canonical,
+        )
 
     def basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Repère caméra : avant, droite, haut.
@@ -303,7 +327,10 @@ def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
             faces.append((np.stack([p0, p1, p2]), False))
             faces.append((np.stack([p0, p2, p3]), False))
 
-    # Toit mesuré : la surface réelle du nDSM remplace la fermeture inventée.
+    # Sans mesure, aucune géométrie architecturale n'est inventée : pas de
+    # cône, pas de pente fictive. Le prisme se ferme par une enveloppe
+    # minimale plate, marquée UNKNOWN côté provenance — elle borne
+    # l'occultation et sert à la collision, jamais à l'apparence.
     if prism.roof_measured:
         vertices = prism.roof_vertices
         for tri in prism.roof_faces:
@@ -315,20 +342,33 @@ def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
         # en reliant chaque arête de l'emprise au point de toit le plus proche.
         return faces
 
-    # Sans mesure, le prisme se ferme par un cône vers son centre. Ce n'est pas
-    # une observation : la carte de confiance déclasse ces faces en
-    # conséquence, via `roof_confidence`.
-    centre = fp.mean(axis=0)
-    apex = np.array([centre[0], centre[1], h])
-    for i in range(n):
-        a = fp[i]
-        b = fp[(i + 1) % n]
-        tri = np.stack([
-            np.array([a[0], a[1], h]),
-            np.array([b[0], b[1], h]),
-            apex,
-        ])
-        faces.append((tri, True))
+    from shapely.geometry import Polygon as _Polygon
+    from shapely.ops import triangulate as _triangulate
+
+    polygon = _Polygon(fp)
+    lookup = {(round(float(x), 6), round(float(y), 6)): index for index, (x, y) in enumerate(fp)}
+    for triangle in _triangulate(polygon):
+        if not polygon.covers(triangle):
+            continue
+        indices = []
+        for x, y in triangle.exterior.coords[:-1]:
+            index = lookup.get((round(float(x), 6), round(float(y), 6)))
+            if index is None:
+                indices = []
+                break
+            indices.append(index)
+        if len(indices) != 3:
+            continue
+        a, b, c = fp[indices]
+        cross_2d = float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+        if cross_2d < 0:
+            indices.reverse()
+        faces.append((
+            np.stack([
+                np.array([fp[i][0], fp[i][1], h]) for i in indices
+            ]),
+            True,
+        ))
     return faces
 
 
@@ -474,11 +514,20 @@ def _furniture_faces(item) -> list[np.ndarray]:  # noqa: ANN001
 def _project(points: np.ndarray, camera: Camera) -> tuple[np.ndarray, np.ndarray]:
     """Passe du monde à l'écran. Retourne les pixels et la profondeur.
 
+    Avec un contrat ``CanonicalCamera``, la projection est déléguée au
+    contrat — intrinsèques exacts et distorsion comprise : viewer, textures
+    et z-buffer partagent alors le même pixel pour le même point 3D. Sans
+    contrat, le chemin FOV historique subsiste.
+
     Les trois axes du repère caméra sont regroupés en une seule matrice,
     mémorisée avec la pose : un produit matriciel remplace trois produits
     scalaires et l'assemblage qui suivait. Appelée une fois par triangle,
     cette fonction faisait à elle seule vingt-huit mille `stack` par image.
     """
+    if camera.canonical is not None:
+        screen, zcam = camera.canonical.project(points)
+        return screen, zcam
+
     axes = camera.axes()
     local = (points - camera.position) @ axes
     x, y, z = local[:, 0], local[:, 1], local[:, 2]
