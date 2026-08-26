@@ -331,6 +331,12 @@ def _camera_path(  # noqa: PLR0913
                     elevation_deg=elevation,
                     distance_m=round(radius, 4),
                     fov_horizontal_deg=fov_deg,
+                    orientation_xyzw=__import__(
+                        "hotel_pipeline.camera_feasibility", fromlist=["yaw_pitch_quaternion"]
+                    ).yaw_pitch_quaternion(
+                        azimuth,
+                        math.degrees(math.atan2(look_z - camera_z, radius)),
+                    ),
                     faces=faces,
                     blind_field=blind,
                 )

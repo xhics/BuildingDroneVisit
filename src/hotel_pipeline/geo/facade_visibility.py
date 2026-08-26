@@ -10,11 +10,11 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import Enum
 
 import numpy as np
 
 from ..logging import get_logger
+from ..schemas.canonical_states import TexelStatus
 
 log = get_logger("facade-visibility")
 
@@ -26,21 +26,6 @@ LIDAR_CLASSES = (3, 4, 5)
 LIDAR_OCCLUSION_MARGIN_M = 1.5
 POSE_MAX_ERROR_M = 0.5
 POSE_MAX_ERROR_PX = 12
-
-
-class TexelStatus(str, Enum):
-    OBSERVED_CONSENSUS = "OBSERVED_CONSENSUS"
-    OBSERVED_SINGLE = "OBSERVED_SINGLE"
-    REJECTED_DISAGREEMENT = "REJECTED_DISAGREEMENT"
-    REJECTED_OCCLUDED = "REJECTED_OCCLUDED"
-    REJECTED_SEMANTIC = "REJECTED_SEMANTIC"
-    REJECTED_POSE = "REJECTED_POSE"
-    REJECTED_RESOLUTION = "REJECTED_RESOLUTION"
-    UNOBSERVED = "UNOBSERVED"
-
-    @property
-    def is_observed(self) -> bool:
-        return self in (TexelStatus.OBSERVED_CONSENSUS, TexelStatus.OBSERVED_SINGLE)
 
 
 REJECTION_ORDER = (
@@ -219,6 +204,7 @@ def measure_facade_alignment(
     plane,
     proxy_depth: ProxyDepth | None = None,
     building_mask: np.ndarray | None = None,
+    facade_face_ids: set[int] | None = None,
 ) -> tuple[float, float, int]:
     """Écart médian entre l'arête haute projetée du mur et le masque building.
 
@@ -235,34 +221,44 @@ def measure_facade_alignment(
     if screen is None:
         return float("inf"), float("inf"), 0
 
-    x0, x1 = max(0, int(np.floor(screen[0, 0]))), min(width - 1, int(np.ceil(screen[1, 0])))
-    if x1 < x0:
+    # Problème 43 : échantillonner sur toute l'étendue, indépendamment du sens
+    x_min_px = max(0, int(np.floor(min(screen[0, 0], screen[1, 0]))))
+    x_max_px = min(width - 1, int(np.ceil(max(screen[0, 0], screen[1, 0]))))
+    if x_max_px < x_min_px:
         return float("inf"), float("inf"), 0
 
     dx = screen[1, 0] - screen[0, 0]
     dy = screen[1, 1] - screen[0, 1]
     dz = screen_z[1] - screen_z[0]
     errors_px = []
-    for x in range(x0, x1 + 1):
-        if dx == 0:
-            y_proj = screen[0, 1]
-            z_proj = float(screen_z[0])
+    for x_px in range(x_min_px, x_max_px + 1):
+        if abs(dx) < 1e-6:
+            t = 0.5
         else:
-            t = (x - screen[0, 0]) / dx
-            y_proj = screen[0, 1] + t * dy
-            z_proj = float(screen_z[0] + t * dz)
-        y_proj_int = round(y_proj)
+            t = (x_px - screen[0, 0]) / dx
+        t = max(0.0, min(1.0, t))
+        y_proj = screen[0, 1] + t * dy
+        z_proj = float(screen_z[0] + t * dz)
+        y_proj_int = int(round(y_proj))
         if not (0 <= y_proj_int < height):
             continue
-        col_mask = building_mask[:, x]
-        if not col_mask.any():
-            continue
-        if proxy_depth is not None:
-            hit_depth, _ = proxy_depth.hit(x, y_proj_int)
+
+        # Problèmes 42 et 44 : vérifier que le pixel proxy appartient à cette façade
+        if proxy_depth is not None and facade_face_ids is not None:
+            hit_depth, hit_fid = proxy_depth.hit(x_px, y_proj_int)
+            if hit_fid is not None and hit_fid >= 0 and hit_fid not in facade_face_ids:
+                continue
             if hit_depth != float("inf") and hit_depth < z_proj - PROXY_DEPTH_TOLERANCE_M:
                 continue
-        y_mask = round(np.argmax(col_mask))
-        errors_px.append(abs(y_proj - y_mask))
+
+        # Problème 42 : comparer au masque observé autour de la projection,
+        # pas au pixel le plus haut de la colonne
+        col_mask = building_mask[:, x_px]
+        if not col_mask.any():
+            continue
+        mask_ys = np.where(col_mask)[0]
+        closest_y = int(mask_ys[np.argmin(np.abs(mask_ys - y_proj))])
+        errors_px.append(abs(y_proj - closest_y))
 
     if not errors_px:
         return float("inf"), float("inf"), 0
@@ -274,15 +270,65 @@ def measure_facade_alignment(
 
 
 def _estimate_local_gsd(camera, plane) -> float:
-    centre = plane.point(plane.length_m * 0.5, 0.5)
-    to_cam = np.asarray(camera.position, dtype=np.float64) - centre
-    dist = float(np.linalg.norm(to_cam))
-    if dist < 1e-6:
-        return 0.12
-    focal = getattr(camera, "f", None)
-    if not focal:
-        return 0.12
-    return dist / max(focal, 1e-6)
+    """GSD local par jacobien numérique de la projection au centre de la façade.
+
+    Remplace le calcul ponctuel par une estimation de la déformation pixel/mètre
+    dans les directions (u, z) du plan, ce qui rend le GSD insensible à un
+    déplacement artificiel du point d'échantillonnage.
+    """
+    eps = 1e-3
+    u = plane.length_m * 0.5
+    v_norm = 0.5
+    p0 = plane.point(u, v_norm)
+    p_u = plane.point(u + eps, v_norm)
+    z_abs = v_norm * plane.top_z(u)
+    dz = eps
+    v_norm_z = min(1.0, v_norm + dz / max(plane.top_z(u), 1e-6))
+    p_z = plane.point(u, v_norm_z)
+
+    pts = np.array([p0, p_u, p_z])
+    screen, _ = camera.project(pts)
+    if screen is None or screen.shape[0] < 3:
+        to_cam = np.asarray(camera.position, dtype=np.float64) - p0
+        dist = float(np.linalg.norm(to_cam))
+        focal = getattr(camera, "f", None)
+        if dist < 1e-6 or not focal:
+            return 0.12
+        return dist / max(focal, 1e-6)
+
+    dx_du = (screen[1, 0] - screen[0, 0]) / eps
+    dy_du = (screen[1, 1] - screen[0, 1]) / eps
+    dx_dz = (screen[2, 0] - screen[0, 0]) / dz
+    dy_dz = (screen[2, 1] - screen[0, 1]) / dz
+
+    jac_x = max(math.sqrt(dx_du * dx_du + dy_du * dy_du), 1e-6)
+    jac_z = max(math.sqrt(dx_dz * dx_dz + dy_dz * dy_dz), 1e-6)
+    gsd = 1.0 / min(jac_x, jac_z)
+    return max(0.005, min(gsd, 0.5))
+
+
+def local_facade_reprojection_gate(
+    measurements: Sequence[tuple[str, str, float, float, int]],
+    *,
+    max_error_px: float = POSE_MAX_ERROR_PX,
+    max_error_m: float = POSE_MAX_ERROR_M,
+) -> dict:
+    """Require every measured (facade, view) pair to satisfy local alignment."""
+    rows = []
+    for facade_id, view_id, error_px, error_m, samples in measurements:
+        passed = samples > 0 and error_px <= max_error_px and error_m <= max_error_m
+        rows.append({
+            "facade_id": facade_id, "view_id": view_id,
+            "error_px": float(error_px), "error_m": float(error_m),
+            "samples": int(samples), "passed": passed,
+        })
+    return {
+        "status": "measured" if rows else "unavailable",
+        "passed": bool(rows) and all(row["passed"] for row in rows),
+        "measurements": rows,
+        "max_error_px": max_error_px,
+        "max_error_m": max_error_m,
+    }
 
 
 def admit(
@@ -323,4 +369,5 @@ __all__ = [
     "TexelStatus",
     "admit",
     "measure_facade_alignment",
+    "local_facade_reprojection_gate",
 ]

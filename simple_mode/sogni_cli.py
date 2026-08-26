@@ -32,7 +32,6 @@ Sogni.** Il n'existe aucun mode bac-à-sable — voir le docstring de
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -184,6 +183,193 @@ def _run(command: list[str], *, timeout: int, env: dict | None = None) -> subpro
         raise SogniCliError("sogni-agent introuvable dans le PATH") from exc
 
 
+def generate_transition_clip(
+    from_image: str | Path,
+    to_image: str | Path,
+    prompt: str,
+    *,
+    out_path: str | Path,
+    video_model: str = DEFAULT_VIDEO_MODEL,
+    duration_s: int = DEFAULT_CLIP_DURATION_S,
+    timeout: int = DEFAULT_TIMEOUT_S,
+) -> Path:
+    """Génère un unique clip entre deux images réelles (premier/dernier plan).
+
+    C'est l'usage où ces modèles sont fiables : les deux bornes sont des
+    images existantes et proches en point de vue, le modèle n'a qu'à
+    inventer le court passage entre elles. À ne pas confondre avec le
+    morphing entre deux points de vue incompatibles (vue satellite verticale
+    vs photo de rue), qui produit des éléments incohérents en cours de plan.
+
+    Sert notamment à combler la traversée du bâtiment, que le rendu 3D ne
+    peut pas produire faute d'intérieur modélisé — voir
+    ``cesium_render.build_traverse_poses``.
+    """
+    sogni_agent = _find_sogni_agent()
+    if sogni_agent is None:
+        raise SogniCliError(
+            "sogni-agent introuvable. Installer avec : "
+            "npm install -g @sogni-ai/sogni-creative-agent-skill@latest"
+        )
+    for image in (from_image, to_image):
+        if not Path(image).exists():
+            raise SogniCliError(f"image de référence introuvable : {image}")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sogni_agent, "--video", "-m", video_model,
+        "--ref", str(from_image), "--ref-end", str(to_image),
+        "--duration", str(duration_s),
+        "-o", str(out_path), "--json", prompt,
+    ]
+    result = _run(command, timeout=timeout, env={**os.environ})
+    if result.returncode != 0 or not out_path.exists():
+        log_path = out_path.with_suffix(".log")
+        log_path.write_text(
+            f"COMMAND: {command}\nRETURNCODE: {result.returncode}\n\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n",
+            encoding="utf-8",
+        )
+        raise SogniCliError(
+            f"clip de transition échoué (code {result.returncode}) — détail dans {log_path} :\n"
+            f"{(result.stderr or result.stdout)[-1500:]}"
+        )
+    return out_path
+
+
+#: Checkpoint « référence vers vidéo » : il ne verrouille aucune image, à la
+#: différence de flf2v qui épingle la première et la dernière. Il doit être
+#: demandé par son nom — il n'est jamais choisi automatiquement.
+REFERENCE_VIDEO_MODEL = "minimax-h3-r2v"
+
+
+def generate_from_references(
+    images: list[str | Path],
+    prompt: str,
+    *,
+    out_path: str | Path,
+    duration_s: int = 8,
+    video_model: str = REFERENCE_VIDEO_MODEL,
+    width: int = 1344,
+    height: int = 768,
+    timeout: int = DEFAULT_TIMEOUT_S,
+) -> Path:
+    """Génère un plan à partir d'un **jeu de références**, sans image imposée.
+
+    À utiliser quand les photos doivent inspirer le plan plutôt que d'en
+    constituer les extrémités : le modèle recompose, au lieu d'interpoler
+    entre deux images qu'il doit restituer à l'identique.
+
+    Le prompt doit suivre le contrat Ref2VA à six champs (voir
+    ``interior_journey.build_ref2va_prompt``) ; la première image est passée
+    en ``--ref``, les suivantes en ``-c`` répété, et le prompt les désigne
+    par ``<Picture 1>``, ``<Picture 2>``…
+    """
+    sogni_agent = _find_sogni_agent()
+    if sogni_agent is None:
+        raise SogniCliError(
+            "sogni-agent introuvable. Installer avec : "
+            "npm install -g @sogni-ai/sogni-creative-agent-skill@latest"
+        )
+    images = [Path(i) for i in images]
+    if not images:
+        raise SogniCliError("au moins une image de référence est nécessaire")
+    missing = [str(i) for i in images if not i.exists()]
+    if missing:
+        raise SogniCliError(f"image(s) de référence introuvable(s) : {missing}")
+    if len(images) > 9:
+        raise SogniCliError(f"{len(images)} références : le checkpoint Ref2VA en accepte 9 au plus")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [sogni_agent, "--video", "-m", video_model, "--ref", str(images[0])]
+    for extra in images[1:]:
+        command += ["-c", str(extra)]
+    command += [
+        "--duration", str(duration_s), "-w", str(width), "-h", str(height),
+        "-o", str(out_path), "--json", prompt,
+    ]
+
+    result = _run(command, timeout=timeout, env={**os.environ})
+    if result.returncode != 0 or not out_path.exists():
+        log_path = out_path.with_suffix(".log")
+        log_path.write_text(
+            f"COMMAND: {command}\nRETURNCODE: {result.returncode}\n\n"
+            f"STDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}\n",
+            encoding="utf-8",
+        )
+        raise SogniCliError(
+            f"génération par références échouée (code {result.returncode}) — "
+            f"détail dans {log_path} :\n{(result.stderr or result.stdout)[-1500:]}"
+        )
+    return out_path
+
+
+def generate_transition_chain(
+    anchors: list[str | Path],
+    prompts: list[str],
+    *,
+    out_dir: str | Path,
+    prefix: str = "passage",
+    duration_s: int = DEFAULT_CLIP_DURATION_S,
+    video_model: str = DEFAULT_VIDEO_MODEL,
+    timeout: int = DEFAULT_TIMEOUT_S,
+    progress=None,  # noqa: ANN001 — callable(index, total) optionnel
+) -> list[Path]:
+    """``N`` images d'ancrage -> ``N-1`` clips courts consécutifs.
+
+    Un passage long confié d'un bloc au générateur dérive : plus il invente
+    longtemps sans référence, plus il s'éloigne: c'est ce qui produisait un
+    intérieur incohérent. En le découpant, chaque clip repart d'une image
+    donnée et vise une image donnée — le modèle n'improvise jamais plus de
+    quelques secondes d'affilée.
+
+    ``prompts`` doit contenir un texte par saut (``len(anchors) - 1``).
+    """
+    anchors = [Path(a) for a in anchors]
+    if len(anchors) < 2:
+        raise SogniCliError("au moins deux images d'ancrage sont nécessaires")
+    if len(prompts) != len(anchors) - 1:
+        raise SogniCliError(
+            f"{len(prompts)} prompt(s) pour {len(anchors) - 1} saut(s) : il en faut un par saut"
+        )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    clips: list[Path] = []
+    for index, (start, end) in enumerate(zip(anchors, anchors[1:])):
+        clip = generate_transition_clip(
+            start, end, prompts[index],
+            out_path=out_dir / f"{prefix}_{index:02d}.mp4",
+            video_model=video_model, duration_s=duration_s, timeout=timeout,
+        )
+        clips.append(clip)
+        if progress is not None:
+            progress(index + 1, len(anchors) - 1)
+    return clips
+
+
+def concat_videos(clips: list[str | Path], out_path: str | Path, *, timeout: int = 300) -> Path:
+    """Recolle des clips en une seule vidéo (via `sogni-agent --concat-videos`)."""
+    sogni_agent = _find_sogni_agent()
+    ffmpeg = _find_ffmpeg()
+    if sogni_agent is None or ffmpeg is None:
+        raise SogniCliError("sogni-agent et ffmpeg sont requis pour le recollage")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [sogni_agent, "--concat-videos", str(out_path), *[str(c) for c in clips]]
+    result = _run(command, timeout=timeout, env={**os.environ, "FFMPEG_PATH": ffmpeg})
+    if result.returncode != 0 or not out_path.exists():
+        raise SogniCliError(
+            f"recollage échoué (code {result.returncode}) :\n{(result.stderr or result.stdout)[-1500:]}"
+        )
+    return out_path
+
+
 def generate_video_chain(
     storyboard: ContinuousStoryboard,
     *,
@@ -274,6 +460,9 @@ def generate_video_chain(
 
 
 __all__ = [
+    "concat_videos",
+    "generate_transition_chain",
+    "generate_transition_clip",
     "DEFAULT_CHAIN_KEYFRAMES",
     "DEFAULT_CLIP_DURATION_S",
     "DEFAULT_TIMEOUT_S",

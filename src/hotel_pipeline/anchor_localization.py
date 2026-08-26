@@ -27,6 +27,7 @@ from typing import Protocol, Sequence
 import numpy as np
 
 from .geometry_align import apply_sim3, umeyama_sim3
+from .canonical_registration import CanonicalSim3
 from .schemas import (
     AnchorCandidateEvidence,
     AnchorLocalizationPolicy,
@@ -505,11 +506,11 @@ def select_anchor_core(
             "heading_p90_deg": heading_p90,
             "enu_origin_lat": enu_origin_lat,
             "enu_origin_lon": enu_origin_lon,
-            "sim3": {
-                "scale": float(scale),
-                "rotation": rotation.tolist(),
-                "translation": translation.tolist(),
-            },
+            "sim3": CanonicalSim3(
+                scale=float(scale),
+                rotation=rotation,
+                translation=translation,
+            ).as_dict(),
         },
         status="ready" if not refusal_reasons else "refused",
         refusal_reasons=refusal_reasons,

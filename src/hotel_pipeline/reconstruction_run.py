@@ -43,6 +43,7 @@ class ReconstructionRunner:
         backend: ReconstructionBackend = ReconstructionBackend.COLMAP_INCREMENTAL,
         *,
         selected_asset_ids: list[str] | None = None,
+        holdout_asset_ids: list[str] | None = None,
     ) -> ReconstructionRun:
         """Exécute la reconstruction et retourne un `ReconstructionRun`.
 
@@ -55,23 +56,29 @@ class ReconstructionRunner:
             selected_asset_ids: override optionnel des assets sélectionnés
                 (utilisé pour les tests de cohorte temporelle)
         """
+        holdout = set(holdout_asset_ids or [])
+        requested = list(selected_asset_ids or input_manifest.selected_asset_ids)
+        train_ids = [asset_id for asset_id in requested if asset_id not in holdout]
+        if holdout and not train_ids:
+            raise ValueError("le split train/holdout ne laisse aucune image d'entraînement")
+        effective_ids = train_ids if holdout else selected_asset_ids
         run_id = _new_run_id(backend.value, input_manifest.reconstruction_input_id)
         started = datetime.now(timezone.utc).isoformat()
 
         if backend is ReconstructionBackend.COLMAP_INCREMENTAL:
-            result = _run_colmap_incremental(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_colmap_incremental(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.COLMAP_GLOBAL:
-            result = _run_colmap_global(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_colmap_global(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.MAP_ANYTHING:
-            result = _run_map_anything(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_map_anything(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.VGGT:
-            result = _run_vggt(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_vggt(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.GLUEMAP:
-            result = _run_gluemap(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_gluemap(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.MP_SFM:
-            result = _run_mpsfm(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_mpsfm(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         elif backend is ReconstructionBackend.SYNTHETIC:
-            result = _run_synthetic(self, input_manifest, run_id, selected_asset_ids=selected_asset_ids)
+            result = _run_synthetic(self, input_manifest, run_id, selected_asset_ids=effective_ids)
         else:
             result = ReconstructionRun(
                 run_id=run_id,
@@ -83,6 +90,16 @@ class ReconstructionRunner:
                 error=f"backend {backend.value} non implémenté dans cette phase",
             )
 
+        if holdout:
+            leaked = sorted(holdout & set(train_ids))
+            if leaked:
+                raise ReconstructionRefused(f"holdout présent dans les entrées train: {leaked}")
+            result.metrics.update({
+                "validation_protocol": "train_only_sfm_then_frozen_model_localization",
+                "train_asset_ids": train_ids,
+                "holdout_asset_ids": sorted(holdout),
+                "holdout_absent_from_train_inputs": True,
+            })
         return result
 
 

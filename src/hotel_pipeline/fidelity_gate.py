@@ -51,12 +51,18 @@ def _novel_gate_passes(gate: NovelViewValidationGate | None) -> bool:
     # toutes les comparaisons ci-dessous sans qu'aucun rendu n'ait eu lieu.
     if not gate.metrics_measured:
         return False
+    required = ("feature_inliers", "reprojection_px", "silhouette_iou", "ssim")
+    # Legacy manifests predate per-metric provenance.  New manifests that do
+    # provide it are strict: unavailable/inferred required metrics cannot PASS.
+    if gate.metric_status and any(gate.metric_status.get(name) != "measured" for name in required):
+        return False
     c = gate.pass_criteria
     return (
         gate.feature_inliers >= c.feature_inliers_min
         and gate.ssim >= c.ssim_min
         and gate.reprojection_px <= c.reprojection_px_max
-        and gate.structural_similarity >= c.structural_similarity_min
+        and gate.silhouette_iou is not None
+        and gate.silhouette_iou >= c.silhouette_iou_min
     )
 
 

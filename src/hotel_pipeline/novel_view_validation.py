@@ -94,15 +94,15 @@ def _select_held_out(
 
     if plan.strategy is HoldoutStrategy.LEAVE_ONE_VIEWPOINT_OUT:
         # Retire une vue par groupe de viewpoints, jamais la dernière d'un groupe.
-        held_out: list[str] = []
         by_vp: dict[str, list[str]] = {}
         for aid in sorted(registered_asset_ids):
             vp = _viewpoint_of(workspace, aid)
             by_vp.setdefault(vp, []).append(aid)
-        for vp in sorted(by_vp):
-            members = sorted(by_vp[vp])
-            if len(members) > 1:
-                held_out.append(rng.choice(members))
+        candidates = [
+            sorted(members) for _, members in sorted(by_vp.items())
+            if len(selected_asset_ids) - len(members) >= 3
+        ]
+        held_out = rng.choice(candidates) if candidates else []
     elif plan.strategy is HoldoutStrategy.K_FOLD:
         ids = sorted(registered_asset_ids)
         k = max(2, int(round(1.0 / max(plan.benchmark_profile, 0.1))))
@@ -199,13 +199,13 @@ def build_novel_view_gate(
             return NovelViewValidationGate(
                 holdout_plan=holdout_plan,
                 feature_inliers=_clamp(measurement["feature_inliers"]),
-                silhouette_iou=_clamp(measurement["silhouette_iou"]),
                 reprojection_px=max(0.0, measurement["reprojection_px"]),
-                structural_similarity=_clamp(measurement["structural_similarity"]),
+                normalized_reprojection_score=_clamp(measurement["normalized_reprojection_score"]),
+                metric_status=measurement["metric_status"],
                 # SSIM et LPIPS exigent une image rendue : ils restent aux
                 # défauts du schéma, et rien ne prétend les avoir mesurés.
                 pass_criteria=criteria,
-                metrics_measured=True,
+                metrics_measured=False,
                 unmeasured_reason=(
                     "mesure creuse : reprojection sur observations ; "
                     "SSIM et LPIPS exigent un rendu dense"

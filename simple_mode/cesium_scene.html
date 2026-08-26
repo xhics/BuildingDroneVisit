@@ -51,6 +51,16 @@
         // immédiatement le rendu de synthèse sur les plans dégagés.
         viewer.scene.skyAtmosphere.show = true;
 
+        // Heure de tournage. Attention à la portée réelle : les tuiles Google
+        // sont photographiées puis texturées avec leur éclairage d'origine,
+        // ombres comprises. Déplacer le soleil change donc le ciel et
+        // l'atmosphère, mais **pas** l'éclairage des bâtiments — un vrai
+        // passage en heure bleue ou de nuit relève de l'étalonnage, en aval.
+        if (config.isoTime) {
+          viewer.clock.currentTime = Cesium.JulianDate.fromIso8601(config.isoTime);
+          viewer.clock.shouldAnimate = false;
+        }
+
         // Le brouillard atmosphérique de Cesium délave les vues rasantes.
         viewer.scene.fog.enabled = false;
 
@@ -80,19 +90,74 @@
           await new Promise((r) => setTimeout(r, 50));
         }
 
+        // Échantillonner un seul point n'est pas déterministe : selon le
+        // niveau de détail chargé, le rayon touche le sol, un toit ou un
+        // arbre — écarts de 15 m constatés entre deux exécutions du même
+        // rendu. On tire donc une couronne de points autour du sujet et on
+        // en prend la médiane, robuste aux deux types d'aberration.
+        const R = 6378137.0;
+        const ring = [centre];
+        for (const dist of [60, 120, 200, 300]) {
+          for (const bearing of [0, 45, 90, 135, 180, 225, 270, 315]) {
+            const a = (bearing * Math.PI) / 180;
+            const dn = (dist * Math.cos(a)) / R;
+            const de = (dist * Math.sin(a)) / (R * Math.cos((config.centre.lat * Math.PI) / 180));
+            ring.push(
+              Cesium.Cartographic.fromDegrees(
+                config.centre.lon + (de * 180) / Math.PI,
+                config.centre.lat + (dn * 180) / Math.PI
+              )
+            );
+          }
+        }
+
+        // Points serrés sur le sujet : ils touchent le bâti, donc son sommet.
+        const near = [centre];
+        for (const dist of [15, 30]) {
+          for (const bearing of [0, 60, 120, 180, 240, 300]) {
+            const a = (bearing * Math.PI) / 180;
+            const dn = (dist * Math.cos(a)) / R;
+            const de = (dist * Math.sin(a)) / (R * Math.cos((config.centre.lat * Math.PI) / 180));
+            near.push(
+              Cesium.Cartographic.fromDegrees(
+                config.centre.lon + (de * 180) / Math.PI,
+                config.centre.lat + (dn * 180) / Math.PI
+              )
+            );
+          }
+        }
+
         let groundHeight = 0;
+        let topHeight = 0;
         try {
-          const sampled = await viewer.scene.sampleHeightMostDetailed([centre]);
-          if (sampled && sampled.length && Number.isFinite(sampled[0].height)) {
-            groundHeight = sampled[0].height;
-            window.droneGroundSource = "tuiles 3D";
+          const sampled = await viewer.scene.sampleHeightMostDetailed([...ring, ...near]);
+          const ringH = sampled
+            .slice(0, ring.length)
+            .filter((c) => c && Number.isFinite(c.height))
+            .map((c) => c.height)
+            .sort((x, y) => x - y);
+          const nearH = sampled
+            .slice(ring.length)
+            .filter((c) => c && Number.isFinite(c.height))
+            .map((c) => c.height)
+            .sort((x, y) => x - y);
+
+          if (ringH.length) {
+            // Le sol est la surface basse : une médiane mêlerait toitures et
+            // arbres au terrain. Un quantile bas isole le sol réel.
+            groundHeight = ringH[Math.floor(ringH.length * 0.2)];
+            window.droneGroundSource = `quantile 20% de ${ringH.length} points`;
           } else {
             window.droneGroundSource = "echec echantillonnage";
           }
+          // Le sommet du bâti est la surface haute près du sujet ; un quantile
+          // haut évite qu'un arbre isolé ne fasse la mesure.
+          topHeight = nearH.length ? nearH[Math.floor(nearH.length * 0.8)] : groundHeight;
         } catch (e) {
           window.droneGroundSource = "erreur: " + String(e && e.message ? e.message : e);
         }
         window.droneGroundHeight = groundHeight;
+        window.droneTopHeight = topHeight;
         window.droneReady = true;
       } catch (err) {
         window.droneError = String(err && err.message ? err.message : err);
@@ -111,8 +176,11 @@
           viewer.scene.render();
           const pending = window.droneTileset.tilesLoaded ? 0 : 1;
           stableFrames = pending === 0 ? stableFrames + 1 : 0;
-          if (stableFrames >= 8 || Date.now() - started > timeoutMs) {
-            resolve(stableFrames >= 8);
+          // 4 images stables suffisent à confirmer que le chargement est
+          // terminé ; au-delà on ne fait que payer des rendus 1080p inutiles,
+          // et le coût dominant est déjà le transfert des tuiles.
+          if (stableFrames >= 4 || Date.now() - started > timeoutMs) {
+            resolve(stableFrames >= 4);
             return;
           }
           requestAnimationFrame(step);

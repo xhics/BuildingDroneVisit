@@ -388,6 +388,20 @@ def enrich(payload: dict) -> dict:
     }
     score = sum(component_scores[name] * weights[name] for name in weights)
     payload["facade_features"] = features
+    payload["openings"] = []
+    for index, feature in enumerate(features):
+        if feature.get("kind") not in {"window", "door", "arched_window"}:
+            continue
+        payload["openings"].append({
+            "opening_id": f"opening-{index:04d}",
+            "kind": feature["kind"],
+            "edge_index": feature.get("edge_index"),
+            "contour_xyz_m": feature.get("vertices", []),
+            "reveal_depth_m": 0.12 if feature["kind"] == "window" else 0.18,
+            "material": "glass" if "window" in feature["kind"] else "door",
+            "provenance_class": feature.get("provenance_class", "INFERRED"),
+            "topology": "wall_opening",
+        })
     payload["facade_grammar"] = {
         "contract_version": 1,
         "status": "generated",

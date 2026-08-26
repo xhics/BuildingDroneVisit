@@ -271,6 +271,30 @@ function tick(){{if(spin){{az+=.0025;draw();}}requestAnimationFrame(tick)}}addEv
 </script></body></html>"""
 
 
+def _webgl_html(payload: dict, manifest: dict, gltf: dict) -> str:
+    """Self-contained GPU viewer with native depth and perspective UVs."""
+    payload_json, manifest_json, gltf_json = map(_safe_json, (payload, manifest, gltf))
+    return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>BuildingDroneVisit · WebGL</title>
+<style>html,body,#cv{{margin:0;width:100%;height:100%;overflow:hidden;background:#101722}}#cv{{display:block}}
+#hud{{position:fixed;left:14px;top:14px;padding:12px 15px;border:1px solid #344252;border-radius:10px;background:#101822e8;color:#f6f8fa;font:13px system-ui}}small{{color:#a8b4c2}}</style></head>
+<body><canvas id="cv"></canvas><div id="hud"><b>MODE DÉMONSTRATION · GPU</b><br><small>CanonicalSceneMesh · z-buffer · UV perspective</small></div>
+<script>const PAYLOAD={payload_json},MANIFEST={manifest_json},GLTF={gltf_json};
+const cv=document.getElementById('cv'),gl=cv.getContext('webgl2',{{antialias:true,depth:true}});if(!gl)throw Error('WebGL2 requis');
+gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.enable(gl.CULL_FACE);gl.cullFace(gl.BACK);
+const vs=`#version 300 es\nin vec3 p;in vec3 n;in vec2 uv;uniform mat4 mvp;out vec3 N;out vec2 U;void main(){{gl_Position=mvp*vec4(p,1.);N=n;U=uv;}}`,
+fs=`#version 300 es\nprecision highp float;in vec3 N;in vec2 U;out vec4 c;void main(){{float l=.28+.72*max(dot(normalize(N),normalize(vec3(.4,-.3,.85))),0.);vec3 a=mix(vec3(.28,.20,.17),vec3(.55,.38,.29),step(.5,fract(U.x*12.))*step(.5,fract(U.y*12.)));c=vec4(a*l,1.);}}`;
+function shader(t,s){{const q=gl.createShader(t);gl.shaderSource(q,s);gl.compileShader(q);if(!gl.getShaderParameter(q,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(q));return q}}const pr=gl.createProgram();gl.attachShader(pr,shader(gl.VERTEX_SHADER,vs));gl.attachShader(pr,shader(gl.FRAGMENT_SHADER,fs));gl.linkProgram(pr);gl.useProgram(pr);
+const uri=GLTF.buffers[0].uri.split(',')[1],raw=Uint8Array.from(atob(uri),c=>c.charCodeAt(0)),views=GLTF.bufferViews,acc=GLTF.accessors;
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);function attr(name,ai,size){{const a=acc[ai],v=views[a.bufferView],loc=gl.getAttribLocation(pr,name),b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,raw.slice(v.byteOffset||0,(v.byteOffset||0)+v.byteLength),gl.STATIC_DRAW);gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,size,gl.FLOAT,false,0,0)}}attr('p',0,3);attr('n',1,3);attr('uv',2,2);
+const ia=acc[3],iv=views[ia.bufferView],ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,raw.slice(iv.byteOffset||0,(iv.byteOffset||0)+iv.byteLength),gl.STATIC_DRAW);
+const lo=acc[0].min,hi=acc[0].max,focus=lo.map((v,i)=>(v+hi[i])/2),span=Math.max(...hi.map((v,i)=>v-lo[i]),1),cam=PAYLOAD.camera||{{}};let az=(cam.azimuth_deg??210)*Math.PI/180,el=.45,dist=span*2.2,drag=false,last=[0,0];
+function mul(a,b){{let o=new Float32Array(16);for(let r=0;r<4;r++)for(let c=0;c<4;c++)for(let k=0;k<4;k++)o[c*4+r]+=a[k*4+r]*b[c*4+k];return o}}function perspective(f,a,n,z){{const q=1/Math.tan(f/2),o=new Float32Array(16);o[0]=q/a;o[5]=q;o[10]=(z+n)/(n-z);o[11]=-1;o[14]=2*z*n/(n-z);return o}}function look(eye,c){{let f=c.map((v,i)=>v-eye[i]),L=Math.hypot(...f);f=f.map(v=>v/L);let s=[f[1],-f[0],0],S=Math.hypot(...s)||1;s=s.map(v=>v/S);let u=[s[1]*f[2],-s[0]*f[2],s[0]*f[1]-s[1]*f[0]],o=new Float32Array([s[0],u[0],-f[0],0,s[1],u[1],-f[1],0,s[2],u[2],-f[2],0,0,0,0,1]);o[12]=-s.reduce((q,v,i)=>q+v*eye[i],0);o[13]=-u.reduce((q,v,i)=>q+v*eye[i],0);o[14]=f.reduce((q,v,i)=>q+v*eye[i],0);return o}}
+function draw(){{const d=Math.min(devicePixelRatio||1,2),w=cv.clientWidth,h=cv.clientHeight;cv.width=w*d;cv.height=h*d;gl.viewport(0,0,cv.width,cv.height);gl.clearColor(.063,.09,.13,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);const eye=[focus[0]+Math.cos(az)*Math.cos(el)*dist,focus[1]+Math.sin(az)*Math.cos(el)*dist,focus[2]+Math.sin(el)*dist],near=cam.near_m??.05,far=cam.far_m??Math.max(10000,dist*10);gl.uniformMatrix4fv(gl.getUniformLocation(pr,'mvp'),false,mul(perspective(Math.PI/3,w/h,near,far),look(eye,focus)));gl.drawElements(gl.TRIANGLES,ia.count,gl.UNSIGNED_INT,0)}}
+cv.onpointerdown=e=>{{drag=true;last=[e.clientX,e.clientY];cv.setPointerCapture(e.pointerId)}};cv.onpointerup=()=>drag=false;cv.onpointermove=e=>{{if(drag){{az+=(e.clientX-last[0])*.008;el=Math.max(-1.4,Math.min(1.4,el-(e.clientY-last[1])*.006));last=[e.clientX,e.clientY];draw()}}}};cv.onwheel=e=>{{e.preventDefault();dist=Math.max(span*.2,dist*Math.exp(e.deltaY*.001));draw()}};addEventListener('resize',draw);draw();
+</script></body></html>"""
+
+
 def build(workspace: Workspace) -> ViewerOutputs:
     """Publie le viewer, son payload stable et son manifeste de provenance."""
     output_dir = workspace.path("11_conditioning")
@@ -310,6 +334,12 @@ def build(workspace: Workspace) -> ViewerOutputs:
     payload_path = workspace.write_json(
         "11_conditioning/viewer_payload.json", payload
     )
+    from .canonical_gltf import export_canonical_gltf
+    gltf_path = workspace.path("11_conditioning", "canonical_scene.gltf")
+    try:
+        gltf_metadata = export_canonical_gltf(payload, gltf_path)
+    except ValueError:
+        gltf_metadata = None
     facade_audit_path = workspace.write_json(
         "11_conditioning/facade_similarity_audit.json",
         payload.get("facade_grammar")
@@ -355,6 +385,11 @@ def build(workspace: Workspace) -> ViewerOutputs:
             "path": "viewer_payload.json",
             "sha256": _sha256(payload_path),
         },
+        "canonical_gltf": ({
+            "path": "canonical_scene.gltf",
+            "sha256": _sha256(gltf_path),
+            **gltf_metadata,
+        } if gltf_metadata is not None else None),
         "facade_similarity": {
             "path": "facade_similarity_audit.json",
             "sha256": _sha256(facade_audit_path),
@@ -386,9 +421,12 @@ def build(workspace: Workspace) -> ViewerOutputs:
     manifest_path = workspace.write_json(
         "11_conditioning/viewer_manifest.json", manifest
     )
-    html_path = workspace.write_text(
-        "11_conditioning/viewer.html", _html(payload, manifest)
+    html = (
+        _webgl_html(payload, manifest, _read_json(gltf_path))
+        if gltf_metadata is not None
+        else _html(payload, manifest)
     )
+    html_path = workspace.write_text("11_conditioning/viewer.html", html)
     return ViewerOutputs(html=html_path, payload=payload_path, manifest=manifest_path)
 
 

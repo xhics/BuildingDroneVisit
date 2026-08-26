@@ -68,6 +68,7 @@ class VerticalTransform(BaseModel):
 
     #: Modèle de géoïde et sa version, quand l'opération en utilise un.
     geoid_model: str | None = None
+    geoid_version: str | None = None
 
     #: Précision annoncée **par l'opération**, non celle qu'on espère.
     accuracy_m: float | None = Field(default=None, ge=0)
@@ -252,6 +253,12 @@ class SpatialReferenceContext(BaseModel):
                 "source_crs": self.source_crs,
                 "working_crs": self.working_crs,
                 "jurisdictions": self.jurisdictions,
+                "vertical_crs": self.vertical.crs,
+                "height_type": self.vertical.height_type.value,
+                "vertical_unit": self.vertical.unit,
+                "vertical_transforms": [
+                    item.model_dump(mode="json") for item in self.vertical.transforms
+                ],
             },
             sort_keys=True, ensure_ascii=False, separators=(",", ":"),
         )

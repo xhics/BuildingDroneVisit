@@ -767,6 +767,9 @@ class CameraFeasibilityField(BaseModel):
     yaw_deg: float = Field(ge=0.0, lt=360.0)
     pitch_deg: float = Field(ge=-90.0, le=90.0)
     fov_deg: float = Field(gt=0.0)
+    orientation_xyzw: tuple[float, float, float, float] | None = None
+    near_m: float = Field(default=0.05, gt=0.0)
+    far_m: float = Field(default=10_000.0, gt=0.0)
 
     visible_surface_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     unknown_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -774,6 +777,7 @@ class CameraFeasibilityField(BaseModel):
     reconstructed_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     minimum_distance_violation: bool = False
     collision: bool = False
+    distance_to_scene_m: float | None = Field(default=None, ge=0.0)
     framing_quality: float = Field(default=0.0, ge=0.0, le=1.0)
     overall_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
@@ -855,11 +859,13 @@ class NovelViewValidationGate(BaseModel):
     holdout_plan: HoldoutPlan
     feature_inliers: float = Field(default=0.0, ge=0.0, le=1.0)
     edge_alignment: float = Field(default=0.0, ge=0.0, le=1.0)
-    silhouette_iou: float = Field(default=0.0, ge=0.0, le=1.0)
+    silhouette_iou: float | None = Field(default=None, ge=0.0, le=1.0)
     lpips: float = Field(default=1.0, ge=0.0, le=1.0)
     ssim: float = Field(default=0.0, ge=0.0, le=1.0)
     reprojection_px: float = Field(default=0.0, ge=0.0)
-    structural_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    structural_similarity: float | None = Field(default=None, ge=0.0, le=1.0)
+    normalized_reprojection_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    metric_status: dict[str, str] = Field(default_factory=dict)
     pass_criteria: NovelViewCriteria
 
     #: Les métriques ci-dessus proviennent-elles d'un rendu réellement comparé

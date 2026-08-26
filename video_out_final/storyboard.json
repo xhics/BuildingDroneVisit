@@ -1,0 +1,187 @@
+{
+  "address": "Google Building 41, 1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA",
+  "master_prompt_fr": "Vol de drone continu et ininterrompu autour de « Google Building 41, 1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA ». Une seule prise, sans coupure ni arrêt entre les mouvements : 1) établit le contexte : le bâtiment et ses abords, vus d'ensemble; 2) rapproche le regard du spectateur vers l'entrée du bâtiment; 3) figure signature : révèle les façades sous plusieurs angles en se rapprochant; 4) clôt la séquence sur un mouvement dynamique et rasant. Le vol se termine en traversant la façade du bâtiment comme si les murs devenaient transparents, révélant un intérieur cohérent avec le style architectural extérieur, avant de ressortir de l'autre côté. Mouvement fluide et stabilisé de bout en bout, vitesse constante, aucune coupure de montage, cohérent avec les images de référence fournies.",
+  "total_duration_s": 30.0,
+  "keyframes": [
+    {
+      "order": 0,
+      "maneuver_id": "orbit_reco",
+      "east_m": 0.0,
+      "north_m": 60.3,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 1,
+      "maneuver_id": "orbit_reco",
+      "east_m": 40.5,
+      "north_m": 44.6,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 2,
+      "maneuver_id": "orbit_reco",
+      "east_m": 60.0,
+      "north_m": 5.8,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 3,
+      "maneuver_id": "orbit_reco",
+      "east_m": 48.3,
+      "north_m": -35.9,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 4,
+      "maneuver_id": "orbit_reco",
+      "east_m": 11.6,
+      "north_m": -59.1,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 5,
+      "maneuver_id": "orbit_reco",
+      "east_m": -31.1,
+      "north_m": -51.6,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 6,
+      "maneuver_id": "orbit_reco",
+      "east_m": -57.7,
+      "north_m": -17.3,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 7,
+      "maneuver_id": "orbit_reco",
+      "east_m": -54.4,
+      "north_m": 25.9,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 8,
+      "maneuver_id": "orbit_reco",
+      "east_m": -22.8,
+      "north_m": 55.7,
+      "altitude_m": 49.3,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 9,
+      "maneuver_id": "reveal_push",
+      "east_m": -0.0,
+      "north_m": 81.2,
+      "altitude_m": 43.2,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 10,
+      "maneuver_id": "orbit_descent",
+      "east_m": 1.8,
+      "north_m": 123.6,
+      "altitude_m": 30.5,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 11,
+      "maneuver_id": "orbit_descent",
+      "east_m": 34.6,
+      "north_m": 97.3,
+      "altitude_m": 25.8,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 12,
+      "maneuver_id": "orbit_descent",
+      "east_m": 22.7,
+      "north_m": 57.5,
+      "altitude_m": 20.6,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 13,
+      "maneuver_id": "orbit_descent",
+      "east_m": -17.9,
+      "north_m": 59.6,
+      "altitude_m": 14.7,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 14,
+      "maneuver_id": "orbit_descent",
+      "east_m": -16.3,
+      "north_m": 98.7,
+      "altitude_m": 7.6,
+      "reference_image": "video_out_final\\streetview_JxRO0tquKTTXzSv0JHqVHw.jpg",
+      "reference_kind": "street_view"
+    },
+    {
+      "order": 15,
+      "maneuver_id": "orbit_descent",
+      "east_m": 15.6,
+      "north_m": 83.8,
+      "altitude_m": -1.8,
+      "reference_image": "video_out_final\\streetview_MtUtObt3RVkxOxmw7WpsSg.jpg",
+      "reference_kind": "street_view"
+    },
+    {
+      "order": 16,
+      "maneuver_id": "flyover",
+      "east_m": 58.1,
+      "north_m": 80.8,
+      "altitude_m": -2.9,
+      "reference_image": "video_out_final\\streetview_ryFC5PXiPoY_QAWnskaItw.jpg",
+      "reference_kind": "street_view"
+    },
+    {
+      "order": 17,
+      "maneuver_id": "flyover",
+      "east_m": 102.5,
+      "north_m": 79.3,
+      "altitude_m": -3.6,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 18,
+      "maneuver_id": "flyover",
+      "east_m": 146.8,
+      "north_m": 77.8,
+      "altitude_m": -4.4,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "satellite"
+    },
+    {
+      "order": 19,
+      "maneuver_id": "traversee_finale",
+      "east_m": 146.8,
+      "north_m": 77.8,
+      "altitude_m": -4.4,
+      "reference_image": "video_out_final\\satellite.png",
+      "reference_kind": "generatif"
+    }
+  ]
+}

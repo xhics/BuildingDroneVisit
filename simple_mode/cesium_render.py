@@ -99,6 +99,21 @@ class CameraPose:
         }
 
 
+def _flatten_with_mode(maneuvers: list[Maneuver]) -> list[tuple[Waypoint, str]]:
+    """Points du trajet, chacun avec le mode de visée de sa figure."""
+    out: list[tuple[Waypoint, str]] = []
+    for maneuver in maneuvers:
+        for waypoint in maneuver.waypoints:
+            if out and (
+                abs(out[-1][0].east_m - waypoint.east_m) < 1e-6
+                and abs(out[-1][0].north_m - waypoint.north_m) < 1e-6
+                and abs(out[-1][0].altitude_m - waypoint.altitude_m) < 1e-6
+            ):
+                continue
+            out.append((waypoint, maneuver.heading_mode))
+    return out
+
+
 def _flatten(maneuvers: list[Maneuver]) -> list[Waypoint]:
     points: list[Waypoint] = []
     for maneuver in maneuvers:
@@ -157,23 +172,45 @@ def build_poses(
     *,
     frame_count: int,
     target_height_m: float = 15.0,
+    enforce_envelope: bool = True,
 ) -> list[CameraPose]:
-    """Convertit la trajectoire en poses caméra visant le bâtiment.
+    """Convertit la trajectoire en poses caméra.
 
-    Le cap pointe vers le centre géocodé et le tangage est calculé depuis la
-    hauteur relative : la caméra regarde donc réellement le sujet à chaque
-    image, au lieu de garder une orientation fixe.
+    Le tangage est calculé depuis la hauteur relative, et le cap dépend du
+    ``heading_mode`` de chaque figure : braqué sur le sujet pour les orbites,
+    dans le sens du vol pour une traversée.
+
+    ``enforce_envelope`` applique les bornes de qualité photogrammétrique ;
+    les segments de traversée doivent s'en affranchir pour pouvoir cadrer une
+    façade de près.
     """
-    points = _resample_path(_flatten(maneuvers), frame_count)
+    flat = _flatten_with_mode(maneuvers)
+    source = [w for w, _m in flat]
+    points = _resample_path(source, frame_count)
+
+    # Le mode de visée suit la géométrie, pas l'indice : on retrouve pour
+    # chaque point ré-échantillonné la figure d'origine la plus proche.
+    def mode_at(index: int) -> str:
+        if not flat:
+            return "centre"
+        target = points[index]
+        best, best_d = 0, float("inf")
+        for i, (w, _m) in enumerate(flat):
+            d = (w.east_m - target.east_m) ** 2 + (w.north_m - target.north_m) ** 2 + (
+                w.altitude_m - target.altitude_m
+            ) ** 2
+            if d < best_d:
+                best, best_d = i, d
+        return flat[best][1]
 
     poses: list[CameraPose] = []
-    for waypoint in points:
+    for index, waypoint in enumerate(points):
         east, north = waypoint.east_m, waypoint.north_m
 
         # Repousse la pose hors du rayon minimal, en conservant son azimut :
         # la figure garde sa forme, seule son échelle est bornée.
         radius = math.hypot(east, north)
-        if radius < MIN_RADIUS_M:
+        if enforce_envelope and radius < MIN_RADIUS_M:
             if radius < 1e-6:
                 east, north = 0.0, MIN_RADIUS_M
             else:
@@ -182,20 +219,242 @@ def build_poses(
 
         p_lat, p_lon = offset_to_latlon(lat, lon, east, north)
 
-        # Cap : depuis la position vers le centre (0,0) du repère local.
-        heading = math.degrees(math.atan2(-east, -north)) % 360.0
+        if mode_at(index) == "trajet" and index < len(points) - 1:
+            # Cap dans le sens du vol : sans cela, une fois le bâtiment
+            # franchi, la caméra pivoterait pour le viser de nouveau.
+            nxt = points[index + 1]
+            heading = math.degrees(math.atan2(nxt.east_m - waypoint.east_m, nxt.north_m - waypoint.north_m)) % 360.0
+        elif mode_at(index) == "trajet":
+            prev = points[index - 1] if len(points) > 1 else waypoint
+            heading = math.degrees(math.atan2(waypoint.east_m - prev.east_m, waypoint.north_m - prev.north_m)) % 360.0
+        else:
+            # Cap : depuis la position vers le centre (0,0) du repère local.
+            heading = math.degrees(math.atan2(-east, -north)) % 360.0
 
-        altitude = max(MIN_ALTITUDE_M, waypoint.altitude_m)
+        altitude = waypoint.altitude_m
+        if enforce_envelope:
+            altitude = max(MIN_ALTITUDE_M, altitude)
+        altitude = max(2.0, altitude)
 
-        ground_distance = math.hypot(east, north)
-        rise = altitude - target_height_m
-        pitch = -math.degrees(math.atan2(rise, max(1.0, ground_distance)))
-        pitch = max(-89.0, min(10.0, pitch))
+        if mode_at(index) == "trajet":
+            # Vol de traversée : la caméra reste quasi horizontale pour
+            # cadrer la façade, et non le toit — une visée plongeante donne
+            # au générateur une vue de dessus, d'où l'« intérieur » qui
+            # apparaît au-dessus du bâtiment au lieu de dedans.
+            pitch = -4.0
+        else:
+            ground_distance = math.hypot(east, north)
+            rise = altitude - target_height_m
+            pitch = -math.degrees(math.atan2(rise, max(1.0, ground_distance)))
+            pitch = max(-89.0, min(10.0, pitch))
 
         poses.append(
             CameraPose(lat=p_lat, lon=p_lon, agl=altitude, heading=heading, pitch=pitch)
         )
     return poses
+
+
+#: Vitesse de la caméra, en m/s. Un survol cinématique posé tient plutôt
+#: entre 8 et 15 m/s, mais un trajet de ~1,8 km y dure plus de deux minutes,
+#: soit plusieurs heures de rendu. 25 m/s (90 km/h) reste dans le domaine
+#: d'un drone rapide en ligne droite et divise la durée par deux ; au-delà,
+#: le mouvement cesse d'être crédible et la photogrammétrie défile trop vite
+#: pour être lue.
+CRUISE_SPEED_MPS = 25.0
+
+
+def path_length_m(maneuvers: list[Maneuver]) -> float:
+    """Longueur du trajet, en 3D (les montées comptent)."""
+    points = _flatten(maneuvers)
+    return sum(
+        math.dist(
+            (a.east_m, a.north_m, a.altitude_m), (b.east_m, b.north_m, b.altitude_m)
+        )
+        for a, b in zip(points, points[1:])
+    )
+
+
+def allocate_frames(
+    lengths: list[float], *, fps: int, cruise_speed_mps: float = CRUISE_SPEED_MPS
+) -> list[int]:
+    """Images à rendre par segment, pour une vitesse identique partout.
+
+    Répartir les images à parts fixes (70/30, par exemple) alors que les
+    segments n'ont pas la même longueur fait varier la vitesse au raccord —
+    mesuré à ×1,5 entre l'avant et l'après d'une traversée. En dérivant le
+    nombre d'images de la longueur et d'une vitesse commune, chaque segment
+    parcourt la même distance par image, donc la caméra reprend exactement à
+    l'allure où elle s'était arrêtée.
+    """
+    return [max(2, round(length / cruise_speed_mps * fps)) for length in lengths]
+
+
+def probe_site(lat: float, lon: float, api_key: str, *, timeout_ms: int = 120000) -> dict:
+    """Mesure sol et sommet du bâti sur les tuiles 3D, avant tout rendu.
+
+    Sans cette mesure, l'altitude de traversée n'est qu'une supposition : si
+    elle dépasse la hauteur du bâtiment, la caméra survole les toits et le
+    générateur, n'ayant aucune façade devant lui, fabrique un intérieur
+    flottant au-dessus du bâti.
+
+    Renvoie ``{"ground": float, "top": float, "height": float}`` en mètres.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            args=["--headless=new", "--enable-gpu", "--ignore-gpu-blocklist", "--enable-webgl"]
+        )
+        page = browser.new_page(viewport={"width": 640, "height": 360})
+        page.goto(SCENE_HTML.as_uri())
+        page.evaluate(
+            "config => window.dronePrepare(config)",
+            {"apiKey": api_key, "centre": {"lat": lat, "lon": lon}, "waypoints": []},
+        )
+        page.wait_for_function(
+            "window.droneReady === true || window.droneError !== null", timeout=timeout_ms
+        )
+        error = page.evaluate("window.droneError")
+        if error:
+            browser.close()
+            raise CesiumRenderError(f"sondage du site échoué : {error}")
+        ground = float(page.evaluate("window.droneGroundHeight"))
+        top = float(page.evaluate("window.droneTopHeight"))
+        browser.close()
+
+    return {"ground": ground, "top": top, "height": max(0.0, top - ground)}
+
+
+def build_continuous_traverse(
+    *,
+    traverse_bearing_deg: float = 90.0,
+    traverse_altitude_m: float = 30.0,
+    entry_distance_m: float = 55.0,
+    exit_distance_m: float = 120.0,
+    samples: int = 40,
+) -> tuple[list[Maneuver], list[Maneuver]]:
+    """Découpe le vol en deux parties continues, séparées par la traversée.
+
+    Renvoie ``(avant, apres)``. « Avant » enchaîne les figures d'orbite puis
+    une approche frontale qui finit face à la façade ; « après » repart de
+    l'autre côté du bâtiment, dans le même sens, et se dégage en altitude.
+
+    Les deux parties se rendent en 3D réel et ne sont **pas** deux vols
+    distincts : la seconde reprend exactement là où la première s'arrête, à
+    l'épaisseur du bâtiment près — c'est précisément ce trou que
+    l'interpolation IA vient combler. Sans cette construction, chaque
+    segment démarrerait à un endroit arbitraire et la suite ne se lirait pas
+    comme un seul vol.
+    """
+    from .maneuvers import _line, artistic_maneuvers, chain_maneuvers
+
+    figures = artistic_maneuvers()
+    # Tout sauf la dernière figure précède la traversée ; le survol final
+    # conclut la séquence une fois le bâtiment franchi.
+    orbits = chain_maneuvers(figures[:-1])
+    end = orbits[-1].waypoints[-1]
+
+    angle = math.radians(traverse_bearing_deg)
+    de, dn = math.sin(angle), math.cos(angle)
+    entry = (-de * entry_distance_m, -dn * entry_distance_m)
+
+    # L'orbite se termine à un azimut arbitraire : sans ce raccord, la ligne
+    # d'approche partirait de travers et n'attaquerait pas la façade de face
+    # (cap mesuré à 191° au lieu de 90°). On rejoint d'abord l'axe de
+    # traversée, en gardant le sujet à l'image, puis on fonce droit dessus.
+    align_start = (-de * (entry_distance_m + 85.0), -dn * (entry_distance_m + 85.0))
+    alignment = Maneuver(
+        id="alignement_axe",
+        name_fr="Alignement sur l'axe de traversée",
+        color=(191, 90, 242),
+        waypoints=_line(
+            (end.east_m, end.north_m, end.altitude_m),
+            (align_start[0], align_start[1], traverse_altitude_m + 12.0),
+            samples=samples,
+        ),
+        skill_fr="repositionnement en descente douce pour se placer dans l'axe",
+        purpose_fr="place le drone dans l'axe du bâtiment avant l'approche",
+    )
+
+    approach = Maneuver(
+        id="approche_facade",
+        name_fr="Approche frontale de la façade",
+        color=(255, 214, 10),
+        waypoints=_line(
+            (align_start[0], align_start[1], traverse_altitude_m + 12.0),
+            (entry[0], entry[1], traverse_altitude_m),
+            samples=samples,
+        ),
+        skill_fr="rapprochement rectiligne à hauteur de façade, vitesse constante",
+        purpose_fr="amène le regard face au bâtiment, juste avant la traversée",
+        heading_mode="trajet",
+    )
+
+    exit_leg = Maneuver(
+        id="sortie_traversee",
+        name_fr="Sortie de la traversée",
+        color=(70, 214, 140),
+        waypoints=_line(
+            (de * entry_distance_m, dn * entry_distance_m, traverse_altitude_m),
+            (de * exit_distance_m, dn * exit_distance_m, traverse_altitude_m + 20.0),
+            samples=samples,
+        ),
+        skill_fr="poursuite rectiligne après le franchissement, sans rupture de vitesse",
+        purpose_fr="ressort de l'autre côté et poursuit le mouvement",
+        heading_mode="trajet",
+    )
+
+    after = chain_maneuvers([exit_leg, figures[-1]])
+    return [*orbits, alignment, approach], after
+
+
+def build_traverse_poses(
+    lat: float,
+    lon: float,
+    *,
+    bearing_deg: float,
+    altitude_m: float = 40.0,
+    approach_from_m: float = 90.0,
+    stop_before_m: float = 55.0,
+    exit_to_m: float = 90.0,
+    frames_per_leg: int = 24,
+) -> tuple[list[CameraPose], list[CameraPose]]:
+    """Poses d'approche puis de sortie de l'autre côté, pour l'effet de traversée.
+
+    Renvoie ``(approche, sortie)`` : deux vols rectilignes opposés, alignés
+    sur le même axe (``bearing_deg``, cap de l'approche vers le bâtiment).
+    Le passage **à travers** le bâti n'est délibérément pas rendu ici : les
+    tuiles 3D ne modélisent que l'extérieur, la caméra n'y verrait que le
+    maillage vu de l'envers. Ce trou est destiné à être comblé par une
+    interpolation IA entre la dernière image de l'approche et la première de
+    la sortie — deux images **réelles** et proches en point de vue, ce qui
+    est le cas d'usage où ces modèles sont fiables.
+    """
+    angle = math.radians(bearing_deg)
+    # Vecteur unitaire du sens de vol (l'approche va vers le centre).
+    de, dn = math.sin(angle), math.cos(angle)
+
+    def leg(start_distance: float, end_distance: float) -> list[CameraPose]:
+        poses: list[CameraPose] = []
+        for i in range(frames_per_leg):
+            t = i / (frames_per_leg - 1)
+            distance = start_distance + (end_distance - start_distance) * t
+            # Position en amont du centre le long de l'axe de vol.
+            east, north = -de * distance, -dn * distance
+            p_lat, p_lon = offset_to_latlon(lat, lon, east, north)
+            pitch = -math.degrees(math.atan2(altitude_m - 15.0, max(1.0, abs(distance))))
+            poses.append(
+                CameraPose(
+                    lat=p_lat, lon=p_lon, agl=max(MIN_ALTITUDE_M, altitude_m),
+                    heading=bearing_deg % 360.0, pitch=max(-89.0, min(10.0, pitch)),
+                )
+            )
+        return poses
+
+    approach = leg(approach_from_m, stop_before_m)
+    # La sortie repart de l'autre côté du bâtiment, même axe, même sens.
+    exit_leg = leg(-stop_before_m, -exit_to_m)
+    return approach, exit_leg
 
 
 def render_flight(
@@ -207,6 +466,7 @@ def render_flight(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
+    iso_time: str | None = None,
     keep_frames: bool = False,
     progress=None,  # noqa: ANN001 — callable(index, total, note="") optionnel
 ) -> Path:
@@ -234,16 +494,45 @@ def render_flight(
     frames_dir.mkdir(parents=True)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            args=[
-                # WebGL logiciel : indispensable en headless sans GPU, sinon
-                # Cesium ne rend qu'un fond noir.
-                "--use-gl=angle",
-                "--use-angle=swiftshader",
-                "--enable-unsafe-swiftshader",
-                "--ignore-gpu-blocklist",
-            ]
-        )
+        # Le mode headless récent de Chromium sait utiliser un vrai GPU : sur
+        # cette scène, ~13 s par image en 1080p avec SwiftShader (rendu
+        # logiciel) contre une fraction de seconde via Direct3D11. Le repli
+        # logiciel reste indispensable sur une machine sans GPU exploitable,
+        # sinon Cesium ne rend qu'un fond noir.
+        hardware_args = [
+            "--headless=new",
+            "--enable-gpu",
+            "--ignore-gpu-blocklist",
+            "--enable-webgl",
+        ]
+        software_args = [
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
+            "--ignore-gpu-blocklist",
+        ]
+        browser = None
+        for args in (hardware_args, software_args):
+            try:
+                candidate = playwright.chromium.launch(args=args)
+                probe = candidate.new_page()
+                renderer = probe.evaluate(
+                    "() => { const c = document.createElement('canvas');"
+                    " const gl = c.getContext('webgl2') || c.getContext('webgl');"
+                    " if (!gl) return ''; const d = gl.getExtension('WEBGL_debug_renderer_info');"
+                    " return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); }"
+                )
+                probe.close()
+                if renderer:
+                    browser = candidate
+                    if progress is not None:
+                        progress(0, len(poses), f"rendu via {renderer[:70]}")
+                    break
+                candidate.close()
+            except Exception:  # noqa: BLE001 — on essaie simplement le repli
+                continue
+        if browser is None:
+            raise CesiumRenderError("aucun contexte WebGL disponible (ni matériel, ni logiciel)")
         page = browser.new_page(viewport={"width": width, "height": height})
         page.goto(SCENE_HTML.as_uri())
 
@@ -252,6 +541,7 @@ def render_flight(
             {
                 "apiKey": api_key,
                 "centre": {"lat": centre[0], "lon": centre[1]},
+                "isoTime": iso_time,
                 "waypoints": [p.as_dict() for p in poses],
             },
         )

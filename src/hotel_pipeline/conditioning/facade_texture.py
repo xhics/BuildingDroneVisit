@@ -253,11 +253,12 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
     return mask.astype(bool)
 
 
-def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
+def _build_triangles_with_edges(payload: dict) -> tuple[list[np.ndarray], list[int], dict[str, list[int]]]:
     triangles: list[np.ndarray] = []
     face_ids: list[int] = []
+    edge_face_ids: dict[str, list[int]] = {}
     fid = 0
-    for volume in payload.get("volumes", []):
+    for volume_index, volume in enumerate(payload.get("volumes", [])):
         fp = volume.get("fp") or []
         wh = volume.get("wh") or []
         h_default = float(volume.get("h") or 8.0)
@@ -272,6 +273,8 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
                 d = np.array([fp[i][0], fp[i][1], h_i], dtype=np.float64)
                 triangles.extend([[a, b, c], [a, c, d]])
                 face_ids.extend([fid, fid + 1])
+                key = f"{volume_index}:{i}"
+                edge_face_ids[key] = [fid, fid + 1]
                 fid += 2
         rv = volume.get("rv") or []
         rf = volume.get("rf") or []
@@ -294,11 +297,27 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
                         triangles.append(tri)
                         face_ids.append(fid)
                         fid += 1
+    return triangles, face_ids, edge_face_ids
+
+
+def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
+    """Backward-compatible public helper; edge ownership stays internal."""
+    triangles, face_ids, _ = _build_triangles_with_edges(payload)
     return triangles, face_ids
 
 
-def _pose_error_for_view(camera, plane: FacadePlane, building_mask: np.ndarray) -> tuple[float, float, int]:
-    return measure_facade_alignment(camera, plane, building_mask=building_mask)
+def _pose_error_for_view(
+    camera,
+    plane: FacadePlane,
+    building_mask: np.ndarray,
+    facade_face_ids: set[int] | None = None,
+) -> tuple[float, float, int]:
+    return measure_facade_alignment(
+        camera,
+        plane,
+        building_mask=building_mask,
+        facade_face_ids=facade_face_ids,
+    )
 
 
 def _atlas_alpha(statuses: np.ndarray) -> np.ndarray:
@@ -456,7 +475,14 @@ def build(workspace: Workspace, payload: dict) -> dict:
 
     views: list[tuple] = []
     view_ids: list[str] = []
-    triangles, face_ids = _build_triangles_from_payload(payload)
+    triangles, face_ids, edge_face_ids = _build_triangles_with_edges(payload)
+
+    target = next((volume for volume in payload.get("volumes", []) if volume.get("target")), None)
+    target_volume_index = None
+    for volume_index, volume in enumerate(payload.get("volumes", [])):
+        if volume.get("target"):
+            target_volume_index = volume_index
+            break
 
     for model_image in reconstruction.images.values():
         resolved = _asset_for_model_image(workspace, asset_manifest.get("assets", []), model_image.name)
@@ -532,6 +558,9 @@ def build(workspace: Workspace, payload: dict) -> dict:
         )
         plane.normal *= outward_factor
 
+        edge_key = f"{target_volume_index}:{edge_index}" if target_volume_index is not None else None
+        facade_face_ids = set(edge_face_ids.get(edge_key, [])) if edge_key else None
+
         edge_views = []
         for asset_id, rgb, camera, combined_mask, proxy, laz_occ in views:
             if combined_mask is None:
@@ -542,7 +571,9 @@ def build(workspace: Workspace, payload: dict) -> dict:
             vis = facade_mask & combined_mask
             if not vis.any():
                 continue
-            pose_px, pose_m, cols_used = _pose_error_for_view(camera, plane, combined_mask)
+            pose_px, pose_m, cols_used = _pose_error_for_view(
+                camera, plane, combined_mask, facade_face_ids=facade_face_ids
+            )
             if pose_m > 0.5:
                 continue
             edge_views.append((asset_id, rgb, camera, vis, proxy, laz_occ, pose_m))
@@ -628,13 +659,16 @@ def build(workspace: Workspace, payload: dict) -> dict:
     payload["appearance_profile"] = appearance
     payload["reference_fusion"] = result
 
-    _apply_feature_coverage(payload, textures)
+    _apply_feature_coverage(payload, textures, workspace=workspace)
     workspace.write_json("11_conditioning/facade_texture_audit.json", result)
     return result
 
 
-def _apply_feature_coverage(payload: dict, textures: list[dict]) -> None:
+def _apply_feature_coverage(payload: dict, textures: list[dict], workspace=None) -> None:
+    """Suppress synthetic detail only where its own footprint has photo support."""
     textures_by_edge = {item["edge_index"]: item for item in textures}
+    target = next((v for v in payload.get("volumes", []) if v.get("target")), None) or {}
+    ring = target.get("fp") or []
     for feature in payload.get("facade_features") or []:
         edge_index = feature.get("edge_index")
         if edge_index is None:
@@ -650,18 +684,37 @@ def _apply_feature_coverage(payload: dict, textures: list[dict]) -> None:
             feature["covered_by_photo"] = False
             continue
         feature_poly = np.asarray(vertices, dtype=float)
-        min_u = float(np.min(feature_poly[:, 0]))
-        max_u = float(np.max(feature_poly[:, 0]))
-        min_v = float(np.min(feature_poly[:, 1])) if feature_poly.shape[1] > 1 else 0.0
-        max_v = float(np.max(feature_poly[:, 1])) if feature_poly.shape[1] > 1 else 1.0
-        area = (max_u - min_u) * (max_v - min_v)
         observed = float(texture.get("observed_fraction", 0.0))
+        area = 1.0
+        if workspace is not None and 0 <= edge_index < len(ring):
+            start = np.asarray(ring[edge_index][:2], dtype=float)
+            end = np.asarray(ring[(edge_index + 1) % len(ring)][:2], dtype=float)
+            tangent = end - start
+            length = float(np.linalg.norm(tangent))
+            if length > 1e-6:
+                tangent /= length
+                us = (feature_poly[:, :2] - start) @ tangent
+                zs = feature_poly[:, 2] if feature_poly.shape[1] >= 3 else feature_poly[:, 1]
+                min_u, max_u = float(us.min()), float(us.max())
+                min_v, max_v = float(zs.min()), float(zs.max())
+                area = (max_u - min_u) * (max_v - min_v)
+                atlas_path = workspace.path("11_conditioning", *texture["path"].split("/"))
+                if atlas_path.is_file():
+                    alpha = np.asarray(Image.open(atlas_path).convert("RGBA"))[:, :, 3]
+                    # Saved atlas is vertically flipped.
+                    x0 = int(np.floor(min_u / max(length, 1e-9) * alpha.shape[1]))
+                    x1 = int(np.ceil(max_u / max(length, 1e-9) * alpha.shape[1]))
+                    height_m = max(float(texture.get("top_z_start_m", 0)), float(texture.get("top_z_end_m", 0)), 1e-9)
+                    y0 = alpha.shape[0] - int(np.ceil(max_v / height_m * alpha.shape[0]))
+                    y1 = alpha.shape[0] - int(np.floor(min_v / height_m * alpha.shape[0]))
+                    crop = alpha[max(0, y0):min(alpha.shape[0], y1), max(0, x0):min(alpha.shape[1], x1)]
+                    observed = float(np.mean(crop > 0)) if crop.size else 0.0
         if area <= 0.0:
             feature["texture_coverage"] = 0.0
             feature["covered_by_photo"] = False
             continue
         feature["texture_coverage"] = observed
-        feature["covered_by_photo"] = observed > 0.1
+        feature["covered_by_photo"] = observed >= 0.6
 
 
 __all__ = ["build"]

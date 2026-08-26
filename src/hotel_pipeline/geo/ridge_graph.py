@@ -343,6 +343,21 @@ def consistent_pairs(graph: RidgeGraph, matches: dict[int, tuple]) -> dict[int, 
     return verdicts
 
 
+def validate_roof_graph(graph: RidgeGraph) -> dict:
+    """Reject impossible crossings between ridges that share no junction."""
+    from shapely.geometry import LineString
+    crossings = []
+    for i, first in enumerate(graph.edges):
+        a0, a1 = graph.nodes[first.node_a].position, graph.nodes[first.node_b].position
+        for second in graph.edges[i+1:]:
+            if {first.node_a, first.node_b} & {second.node_a, second.node_b}:
+                continue
+            b0, b1 = graph.nodes[second.node_a].position, graph.nodes[second.node_b].position
+            if LineString([a0[:2],a1[:2]]).crosses(LineString([b0[:2],b1[:2]])):
+                crossings.append([first.index, second.index])
+    return {"passed":not crossings, "impossible_crossings":crossings, "component_count":len(graph.components()), "support_required":"geometric_intersection+normal_compatibility+lidar_or_photo"}
+
+
 __all__ = [
     "JUNCTION_TOLERANCE_M",
     "MIN_EDGE_LENGTH_M",
@@ -353,4 +368,5 @@ __all__ = [
     "RidgeNode",
     "build",
     "consistent_pairs",
+    "validate_roof_graph",
 ]

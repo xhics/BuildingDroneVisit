@@ -64,6 +64,88 @@ def _load_run_points(reconstruction_run_id: str, workspace: Workspace) -> np.nda
     return _load_colmap_points3d(normalized_dir.parent)
 
 
+def _load_scene_triangles(workspace: Workspace) -> np.ndarray:
+    path = workspace.path("11_conditioning", "conditioned_scene.json")
+    if not path.is_file():
+        return np.empty((0, 3, 3))
+    payload = json.loads(path.read_text("utf-8"))
+    triangles: list[np.ndarray] = []
+    for volume in payload.get("buildings", payload.get("volumes", [])):
+        mesh = volume.get("solid_mesh") or volume.get("solid") or {}
+        vertices = np.asarray(mesh.get("vertices") or [], dtype=float)
+        for face in mesh.get("faces") or []:
+            if len(face) >= 3 and vertices.size:
+                for i in range(1, len(face) - 1):
+                    triangles.append(vertices[[face[0], face[i], face[i + 1]]])
+    terrain = payload.get("terrain") or {}
+    vertices = np.asarray(terrain.get("vertices") or [], dtype=float)
+    for face in terrain.get("faces") or []:
+        if len(face) >= 3 and vertices.size:
+            for i in range(1, len(face) - 1):
+                triangles.append(vertices[[face[0], face[i], face[i + 1]]])
+    return np.asarray(triangles) if triangles else np.empty((0, 3, 3))
+
+
+def _point_triangle_distance(p: np.ndarray, tri: np.ndarray) -> float:
+    """Exact closest-point distance to one triangle."""
+    a, b, c = tri
+    ab, ac, ap = b - a, c - a, p - a
+    d1, d2 = float(ab @ ap), float(ac @ ap)
+    if d1 <= 0 and d2 <= 0: return float(np.linalg.norm(ap))
+    bp = p - b; d3, d4 = float(ab @ bp), float(ac @ bp)
+    if d3 >= 0 and d4 <= d3: return float(np.linalg.norm(bp))
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0 and d1 >= 0 and d3 <= 0:
+        return float(np.linalg.norm(p - (a + d1 / (d1 - d3) * ab)))
+    cp = p - c; d5, d6 = float(ab @ cp), float(ac @ cp)
+    if d6 >= 0 and d5 <= d6: return float(np.linalg.norm(cp))
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0 and d2 >= 0 and d6 <= 0:
+        return float(np.linalg.norm(p - (a + d2 / (d2 - d6) * ac)))
+    va = d3 * d6 - d5 * d4
+    if va <= 0 and d4 - d3 >= 0 and d5 - d6 >= 0:
+        return float(np.linalg.norm(p - (b + (d4 - d3) / ((d4 - d3) + (d5 - d6)) * (c - b))))
+    normal = np.cross(ab, ac)
+    return abs(float((p - a) @ normal)) / max(float(np.linalg.norm(normal)), 1e-12)
+
+
+def distance_to_mesh(position: np.ndarray, triangles: np.ndarray) -> float:
+    return min((_point_triangle_distance(position, tri) for tri in triangles), default=float("inf"))
+
+
+def segment_intersects_mesh(start: np.ndarray, end: np.ndarray, triangles: np.ndarray) -> bool:
+    """Möller–Trumbore segment test used for swept drone collision."""
+    direction = end - start
+    for tri in triangles:
+        a, b, c = tri
+        edge1, edge2 = b - a, c - a
+        h = np.cross(direction, edge2)
+        det = float(edge1 @ h)
+        if abs(det) < 1e-10:
+            continue
+        inv_det = 1.0 / det
+        s = start - a
+        u = inv_det * float(s @ h)
+        if not 0.0 <= u <= 1.0:
+            continue
+        q = np.cross(s, edge1)
+        v = inv_det * float(direction @ q)
+        if v < 0.0 or u + v > 1.0:
+            continue
+        t = inv_det * float(edge2 @ q)
+        if 0.0 <= t <= 1.0:
+            return True
+    return False
+
+
+def yaw_pitch_quaternion(yaw_deg: float, pitch_deg: float) -> tuple[float, float, float, float]:
+    """Camera orientation quaternion in xyzw convention (roll=0)."""
+    yaw, pitch = math.radians(yaw_deg), math.radians(pitch_deg)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    return (-sp * sy, sp * cy, cp * sy, cp * cy)
+
+
 def _visible_fraction_from_points(
     position: np.ndarray,
     yaw_deg: float,
@@ -125,6 +207,10 @@ class CameraFeasibilityEvaluator:
         proxy_fraction: float = 0.0,
         unknown_fraction: float = 0.0,
         reconstruction_run_id: str | None = None,
+        safety_radius_m: float = 0.35,
+        previous_position_local_m: tuple[float, float, float] | None = None,
+        near_m: float = 0.05,
+        far_m: float = 10_000.0,
     ) -> CameraFeasibilityField:
         reconstructed = reconstructed_fraction
         unknown = unknown_fraction
@@ -141,16 +227,18 @@ class CameraFeasibilityEvaluator:
                 proxy = max(0.0, 1.0 - reconstructed - unknown)
 
         visible = max(0.0, min(1.0, reconstructed + proxy * 0.5))
-        collision = False
+        triangles = _load_scene_triangles(self.workspace)
+        scene_distance = distance_to_mesh(np.asarray(position_local_m, dtype=float), triangles)
+        collision = bool(scene_distance <= safety_radius_m)
+        if previous_position_local_m is not None:
+            collision = collision or segment_intersects_mesh(
+                np.asarray(previous_position_local_m, dtype=float),
+                np.asarray(position_local_m, dtype=float), triangles,
+            )
         distance_violation = False
 
         if min_distance_m > 0:
-            dist = (
-                position_local_m[0] ** 2
-                + position_local_m[1] ** 2
-                + position_local_m[2] ** 2
-            ) ** 0.5
-            distance_violation = dist < min_distance_m
+            distance_violation = scene_distance < min_distance_m
 
         framing = visible if not distance_violation else 0.0
         overall = visible * 0.7 + framing * 0.3
@@ -161,12 +249,16 @@ class CameraFeasibilityEvaluator:
             yaw_deg=yaw_deg,
             pitch_deg=pitch_deg,
             fov_deg=fov_deg,
+            orientation_xyzw=yaw_pitch_quaternion(yaw_deg, pitch_deg),
+            near_m=near_m,
+            far_m=far_m,
             visible_surface_confidence=round(visible, 3),
             unknown_fraction=round(unknown, 3),
             proxy_fraction=round(proxy, 3),
             reconstructed_fraction=round(reconstructed, 3),
             minimum_distance_violation=distance_violation,
             collision=collision,
+            distance_to_scene_m=None if not math.isfinite(scene_distance) else round(scene_distance, 3),
             framing_quality=round(framing, 3),
             overall_score=round(overall, 3),
         )
@@ -214,6 +306,7 @@ def build_validated_camera_path(
 
     evaluator = CameraFeasibilityEvaluator(workspace)
     poses = []
+    previous_position = None
     for idx, pose in enumerate(probe.poses):
         field = evaluator.evaluate_pose(
             pose_id=f"pose-{idx:03d}",
@@ -222,8 +315,10 @@ def build_validated_camera_path(
             pitch_deg=0.0,
             fov_deg=pose.fov_horizontal_deg,
             reconstruction_run_id=reconstruction_run_id,
+            previous_position_local_m=previous_position,
         )
         poses.append(field)
+        previous_position = pose.position_local_m
 
     derivation = (
         f"trajectoire probe autour du nuage reconstruit "

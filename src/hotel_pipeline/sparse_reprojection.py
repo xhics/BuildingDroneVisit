@@ -178,6 +178,25 @@ def load_points(run_dir: Path) -> np.ndarray:
     return np.array(rows) if rows else np.empty((0, 3))
 
 
+def load_points_by_id(run_dir: Path) -> dict[int, np.ndarray]:
+    """COLMAP points keyed by their (possibly sparse) POINT3D_ID."""
+    path = run_dir / "normalized" / "points3D"
+    if not path.is_file():
+        return {}
+    points: dict[int, np.ndarray] = {}
+    for line in path.read_text("utf-8").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            points[int(parts[0])] = np.asarray(parts[1:4], dtype=float)
+        except ValueError:
+            continue
+    return points
+
+
 def load_observations(run_dir: Path) -> dict[str, dict[int, np.ndarray]]:
     """Observations 2D par image : `{asset_id: {point3D_id: (u, v)}}`.
 
@@ -302,7 +321,10 @@ def measure_held_out(
     d'intrinsèques, aucune vue cachée exploitable) plutôt qu'un score par
     défaut.
     """
-    points = load_points(run_dir)
+    points_by_id = load_points_by_id(run_dir)
+    point_ids = list(points_by_id)
+    points = np.stack([points_by_id[pid] for pid in point_ids]) if point_ids else np.empty((0, 3))
+    row_by_id = {point_id: row for row, point_id in enumerate(point_ids)}
     poses = load_poses(run_dir)
     cameras = load_intrinsics(run_dir)
     observations = load_observations(run_dir)
@@ -347,10 +369,7 @@ def measure_held_out(
 
         # Seuls les points que la vue cachée a **réellement** observés, et que
         # le modèle prétend y voir, sont comparables.
-        common = [
-            point_id for point_id in seen
-            if 0 <= point_id < len(points) and mask[point_id]
-        ]
+        common = [point_id for point_id in seen if point_id in row_by_id and mask[row_by_id[point_id]]]
         if not common:
             # Le modèle ne prédit rien de ce que la vue a vu : désaccord
             # total, non absence de mesure.
@@ -360,7 +379,7 @@ def measure_held_out(
             continue
 
         errors = np.array(
-            [float(np.linalg.norm(uv[pid] - seen[pid])) for pid in common]
+            [float(np.linalg.norm(uv[row_by_id[pid]] - seen[pid])) for pid in common]
         )
         residuals.append(float(np.median(errors)))
 
@@ -387,12 +406,22 @@ def measure_held_out(
     return {
         "feature_inliers": float(np.median(inlier_ratios)),
         "reprojection_px": reprojection_px,
-        "silhouette_iou": float(np.median(ious)) if ious else 0.0,
+        # Sparse point envelopes are not silhouettes.  A real mesh/observed
+        # mask raster comparison must populate this metric elsewhere.
+        "silhouette_iou": None,
         # Cohérence structurelle : le résidu rapporté à la diagonale du
         # capteur — une grandeur du dispositif, non une constante choisie.
-        "structural_similarity": (
+        "normalized_reprojection_score": (
             float(max(0.0, 1.0 - reprojection_px / diagonal)) if diagonal > 0 else 0.0
         ),
+        "metric_status": {
+            "feature_inliers": "measured",
+            "reprojection_px": "measured",
+            "normalized_reprojection_score": "inferred",
+            "silhouette_iou": "unavailable",
+            "ssim": "unavailable",
+            "lpips": "unavailable",
+        },
         "held_out_measured": measured,
         "points_used": int(points.shape[0]),
     }
@@ -403,6 +432,7 @@ __all__ = [
     "load_poses",
     "load_observations",
     "load_points",
+    "load_points_by_id",
     "measure_held_out",
     "project",
     "quaternion_to_rotation",

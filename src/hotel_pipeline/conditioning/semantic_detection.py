@@ -741,4 +741,10 @@ def _persist_texture_rasters(
         raster_path = asset_dir / raster_name
         Image.fromarray((binary * 255).astype(np.uint8), mode="L").save(raster_path)
         view["raster"] = f"texture_view_masks/{texture_run_id}/{asset_id}/{raster_name}"
+        from ..integrity_digests import mask_raster_digest
+        view["raster_digest"] = mask_raster_digest(
+            binary.astype(np.uint8), asset_id=asset_id,
+            pixel_transform=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+            segmenter_version=str(view.get("segmenter_version") or "semantic-detection-v1"),
+        )
 

@@ -67,6 +67,298 @@ def _detect_scale(address: str, places_key: str | None) -> tuple[float, float, f
     return radius_scale, altitude_scale, diagonal
 
 
+def _regenerate_from_render(
+    args, geocoded: dict, frames_dir: Path, maneuvers: list, out_dir: Path, label: str
+) -> list[Path]:  # noqa: ANN001
+    """Régénère chaque plan par l'IA à partir des images rendues en 3D.
+
+    Le rendu 3D fixe la trajectoire, la géométrie et le cadrage ; le
+    générateur fournit ce que le moteur 3D ne sait pas produire — flou de
+    mouvement, matière photographique, lumière. Lève :class:`SogniCliError`
+    au premier plan en échec plutôt que de continuer à facturer.
+    """
+    from .aerial_journey import build_aerial_prompt, select_segments, total_cost_hint
+    from .production_plan import TIMES_OF_DAY
+    from .sogni_cli import generate_from_references
+
+    frames = sorted(frames_dir.glob("frame_*.png"))
+    segments = select_segments(
+        frames, maneuvers,
+        segment_seconds=args.ai_segment_seconds, source_fps=args.render_3d_fps,
+    )
+    if not segments:
+        return []
+
+    look = TIMES_OF_DAY.get(args.time_of_day)
+    establishment = geocoded["formatted_address"].split(",")[0]
+    print(f"  {label} : {total_cost_hint(segments)} — facturé…")
+
+    produced: list[Path] = []
+    for index, segment in enumerate(segments):
+        prompt = build_aerial_prompt(
+            segment, establishment_fr=establishment,
+            time_of_day_fr=look.look_fr if look else "",
+        )
+        produced.append(
+            generate_from_references(
+                segment.frames, prompt,
+                out_path=out_dir / f"ia_{label}_{index:02d}.mp4",
+                duration_s=segment.duration_s,
+            )
+        )
+        print(f"    plan {index + 1}/{len(segments)} ({segment.name_fr})", flush=True)
+    return produced
+
+
+def _interior_stops(args, geocoded: dict, out_dir: Path) -> list:  # noqa: ANN001
+    """Photos réelles de l'établissement, à utiliser comme étapes intérieures.
+
+    Sans elles le passage n'a aucune matière et le générateur invente une
+    enfilade générique. Un échec de sourcing n'est pas bloquant : on retombe
+    sur un passage direct, plus court, plutôt que d'interrompre le rendu.
+    """
+    if args.interior_photos <= 0:
+        return []
+    places_key = os.environ.get("GOOGLE_PLACES_API_KEY") or os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not places_key:
+        return []
+
+    from .hotel_sources import HotelSourceError, fetch_photos, find_place
+
+    try:
+        place = find_place(args.address, places_key)
+        photos = fetch_photos(
+            place, places_key, out_dir / "sources", limit=args.interior_photos
+        )
+    except (HotelSourceError, Exception):  # noqa: BLE001 — repli assumé
+        print("  (aucune photo d'établissement récupérée : passage direct)", file=sys.stderr)
+        return []
+
+    from .interior_journey import build_stops
+
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        from .hotel_sources import HotelSite, classify_photos
+
+        try:
+            classify_photos(photos, openai_key)
+            site = HotelSite(args.address, "", "", 0, 0, photos)
+            # Les vues de façade et les panoramas sont déjà couverts, et bien
+            # mieux, par le survol 3D : les rejouer comme étape intérieure
+            # ferait ressortir la caméra du bâtiment qu'elle vient de pénétrer.
+            ordered = [p for p in site.journey() if p.category not in ("exterieur", "vue")]
+            return build_stops(ordered)
+        except HotelSourceError as exc:
+            # Sans classement l'ordre reste celui de Places : moins narratif,
+            # mais les références restent de vraies photos du lieu.
+            print(f"  (classement indisponible, ordre brut : {exc})", file=sys.stderr)
+
+    return build_stops(photos)
+
+
+def _passage_prompts(count: int, anchored: bool) -> list[str]:
+    """Un prompt par saut du passage intérieur."""
+    if not anchored:
+        return [
+            "Vue subjective depuis un drone qui avance. La caméra franchit la façade "
+            "droit devant elle et pénètre à l'intérieur du bâtiment, au même niveau, "
+            "sans monter. Mouvement continu vers l'avant, caméra horizontale."
+        ] * count
+
+    prompts = []
+    for index in range(count):
+        if index == 0:
+            prompts.append(
+                "Vue subjective depuis un drone qui avance. La caméra franchit la "
+                "façade droit devant elle et pénètre à l'intérieur du bâtiment, au "
+                "même niveau, pour déboucher sur l'espace montré à l'image finale. "
+                "Mouvement continu vers l'avant, caméra horizontale, sans coupure."
+            )
+        elif index == count - 1:
+            prompts.append(
+                "La caméra quitte l'espace intérieur en avançant et ressort du "
+                "bâtiment par la façade, débouchant sur la vue extérieure finale. "
+                "Mouvement continu vers l'avant, vitesse constante, sans recul."
+            )
+        else:
+            prompts.append(
+                "La caméra poursuit son avancée à l'intérieur de l'établissement et "
+                "passe de l'espace montré au départ à celui montré à l'arrivée, en "
+                "traversant le passage qui les relie. Mouvement fluide vers l'avant, "
+                "hauteur constante, sans coupure."
+            )
+    return prompts
+
+
+def _render_traverse(
+    args, geocoded: dict, maps_key: str, out_dir: Path, width: int, height: int,
+    *, base_flight: Path, progress,  # noqa: ANN001
+) -> int:
+    """Approche 3D + passage intérieur généré + sortie 3D, recollés.
+
+    Les deux bornes du passage sont des images **réellement rendues** : le
+    modèle n'invente que le court intérieur, qui n'existe dans aucune donnée
+    (les tuiles 3D ne modélisent que l'extérieur).
+    """
+    from .cesium_render import (
+        CesiumRenderError,
+        build_continuous_traverse,
+        build_poses,
+        probe_site,
+        render_flight,
+    )
+    from .sogni_cli import (
+        SogniCliError,
+        concat_videos,
+        generate_from_references,
+        generate_transition_chain,
+    )
+
+    sogni_key = os.environ.get("SOGNI_API_KEY")
+    if not sogni_key:
+        print("Erreur : --traverse nécessite SOGNI_API_KEY dans .env.", file=sys.stderr)
+        return 1
+
+    traverse_altitude = args.traverse_altitude
+    entry_distance = 55.0
+    if traverse_altitude <= 0:
+        # Mesure du bâti avant de construire la trajectoire : viser au-dessus
+        # du toit ferait survoler le bâtiment au lieu de lui faire face, et le
+        # générateur, privé de façade, invente un intérieur en l'air.
+        try:
+            site = probe_site(geocoded["lat"], geocoded["lon"], maps_key)
+        except CesiumRenderError as exc:
+            print(f"Sondage du site échoué : {exc}", file=sys.stderr)
+            return 1
+        traverse_altitude = max(4.0, site["height"] * 0.55)
+        # Un petit bâtiment doit être abordé de plus près, sinon sa façade
+        # n'occupe qu'une fraction de l'image.
+        entry_distance = max(20.0, site["height"] * 3.0)
+        print(
+            f"  bâti mesuré : {site['height']:.1f} m de haut -> traversée à "
+            f"{traverse_altitude:.1f} m, entrée à {entry_distance:.0f} m"
+        )
+
+    # Un seul vol, coupé en deux par l'épaisseur du bâtiment — et non deux
+    # vidéos indépendantes qui démarreraient chacune à un endroit arbitraire.
+    before, after = build_continuous_traverse(
+        traverse_bearing_deg=args.traverse_bearing,
+        traverse_altitude_m=traverse_altitude,
+        entry_distance_m=entry_distance,
+    )
+    # Les images sont réparties d'après la longueur de chaque segment, pas à
+    # parts fixes : sinon la caméra change d'allure au raccord (×1,5 mesuré).
+    from .cesium_render import allocate_frames, path_length_m
+
+    lengths = [path_length_m(before), path_length_m(after)]
+    frames_before, frames_after = allocate_frames(
+        lengths, fps=args.render_3d_fps, cruise_speed_mps=args.cruise_speed
+    )
+    print(
+        f"\nVol continu avec traversée (cap {args.traverse_bearing:.0f}°) — "
+        f"vitesse {args.cruise_speed:.0f} m/s : {lengths[0]:.0f} m puis {lengths[1]:.0f} m, "
+        f"soit {(sum(lengths) / args.cruise_speed):.0f} s de vol"
+    )
+    legs = {}
+    try:
+        for name, maneuvers_part, count in (
+            ("avant", before, frames_before),
+            ("apres", after, frames_after),
+        ):
+            poses = build_poses(
+                maneuvers_part, geocoded["lat"], geocoded["lon"],
+                frame_count=count, enforce_envelope=False,
+            )
+            legs[name] = render_flight(
+                poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
+                out_path=out_dir / f"vol_{name}.mp4", width=width, height=height,
+                fps=args.render_3d_fps, keep_frames=True, progress=progress,
+            )
+    except CesiumRenderError as exc:
+        print(f"Rendu du vol échoué : {exc}", file=sys.stderr)
+        return 1
+
+    # Bornes du passage : dernière image avant le bâtiment, première après.
+    last_approach = sorted((out_dir / "vol_avant_frames").glob("frame_*.png"))[-1]
+    first_exit = sorted((out_dir / "vol_apres_frames").glob("frame_*.png"))[0]
+
+    # Étapes intérieures : de vraies photos de l'établissement. Elles servent
+    # d'ancrages intermédiaires, ce qui découpe le passage en sauts courts —
+    # un long passage d'un seul tenant dérive, et atteignait ici le plafond de
+    # 15 s du modèle, soit 15 % de vidéo entièrement inventée.
+    # Mode « références libres » (Ref2VA) : les photos inspirent le plan au
+    # lieu d'en verrouiller les extrémités. Le mode flf2v précédent épinglait
+    # première et dernière image, d'où un rendu trop littéral où l'on
+    # reconnaissait les photos plutôt qu'un mouvement de caméra.
+    stops = _interior_stops(args, geocoded, out_dir)
+    if not stops:
+        print("  (aucune photo d'intérieur : passage direct entre deux images rendues)")
+        anchors = [last_approach, first_exit]
+        try:
+            clips = generate_transition_chain(
+                anchors, _passage_prompts(1, False), out_dir=out_dir / "passages",
+                duration_s=args.passage_clip_seconds,
+            )
+        except SogniCliError as exc:
+            print(f"Passage intérieur échoué : {exc}", file=sys.stderr)
+            return 1
+    else:
+        from .interior_journey import build_ref2va_prompt
+        from .production_plan import TIMES_OF_DAY
+
+        look = TIMES_OF_DAY.get(args.time_of_day)
+        prompt = build_ref2va_prompt(
+            stops,
+            establishment_fr=geocoded["formatted_address"].split(",")[0],
+            time_of_day_fr=look.look_fr if look else "",
+        )
+        print(
+            f"Passage intérieur : {len(stops)} espace(s) réel(s) en références libres "
+            f"({' -> '.join(s.label_fr for s in stops)}) — facturé…"
+        )
+        try:
+            clips = [
+                generate_from_references(
+                    [s.photo for s in stops], prompt,
+                    out_path=out_dir / "vol_interieur.mp4",
+                    duration_s=args.interior_seconds,
+                )
+            ]
+        except SogniCliError as exc:
+            print(f"Passage intérieur échoué : {exc}", file=sys.stderr)
+            print(f"Les deux segments 3D restent disponibles : {legs}", file=sys.stderr)
+            return 1
+
+    # Le rendu 3D peut servir de livrable, ou seulement de référence : dans ce
+    # dernier cas chaque plan aérien est régénéré, ce qui apporte le flou de
+    # mouvement et la matière photographique absents du moteur 3D.
+    aerial_before = [legs["avant"]]
+    aerial_after = [legs["apres"]]
+    if args.ai_final:
+        try:
+            aerial_before = _regenerate_from_render(
+                args, geocoded, out_dir / "vol_avant_frames", before, out_dir, "avant"
+            ) or aerial_before
+            aerial_after = _regenerate_from_render(
+                args, geocoded, out_dir / "vol_apres_frames", after, out_dir, "apres"
+            ) or aerial_after
+        except SogniCliError as exc:
+            print(f"Régénération IA échouée : {exc}", file=sys.stderr)
+            print("  (les rendus 3D restent disponibles)", file=sys.stderr)
+            return 1
+
+    try:
+        final = concat_videos(
+            [*aerial_before, *clips, *aerial_after], out_dir / "vol_complet.mp4"
+        )
+    except SogniCliError as exc:
+        print(f"Recollage échoué : {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Vol complet (une seule séquence continue) : {final}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Story-board continu d'un survol drone à partir d'une adresse."
@@ -105,9 +397,99 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--render-3d-fps", type=int, default=12, help="Images par seconde du vol 3D (défaut: 12)")
     parser.add_argument(
+        "--cruise-speed",
+        type=float,
+        default=25.0,
+        help=(
+            "Vitesse de la caméra en m/s (défaut: 25, drone rapide). C'est elle qui fixe "
+            "la durée : la vidéo dure aussi longtemps que le trajet l'exige, ce qui "
+            "garantit une vitesse identique d'un segment à l'autre. 8-15 pour un survol "
+            "posé mais plus long à rendre ; au-delà de 25 le mouvement perd en crédibilité."
+        ),
+    )
+    parser.add_argument(
         "--render-3d-size",
         default="1280x720",
         help="Résolution du vol 3D, format LARGEURxHAUTEUR (défaut: 1280x720)",
+    )
+    parser.add_argument(
+        "--traverse",
+        action="store_true",
+        help=(
+            "Ajoute un plan de traversée du bâtiment : approche et sortie rendues en 3D réel, "
+            "passage intérieur comblé par Sogni entre les deux images réelles (facturé). "
+            "S'utilise avec --render-3d."
+        ),
+    )
+    parser.add_argument(
+        "--traverse-bearing",
+        type=float,
+        default=90.0,
+        help="Cap de l'axe de traversée en degrés (défaut: 90, soit d'ouest en est)",
+    )
+    parser.add_argument(
+        "--traverse-altitude",
+        type=float,
+        default=0.0,
+        help=(
+            "Altitude de la traversée en mètres au-dessus du sol. Par défaut (0), "
+            "elle est déduite de la hauteur réelle du bâtiment mesurée sur les tuiles 3D. "
+            "Viser trop haut fait survoler le toit : le générateur, sans façade devant "
+            "lui, fabrique alors un intérieur flottant au-dessus du bâtiment."
+        ),
+    )
+    parser.add_argument(
+        "--interior-photos",
+        type=int,
+        default=4,
+        help=(
+            "Nombre de photos réelles de l'établissement servant d'étapes intérieures "
+            "(défaut: 4 ; 0 pour un passage direct). Chaque étape ajoute un saut facturé, "
+            "mais raccourcit d'autant ce que le générateur doit inventer sans référence."
+        ),
+    )
+    parser.add_argument(
+        "--ai-final",
+        action="store_true",
+        help=(
+            "Le rendu 3D ne sert plus que de référence : chaque plan est régénéré par "
+            "l'IA à partir des images rendues (mode Ref2VA). Apporte flou de mouvement, "
+            "24 i/s et matière photographique, que la 3D ne peut pas produire. Facturé "
+            "par plan."
+        ),
+    )
+    parser.add_argument(
+        "--ai-segment-seconds",
+        type=int,
+        default=10,
+        help="Durée de chaque plan régénéré (défaut: 10 s ; le modèle accepte 6 à 15)",
+    )
+    parser.add_argument(
+        "--interior-seconds",
+        type=int,
+        default=10,
+        help=(
+            "Durée du parcours intérieur en secondes (défaut: 10 ; le modèle accepte "
+            "6 à 15). Généré en une passe à partir des photos en références libres."
+        ),
+    )
+    parser.add_argument(
+        "--time-of-day",
+        default="doree",
+        choices=["aube", "matin", "midi", "doree", "bleue", "nuit"],
+        help=(
+            "Moment de la journée (défaut: doree). Oriente le vocabulaire des prompts ; "
+            "sans effet sur les tuiles 3D, dont les textures portent leur éclairage d'origine."
+        ),
+    )
+    parser.add_argument(
+        "--passage-clip-seconds",
+        type=int,
+        default=5,
+        help=(
+            "Durée de chaque saut du passage intérieur (défaut: 5 s). Le modèle dérive "
+            "au-delà de quelques secondes : mieux vaut plusieurs sauts courts qu'un long."
+        ),
     )
     parser.add_argument(
         "--probe-sogni",
@@ -218,6 +600,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.render_3d:
         from .cesium_render import CesiumRenderError, build_poses, render_flight
+        from .maneuvers import artistic_maneuvers
+
+        # Le gabarit par défaut vise des rayons serrés qui sortent de
+        # l'enveloppe nette des tuiles photogrammétriques : plus de la moitié
+        # de ses poses devraient être repoussées, ce qui déforme la figure.
+        # La séquence artistique y tient d'emblée et alterne des figures de
+        # natures distinctes plutôt que des orbites successives. Un plan conçu
+        # par IA (--ai-plan-fixture) reste prioritaire : il est demandé explicitement.
+        flight_maneuvers = maneuvers if args.ai_plan_fixture else chain_maneuvers(
+            scale_maneuvers(artistic_maneuvers(), radius_scale=radius_scale, altitude_scale=1.0)
+        )
 
         try:
             width, height = (int(v) for v in args.render_3d_size.lower().split("x"))
@@ -225,31 +618,48 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Erreur : --render-3d-size invalide ({args.render_3d_size!r}), attendu LARGEURxHAUTEUR.", file=sys.stderr)
             return 1
 
-        frame_count = max(2, round(args.render_3d_duration * args.render_3d_fps))
-        poses = build_poses(maneuvers, geocoded["lat"], geocoded["lon"], frame_count=frame_count)
-        flight_path = out_dir / "flight_3d.mp4"
-
-        print(
-            f"\nRendu 3D : {frame_count} images ({args.render_3d_duration:.0f}s à "
-            f"{args.render_3d_fps} i/s, {width}x{height}) — géométrie réelle, sans facturation Sogni."
-        )
-
         def _progress(index: int, total: int, note: str) -> None:
             if note:
                 print(f"  {note}")
             elif index % 10 == 0 or index == total:
                 print(f"  {index}/{total} images", flush=True)
 
-        try:
-            result = render_flight(
-                poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
-                out_path=flight_path, width=width, height=height,
-                fps=args.render_3d_fps, progress=_progress,
+        if args.traverse:
+            # La traversée n'est pas un plan à part : c'est le même vol, coupé
+            # par l'épaisseur du bâtiment. Le rendre en plus d'un vol complet
+            # produirait deux séquences sans lien — le défaut relevé sur la
+            # première version.
+            code = _render_traverse(
+                args, geocoded, maps_key, out_dir, width, height,
+                base_flight=None, progress=_progress,
             )
-        except CesiumRenderError as exc:
-            print(f"Rendu 3D échoué : {exc}", file=sys.stderr)
-            return 1
-        print(f"Vol 3D généré : {result}")
+            if code != 0:
+                return code
+        else:
+            from .cesium_render import allocate_frames, path_length_m
+
+            # Même règle que pour la traversée : la durée découle du trajet et
+            # de la vitesse, pour que l'allure soit comparable d'un vol à l'autre.
+            length = path_length_m(flight_maneuvers)
+            (frame_count,) = allocate_frames(
+                [length], fps=args.render_3d_fps, cruise_speed_mps=args.cruise_speed
+            )
+            poses = build_poses(flight_maneuvers, geocoded["lat"], geocoded["lon"], frame_count=frame_count)
+            print(
+                f"\nRendu 3D : {length:.0f} m à {args.cruise_speed:.0f} m/s -> "
+                f"{frame_count} images ({frame_count / args.render_3d_fps:.0f}s à "
+                f"{args.render_3d_fps} i/s, {width}x{height}) — géométrie réelle, sans facturation Sogni."
+            )
+            try:
+                result = render_flight(
+                    poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
+                    out_path=out_dir / "flight_3d.mp4", width=width, height=height,
+                    fps=args.render_3d_fps, progress=_progress,
+                )
+            except CesiumRenderError as exc:
+                print(f"Rendu 3D échoué : {exc}", file=sys.stderr)
+                return 1
+            print(f"Vol 3D généré : {result}")
 
     if args.probe_sogni:
         sogni_key = os.environ.get("SOGNI_API_KEY")

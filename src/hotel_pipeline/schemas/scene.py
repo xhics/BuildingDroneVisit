@@ -90,6 +90,9 @@ class CameraPose(BaseModel):
     elevation_deg: float = Field(gt=-90, lt=90)
     distance_m: float = Field(gt=0)
     fov_horizontal_deg: float = Field(gt=0, le=120)
+    orientation_xyzw: tuple[float, float, float, float] | None = None
+    near_m: float = Field(default=0.05, gt=0.0)
+    far_m: float = Field(default=10_000.0, gt=0.0)
 
     #: Ce que la pose regarde, quand c'est connu — `FACADE_PRIMARY`…
     faces: str | None = None

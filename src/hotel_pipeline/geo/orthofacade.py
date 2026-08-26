@@ -53,17 +53,40 @@ class FacadePlane:
     height_m: float
     top_z_start_m: float = 0.0
     top_z_end_m: float = 0.0
+    profile_uz_m: tuple[tuple[float, float], ...] = ()
 
     def __post_init__(self) -> None:
         if self.top_z_start_m <= 0:
             self.top_z_start_m = float(self.height_m)
         if self.top_z_end_m <= 0:
             self.top_z_end_m = float(self.height_m)
+        if self.profile_uz_m:
+            profile = sorted((float(u), float(z)) for u, z in self.profile_uz_m)
+            if profile[0][0] > 0.0:
+                profile.insert(0, (0.0, profile[0][1]))
+            if profile[-1][0] < self.length_m:
+                profile.append((self.length_m, profile[-1][1]))
+            self.profile_uz_m = tuple(profile)
+            self.height_m = max(z for _, z in profile)
 
     def top_z(self, u: float) -> float:
+        if self.profile_uz_m:
+            u = max(0.0, min(float(u), self.length_m))
+            for (u0, z0), (u1, z1) in zip(self.profile_uz_m, self.profile_uz_m[1:]):
+                if u <= u1:
+                    t = (u - u0) / max(u1 - u0, 1e-9)
+                    return z0 + t * (z1 - z0)
+            return self.profile_uz_m[-1][1]
         """Hauteur du mur à l'abscisse `u`, interpolation linéaire."""
         t = max(0.0, min(1.0, u / max(self.length_m, 1e-6)))
         return self.top_z_start_m + t * (self.top_z_end_m - self.top_z_start_m)
+
+    def point_at_z(self, u: float, z_m: float) -> np.ndarray:
+        """Point 3D in metric atlas coordinates (u_m, z_m)."""
+        return self.origin + self.along * float(u) + np.array([0.0, 0.0, float(z_m)])
+
+    def contains_uz(self, u: float, z_m: float) -> bool:
+        return 0.0 <= u <= self.length_m and 0.0 <= z_m <= self.top_z(u) + 1e-9
 
     def point(self, u: float, v_norm: float) -> np.ndarray:
         """Point 3D à l'abscisse `u`, à la fraction de hauteur `v_norm` (0..1)."""
@@ -135,7 +158,15 @@ class Orthofacade:
         return sum(1 for t in self.support if t.is_observed) / len(self.support)
 
     def as_dict(self) -> dict:
-        counts = self.by_status()
+        legacy_counts = self.by_status()
+        aliases = {
+            "non_observe": "UNOBSERVED", "vue_unique": "OBSERVED_SINGLE",
+            "accorde": "OBSERVED_CONSENSUS", "desaccord": "REJECTED_DISAGREEMENT",
+        }
+        counts: dict[str, int] = {}
+        for name, count in legacy_counts.items():
+            canonical = aliases.get(name, name)
+            counts[canonical] = counts.get(canonical, 0) + count
         return {
             "facade_id": self.facade_id,
             "width_px": self.width_px,
@@ -144,7 +175,7 @@ class Orthofacade:
             "observed_fraction": round(self.observed_fraction, 3),
             "by_status": counts,
             "disagreement_fraction": round(
-                counts.get("desaccord", 0) / max(len(self.support), 1), 3
+                counts.get("REJECTED_DISAGREEMENT", 0) / max(len(self.support), 1), 3
             ),
             "provenance": self.provenance,
             "caveats": [
@@ -164,6 +195,7 @@ def plane_from_edge(
     facade_id: str = "FACADE",
     top_z_start_m: float | None = None,
     top_z_end_m: float | None = None,
+    profile_uz_m: Sequence[tuple[float, float]] | None = None,
 ) -> FacadePlane:
     """Construit le plan d'un mur depuis une arête d'emprise et une hauteur."""
     start = np.asarray(start, dtype=np.float64)
@@ -182,6 +214,7 @@ def plane_from_edge(
         height_m=h,
         top_z_start_m=float(top_z_start_m) if top_z_start_m is not None else h,
         top_z_end_m=float(top_z_end_m) if top_z_end_m is not None else h,
+        profile_uz_m=tuple(profile_uz_m or ()),
     )
 
 
@@ -262,7 +295,7 @@ def rectify(
     données de la vue courante, pas une globale.
     """
     cols = max(int(round(plane.length_m / texel_m)), 1)
-    rows = max(int(round(plane.height_m / texel_m)), 1)
+    rows = max(int(math.ceil(plane.height_m / texel_m)), 1)
     found = Orthofacade(facade_id=plane.facade_id, width_px=cols, height_px=rows)
     found.support = [TexelSupport() for _ in range(rows * cols)]
 
@@ -278,7 +311,7 @@ def rectify(
     skipped_resolution = 0
     rejection_counts: dict[str, int] = {}
 
-    v_norms = np.linspace(0.5 / rows, 1.0 - 0.5 / rows, rows)
+    zs = (np.arange(rows) + 0.5) * texel_m
     us = (np.arange(cols) + 0.5) * texel_m
 
     for view in views:
@@ -305,8 +338,11 @@ def rectify(
                 continue
 
         used += 1
-        for row, v_norm in enumerate(v_norms):
-            points = np.array([plane.point(u, v_norm) for u in us])
+        for row, z_m in enumerate(zs):
+            inside = np.asarray([plane.contains_uz(u, z_m) for u in us])
+            if not inside.any():
+                continue
+            points = np.array([plane.point_at_z(u, z_m) for u in us])
             screen, depth = camera.project(points)
             if screen is None:
                 continue
@@ -317,6 +353,8 @@ def rectify(
             incidence_v = np.degrees(np.arccos(np.clip(cosine_v, -1.0, 1.0)))
 
             for col in range(cols):
+                if not inside[col]:
+                    continue
                 x, y = screen[col]
                 ix, iy = int(round(x)), int(round(y))
                 if not (0 <= ix < image.shape[1] and 0 <= iy < image.shape[0]):

@@ -1,0 +1,61 @@
+from enum import StrEnum
+
+
+class MeasurementState(StrEnum):
+    MEASURED = "MEASURED"
+    INFERRED = "INFERRED"
+    UNKNOWN = "UNKNOWN"
+
+
+class TexelStatus(StrEnum):
+    OBSERVED_CONSENSUS = "OBSERVED_CONSENSUS"
+    OBSERVED_SINGLE = "OBSERVED_SINGLE"
+    REJECTED_DISAGREEMENT = "REJECTED_DISAGREEMENT"
+    REJECTED_OCCLUDED = "REJECTED_OCCLUDED"
+    REJECTED_SEMANTIC = "REJECTED_SEMANTIC"
+    REJECTED_POSE = "REJECTED_POSE"
+    REJECTED_RESOLUTION = "REJECTED_RESOLUTION"
+    UNOBSERVED = "UNOBSERVED"
+
+    @property
+    def is_observed(self) -> bool:
+        return self in {self.OBSERVED_CONSENSUS, self.OBSERVED_SINGLE}
+
+
+class SurfaceType(StrEnum):
+    FACADE = "FACADE"
+    ROOF = "ROOF"
+    TERRAIN = "TERRAIN"
+    OPENING = "OPENING"
+    ARCHITECTURAL_DETAIL = "ARCHITECTURAL_DETAIL"
+    UNKNOWN = "UNKNOWN"
+
+
+class VisibilityState(StrEnum):
+    VISIBLE = "VISIBLE"
+    OCCLUDED = "OCCLUDED"
+    OUTSIDE_FRUSTUM = "OUTSIDE_FRUSTUM"
+    UNKNOWN = "UNKNOWN"
+
+
+class MaterialClass(StrEnum):
+    DIFFUSE = "DIFFUSE"
+    GLASS = "GLASS"
+    REFLECTIVE_METAL = "REFLECTIVE_METAL"
+    TRANSLUCENT = "TRANSLUCENT"
+    UNKNOWN = "UNKNOWN"
+
+
+class RealityLevel(StrEnum):
+    MEASURED = "MEASURED"
+    SAFE_FOR_CLOSEUP = "SAFE_FOR_CLOSEUP"
+    SAFE_FOR_NOVEL_VIEW = "SAFE_FOR_NOVEL_VIEW"
+    DISTANT_VIEW_ONLY = "DISTANT_VIEW_ONLY"
+    INFERRED = "INFERRED"
+    NO_FLY_NO_RENDER = "NO_FLY/NO_RENDER"
+
+
+__all__ = [
+    "MaterialClass", "MeasurementState", "RealityLevel", "SurfaceType",
+    "TexelStatus", "VisibilityState",
+]

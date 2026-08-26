@@ -137,6 +137,29 @@ def download_image(panorama: Panorama, api_key: str, dest_path: str | Path, **kw
     return path
 
 
+def assign_to_positions(
+    panoramas: list[Panorama],
+    positions: list[tuple[float, float]],
+    *,
+    max_distance_m: float = 80.0,
+) -> list[Panorama | None]:
+    """Pour chaque position de caméra, le panorama réel le plus proche.
+
+    C'est l'ancrage **spatial** : la référence utilisée à un instant donné
+    montre l'endroit que la caméra survole réellement, au lieu d'être choisie
+    par thème. Sans cela, un survol de l'aile est pourrait s'appuyer sur une
+    photo de la façade ouest, et la transition inventerait un raccord entre
+    deux endroits sans rapport.
+
+    ``None`` là où aucun panorama n'est assez proche : mieux vaut une étape
+    sans référence, assumée, qu'une référence trompeuse.
+    """
+    return [
+        nearest_to(panoramas, lat, lon, max_distance_m=max_distance_m)
+        for lat, lon in positions
+    ]
+
+
 def nearest_to(
     panoramas: list[Panorama], lat: float, lon: float, *, max_distance_m: float = 40.0
 ) -> Panorama | None:
@@ -152,6 +175,7 @@ def nearest_to(
 
 __all__ = [
     "Panorama",
+    "assign_to_positions",
     "download_image",
     "find_panoramas",
     "image_url",

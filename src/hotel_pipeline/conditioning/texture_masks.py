@@ -40,6 +40,7 @@ class TextureViewMask:
     image_path: Path | None = None
     width: int = 0
     height: int = 0
+    raster_digest: str | None = None
 
 
 def _read_json(path: Path) -> dict | None:
@@ -170,11 +171,14 @@ def _build_from_texture_masks_json(workspace: Workspace) -> dict[str, TextureVie
                 width,
                 height,
             )
-        occluders = _merge_polygons_into_mask(
-            [view.get("occluders_polygon") or []],
-            width,
-            height,
-        ) if view.get("occluders_polygon") else None
+        occluder_raster = view.get("occluder_raster") or view.get("occluders_raster")
+        occluders = _load_raster(
+            workspace.path("11_conditioning", "texture_view_masks", occluder_raster)
+        ) if occluder_raster else None
+        if occluders is None and view.get("occluders_polygon"):
+            occluders = _merge_polygons_into_mask(
+                [view.get("occluders_polygon") or []], width, height
+            )
         masks[asset_id] = TextureViewMask(
             asset_id=asset_id,
             building=building,
@@ -185,6 +189,7 @@ def _build_from_texture_masks_json(workspace: Workspace) -> dict[str, TextureVie
             image_path=Path(view["image_path"]) if view.get("image_path") else None,
             width=view.get("width", 0),
             height=view.get("height", 0),
+            raster_digest=view.get("raster_digest"),
         )
     return masks
 

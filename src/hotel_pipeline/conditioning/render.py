@@ -42,6 +42,8 @@ class Camera:
     fov_deg: float = 60.0
     width: int = 512
     height: int = 288
+    near_m: float = 0.05
+    far_m: float = 10_000.0
 
     def basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Repère caméra : avant, droite, haut.
@@ -565,7 +567,10 @@ def _rasterise(
     # dans la carte. Les quatre recopies qui suivaient étaient sans effet.
     rows, cols = slice(min_y, max_y + 1), slice(min_x, max_x + 1)
     region_depth = depth[rows, cols]
-    closer = inside & (tri_depth < region_depth) & (tri_depth > 0)
+    closer = (
+        inside & (tri_depth < region_depth)
+        & (tri_depth >= camera.near_m) & (tri_depth <= camera.far_m)
+    )
     if not closer.any():
         return
 
@@ -682,7 +687,7 @@ def _visible(bounds: tuple[np.ndarray, float], camera: Camera) -> bool:
 
     depth = float(offset @ forward)
     # Derrière la caméra, et pas seulement de justesse.
-    if depth + radius <= 0.05:
+    if depth + radius <= camera.near_m or depth - radius >= camera.far_m:
         return False
 
     # Demi-champ élargi du rayon de l'objet : un massif dont le centre sort du
