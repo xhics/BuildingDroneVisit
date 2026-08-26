@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from math import exp, radians, sqrt
+from math import exp, radians, sqrt, tan
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -36,11 +36,15 @@ class PoseUncertainty:
     def expected_pixel_error(self, *, focal_px: float, depth_m: float) -> float:
         if depth_m <= 0 or focal_px <= 0:
             raise ValueError("depth_m and focal_px must be positive")
-        lateral = sqrt(self.translation_sigma_m[0] ** 2 + self.translation_sigma_m[1] ** 2)
+        lateral = sqrt(
+            self.translation_sigma_m[0] ** 2 + self.translation_sigma_m[1] ** 2
+        )
         angular = sqrt(sum(radians(v) ** 2 for v in self.rotation_sigma_deg))
         return float(focal_px * (lateral / depth_m + angular))
 
-    def texture_weight(self, *, focal_px: float, depth_m: float, tolerance_px: float = 3.0) -> float:
+    def texture_weight(
+        self, *, focal_px: float, depth_m: float, tolerance_px: float = 3.0
+    ) -> float:
         error = self.expected_pixel_error(focal_px=focal_px, depth_m=depth_m)
         return float(exp(-0.5 * (error / tolerance_px) ** 2))
 
@@ -65,15 +69,17 @@ class TemporalConflict:
 def temporal_conflicts(sources: Sequence[TemporalSource]) -> list[TemporalConflict]:
     conflicts: list[TemporalConflict] = []
     for index, left in enumerate(sources):
-        for right in sources[index + 1:]:
+        for right in sources[index + 1 :]:
             l0, l1 = left.interval()
             r0, r1 = right.interval()
             disjoint = l1 < r0 or r1 < l0
             if disjoint and left.structure_signature != right.structure_signature:
-                conflicts.append(TemporalConflict(
-                    (left.source_id, right.source_id),
-                    "non-overlapping validity intervals describe different structures",
-                ))
+                conflicts.append(
+                    TemporalConflict(
+                        (left.source_id, right.source_id),
+                        "non-overlapping validity intervals describe different structures",
+                    )
+                )
     return conflicts
 
 
@@ -96,12 +102,29 @@ def resolve_material_appearance(
     Observations are ``(view_id, rgb, incidence_degrees)``.
     """
     if material_class in {MaterialClass.GLASS, MaterialClass.REFLECTIVE_METAL}:
-        chosen = min(observations, key=lambda row: abs(row[2]))[0] if observations else None
-        metallic = 1.0 if material_class is MaterialClass.REFLECTIVE_METAL else 0.0
-        return MaterialAppearance(material_class, (0.35, 0.42, 0.48, 0.55), 0.12, metallic, 0.55, chosen)
+        chosen = (
+            min(observations, key=lambda row: abs(row[2]))[0]
+            if observations
+            else None
+        )
+        metallic = (
+            1.0 if material_class is MaterialClass.REFLECTIVE_METAL else 0.0
+        )
+        return MaterialAppearance(
+            material_class,
+            (0.35, 0.42, 0.48, 0.55),
+            0.12,
+            metallic,
+            0.55,
+            chosen,
+        )
     if not observations:
-        return MaterialAppearance(material_class, (0.5, 0.5, 0.5, 1.0), 0.8, 0.0)
-    rgb = np.median(np.asarray([row[1] for row in observations], dtype=float), axis=0)
+        return MaterialAppearance(
+            material_class, (0.5, 0.5, 0.5, 1.0), 0.8, 0.0
+        )
+    rgb = np.median(
+        np.asarray([row[1] for row in observations], dtype=float), axis=0
+    )
     return MaterialAppearance(material_class, (*map(float, rgb), 1.0), 0.8, 0.0)
 
 
@@ -113,15 +136,21 @@ class CanonicalSurfaceIdentity:
 
     def __post_init__(self) -> None:
         if not all((self.building_id, self.part_id, self.surface_id)):
-            raise ValueError("building_id, part_id and surface_id are mandatory")
+            raise ValueError(
+                "building_id, part_id and surface_id are mandatory"
+            )
 
 
-def validate_surface_assignments(surfaces: Iterable[CanonicalSurfaceIdentity]) -> None:
+def validate_surface_assignments(
+    surfaces: Iterable[CanonicalSurfaceIdentity],
+) -> None:
     owners: dict[str, tuple[str, str]] = {}
     for surface in surfaces:
         owner = (surface.building_id, surface.part_id)
         if surface.surface_id in owners and owners[surface.surface_id] != owner:
-            raise ValueError(f"surface {surface.surface_id!r} is shared by multiple structures")
+            raise ValueError(
+                f"surface {surface.surface_id!r} is shared by multiple structures"
+            )
         owners[surface.surface_id] = owner
 
 
@@ -131,14 +160,160 @@ class SiteStructure:
     structure_type: str
     triangles: np.ndarray = field(compare=False, repr=False)
 
-    def blocks_segment(self, start: Sequence[float], end: Sequence[float]) -> bool:
-        return segment_intersects_mesh(np.asarray(start, float), np.asarray(end, float), np.asarray(self.triangles, float))
+    def blocks_segment(
+        self, start: Sequence[float], end: Sequence[float]
+    ) -> bool:
+        return segment_intersects_mesh(
+            np.asarray(start, float),
+            np.asarray(end, float),
+            np.asarray(self.triangles, float),
+        )
 
 
 def visible_fraction(samples_visible: Sequence[bool]) -> float:
     if not samples_visible:
         raise ValueError("visibility requires at least one coverage sample")
     return float(np.mean(np.asarray(samples_visible, dtype=bool)))
+
+
+# ---------------------------------------------------------------------------
+# Appearance-resolution gate
+# ---------------------------------------------------------------------------
+
+
+def render_pixel_footprint_m(
+    distance_m: float, *, output_width_px: int, horizontal_fov_deg: float
+) -> float:
+    """Approximate metres represented by one output pixel on a frontal surface."""
+    if distance_m <= 0:
+        raise ValueError("distance_m must be positive")
+    if output_width_px <= 0:
+        raise ValueError("output_width_px must be positive")
+    if not 0.0 < horizontal_fov_deg < 179.0:
+        raise ValueError("horizontal_fov_deg must be in (0, 179)")
+    width_m = 2.0 * float(distance_m) * tan(
+        radians(float(horizontal_fov_deg)) * 0.5
+    )
+    return width_m / int(output_width_px)
+
+
+def texture_upscale_factor(
+    effective_gsd_m: float,
+    distance_m: float,
+    *,
+    output_width_px: int = 1920,
+    horizontal_fov_deg: float = 60.0,
+) -> float:
+    """How much a real texture must be enlarged to feed the requested shot.
+
+    ``1`` means the source texture is at least as detailed as the output.
+    ``4`` means every measured texel would have to become roughly 4 output
+    pixels in one dimension; structural detail is then necessarily invented.
+    """
+    if effective_gsd_m <= 0:
+        raise ValueError("effective_gsd_m must be positive")
+    required = render_pixel_footprint_m(
+        distance_m,
+        output_width_px=output_width_px,
+        horizontal_fov_deg=horizontal_fov_deg,
+    )
+    return float(effective_gsd_m / max(required, 1e-12))
+
+
+def minimum_texture_distance_m(
+    effective_gsd_m: float,
+    *,
+    output_width_px: int = 1920,
+    horizontal_fov_deg: float = 60.0,
+    max_upscale: float = 2.0,
+) -> float:
+    """Nearest distance at which measured texture still supports the output."""
+    if effective_gsd_m <= 0:
+        raise ValueError("effective_gsd_m must be positive")
+    if max_upscale <= 0:
+        raise ValueError("max_upscale must be positive")
+    if output_width_px <= 0:
+        raise ValueError("output_width_px must be positive")
+    half_angle = radians(float(horizontal_fov_deg)) * 0.5
+    denominator = 2.0 * tan(half_angle) * float(max_upscale)
+    if denominator <= 0:
+        raise ValueError("invalid field of view")
+    return float(effective_gsd_m * int(output_width_px) / denominator)
+
+
+@dataclass(frozen=True)
+class TextureResolutionAssessment:
+    surface_id: str
+    distance_m: float
+    effective_gsd_m: float
+    required_gsd_m: float
+    upscale_factor: float
+    minimum_safe_distance_m: float
+    safe: bool
+    reasons: tuple[str, ...]
+
+
+def assess_texture_resolution(
+    surface_id: str,
+    *,
+    distance_m: float,
+    effective_gsd_m: float,
+    coverage_fraction: float = 1.0,
+    sharpness: float = 1.0,
+    consensus_views: int = 2,
+    output_width_px: int = 1920,
+    horizontal_fov_deg: float = 60.0,
+    max_upscale: float = 2.0,
+    minimum_coverage: float = 0.85,
+    minimum_sharpness: float = 0.45,
+    minimum_consensus_views: int = 2,
+) -> TextureResolutionAssessment:
+    """Decide whether real appearance evidence can support a requested shot."""
+    required = render_pixel_footprint_m(
+        distance_m,
+        output_width_px=output_width_px,
+        horizontal_fov_deg=horizontal_fov_deg,
+    )
+    upscale = texture_upscale_factor(
+        effective_gsd_m,
+        distance_m,
+        output_width_px=output_width_px,
+        horizontal_fov_deg=horizontal_fov_deg,
+    )
+    minimum_distance = minimum_texture_distance_m(
+        effective_gsd_m,
+        output_width_px=output_width_px,
+        horizontal_fov_deg=horizontal_fov_deg,
+        max_upscale=max_upscale,
+    )
+    reasons: list[str] = []
+    if upscale > max_upscale:
+        reasons.append(
+            f"texture requires {upscale:.2f}x upscale (limit {max_upscale:.2f}x)"
+        )
+    if coverage_fraction < minimum_coverage:
+        reasons.append(
+            f"texture coverage {coverage_fraction:.0%} below {minimum_coverage:.0%}"
+        )
+    if sharpness < minimum_sharpness:
+        reasons.append(
+            f"texture sharpness {sharpness:.2f} below {minimum_sharpness:.2f}"
+        )
+    if consensus_views < minimum_consensus_views:
+        reasons.append(
+            f"texture has {consensus_views} agreeing view(s), "
+            f"requires {minimum_consensus_views}"
+        )
+    return TextureResolutionAssessment(
+        surface_id=surface_id,
+        distance_m=float(distance_m),
+        effective_gsd_m=float(effective_gsd_m),
+        required_gsd_m=float(required),
+        upscale_factor=float(upscale),
+        minimum_safe_distance_m=float(minimum_distance),
+        safe=not reasons,
+        reasons=tuple(reasons),
+    )
 
 
 @dataclass(frozen=True)
@@ -155,6 +330,9 @@ class RealityMetrics:
     measured_geometry_fraction: float
     inferred_geometry_fraction: float
     texture_coverage: float
+    texture_effective_gsd_m: float | None = None
+    texture_sharpness: float | None = None
+    texture_consensus_views: int | None = None
 
 
 @dataclass(frozen=True)
@@ -177,13 +355,32 @@ def assess_reality(metrics: RealityMetrics) -> RealityAssessment:
     }
     missing = tuple(name for name, value in evidence.items() if value is None)
     failures = list(missing)
-    if metrics.reprojection_p90_px is not None and metrics.reprojection_p90_px > 8: failures.append("reprojection")
-    if metrics.silhouette_iou is not None and metrics.silhouette_iou < 0.8: failures.append("silhouette")
-    if metrics.lidar_rmse_m is not None and metrics.lidar_rmse_m > 0.25: failures.append("lidar")
-    for name in ("roof_topology", "terrain_contact", "occlusion_ordering", "manifoldness", "provenance"):
-        if evidence[name] is False: failures.append(name)
-    reprojection = 20.0 if metrics.reprojection_p90_px is None else metrics.reprojection_p90_px
-    silhouette = 0.0 if metrics.silhouette_iou is None else metrics.silhouette_iou
+    if (
+        metrics.reprojection_p90_px is not None
+        and metrics.reprojection_p90_px > 8
+    ):
+        failures.append("reprojection")
+    if metrics.silhouette_iou is not None and metrics.silhouette_iou < 0.8:
+        failures.append("silhouette")
+    if metrics.lidar_rmse_m is not None and metrics.lidar_rmse_m > 0.25:
+        failures.append("lidar")
+    for name in (
+        "roof_topology",
+        "terrain_contact",
+        "occlusion_ordering",
+        "manifoldness",
+        "provenance",
+    ):
+        if evidence[name] is False:
+            failures.append(name)
+    reprojection = (
+        20.0
+        if metrics.reprojection_p90_px is None
+        else metrics.reprojection_p90_px
+    )
+    silhouette = (
+        0.0 if metrics.silhouette_iou is None else metrics.silhouette_iou
+    )
     lidar_rmse = 1.0 if metrics.lidar_rmse_m is None else metrics.lidar_rmse_m
     quality = [
         max(0.0, 1.0 - reprojection / 12.0),
@@ -194,7 +391,11 @@ def assess_reality(metrics: RealityMetrics) -> RealityAssessment:
     ]
     score = float(np.mean(quality))
     if failures:
-        level = RealityLevel.NO_FLY_NO_RENDER if len(set(failures)) >= 3 else RealityLevel.DISTANT_VIEW_ONLY
+        level = (
+            RealityLevel.NO_FLY_NO_RENDER
+            if len(set(failures)) >= 3
+            else RealityLevel.DISTANT_VIEW_ONLY
+        )
     elif score >= 0.9 and metrics.measured_geometry_fraction >= 0.9:
         level = RealityLevel.SAFE_FOR_CLOSEUP
     elif score >= 0.72 and metrics.measured_geometry_fraction >= 0.6:
@@ -203,7 +404,9 @@ def assess_reality(metrics: RealityMetrics) -> RealityAssessment:
         level = RealityLevel.INFERRED
     else:
         level = RealityLevel.DISTANT_VIEW_ONLY
-    return RealityAssessment(round(score, 4), level, tuple(sorted(set(failures))))
+    return RealityAssessment(
+        round(score, 4), level, tuple(sorted(set(failures)))
+    )
 
 
 @dataclass(frozen=True)
@@ -212,26 +415,84 @@ class PathSurfaceObservation:
     level: RealityLevel
     distance_m: float
     unknown_visible_fraction: float
+    texture_effective_gsd_m: float | None = None
+    texture_coverage: float | None = None
+    texture_sharpness: float | None = None
+    texture_consensus_views: int | None = None
 
 
 def validate_camera_path_reality(
-    observations: Sequence[PathSurfaceObservation], *, unknown_limit: float = 0.03,
+    observations: Sequence[PathSurfaceObservation],
+    *,
+    unknown_limit: float = 0.03,
+    output_width_px: int = 1920,
+    horizontal_fov_deg: float = 60.0,
+    max_texture_upscale: float = 2.0,
+    minimum_texture_coverage: float = 0.85,
+    minimum_texture_sharpness: float = 0.45,
+    minimum_texture_consensus_views: int = 2,
 ) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     for item in observations:
         if item.unknown_visible_fraction > unknown_limit:
-            reasons.append(f"{item.surface_id}: unknown visibility exceeds limit")
+            reasons.append(
+                f"{item.surface_id}: unknown visibility exceeds limit"
+            )
         if item.level is RealityLevel.NO_FLY_NO_RENDER:
             reasons.append(f"{item.surface_id}: no-fly/no-render")
-        if item.distance_m < 5 and item.level not in {RealityLevel.MEASURED, RealityLevel.SAFE_FOR_CLOSEUP}:
-            reasons.append(f"{item.surface_id}: close-up requires SAFE_FOR_CLOSEUP")
-        elif item.level not in {RealityLevel.MEASURED, RealityLevel.SAFE_FOR_CLOSEUP, RealityLevel.SAFE_FOR_NOVEL_VIEW}:
+        if item.distance_m < 5 and item.level not in {
+            RealityLevel.MEASURED,
+            RealityLevel.SAFE_FOR_CLOSEUP,
+        }:
+            reasons.append(
+                f"{item.surface_id}: close-up requires SAFE_FOR_CLOSEUP"
+            )
+        elif item.level not in {
+            RealityLevel.MEASURED,
+            RealityLevel.SAFE_FOR_CLOSEUP,
+            RealityLevel.SAFE_FOR_NOVEL_VIEW,
+        }:
             reasons.append(f"{item.surface_id}: unsafe for novel view")
+
+        # Geometry may be excellent while the available photographs are too
+        # coarse for this camera distance.  When appearance evidence is
+        # supplied, fail the same path rather than asking generative AI to
+        # hallucinate windows/bricks that the sources cannot resolve.
+        if item.texture_effective_gsd_m is not None:
+            texture = assess_texture_resolution(
+                item.surface_id,
+                distance_m=item.distance_m,
+                effective_gsd_m=item.texture_effective_gsd_m,
+                coverage_fraction=(
+                    1.0
+                    if item.texture_coverage is None
+                    else item.texture_coverage
+                ),
+                sharpness=(
+                    1.0
+                    if item.texture_sharpness is None
+                    else item.texture_sharpness
+                ),
+                consensus_views=(
+                    minimum_texture_consensus_views
+                    if item.texture_consensus_views is None
+                    else item.texture_consensus_views
+                ),
+                output_width_px=output_width_px,
+                horizontal_fov_deg=horizontal_fov_deg,
+                max_upscale=max_texture_upscale,
+                minimum_coverage=minimum_texture_coverage,
+                minimum_sharpness=minimum_texture_sharpness,
+                minimum_consensus_views=minimum_texture_consensus_views,
+            )
+            reasons.extend(
+                f"{item.surface_id}: {reason}" for reason in texture.reasons
+            )
     return not reasons, tuple(reasons)
 
 
 def assess_canonical_scene(
-    scene: dict, measured_evidence: dict[str, dict] | None = None,
+    scene: dict, measured_evidence: dict[str, dict] | None = None
 ) -> dict[str, RealityAssessment]:
     """Measure every canonical volume from real artifacts, failing closed.
 
@@ -241,39 +502,82 @@ def assess_canonical_scene(
     """
     evidence = measured_evidence or {}
     assessments: dict[str, RealityAssessment] = {}
-    for index, building in enumerate(scene.get("buildings", scene.get("volumes", []))):
-        subject_id = str(building.get("feature_id") or building.get("id") or f"building-{index}")
+    for index, building in enumerate(
+        scene.get("buildings", scene.get("volumes", []))
+    ):
+        subject_id = str(
+            building.get("feature_id")
+            or building.get("id")
+            or f"building-{index}"
+        )
         row = evidence.get(subject_id, {})
         topology = building.get("topology") or {}
         provenance = (
             building.get("triangle_provenance")
             or building.get("source_ids")
-            or ([building.get("provenance_class")] if building.get("provenance_class") else [])
+            or (
+                [building.get("provenance_class")]
+                if building.get("provenance_class")
+                else []
+            )
         )
-        measured_fraction = float(row.get("measured_geometry_fraction", 0.0))
-        inferred_fraction = float(row.get("inferred_geometry_fraction", max(0.0, 1.0 - measured_fraction)))
+        measured_fraction = float(
+            row.get("measured_geometry_fraction", 0.0)
+        )
+        inferred_fraction = float(
+            row.get(
+                "inferred_geometry_fraction",
+                max(0.0, 1.0 - measured_fraction),
+            )
+        )
         metrics = RealityMetrics(
             geometry_rmse_m=row.get("geometry_rmse_m"),
             reprojection_p90_px=row.get("reprojection_p90_px"),
             silhouette_iou=row.get("silhouette_iou"),
             lidar_rmse_m=row.get("lidar_rmse_m"),
-            roof_topology_valid=topology.get("watertight") if topology else None,
+            roof_topology_valid=(
+                topology.get("watertight") if topology else None
+            ),
             terrain_contact_valid=row.get("terrain_contact_valid"),
             occlusion_ordering_valid=row.get("occlusion_ordering_valid"),
-            manifold=(topology.get("non_manifold_edges") == 0) if "non_manifold_edges" in topology else None,
+            manifold=(
+                (topology.get("non_manifold_edges") == 0)
+                if "non_manifold_edges" in topology
+                else None
+            ),
             provenance_complete=bool(provenance),
             measured_geometry_fraction=measured_fraction,
             inferred_geometry_fraction=inferred_fraction,
             texture_coverage=float(row.get("texture_coverage", 0.0)),
+            texture_effective_gsd_m=row.get("texture_effective_gsd_m"),
+            texture_sharpness=row.get("texture_sharpness"),
+            texture_consensus_views=row.get("texture_consensus_views"),
         )
         assessments[subject_id] = assess_reality(metrics)
     return assessments
 
 
 __all__ = [
-    "CanonicalSurfaceIdentity", "GeometryUncertainty", "MaterialAppearance",
-    "PathSurfaceObservation", "PoseUncertainty", "RealityAssessment", "RealityMetrics",
-    "SiteStructure", "TemporalConflict", "TemporalSource", "assess_canonical_scene", "assess_reality",
-    "resolve_material_appearance", "temporal_conflicts", "validate_camera_path_reality",
-    "validate_surface_assignments", "visible_fraction",
+    "CanonicalSurfaceIdentity",
+    "GeometryUncertainty",
+    "MaterialAppearance",
+    "PathSurfaceObservation",
+    "PoseUncertainty",
+    "RealityAssessment",
+    "RealityMetrics",
+    "SiteStructure",
+    "TemporalConflict",
+    "TemporalSource",
+    "TextureResolutionAssessment",
+    "assess_canonical_scene",
+    "assess_reality",
+    "assess_texture_resolution",
+    "minimum_texture_distance_m",
+    "render_pixel_footprint_m",
+    "resolve_material_appearance",
+    "temporal_conflicts",
+    "texture_upscale_factor",
+    "validate_camera_path_reality",
+    "validate_surface_assignments",
+    "visible_fraction",
 ]
