@@ -39,10 +39,17 @@
           fullscreenButton: false,
           infoBox: false,
           selectionIndicator: false,
-          requestRenderMode: false,
+          // Rendu à la demande : en WebGL logiciel (headless sans GPU), une
+          // boucle de rendu continue sature le processus et fait expirer les
+          // captures d'écran. On pilote chaque image explicitement.
+          requestRenderMode: true,
+          maximumRenderTimeChange: Infinity,
           globe: false,           // les tuiles 3D fournissent le terrain
-          skyAtmosphere: false,
         });
+
+        // Ciel et atmosphère : sans eux l'horizon est noir, ce qui trahit
+        // immédiatement le rendu de synthèse sur les plans dégagés.
+        viewer.scene.skyAtmosphere.show = true;
 
         // Le brouillard atmosphérique de Cesium délave les vues rasantes.
         viewer.scene.fog.enabled = false;
@@ -61,6 +68,18 @@
         // pour transformer un vol rasant en vue d'horizon. Échantillonner la
         // scène rendue supprime l'ambiguïté de référentiel.
         const centre = Cesium.Cartographic.fromDegrees(config.centre.lon, config.centre.lat);
+
+        // Cadrer le centre et rendre quelques images avant d'échantillonner :
+        // sans cela la mesure porte sur des tuiles grossières et varie d'une
+        // exécution à l'autre (écarts d'une quinzaine de mètres observés).
+        viewer.camera.setView({
+          destination: Cesium.Cartesian3.fromDegrees(config.centre.lon, config.centre.lat, 1000),
+        });
+        for (let i = 0; i < 30; i++) {
+          viewer.scene.render();
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
         let groundHeight = 0;
         try {
           const sampled = await viewer.scene.sampleHeightMostDetailed([centre]);

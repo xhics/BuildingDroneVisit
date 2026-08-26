@@ -270,7 +270,9 @@ def render_flight(
             page.evaluate(
                 "args => window.droneSeek(args[0], args[1])", [index, TILE_TIMEOUT_MS]
             )
-            page.screenshot(path=str(frames_dir / f"frame_{index:05d}.png"))
+            # Le WebGL logiciel rend lentement en haute résolution : la valeur
+            # par défaut de Playwright (30 s) expire sur des vues chargées.
+            page.screenshot(path=str(frames_dir / f"frame_{index:05d}.png"), timeout=120000)
             if progress is not None:
                 progress(index + 1, len(poses), "")
 

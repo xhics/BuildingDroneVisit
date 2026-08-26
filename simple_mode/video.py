@@ -92,6 +92,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Charge un plan JSON local (même schéma que simple_mode.ai_plan) au lieu du gabarit par défaut",
     )
     parser.add_argument(
+        "--render-3d",
+        action="store_true",
+        help=(
+            "Rend un vrai vol de drone sur la géométrie 3D de Google (Cesium) : la trajectoire "
+            "calculée est réellement appliquée, rendu déterministe, aucune invention. "
+            "Nécessite playwright + chromium et ffmpeg."
+        ),
+    )
+    parser.add_argument(
+        "--render-3d-duration", type=float, default=15.0, help="Durée du vol 3D en secondes (défaut: 15)"
+    )
+    parser.add_argument("--render-3d-fps", type=int, default=12, help="Images par seconde du vol 3D (défaut: 12)")
+    parser.add_argument(
+        "--render-3d-size",
+        default="1280x720",
+        help="Résolution du vol 3D, format LARGEURxHAUTEUR (défaut: 1280x720)",
+    )
+    parser.add_argument(
         "--probe-sogni",
         action="store_true",
         help="Sonde l'API Sogni (SOGNI_API_KEY requis) pour confirmer le schéma réel avant un envoi",
@@ -197,6 +215,41 @@ def main(argv: list[str] | None = None) -> int:
         f"référence ({street_view_count} Street View, {len(storyboard.keyframes) - street_view_count} "
         f"satellite/générative), durée totale estimée {storyboard.total_duration_s:.0f}s"
     )
+
+    if args.render_3d:
+        from .cesium_render import CesiumRenderError, build_poses, render_flight
+
+        try:
+            width, height = (int(v) for v in args.render_3d_size.lower().split("x"))
+        except ValueError:
+            print(f"Erreur : --render-3d-size invalide ({args.render_3d_size!r}), attendu LARGEURxHAUTEUR.", file=sys.stderr)
+            return 1
+
+        frame_count = max(2, round(args.render_3d_duration * args.render_3d_fps))
+        poses = build_poses(maneuvers, geocoded["lat"], geocoded["lon"], frame_count=frame_count)
+        flight_path = out_dir / "flight_3d.mp4"
+
+        print(
+            f"\nRendu 3D : {frame_count} images ({args.render_3d_duration:.0f}s à "
+            f"{args.render_3d_fps} i/s, {width}x{height}) — géométrie réelle, sans facturation Sogni."
+        )
+
+        def _progress(index: int, total: int, note: str) -> None:
+            if note:
+                print(f"  {note}")
+            elif index % 10 == 0 or index == total:
+                print(f"  {index}/{total} images", flush=True)
+
+        try:
+            result = render_flight(
+                poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
+                out_path=flight_path, width=width, height=height,
+                fps=args.render_3d_fps, progress=_progress,
+            )
+        except CesiumRenderError as exc:
+            print(f"Rendu 3D échoué : {exc}", file=sys.stderr)
+            return 1
+        print(f"Vol 3D généré : {result}")
 
     if args.probe_sogni:
         sogni_key = os.environ.get("SOGNI_API_KEY")
