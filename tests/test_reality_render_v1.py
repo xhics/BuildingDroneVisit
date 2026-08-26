@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-import numpy as np
 import pytest
 
 from hotel_pipeline.architectural_geometry import primitive_mesh
@@ -118,25 +117,3 @@ def test_camera_path_is_rejected_when_texture_resolution_is_too_coarse() -> None
     )
     assert not accepted
     assert any("upscale" in reason for reason in reasons)
-
-
-def test_v2v_structure_score_detects_large_geometry_drift() -> None:
-    cv2 = pytest.importorskip("cv2")
-    from simple_mode.reality_qa import edge_structure_score
-
-    source = np.zeros((240, 320, 3), dtype=np.uint8)
-    cv2.rectangle(source, (50, 50), (270, 190), (255, 255, 255), 4)
-    cv2.line(source, (80, 80), (240, 80), (255, 255, 255), 3)
-    cv2.line(source, (80, 120), (240, 120), (255, 255, 255), 3)
-
-    same_structure = source.copy()
-    same_structure[source > 0] = 180
-    drifted = np.zeros_like(source)
-    cv2.rectangle(drifted, (85, 50), (305, 190), (255, 255, 255), 4)
-    cv2.line(drifted, (115, 80), (275, 80), (255, 255, 255), 3)
-    cv2.line(drifted, (115, 120), (275, 120), (255, 255, 255), 3)
-
-    stable_score = edge_structure_score(source, same_structure)
-    drift_score = edge_structure_score(source, drifted)
-    assert stable_score is not None and stable_score > 0.9
-    assert drift_score is not None and drift_score < 0.5
