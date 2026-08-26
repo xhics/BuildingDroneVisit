@@ -26,6 +26,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# Mode simple (simple_mode/) — plan de vol et illustration via OpenAI.
+# Non requis par hotel_pipeline lui-même.
+simple-ai = [
+    "openai>=1.40",
+]
 # Couche vision — cible : image GPU (Lot 2). Chaque bibliothèque remplace du
 # code qu'il aurait fallu écrire et calibrer.
 vision = [

@@ -101,10 +101,10 @@ def test_orthofacade_statuses_are_exclusive():
     assert support.is_observed
 
     support.contributing = 2
-    support.disagreement = 50.0
-    assert support.status == "desaccord"
+    support.rejection_reason = "REJECTED_DISAGREEMENT"
+    assert support.status == "REJECTED_DISAGREEMENT"
     assert not support.is_observed
 
-    support.disagreement = 0.0
+    support.rejection_reason = None
     assert support.status == "accorde"
     assert support.is_observed

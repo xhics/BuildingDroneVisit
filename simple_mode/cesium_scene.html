@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Cesium.js"></script>
+  <link href="https://cesium.com/downloads/cesiumjs/releases/1.121/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <style>
+    html, body, #cesiumContainer { width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; background: #000; }
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <script>
+    // Piloté depuis Python (simple_mode/cesium_render.py) via Playwright :
+    // window.dronePrepare(config) charge la scène, puis window.droneSeek(i)
+    // place la caméra sur le waypoint i et ne rend la main qu'une fois les
+    // tuiles réellement chargées — sinon on capture de la géométrie floue ou
+    // absente, ce qui est le piège classique de ce type de rendu.
+    let viewer = null;
+    let waypoints = [];
+
+    window.droneReady = false;
+    window.droneError = null;
+
+    window.dronePrepare = async function (config) {
+      try {
+        waypoints = config.waypoints;
+
+        // Aucun jeton Cesium ion : on ne consomme que les tuiles Google.
+        viewer = new Cesium.Viewer("cesiumContainer", {
+          baseLayer: false,
+          baseLayerPicker: false,
+          geocoder: false,
+          homeButton: false,
+          sceneModePicker: false,
+          navigationHelpButton: false,
+          animation: false,
+          timeline: false,
+          fullscreenButton: false,
+          infoBox: false,
+          selectionIndicator: false,
+          requestRenderMode: false,
+          globe: false,           // les tuiles 3D fournissent le terrain
+          skyAtmosphere: false,
+        });
+
+        // Le brouillard atmosphérique de Cesium délave les vues rasantes.
+        viewer.scene.fog.enabled = false;
+
+        const tileset = await Cesium.Cesium3DTileset.fromUrl(
+          `https://tile.googleapis.com/v1/3dtiles/root.json?key=${config.apiKey}`,
+          { showCreditsOnScreen: false }
+        );
+        viewer.scene.primitives.add(tileset);
+        window.droneTileset = tileset;
+
+        // Altitude du sol mesurée sur les tuiles elles-mêmes. L'API Google
+        // Elevation renverrait une altitude au-dessus du géoïde (niveau de la
+        // mer) alors que Cesium positionne la caméra au-dessus de
+        // l'ellipsoïde WGS84 : à Mountain View l'écart atteint ~32 m, assez
+        // pour transformer un vol rasant en vue d'horizon. Échantillonner la
+        // scène rendue supprime l'ambiguïté de référentiel.
+        const centre = Cesium.Cartographic.fromDegrees(config.centre.lon, config.centre.lat);
+        let groundHeight = 0;
+        try {
+          const sampled = await viewer.scene.sampleHeightMostDetailed([centre]);
+          if (sampled && sampled.length && Number.isFinite(sampled[0].height)) {
+            groundHeight = sampled[0].height;
+            window.droneGroundSource = "tuiles 3D";
+          } else {
+            window.droneGroundSource = "echec echantillonnage";
+          }
+        } catch (e) {
+          window.droneGroundSource = "erreur: " + String(e && e.message ? e.message : e);
+        }
+        window.droneGroundHeight = groundHeight;
+        window.droneReady = true;
+      } catch (err) {
+        window.droneError = String(err && err.message ? err.message : err);
+      }
+    };
+
+    // Attend que les tuiles visibles depuis la pose courante soient chargées.
+    // `tilesLoaded` peut basculer à true trop tôt sur une caméra qui vient de
+    // bouger : on exige donc plusieurs rendus consécutifs sans requête en
+    // attente avant de considérer la vue comme stable.
+    function waitForTiles(timeoutMs) {
+      return new Promise((resolve) => {
+        const started = Date.now();
+        let stableFrames = 0;
+        function step() {
+          viewer.scene.render();
+          const pending = window.droneTileset.tilesLoaded ? 0 : 1;
+          stableFrames = pending === 0 ? stableFrames + 1 : 0;
+          if (stableFrames >= 8 || Date.now() - started > timeoutMs) {
+            resolve(stableFrames >= 8);
+            return;
+          }
+          requestAnimationFrame(step);
+        }
+        step();
+      });
+    }
+
+    window.droneSeek = async function (index, timeoutMs) {
+      const w = waypoints[index];
+      // `agl` = hauteur au-dessus du sol ; le référentiel absolu est ajouté
+      // ici à partir de la mesure faite sur les tuiles.
+      const height = window.droneGroundHeight + w.agl;
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(w.lon, w.lat, height),
+        orientation: {
+          heading: Cesium.Math.toRadians(w.heading),
+          pitch: Cesium.Math.toRadians(w.pitch),
+          roll: 0.0,
+        },
+      });
+      return await waitForTiles(timeoutMs || 15000);
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+{
+  "maneuvers": [
+    {
+      "id": "orbite_grand_angle",
+      "name_fr": "Orbite grand angle",
+      "kind": "circle",
+      "clockwise": true,
+      "radius_m": 60.0,
+      "altitude_m": 50.0,
+      "turns": 1.0,
+      "purpose_fr": "établit l'ensemble du site et son environnement urbain avant de s'en approcher",
+      "skill_fr": "orbite stabilisée à grand rayon — vitesse angulaire volontairement lente pour éviter le flou de mouvement en téléobjectif, exige un mode POI GPS-assisté ou une main très régulière au manche"
+    },
+    {
+      "id": "approche_entree",
+      "name_fr": "Approche vers l'entrée",
+      "kind": "line",
+      "clockwise": true,
+      "start": [10.0, -80.0, 28.0],
+      "end": [10.0, -15.0, 10.0],
+      "purpose_fr": "guide le regard vers l'entrée principale, au sud du bâtiment",
+      "skill_fr": "translation avec décélération progressive et légère bascule de l'inclinaison caméra vers le bas à l'approche du sujet, pour ne pas ralentir brutalement"
+    },
+    {
+      "id": "spirale_facade_est",
+      "name_fr": "Spirale le long de la façade est",
+      "kind": "spiral",
+      "clockwise": false,
+      "radius_start_m": 45.0,
+      "radius_end_m": 16.0,
+      "altitude_start_m": 35.0,
+      "altitude_end_m": 9.0,
+      "turns": 1.5,
+      "purpose_fr": "révèle la façade vitrée est sous plusieurs angles en se rapprochant — la figure signature de la séquence",
+      "skill_fr": "rayon, altitude et cap varient tous les trois en continu — la figure la plus exigeante du passage, nécessite un pilote confirmé en vol manuel ou un logiciel de mission gérant une orbite à rayon variable"
+    },
+    {
+      "id": "survol_cour_interieure",
+      "name_fr": "Survol de la cour intérieure",
+      "kind": "line",
+      "clockwise": true,
+      "start": [-40.0, 20.0, 14.0],
+      "end": [30.0, -5.0, 7.0],
+      "purpose_fr": "traverse la cour intérieure en diagonale pour montrer l'aménagement paysager",
+      "skill_fr": "vol à basse altitude en espace semi-confiné — la réception GPS y est souvent dégradée entre les ailes du bâtiment, ce qui impose un pilotage assisté visuellement plutôt qu'un vol tout automatique"
+    },
+    {
+      "id": "sortie_ascendante",
+      "name_fr": "Sortie ascendante en spirale",
+      "kind": "spiral",
+      "clockwise": true,
+      "radius_start_m": 14.0,
+      "radius_end_m": 50.0,
+      "altitude_start_m": 8.0,
+      "altitude_end_m": 55.0,
+      "turns": 0.75,
+      "purpose_fr": "clôt la vidéo sur un retrait ascendant qui recontextualise le bâtiment dans son quartier",
+      "skill_fr": "montée verticale combinée à un éloignement et une rotation progressifs — exige un contrôle fin du gaz pour une sortie fluide, sans à-coup ni décrochage visuel de la trajectoire"
+    }
+  ]
+}

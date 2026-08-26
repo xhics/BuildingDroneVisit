@@ -8,9 +8,9 @@ est le résultat attendu ; le proxy mesuré reprend sa place sous les trous.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence
 
 import numpy as np
 
@@ -144,7 +144,11 @@ class ProxyDepth:
                     w = 1.0 - u - v
                     if u < -1e-4 or v < -1e-4 or w < -1e-4:
                         continue
-                    z_pixel = w * z0 + u * z1 + v * z2
+                    if z0 > 0 and z1 > 0 and z2 > 0:
+                        inv_z = w * (1.0 / z0) + u * (1.0 / z1) + v * (1.0 / z2)
+                        z_pixel = 1.0 / inv_z
+                    else:
+                        z_pixel = w * z0 + u * z1 + v * z2
                     if z_pixel < depth[py, px]:
                         depth[py, px] = z_pixel
                         face_map[py, px] = fid
@@ -191,22 +195,21 @@ class LidarOcclusion:
         valid = np.zeros((height, width), dtype=bool)
 
         for i in range(len(points)):
-            px, py = int(round(screen[i, 0])), int(round(screen[i, 1]))
+            px, py = round(screen[i, 0]), round(screen[i, 1])
             if not (0 <= px < width and 0 <= py < height):
                 continue
             d = float(depth[i])
             if not math.isfinite(d) or d <= 0.0:
                 continue
-            r_px = max(1, min(6, int(math.ceil(focal_px * 0.5 / max(d, 1e-6)))))
+            r_px = max(1, min(6, math.ceil(focal_px * 0.5 / max(d, 1e-6))))
             for dy in range(-r_px, r_px + 1):
                 for dx in range(-r_px, r_px + 1):
                     if dx * dx + dy * dy > r_px * r_px:
                         continue
                     sy, sx = py + dy, px + dx
-                    if 0 <= sy < height and 0 <= sx < width:
-                        if d < depth_map[sy, sx]:
-                            depth_map[sy, sx] = d
-                            valid[sy, sx] = True
+                    if 0 <= sy < height and 0 <= sx < width and d < depth_map[sy, sx]:
+                        depth_map[sy, sx] = d
+                        valid[sy, sx] = True
 
         return cls(depth=depth_map, valid=valid)
 
@@ -228,32 +231,37 @@ def measure_facade_alignment(
         plane.point(0.0, 1.0),
         plane.point(plane.length_m, 1.0),
     ])
-    screen, _ = camera.project(top_edge)
+    screen, screen_z = camera.project(top_edge)
     if screen is None:
         return float("inf"), float("inf"), 0
 
-    x0, x1 = int(np.floor(screen[0, 0])), int(np.ceil(screen[1, 0]))
-    x0 = max(0, x0)
-    x1 = min(width - 1, x1)
+    x0, x1 = max(0, int(np.floor(screen[0, 0]))), min(width - 1, int(np.ceil(screen[1, 0])))
     if x1 < x0:
         return float("inf"), float("inf"), 0
 
     dx = screen[1, 0] - screen[0, 0]
     dy = screen[1, 1] - screen[0, 1]
+    dz = screen_z[1] - screen_z[0]
     errors_px = []
     for x in range(x0, x1 + 1):
         if dx == 0:
             y_proj = screen[0, 1]
+            z_proj = float(screen_z[0])
         else:
             t = (x - screen[0, 0]) / dx
             y_proj = screen[0, 1] + t * dy
-        y_proj = int(round(y_proj))
-        if not (0 <= y_proj < height):
+            z_proj = float(screen_z[0] + t * dz)
+        y_proj_int = round(y_proj)
+        if not (0 <= y_proj_int < height):
             continue
         col_mask = building_mask[:, x]
         if not col_mask.any():
             continue
-        y_mask = int(np.argmax(col_mask))
+        if proxy_depth is not None:
+            hit_depth, _ = proxy_depth.hit(x, y_proj_int)
+            if hit_depth != float("inf") and hit_depth < z_proj - PROXY_DEPTH_TOLERANCE_M:
+                continue
+        y_mask = round(np.argmax(col_mask))
         errors_px.append(abs(y_proj - y_mask))
 
     if not errors_px:
@@ -266,7 +274,7 @@ def measure_facade_alignment(
 
 
 def _estimate_local_gsd(camera, plane) -> float:
-    centre = plane.point(plane.length_m * 0.5, plane.height_m * 0.5)
+    centre = plane.point(plane.length_m * 0.5, 0.5)
     to_cam = np.asarray(camera.position, dtype=np.float64) - centre
     dist = float(np.linalg.norm(to_cam))
     if dist < 1e-6:
@@ -308,6 +316,8 @@ def admit(
 
 
 __all__ = [
+    "REJECTION_ORDER",
+    "FacadeTexelCandidate",
     "LidarOcclusion",
     "ProxyDepth",
     "TexelStatus",

@@ -14,7 +14,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -479,9 +479,11 @@ def run(
     observations: list[dict] = []
     started = time.monotonic()
     mask_root = None
+    texture_run_id = None
     if purpose == "texture":
-        generated_at = datetime.now(timezone.utc)
+        generated_at = datetime.now(UTC)
         run_id = f"texture-{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
+        texture_run_id = run_id
         mask_root = workspace.path("11_conditioning", "texture_view_masks", run_id)
         mask_root.mkdir(parents=True, exist_ok=True)
 
@@ -523,14 +525,7 @@ def run(
             }
             observations.append(observation)
 
-            if purpose == "texture" and mask_root is not None and mask is not None:
-                asset_dir = mask_root / selected.asset_id
-                asset_dir.mkdir(parents=True, exist_ok=True)
-                mask_path = asset_dir / f"{observation['observation_id']}.png"
-                mask_img = Image.fromarray(mask["points"] if isinstance(mask, dict) else mask)
-                mask_img.save(mask_path)
-
-    generated_at = datetime.now(timezone.utc)
+    generated_at = datetime.now(UTC)
     run_id = f"semantic-{generated_at.strftime('%Y%m%dT%H%M%SZ')}"
     previews = _write_previews(workspace, images, observations, run_id)
     payload = {
@@ -591,6 +586,7 @@ def run(
                         (i.path for i in images if i.asset_id == aid), ""
                     )),
                     "building_polygon": [],
+                    "building_polygons": [],
                     "occluders_polygon": [],
                     "fidelity": "polygon_no_holes",
                     "classes_present": [],
@@ -604,9 +600,10 @@ def run(
             view["classes_present"].append(cls)
             seg = obs.get("segmentation_2d")
             if cls == "building" and seg:
-                view["building_polygon"] = seg.get("points", [])
-                view["width"] = seg.get("width", view["width"])
-                view["height"] = seg.get("height", view["height"])
+                points = seg.get("points", [])
+                if points:
+                    view["building_polygons"].append(points)
+                    view["building_polygon"] = points
                 if seg.get("has_holes"):
                     view["fidelity"] = "polygon_with_occluders"
             elif cls in {"car", "truck", "bus", "person", "bicycle", "bush", "hedge",
@@ -623,6 +620,10 @@ def run(
                     "decision": "pending",
                 })
         texture_payload["views"] = list(view_index.values())
+        if purpose == "texture" and mask_root is not None:
+            _persist_texture_rasters(
+                workspace, mask_root, texture_run_id, images, texture_payload["views"]
+            )
         tex_path = workspace.path("11_conditioning", "texture_view_masks.json")
         workspace.write_json(tex_path, texture_payload)
         return tex_path, texture_payload
@@ -671,3 +672,73 @@ def _select_colmap_images(workspace: Workspace) -> list[SelectedImage]:
             pose_evidence_class="anchor_measured",
         ))
     return selected
+
+
+def _rasterize_polygons(polygons: list[list[list[float]]], width: int, height: int) -> np.ndarray | None:
+    """Rastérise une ou plusieurs polylignes de bâtiment en masque binaire (H, W)."""
+    import cv2
+
+    if not polygons or width <= 0 or height <= 0:
+        return None
+    mask = np.zeros((height, width), dtype=np.uint8)
+    all_points: list[np.ndarray] = []
+    for polygon in polygons:
+        pts = np.asarray(polygon, dtype=np.int32)
+        if pts.shape[0] >= 3:
+            all_points.append(pts)
+    if not all_points:
+        return None
+    cv2.fillPoly(mask, all_points, 1)
+    return mask.astype(bool)
+
+
+def _persist_texture_rasters(
+    workspace: Workspace,
+    mask_root: Path,
+    texture_run_id: str | None,
+    images: list[SelectedImage],
+    views: list[dict],
+) -> None:
+    """Rasterise les masques de bâtiment avec les trous d'occulteurs.
+
+    Écrit un PNG par vue dans ``mask_root/{asset_id}/building_mask.png`` où
+    les pixels d'occulteurs (arbres, voitures, etc.) sont mis à 0,
+    préservant ainsi les trous SAM originaux.
+    """
+    if not texture_run_id:
+        return
+    image_dims: dict[str, tuple[int, int]] = {}
+    for selected in images:
+        if selected.asset_id not in image_dims:
+            try:
+                with Image.open(selected.path) as src:
+                    image_dims[selected.asset_id] = src.size
+            except OSError:
+                image_dims[selected.asset_id] = (0, 0)
+
+    for view in views:
+        asset_id = view.get("asset_id", "")
+        dim = image_dims.get(asset_id, (0, 0))
+        view["width"], view["height"] = dim
+        if dim[0] <= 0 or dim[1] <= 0:
+            continue
+        polygons = view.get("building_polygons") or []
+        occluder_polygons = view.get("occluders_polygon") or []
+        if not polygons and not occluder_polygons:
+            continue
+        binary = _rasterize_polygons(polygons, dim[0], dim[1]) if polygons else None
+        if occluder_polygons:
+            occluder_mask = _rasterize_polygons([occluder_polygons], dim[0], dim[1])
+            if occluder_mask is not None:
+                if binary is None:
+                    binary = np.zeros_like(occluder_mask)
+                binary[occluder_mask] = False
+        if binary is None:
+            continue
+        asset_dir = mask_root / asset_id
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        raster_name = "building_mask.png"
+        raster_path = asset_dir / raster_name
+        Image.fromarray((binary * 255).astype(np.uint8), mode="L").save(raster_path)
+        view["raster"] = f"texture_view_masks/{texture_run_id}/{asset_id}/{raster_name}"
+

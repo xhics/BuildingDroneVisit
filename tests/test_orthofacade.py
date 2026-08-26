@@ -17,6 +17,7 @@ from hotel_pipeline.geo.orthofacade import (
     plane_from_edge,
     rectify,
 )
+from hotel_pipeline.geo.facade_visibility import LidarOcclusion, ProxyDepth
 
 
 class _Camera:
@@ -133,8 +134,8 @@ class TestSupport:
         assert TexelSupport(contributing=3, disagreement=5.0).status == "accorde"
 
     def test_disagreement_is_reported_not_smoothed(self):
-        texel = TexelSupport(contributing=3, disagreement=DISAGREEMENT_LEVEL + 10)
-        assert texel.status == "desaccord"
+        texel = TexelSupport(contributing=3, rejection_reason="REJECTED_DISAGREEMENT")
+        assert texel.status == "REJECTED_DISAGREEMENT"
         assert not texel.is_observed
 
     def test_two_views_of_the_same_wall_agree(self):
@@ -214,3 +215,90 @@ class TestReport:
     def test_as_dict_texel_m_is_facade(self):
         payload = rectify(_wall(), [("A", _image(), _Camera())]).as_dict()
         assert payload["texel_m"] == TEXEL_M_FACADE
+
+
+def _proxy_with_occluder(width=640, height=480, occ_x=320, occ_y=240, occ_radius=20):
+    depth = np.full((height, width), np.inf)
+    face_map = np.full((height, width), -1, dtype=np.int32)
+    for dy in range(-occ_radius, occ_radius + 1):
+        for dx in range(-occ_radius, occ_radius + 1):
+            if dx * dx + dy * dy <= occ_radius * occ_radius:
+                py, px = occ_y + dy, occ_x + dx
+                if 0 <= py < height and 0 <= px < width:
+                    depth[py, px] = 5.0
+                    face_map[py, px] = 99
+    return ProxyDepth(width=width, height=height, depth=depth, face_id_map=face_map)
+
+
+class TestProxyPerView:
+    def test_proxy_occludes_pixels_behind_it(self):
+        proxy = _proxy_with_occluder()
+        mask = np.ones((480, 640), dtype=bool)
+        found = rectify(_wall(), [("A", _image(), _Camera(), mask, proxy, None)])
+        occ_col = int(320 / 640 * found.width_px)
+        occ_row = int(240 / 480 * found.height_px)
+        occ_slot = occ_row * found.width_px + occ_col
+        assert found.support[occ_slot].contributing == 0
+        assert found.support[occ_slot].rejection_reason == "REJECTED_OCCLUDED"
+
+    def test_proxy_per_view_not_global(self):
+        proxy_occ = _proxy_with_occluder(occ_x=100)
+        mask = np.ones((480, 640), dtype=bool)
+        found = rectify(
+            _wall(),
+            [
+                ("A", _image(), _Camera(), mask, proxy_occ, None),
+                ("B", _image(), _Camera(position=(3.0, -30.0, 2.5)), mask, None, None),
+            ],
+        )
+        assert found.observed_fraction > 0.0
+
+
+class TestLidarPerView:
+    def test_lidar_occludes_pixels(self):
+        proxy = _proxy_with_occluder()
+        lidar_depth = np.full((480, 640), np.inf)
+        lidar_valid = np.zeros((480, 640), dtype=bool)
+        lidar_depth[240, 320] = 5.0
+        lidar_valid[240, 320] = True
+        lidar = LidarOcclusion(depth=lidar_depth, valid=lidar_valid)
+        mask = np.ones((480, 640), dtype=bool)
+        found = rectify(_wall(), [("A", _image(), _Camera(), mask, proxy, lidar)])
+        occ_slot = int(240 / 480 * found.height_px) * found.width_px + int(320 / 640 * found.width_px)
+        assert found.support[occ_slot].rejection_reason == "REJECTED_OCCLUDED"
+
+
+class TestMadBeforeStd:
+    def test_outlier_rejected_by_mad_keeps_inliers(self):
+        plane = _wall()
+        views = [
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
+            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("C", _image((0, 200, 0)), _Camera(position=(0.0, -30.0, 2.5))),
+        ]
+        found = rectify(plane, views)
+        assert found.observed_fraction > 0.3
+
+    def test_consensus_colour_written_to_canvas(self):
+        plane = _wall()
+        views = [
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
+            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5))),
+        ]
+        found = rectify(plane, views)
+        assert found.image is not None
+        observed = [t for t in found.support if t.is_observed]
+        assert len(observed) > 0
+
+
+class TestRejectionPerCandidate:
+    def test_late_good_view_not_blocked_by_early_bad(self):
+        plane = _wall()
+        mask_a = np.zeros((480, 640), dtype=bool)
+        mask_b = np.ones((480, 640), dtype=bool)
+        views = [
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5)), mask_a),
+            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5)), mask_b),
+        ]
+        found = rectify(plane, views)
+        assert found.observed_fraction > 0.3

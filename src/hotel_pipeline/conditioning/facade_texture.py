@@ -196,9 +196,22 @@ def _asset_for_model_image(
         local = _resolve_asset_path(workspace, asset.get("local_path"))
         if local is None:
             continue
-        if asset_id.endswith(stem) or asset_id.endswith(simplified) or local.stem in {stem, simplified}:
+        if asset_id == stem or asset_id == simplified:
+            return asset_id, local
+        if local.stem == stem or local.stem == simplified:
+            return asset_id, local
+        asset_checksum = asset.get("checksum")
+        if asset_checksum and _file_checksum(local) == asset_checksum:
             return asset_id, local
     return None
+
+
+def _file_checksum(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
@@ -367,10 +380,15 @@ def build(workspace: Workspace, payload: dict) -> dict:
     selection_digest = selection_path.read_bytes() if selection_path and selection_path.is_file() else b""
     anchor_digest = anchor_path.read_bytes() if anchor_path and anchor_path.is_file() else b""
     texture_masks = load_texture_masks(workspace)
-    masks_digest = json.dumps(
-        {k: v.fidelity for k, v in texture_masks.items()},
-        sort_keys=True,
-    ).encode("utf-8")
+    masks_digest = hashlib.sha256()
+    for k, v in sorted(texture_masks.items()):
+        masks_digest.update(k.encode("utf-8"))
+        masks_digest.update(v.fidelity.encode("utf-8") if v.fidelity else b"none")
+        if v.building is not None:
+            masks_digest.update(v.building.tobytes())
+        if v.occluders is not None:
+            masks_digest.update(v.occluders.tobytes())
+    masks_digest_bytes = masks_digest.digest()
 
     policy_thresholds = json.dumps(
         {
@@ -398,7 +416,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
         + model_files_digest
         + selection_digest
         + anchor_digest
-        + masks_digest
+        + masks_digest_bytes
         + policy_thresholds
         + str(TEXTURE_ALGORITHM_VERSION).encode("ascii")
     ).hexdigest()
@@ -516,13 +534,15 @@ def build(workspace: Workspace, payload: dict) -> dict:
 
         edge_views = []
         for asset_id, rgb, camera, combined_mask, proxy, laz_occ in views:
+            if combined_mask is None:
+                continue
             facade_mask = _facade_polygon_mask(camera, plane, rgb.shape[1], rgb.shape[0])
             if facade_mask is None:
                 continue
-            vis = facade_mask & combined_mask if combined_mask is not None else facade_mask
+            vis = facade_mask & combined_mask
             if not vis.any():
                 continue
-            pose_px, pose_m, cols_used = _pose_error_for_view(camera, plane, combined_mask if combined_mask is not None else facade_mask)
+            pose_px, pose_m, cols_used = _pose_error_for_view(camera, plane, combined_mask)
             if pose_m > 0.5:
                 continue
             edge_views.append((asset_id, rgb, camera, vis, proxy, laz_occ, pose_m))
@@ -629,8 +649,19 @@ def _apply_feature_coverage(payload: dict, textures: list[dict]) -> None:
             feature["texture_coverage"] = 0.0
             feature["covered_by_photo"] = False
             continue
-        feature["texture_coverage"] = 0.0
-        feature["covered_by_photo"] = False
+        feature_poly = np.asarray(vertices, dtype=float)
+        min_u = float(np.min(feature_poly[:, 0]))
+        max_u = float(np.max(feature_poly[:, 0]))
+        min_v = float(np.min(feature_poly[:, 1])) if feature_poly.shape[1] > 1 else 0.0
+        max_v = float(np.max(feature_poly[:, 1])) if feature_poly.shape[1] > 1 else 1.0
+        area = (max_u - min_u) * (max_v - min_v)
+        observed = float(texture.get("observed_fraction", 0.0))
+        if area <= 0.0:
+            feature["texture_coverage"] = 0.0
+            feature["covered_by_photo"] = False
+            continue
+        feature["texture_coverage"] = observed
+        feature["covered_by_photo"] = observed > 0.1
 
 
 __all__ = ["build"]

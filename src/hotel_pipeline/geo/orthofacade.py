@@ -37,6 +37,8 @@ DISAGREEMENT_LEVEL = 42.0
 MAX_INLIER_SPREAD_DE = 12.0
 MAD_OUTLIER_K = 2.5
 MIN_INLIERS_FOR_CONSENSUS = 2
+PROXY_DEPTH_TOLERANCE_M = 0.25
+LIDAR_OCCLUSION_MARGIN_M = 1.5
 
 
 @dataclass
@@ -97,8 +99,6 @@ class TexelSupport:
             return self.rejection_reason
         if self.contributing == 0:
             return "non_observe"
-        if self.disagreement >= DISAGREEMENT_LEVEL:
-            return "desaccord"
         if self.contributing == 1:
             return "vue_unique"
         return "accorde"
@@ -253,11 +253,14 @@ def rectify(
     plane: FacadePlane,
     views: Sequence,
     texel_m: float = TEXEL_M_FACADE,
-    proxy_depth: ProxyDepth | None = None,
-    occlusion: LidarOcclusion | None = None,
     policy: dict | None = None,
 ) -> Orthofacade:
-    """Projette chaque vue dans le plan du mur et fusionne les contributions."""
+    """Projette chaque vue dans le plan du mur et fusionne les contributions.
+
+    Chaque vue est un tuple (asset_id, image, camera, vis, proxy, laz_occ, ...).
+    ``proxy`` et ``laz_occ`` sont par vue : la profondeur est testée avec les
+    données de la vue courante, pas une globale.
+    """
     cols = max(int(round(plane.length_m / texel_m)), 1)
     rows = max(int(round(plane.height_m / texel_m)), 1)
     found = Orthofacade(facade_id=plane.facade_id, width_px=cols, height_px=rows)
@@ -269,7 +272,8 @@ def rectify(
 
     canvas = np.zeros((rows, cols, 3), dtype=np.float64)
     best_incidence = np.full((rows, cols), np.inf)
-    samples: dict[int, list] = {}
+    samples: dict[int, list[tuple[np.ndarray, str, float]]] = {}
+    rejection_log: dict[int, list[str]] = {}
     used = 0
     skipped_resolution = 0
     rejection_counts: dict[str, int] = {}
@@ -280,7 +284,8 @@ def rectify(
     for view in views:
         asset_id, image, camera = view[:3]
         visibility_mask = view[3] if len(view) >= 4 else None
-        building_mask = view[4] if len(view) >= 5 else None
+        view_proxy = view[4] if len(view) >= 5 else None
+        view_lidar = view[5] if len(view) >= 6 else None
 
         centre = plane.point(plane.length_m * 0.5, 0.5)
         to_camera = np.asarray(camera.position, dtype=np.float64) - centre
@@ -322,91 +327,79 @@ def rectify(
                     continue
 
                 slot = row * cols + col
-                texel = found.support[slot]
+                wall_depth = float(depth[col])
 
                 if visibility_mask is not None and not visibility_mask[iy, ix]:
-                    if not texel.rejection_reason:
-                        texel.rejection_reason = "REJECTED_SEMANTIC"
-                        texel.rejection_cause = "semantic_not_building"
-                        rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+                    rejection_log.setdefault(slot, []).append("REJECTED_SEMANTIC")
                     continue
 
-                if proxy_depth is not None:
-                    wall_depth = float(span_v[col])
-                    hit_depth, hit_fid = proxy_depth.hit(ix, iy)
+                if view_proxy is not None:
+                    hit_depth, hit_fid = view_proxy.hit(ix, iy)
                     if hit_fid is not None and hit_fid >= 0 and wall_depth > hit_depth + PROXY_DEPTH_TOLERANCE_M:
-                        if not texel.rejection_reason:
-                            texel.rejection_reason = "REJECTED_OCCLUDED"
-                            texel.rejection_cause = "occluded_by_proxy"
-                            rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+                        rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
                         continue
 
-                if occlusion is not None and occlusion.valid[iy, ix]:
-                    wall_depth = float(span_v[col])
-                    lidar_d = float(occlusion.depth[iy, ix])
+                if view_lidar is not None and view_lidar.valid[iy, ix]:
+                    lidar_d = float(view_lidar.depth[iy, ix])
                     if wall_depth > lidar_d + LIDAR_OCCLUSION_MARGIN_M:
-                        if not texel.rejection_reason:
-                            texel.rejection_reason = "REJECTED_OCCLUDED"
-                            texel.rejection_cause = "occluded_by_lidar"
-                            rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+                        rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
                         continue
 
                 colour = image[iy, ix].astype(np.float64)
-                samples.setdefault(slot, []).append(colour)
+                samples.setdefault(slot, []).append((colour, asset_id, float(incidence_v[col])))
+                texel = found.support[slot]
                 texel.contributing += 1
                 inc = float(incidence_v[col])
                 if inc < (texel.best_incidence_deg or math.inf):
                     texel.best_incidence_deg = inc
                     texel.best_distance_m = float(span_v[col])
                     texel.best_asset = asset_id
-                if inc < best_incidence[row, col]:
-                    best_incidence[row, col] = inc
-                    canvas[row, col] = colour
 
-    for slot, colours in samples.items():
-        if len(colours) < 2:
-            continue
+    for slot, data in samples.items():
         texel = found.support[slot]
-        if texel.rejection_reason:
-            continue
-        arr = np.asarray(colours)
-        std = np.mean(np.std(arr, axis=0))
-        texel.disagreement = float(std)
-        if texel.disagreement >= DISAGREEMENT_LEVEL:
-            texel.rejection_reason = "REJECTED_DISAGREEMENT"
-            texel.rejection_cause = "disagreement"
-            rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+        colours = [c for c, _, _ in data]
+
+        if len(colours) < 2:
             row, col = divmod(slot, cols)
-            canvas[row, col] = 0.0
-        else:
-            labs = np.stack([_lab(tuple(c[:3])) for c in colours])
-            med = np.median(labs, axis=0)
-            mad = np.median(np.abs(labs - med), axis=0) * 1.4826
-            inliers = []
-            for i, lab in enumerate(labs):
-                if np.all(np.abs(lab - med) < MAD_OUTLIER_K * (mad + 1e-8)):
-                    inliers.append(colours[i])
-            if len(inliers) >= MIN_INLIERS_FOR_CONSENSUS:
-                texel.inlier_count = len(inliers)
-                inlier_labs = np.stack([_lab(tuple(c[:3])) for c in inliers])
-                spread = float(np.mean(np.std(inlier_labs, axis=0)))
-                texel.inlier_spread_de = spread
-                if spread <= MAX_INLIER_SPREAD_DE:
-                    texel.consensus_colour = tuple(np.mean(inliers, axis=0)[:3])
-                else:
-                    if not texel.rejection_reason:
-                        texel.rejection_reason = "REJECTED_DISAGREEMENT"
-                        texel.rejection_cause = "inlier_spread"
-                        rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
-                        row, col = divmod(slot, cols)
-                        canvas[row, col] = 0.0
+            canvas[row, col] = colours[0]
+            continue
+
+        labs = np.stack([_lab(tuple(c[:3])) for c in colours])
+        med = np.median(labs, axis=0)
+        mad = np.median(np.abs(labs - med), axis=0) * 1.4826
+        inliers = []
+        for i, lab in enumerate(labs):
+            if np.all(np.abs(lab - med) < MAD_OUTLIER_K * (mad + 1e-8)):
+                inliers.append(colours[i])
+
+        if len(inliers) >= MIN_INLIERS_FOR_CONSENSUS:
+            texel.inlier_count = len(inliers)
+            inlier_labs = np.stack([_lab(tuple(c[:3])) for c in inliers])
+            spread = float(np.mean(np.std(inlier_labs, axis=0)))
+            texel.inlier_spread_de = spread
+            if spread <= MAX_INLIER_SPREAD_DE:
+                texel.consensus_colour = tuple(np.mean(inliers, axis=0)[:3])
+                row, col = divmod(slot, cols)
+                canvas[row, col] = texel.consensus_colour
             else:
-                if not texel.rejection_reason:
-                    texel.rejection_reason = "REJECTED_DISAGREEMENT"
-                    texel.rejection_cause = "insufficient_inliers"
-                    rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
-                    row, col = divmod(slot, cols)
-                    canvas[row, col] = 0.0
+                texel.rejection_reason = "REJECTED_DISAGREEMENT"
+                texel.rejection_cause = "inlier_spread"
+                rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+        else:
+            texel.rejection_reason = "REJECTED_DISAGREEMENT"
+            texel.rejection_cause = "insufficient_inliers"
+            rejection_counts[texel.rejection_reason] = rejection_counts.get(texel.rejection_reason, 0) + 1
+
+    for slot in range(rows * cols):
+        texel = found.support[slot]
+        if texel.contributing > 0:
+            continue
+        reasons = rejection_log.get(slot)
+        if not reasons:
+            continue
+        dominant = max(set(reasons), key=reasons.count)
+        texel.rejection_reason = dominant
+        rejection_counts[dominant] = rejection_counts.get(dominant, 0) + 1
 
     found.image = canvas.astype(np.uint8) if used else None
     found.provenance = {

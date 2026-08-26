@@ -13,7 +13,7 @@ tranchées à ce stade.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -56,19 +56,24 @@ def _load_raster(path: Path) -> np.ndarray | None:
         if image.mode not in ("1", "L", "P"):
             image = image.convert("L")
         return np.asarray(image, dtype=bool)
-    except Exception:
+    except OSError:
         return None
 
 
-def _polygon_to_mask(points: list[list[float]], width: int, height: int) -> np.ndarray:
+def _merge_polygons_into_mask(polygons: list[list[list[float]]], width: int, height: int) -> np.ndarray:
     import cv2
 
-    mask = np.zeros((height, width), dtype=np.uint8)
-    if len(points) < 3:
-        return np.zeros((height, width), dtype=bool)
-    pts = np.asarray([[point[0], point[1]] for point in points], dtype=np.int32)
-    cv2.fillPoly(mask, [pts], 1)
-    return mask.astype(bool)
+    mask = np.zeros((height, width), dtype=bool)
+    if width <= 0 or height <= 0:
+        return mask
+    all_points: list[np.ndarray] = []
+    for polygon in polygons:
+        pts = np.asarray(polygon, dtype=np.int32)
+        if pts.shape[0] >= 3:
+            all_points.append(pts)
+    if all_points:
+        cv2.fillPoly(np.zeros((height, width), dtype=np.uint8), all_points, 1, mask=mask)
+    return mask
 
 
 def _build_from_semantic_observations(workspace: Workspace) -> dict[str, TextureViewMask]:
@@ -101,14 +106,18 @@ def _build_from_semantic_observations(workspace: Workspace) -> dict[str, Texture
         if not any(len(points) >= 3 for points in building_polygons):
             continue
 
-        building_mask = np.zeros((height, width), dtype=bool)
-        occluder_mask = np.zeros((height, width), dtype=bool)
+        building_mask = _merge_polygons_into_mask(building_polygons, width, height)
+        occluder_mask = _merge_polygons_into_mask(
+            [
+                item.get("segmentation_2d", {}).get("points") or []
+                for item in observations
+                if item.get("class") in OCCLUDER_CLASSES
+            ],
+            width,
+            height,
+        )
         sign_regions: list[dict[str, Any]] = []
         classes_present: list[str] = []
-
-        for points in building_polygons:
-            if len(points) >= 3:
-                building_mask |= _polygon_to_mask(points, width, height)
 
         for item in observations:
             cls = str(item.get("class", ""))
@@ -118,9 +127,7 @@ def _build_from_semantic_observations(workspace: Workspace) -> dict[str, Texture
             points = item.get("segmentation_2d", {}).get("points") or []
             if len(points) < 3:
                 continue
-            if cls in OCCLUDER_CLASSES:
-                occluder_mask |= _polygon_to_mask(points, width, height)
-            elif cls in ("sign", "logo"):
+            if cls in ("sign", "logo"):
                 sign_regions.append({
                     "class": cls,
                     "points": points,
@@ -153,18 +160,20 @@ def _build_from_texture_masks_json(workspace: Workspace) -> dict[str, TextureVie
     masks: dict[str, TextureViewMask] = {}
     for view in payload.get("views", []):
         asset_id = str(view.get("asset_id"))
+        width = int(view.get("width", 0))
+        height = int(view.get("height", 0))
         raster_path = workspace.path("11_conditioning", "texture_view_masks", view.get("raster", ""))
         building = _load_raster(raster_path)
         if building is None:
-            building = _polygon_to_mask(
-                view.get("building_polygon", []),
-                view.get("width", 0),
-                view.get("height", 0),
+            building = _merge_polygons_into_mask(
+                view.get("building_polygons") or [view.get("building_polygon") or []],
+                width,
+                height,
             )
-        occluders = _polygon_to_mask(
-            view.get("occluders_polygon", []),
-            view.get("width", 0),
-            view.get("height", 0),
+        occluders = _merge_polygons_into_mask(
+            [view.get("occluders_polygon") or []],
+            width,
+            height,
         ) if view.get("occluders_polygon") else None
         masks[asset_id] = TextureViewMask(
             asset_id=asset_id,
