@@ -767,6 +767,11 @@ class CameraFeasibilityField(BaseModel):
     yaw_deg: float = Field(ge=0.0, lt=360.0)
     pitch_deg: float = Field(ge=-90.0, le=90.0)
     fov_deg: float = Field(gt=0.0)
+    #: Orientation complète : matrice monde→caméra et quaternion associé.
+    #: Toute validation consomme la pose entière — le yaw seul ne suffit pas
+    #: à reconstruire une direction de visée qui porterait un pitch.
+    orientation_matrix: tuple[float, float, float, float, float, float, float, float, float] | None = None
+    orientation_quaternion: tuple[float, float, float, float] | None = None
 
     visible_surface_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     unknown_fraction: float = Field(default=0.0, ge=0.0, le=1.0)

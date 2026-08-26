@@ -79,7 +79,13 @@ LINKED_BUILDING_M = 35.0
 
 @dataclass
 class VegetationPatch:
-    """Un massif végétal, décrit par son emprise et sa hauteur."""
+    """Un massif végétal, décrit par son emprise et sa hauteur.
+
+    Un houppier n'est pas un volume opaque : le feuillage transmet. Chaque
+    massif porte une **classe d'opacité** et une transmittance associée,
+    consommées par le rendu (crédit par pixel) et par la visibilité (une
+    couronne ne rend plus 100 % d'une façade invisible).
+    """
 
     stratum: str
     centre: tuple[float, float]
@@ -93,6 +99,39 @@ class VegetationPatch:
     #: existent : l'image peut qualifier la forme, mais ne remplace pas la
     #: distribution 3D mesurée.
     envelope: list[list[tuple[float, float, float]]] = field(default_factory=list)
+    #: Densité de retours dans l'emprise du massif (points/m²). Elle pilote
+    #: la classe d'opacité : dense → quasi opaque, clairsemé → transparent.
+    density_per_m2: float | None = None
+
+    @property
+    def opacity_class(self) -> str:
+        """Classe d'opacité déduite de la densité mesurée du feuillage.
+
+        Trois classes, jamais deux états : opaque / semi_transparent /
+        uncertain. Une masse sans mesure de densité reste « uncertain » —
+        elle borne l'encombrement sans prétendre bloquer la vue.
+        """
+        if self.density_per_m2 is None:
+            return "uncertain"
+        if self.stratum in ("arbustes", "haies"):
+            # Un feuillage bas se lit d'avantage : seuils resserrés.
+            if self.density_per_m2 >= 40.0:
+                return "opaque"
+            if self.density_per_m2 >= 8.0:
+                return "semi_transparent"
+            return "uncertain"
+        if self.density_per_m2 >= 25.0:
+            return "opaque"
+        if self.density_per_m2 >= 4.0:
+            return "semi_transparent"
+        return "uncertain"
+
+    @property
+    def transmittance(self) -> float:
+        """Fraction de visibilité transmise à travers le massif."""
+        from .vegetation_opacity import TRANSMITTANCE_BY_CLASS
+
+        return TRANSMITTANCE_BY_CLASS[self.opacity_class]
 
     def as_dict(self) -> dict:
         return {
@@ -102,6 +141,11 @@ class VegetationPatch:
             "radius_m": round(self.radius_m, 2),
             "height_m": round(self.height_m, 2),
             "points": self.points,
+            "density_per_m2": (
+                round(self.density_per_m2, 1) if self.density_per_m2 is not None else None
+            ),
+            "opacity_class": self.opacity_class,
+            "transmittance": round(self.transmittance, 3),
             "envelope": [
                 [[round(x, 2), round(y, 2), round(z, 2)] for x, y, z in ring]
                 for ring in self.envelope

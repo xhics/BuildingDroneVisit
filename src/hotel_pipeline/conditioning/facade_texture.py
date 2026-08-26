@@ -163,6 +163,33 @@ class _RegisteredCamera:
         self.rotation = np.asarray(cam_from_world.rotation.matrix(), dtype=float)
         self.translation = np.asarray(cam_from_world.translation, dtype=float)
 
+    # ------------------------------------------------------------------
+    # Contrat caméra : le moteur de rendu (clip near-plane, découpage au
+    # bord, profondeurs Z espace caméra) consomme ces attributs standards.
+    # ------------------------------------------------------------------
+    @property
+    def R(self) -> np.ndarray:
+        return self.rotation
+
+    @property
+    def t(self) -> np.ndarray:
+        return self.translation
+
+    @property
+    def model(self) -> str:
+        return str(self.camera.model_name if hasattr(self.camera, "model_name") else self.camera.model)
+
+    @property
+    def params(self) -> np.ndarray:
+        return np.asarray(self.camera.params, dtype=float)
+
+    @property
+    def near_m(self) -> float:
+        return 0.05
+
+    def img_from_cam(self, points_cam: np.ndarray) -> np.ndarray:
+        return np.asarray(self.camera.img_from_cam(points_cam), dtype=float)
+
     def _to_colmap(self, points: np.ndarray) -> np.ndarray:
         tr = self.transform
         aligned = (
@@ -245,9 +272,9 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
     screen, _depth = camera.project(corners)
     if screen is None:
         return None
-    xs = np.clip(np.round(screen[:, 0]).astype(np.int32), 0, width - 1)
-    ys = np.clip(np.round(screen[:, 1]).astype(np.int32), 0, height - 1)
-    pts = np.stack([xs, ys], axis=1).astype(np.int32)
+    # Aucun clamp au bord : fillPoly découpe le polygone au rectangle image,
+    # une façade à moitié hors champ ne laisse pas de bande artificielle.
+    pts = np.round(screen).astype(np.int32)
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(mask, [pts], 1)
     return mask.astype(bool)

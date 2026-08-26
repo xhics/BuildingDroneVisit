@@ -265,10 +265,14 @@ def rectify(
 ) -> Orthofacade:
     """Projette chaque vue dans le plan du mur et fusionne les contributions.
 
-    Chaque vue est un tuple (asset_id, image, camera, vis, proxy, laz_occ, ...).
-    ``proxy`` et ``laz_occ`` sont par vue : la profondeur est testée avec les
-    données de la vue courante, pas une globale.
+    Chaque vue est soit un ``RegisteredView`` — l'objet du contrat qui porte
+    image, caméra canonique, masque sémantique et les deux cartes de
+    profondeur — soit le tuple historique. Les profondeurs proxy et LiDAR
+    sont **réellement appliquées** à chaque texel : un obstacle devant le mur
+    rejette le texel situé derrière, par comparaison en Z espace caméra.
     """
+    from .facade_visibility import RegisteredView
+
     cols = max(int(round(plane.length_m / texel_m)), 1)
     rows = max(int(round(plane.height_m / texel_m)), 1)
     found = Orthofacade(facade_id=plane.facade_id, width_px=cols, height_px=rows)
@@ -290,13 +294,27 @@ def rectify(
     us = (np.arange(cols) + 0.5) * texel_m
 
     for view in views:
-        asset_id, image, camera = view[:3]
-        visibility_mask = view[3] if len(view) >= 4 else None
-        view_proxy = view[4] if len(view) >= 5 else None
-        view_lidar = view[5] if len(view) >= 6 else None
+        if isinstance(view, RegisteredView):
+            asset_id = view.asset_id
+            image = view.image
+            camera = view.camera
+            visibility_mask = view.semantic_mask
+            view_proxy = view.proxy_depth
+            view_lidar = view.lidar_depth
+            registered = view
+        else:
+            asset_id, image, camera = view[:3]
+            visibility_mask = view[3] if len(view) >= 4 else None
+            view_proxy = view[4] if len(view) >= 5 else None
+            view_lidar = view[5] if len(view) >= 6 else None
+            registered = None
+
+        def _camera_centre(cam):  # noqa: ANN001
+            found = getattr(cam, "position")
+            return np.asarray(found() if callable(found) else found, dtype=np.float64)
 
         centre = plane.point(plane.length_m * 0.5, 0.5)
-        to_camera = np.asarray(camera.position, dtype=np.float64) - centre
+        to_camera = _camera_centre(camera) - centre
         span = float(np.linalg.norm(to_camera))
         if span < 1e-6:
             continue
@@ -318,7 +336,7 @@ def rectify(
             screen, depth = camera.project(points)
             if screen is None:
                 continue
-            to_cam = np.asarray(camera.position, dtype=np.float64) - points
+            to_cam = _camera_centre(camera) - points
             span_v = np.linalg.norm(to_cam, axis=1)
             span_safe = np.maximum(span_v, 1e-6)
             cosine_v = (to_cam @ plane.normal) / span_safe
@@ -341,17 +359,24 @@ def rectify(
                     rejection_log.setdefault(slot, []).append("REJECTED_SEMANTIC")
                     continue
 
-                if view_proxy is not None:
-                    hit_depth, hit_fid = view_proxy.hit(ix, iy)
-                    if hit_fid is not None and hit_fid >= 0 and wall_depth > hit_depth + PROXY_DEPTH_TOLERANCE_M:
+                if registered is not None:
+                    # Contrat RegisteredView : un seul verdict d'occlusion,
+                    # proxy et LiDAR comparés en Z espace caméra.
+                    if registered.occludes((ix, iy), wall_depth):
                         rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
                         continue
+                else:
+                    if view_proxy is not None:
+                        hit_depth, hit_fid = view_proxy.hit(ix, iy)
+                        if hit_fid is not None and hit_fid >= 0 and wall_depth > hit_depth + PROXY_DEPTH_TOLERANCE_M:
+                            rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
+                            continue
 
-                if view_lidar is not None and view_lidar.valid[iy, ix]:
-                    lidar_d = float(view_lidar.depth[iy, ix])
-                    if wall_depth > lidar_d + LIDAR_OCCLUSION_MARGIN_M:
-                        rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
-                        continue
+                    if view_lidar is not None and view_lidar.valid[iy, ix]:
+                        lidar_d = float(view_lidar.depth[iy, ix])
+                        if wall_depth > lidar_d + LIDAR_OCCLUSION_MARGIN_M:
+                            rejection_log.setdefault(slot, []).append("REJECTED_OCCLUDED")
+                            continue
 
                 colour = image[iy, ix].astype(np.float64)
                 samples.setdefault(slot, []).append((colour, asset_id, float(incidence_v[col])))

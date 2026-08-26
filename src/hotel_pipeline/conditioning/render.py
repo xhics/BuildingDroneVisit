@@ -444,6 +444,67 @@ def _vegetation_faces(patch) -> list[np.ndarray]:
     return faces
 
 
+def _rasterise_vegetal(
+    tri: np.ndarray,
+    camera: Camera,
+    depth: np.ndarray,
+    normal: np.ndarray,
+    silhouette: np.ndarray,
+    confidence: np.ndarray,
+    transmittance: float,
+) -> None:
+    """Inscrit un triangle végétal : derrière lui, la scène reste lisible.
+
+    Contrairement à un mur, le feuillage n'écrase pas le crédit des pixels
+    qu'il couvre : le crédit résiduel est proportionnel à sa transmittance,
+    et le z-buffer ne retient le massif que s'il est réellement plus proche.
+    """
+    screen, zcam = _project(tri, camera)
+    if np.any(zcam <= 0.05):
+        return
+    a, b, c = screen
+    area = (b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])
+    if abs(area) < 1e-9:
+        return
+
+    h, w = depth.shape
+    min_x = max(int(np.floor(screen[:, 0].min())), 0)
+    max_x = min(int(np.ceil(screen[:, 0].max())), w - 1)
+    min_y = max(int(np.floor(screen[:, 1].min())), 0)
+    max_y = min(int(np.ceil(screen[:, 1].max())), h - 1)
+    if min_x > max_x or min_y > max_y:
+        return
+
+    px = np.arange(min_x, max_x + 1, dtype=np.float64) + 0.5
+    py = np.arange(min_y, max_y + 1, dtype=np.float64) + 0.5
+    dx = px - a[0]
+    dy = (py - a[1])[:, None]
+
+    inv_area = 1.0 / area
+    w0 = ((b[0] - a[0]) * dy - dx * (b[1] - a[1])) * inv_area
+    w1 = (dx * (c[1] - a[1]) - (c[0] - a[0]) * dy) * inv_area
+    w2 = 1.0 - w0 - w1
+    inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
+    if not inside.any():
+        return
+
+    inv_z = w2 / zcam[0] + w1 / zcam[1] + w0 / zcam[2]
+    inv_z = np.where(np.abs(inv_z) < 1e-12, 1e-12, inv_z)
+    tri_depth = 1.0 / inv_z
+
+    rows, cols = slice(min_y, max_y + 1), slice(min_x, max_x + 1)
+    region_depth = depth[rows, cols]
+    closer = inside & (tri_depth < region_depth) & (tri_depth > 0)
+    if not closer.any():
+        return
+    region_depth[closer] = tri_depth[closer]
+    silhouette[rows, cols][closer] = 3
+    # Crédit résiduel : la façade derrière le feuillage reste pondérée par la
+    # transmittance au lieu de tomber à une valeur d'occultation totale.
+    residual = float(np.clip(VEGETATION_CONFIDENCE * transmittance + 0.02, 0.02, 1.0))
+    confidence[rows, cols][closer] = residual
+
+
 def _patch_faces(patch, terrain=None) -> list[np.ndarray]:  # noqa: ANN001
     """Triangule une plage de sol depuis son contour.
 
@@ -804,13 +865,21 @@ def render_frame(
     # parfois, et le z-buffer tranche. Son crédit est délibérément bas — un
     # massif borne un encombrement, il ne décrit ni espèce ni feuillage.
     if environment is not None:
+        from .vegetation_opacity import TRANSMITTANCE_BY_CLASS
+
         for patch in environment.patches:
             if not _visible(_patch_bounds(patch), camera):
                 continue
+            # La végétation n'est plus un volume opaque : sa transmittance
+            # dégrade le crédit des pixels qu'elle couvre — une couronne
+            # semi-transparente laisse la façade partiellement visible.
+            transmittance = TRANSMITTANCE_BY_CLASS.get(
+                getattr(patch, "opacity_class", "uncertain"), 0.70
+            )
             for tri in _vegetation_faces(patch):
-                _rasterise(
+                _rasterise_vegetal(
                     tri, camera, depth, normal, silhouette, confidence,
-                    silhouette_value=3, confidence_value=VEGETATION_CONFIDENCE,
+                    transmittance,
                 )
         # Le mobilier porte sa propre silhouette : un mât devant une façade
         # occulte réellement, mais le générateur ne doit pas y peindre un
