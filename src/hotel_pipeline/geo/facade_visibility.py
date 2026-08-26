@@ -483,8 +483,41 @@ def measure_facade_alignment(
     return median_px, error_m, len(errors_px)
 
 
+def local_projection_jacobian(camera, point_world, u_direction=None, delta_m=0.05):
+    point = np.asarray(point_world, dtype=np.float64)
+    direction_u = np.asarray(u_direction, dtype=np.float64) if u_direction is not None else np.array([1.0, 0.0, 0.0])
+    norm_u = float(np.linalg.norm(direction_u))
+    if norm_u < 1e-9:
+        return 0.0, 0.0
+    direction_u = direction_u / norm_u
+    base_screen, _ = camera.project(point[None, :])
+    if base_screen is None:
+        return 0.0, 0.0
+    base_screen = np.asarray(base_screen, dtype=np.float64).reshape(-1, 2)
+    def _pixels_per_m(delta):
+        screen, _ = camera.project((point + delta)[None, :])
+        if screen is None:
+            return 0.0
+        displacement = float(np.linalg.norm(np.asarray(screen, dtype=np.float64).reshape(-1, 2)[0] - base_screen[0]))
+        return displacement / max(delta_m, 1e-9)
+    px_per_m_u = _pixels_per_m(direction_u * delta_m)
+    px_per_m_v = _pixels_per_m(np.array([0.0, 0.0, delta_m]))
+    return px_per_m_u, px_per_m_v
+
+
+def effective_gsd_m(camera, point_world, u_direction=None, delta_m=0.05):
+    px_u, px_v = local_projection_jacobian(camera, point_world, u_direction, delta_m)
+    best = min(p for p in (px_u, px_v) if p > 0.0) if (px_u > 0 or px_v > 0) else 0.0
+    if best <= 0.0:
+        return None
+    return 1.0 / best
+
+
 def _estimate_local_gsd(camera, plane) -> float:
     centre = plane.point(plane.length_m * 0.5, 0.5)
+    gsd = effective_gsd_m(camera, centre, plane.along)
+    if gsd is not None:
+        return gsd
     to_cam = np.asarray(camera.position, dtype=np.float64) - centre
     dist = float(np.linalg.norm(to_cam))
     if dist < 1e-6:
@@ -532,5 +565,7 @@ __all__ = [
     "ProxyDepth",
     "TexelStatus",
     "admit",
+    "effective_gsd_m",
+    "local_projection_jacobian",
     "measure_facade_alignment",
 ]

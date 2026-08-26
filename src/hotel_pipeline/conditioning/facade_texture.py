@@ -16,17 +16,19 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from ..logging import get_logger
 from ..geo.facade_visibility import LidarOcclusion, ProxyDepth
 from ..geo.orthofacade import FacadePlane, plane_from_edge, rectify
-from ..geo.facade_visibility import LidarOcclusion, measure_facade_alignment
+from ..geo.facade_visibility import measure_facade_alignment
 from ..workspace import Workspace
+from .canonical_images import CanonicalImageTable
 from .semantic_correspondence import _resolve_model_path
 from .semantic_registered_support import transform_points
-from .texture_masks import load_texture_masks, TextureViewMask
+from .texture_masks import align_mask_to_image, load_texture_masks, TextureViewMask
 
 
-TEXTURE_ALGORITHM_VERSION = 9
-
+log = get_logger("conditioning-facade-texture")
+TEXTURE_ALGORITHM_VERSION = 10
 REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
 
 
@@ -50,8 +52,8 @@ def _resolve_asset_path(workspace: Workspace, raw: str | None) -> Path | None:
 
 
 def _eligible_images(workspace: Workspace, manifest: dict) -> list[tuple[str, Path]]:
-    found: list[tuple[str, Path]] = []
-    seen: set[str] = set()
+    found = []
+    seen = set()
     for asset in manifest.get("assets", []):
         if asset.get("exterior_or_interior") != "exterior":
             continue
@@ -65,7 +67,6 @@ def _eligible_images(workspace: Workspace, manifest: dict) -> list[tuple[str, Pa
             continue
         seen.add(digest)
         found.append((str(asset.get("id")), path))
-
     production = workspace.path("12_production", "scene_8s", "references")
     if production.is_dir():
         for path in sorted(production.glob("*.jpg")):
@@ -95,27 +96,15 @@ def _appearance_profile(images: list[tuple[str, Path]]) -> dict:
         readable += 1
         pixels = np.asarray(image, dtype=np.uint8).reshape(-1, 3)
         r, g, b = pixels[:, 0], pixels[:, 1], pixels[:, 2]
-        brick_mask = (
-            (r.astype(int) > g.astype(int) + 8)
-            & (r.astype(int) > b.astype(int) + 12)
-            & (r > 45)
-            & (r < 225)
-        )
+        brick_mask = (r.astype(int) > g.astype(int) + 8) & (r.astype(int) > b.astype(int) + 12) & (r > 45) & (r < 225)
         dark_mask = (r < 105) & (g < 115) & (b < 125)
-        green_mask = (
-            (g.astype(int) > r.astype(int) + 5)
-            & (g.astype(int) > b.astype(int) + 3)
-            & (g > 45)
-            & (g < 190)
-        )
+        green_mask = (g.astype(int) > r.astype(int) + 5) & (g.astype(int) > b.astype(int) + 3) & (g > 45) & (g < 190)
         for target, mask in ((brick, brick_mask), (dark, dark_mask), (green, green_mask)):
             if int(mask.sum()) >= 25:
                 target.append(np.median(pixels[mask], axis=0))
-
-    def colour(samples: list[np.ndarray], fallback: tuple[int, int, int]) -> str:
+    def colour(samples, fallback):
         value = np.median(np.asarray(samples), axis=0) if samples else np.asarray(fallback)
         return "#" + "".join(f"{int(round(channel)):02x}" for channel in value)
-
     return {
         "method": "robust colour consensus across every readable exterior reference",
         "images_catalogued": len(images),
@@ -149,59 +138,49 @@ def _contact_sheet(images: list[tuple[str, Path]], output: Path) -> None:
 
 
 class _RegisteredCamera:
-    def __init__(self, image, camera, transform: dict):  # noqa: ANN001
+    def __init__(self, image, camera, transform: dict):
         self.image = image
         self.camera = camera
         self.transform = transform
         self.f = float(camera.params[0])
-        self.position = transform_points(
-            np.asarray([image.projection_center()], dtype=float), **transform
-        )[0]
+        self.position = transform_points(np.asarray([image.projection_center()], dtype=float), **transform)[0]
         cam_from_world = image.cam_from_world
         if callable(cam_from_world):
             cam_from_world = cam_from_world()
         self.rotation = np.asarray(cam_from_world.rotation.matrix(), dtype=float)
         self.translation = np.asarray(cam_from_world.translation, dtype=float)
 
-    # ------------------------------------------------------------------
-    # Contrat caméra : le moteur de rendu (clip near-plane, découpage au
-    # bord, profondeurs Z espace caméra) consomme ces attributs standards.
-    # ------------------------------------------------------------------
     @property
-    def R(self) -> np.ndarray:
+    def R(self):
         return self.rotation
 
     @property
-    def t(self) -> np.ndarray:
+    def t(self):
         return self.translation
 
     @property
-    def model(self) -> str:
+    def model(self):
         return str(self.camera.model_name if hasattr(self.camera, "model_name") else self.camera.model)
 
     @property
-    def params(self) -> np.ndarray:
+    def params(self):
         return np.asarray(self.camera.params, dtype=float)
 
     @property
-    def near_m(self) -> float:
+    def near_m(self):
         return 0.05
 
-    def img_from_cam(self, points_cam: np.ndarray) -> np.ndarray:
+    def img_from_cam(self, points_cam):
         return np.asarray(self.camera.img_from_cam(points_cam), dtype=float)
 
     def _to_colmap(self, points: np.ndarray) -> np.ndarray:
         tr = self.transform
-        aligned = (
-            np.asarray(points, dtype=float)
-            + tr["scene_origin_xyz"]
-            - tr["registration_translation"]
-        )
+        aligned = np.asarray(points, dtype=float) + tr["scene_origin_xyz"] - tr["registration_translation"]
         aligned[:, :2] -= np.asarray(tr["projected_origin_xy"], dtype=float)
         aligned -= tr["sim3_translation"]
         return (aligned @ tr["sim3_rotation"]) / tr["sim3_scale"]
 
-    def project(self, points: np.ndarray):  # noqa: ANN201
+    def project(self, points: np.ndarray):
         raw = self._to_colmap(points)
         camera_points = raw @ self.rotation.T + self.translation
         depth = camera_points[:, 2]
@@ -210,35 +189,18 @@ class _RegisteredCamera:
         return screen, depth
 
 
-def _asset_for_model_image(
-    workspace: Workspace, assets: list[dict], image_name: str
-) -> tuple[str, Path] | None:
-    stem = Path(image_name).stem
-    simplified = stem
-    for prefix in ("mapillary-", "illary-", "llary-", "street_view-"):
-        if simplified.startswith(prefix):
-            simplified = simplified[len(prefix):]
-    for asset in assets:
-        asset_id = str(asset.get("id", ""))
-        local = _resolve_asset_path(workspace, asset.get("local_path"))
-        if local is None:
-            continue
-        if asset_id == stem or asset_id == simplified:
-            return asset_id, local
-        if local.stem == stem or local.stem == simplified:
-            return asset_id, local
-        asset_checksum = asset.get("checksum")
-        if asset_checksum and _file_checksum(local) == asset_checksum:
-            return asset_id, local
-    return None
-
-
-def _file_checksum(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray | None] | None:
+    if mask_info is None or mask_info.building is None:
+        return None
+    building = align_mask_to_image(mask_info.building, image_shape[:2], mask_info.transform)
+    if building is None:
+        return None
+    occluders = None
+    if mask_info.occluders is not None:
+        occluders = align_mask_to_image(mask_info.occluders, image_shape[:2], mask_info.transform)
+        if occluders is None and mask_info.transform is None:
+            occluders = None
+    return building, occluders
 
 
 def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
@@ -249,31 +211,16 @@ def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
     holdout = metrics.get("holdout") or metrics.get("fit") or {}
     p90 = holdout.get("p90_m")
     if p90 is not None and p90 > REGISTRATION_HOLDOUT_MAX_P90_M:
-        return (
-            False,
-            f"registration imprécise pour texture (holdout p90={p90:.2f} m > "
-            f"{REGISTRATION_HOLDOUT_MAX_P90_M} m)",
-        )
+        return False, f"registration imprécise pour texture (holdout p90={p90:.2f} m > {REGISTRATION_HOLDOUT_MAX_P90_M} m)"
     return True, ""
 
 
 def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
     import cv2
-
-    corners = np.array(
-        [
-            plane.point(0.0, 0.0),
-            plane.point(plane.length_m, 0.0),
-            plane.point(plane.length_m, 1.0),
-            plane.point(0.0, 1.0),
-        ],
-        dtype=np.float64,
-    )
+    corners = np.array([plane.point(0.0, 0.0), plane.point(plane.length_m, 0.0), plane.point(plane.length_m, 1.0), plane.point(0.0, 1.0)], dtype=np.float64)
     screen, _depth = camera.project(corners)
     if screen is None:
         return None
-    # Aucun clamp au bord : fillPoly découpe le polygone au rectangle image,
-    # une façade à moitié hors champ ne laisse pas de bande artificielle.
     pts = np.round(screen).astype(np.int32)
     mask = np.zeros((height, width), dtype=np.uint8)
     cv2.fillPoly(mask, [pts], 1)
@@ -281,16 +228,8 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
 
 
 def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
-    """Triangles du textureur : lus dans le maillage canonique, jamais refaits.
-
-    Chaque volume porte son `solid` — l'instance canonique partagée avec le
-    renderer, la collision et l'export. L'extrusion locale de l'emprise et
-    la nappe `rv/rf` ne sont plus des sources : elles doublaient les
-    surfaces et divergeaient du maillage rendu. Le repli historique ne sert
-    qu'aux payloads antérieurs au contrat canonique.
-    """
-    triangles: list[np.ndarray] = []
-    face_ids: list[int] = []
+    triangles = []
+    face_ids = []
     fid = 0
     for volume in payload.get("volumes", []):
         solid = volume.get("solid") or {}
@@ -305,8 +244,6 @@ def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list
                         face_ids.append(fid)
                         fid += 1
             continue
-
-        # Repli legacy : payload sans maillage canonique.
         fp = volume.get("fp") or []
         wh = volume.get("wh") or []
         h_default = float(volume.get("h") or 8.0)
@@ -345,7 +282,6 @@ def _atlas_alpha(statuses: np.ndarray) -> np.ndarray:
 
 
 def build(workspace: Workspace, payload: dict) -> dict:
-    """Construit les atlas et enrichit le payload. Échec explicite et non fatal."""
     asset_manifest_path = workspace.path("00_manifest", "asset_manifest.json")
     registration_path = workspace.path("11_conditioning", "vertical_registration.json")
     correspondence_path = workspace.path("11_conditioning", "semantic_correspondences.json")
@@ -378,28 +314,18 @@ def build(workspace: Workspace, payload: dict) -> dict:
         registration = _read(registration_path)
         allowed, refusal_reason = _texture_registration_allowed(registration)
         if not allowed:
-            result = {
-                "status": "unavailable",
-                "reason": refusal_reason,
-                "appearance": appearance,
-            }
+            result = {"status": "unavailable", "reason": refusal_reason, "appearance": appearance}
             payload["appearance_profile"] = appearance
             return result
         correspondence = _read(correspondence_path)
         anchor_path = workspace.root / correspondence["sources"]["anchor_model_manifest"]
         anchor = _read(anchor_path)
-        selection_path = workspace.path(
-            "07_reconstruction", "anchors", f"{anchor['anchor_selection_id']}.json"
-        )
+        selection_path = workspace.path("07_reconstruction", "anchors", f"{anchor['anchor_selection_id']}.json")
         selection = _read(selection_path)
         model_path = _resolve_model_path(workspace, anchor_path, anchor)
         reconstruction = pycolmap.Reconstruction(str(model_path))
 
-        model_files = [
-            model_path / "cameras" / "cameras.txt",
-            model_path / "images" / "images.txt",
-            model_path / "points3D" / "points3D.txt",
-        ]
+        model_files = [model_path / "cameras" / "cameras.txt", model_path / "images" / "images.txt", model_path / "points3D" / "points3D.txt"]
         for p in model_files:
             if p.is_file():
                 model_files_digest += p.read_bytes()
@@ -408,13 +334,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
         payload["appearance_profile"] = appearance
         return result
 
-    target_signature = json.dumps(
-        [{"fp": target.get("fp"), "h": target.get("h"), "wh": target.get("wh")}],
-        sort_keys=True,
-    ).encode("utf-8")
-    reference_signature = "".join(
-        hashlib.sha256(path.read_bytes()).hexdigest() for _asset_id, path in references
-    ).encode("ascii")
+    target_signature = json.dumps([{"fp": target.get("fp"), "h": target.get("h"), "wh": target.get("wh")}], sort_keys=True).encode("utf-8")
+    reference_signature = "".join(hashlib.sha256(path.read_bytes()).hexdigest() for _asset_id, path in references).encode("ascii")
     selection_digest = selection_path.read_bytes() if selection_path and selection_path.is_file() else b""
     anchor_digest = anchor_path.read_bytes() if anchor_path and anchor_path.is_file() else b""
     texture_masks = load_texture_masks(workspace)
@@ -428,124 +349,104 @@ def build(workspace: Workspace, payload: dict) -> dict:
             masks_digest.update(v.occluders.tobytes())
     masks_digest_bytes = masks_digest.digest()
 
-    policy_thresholds = json.dumps(
-        {
-            "TEXEL_M_FACADE": 0.12,
-            "MIN_PIXELS_PER_M": 2.0,
-            "MAX_INCIDENCE_DEG": 65,
-            "PROXY_DEPTH_TOLERANCE_M": 0.25,
-            "LIDAR_CLASSES": [3, 4, 5],
-            "LIDAR_OCCLUSION_MARGIN_M": 1.5,
-            "POSE_MAX_ERROR_M": 0.5,
-            "REGISTRATION_HOLDOUT_MAX_P90_M": 3.0,
-            "MAD_OUTLIER_K": 2.5,
-            "MIN_INLIERS_FOR_CONSENSUS": 2,
-            "MAX_INLIER_SPREAD_DE": 12,
-        },
-        sort_keys=True,
-    ).encode("utf-8")
+    policy_thresholds = json.dumps({
+        "TEXEL_M_FACADE": 0.12,
+        "MIN_PIXELS_PER_M": 2.0,
+        "MAX_INCIDENCE_DEG": 65,
+        "PROXY_DEPTH_TOLERANCE_M": 0.25,
+        "LIDAR_CLASSES": [3, 4, 5],
+        "LIDAR_OCCLUSION_MARGIN_M": 1.5,
+        "POSE_MAX_ERROR_M": 0.5,
+        "REGISTRATION_HOLDOUT_MAX_P90_M": 3.0,
+        "MAD_OUTLIER_K": 2.5,
+        "MIN_INLIERS_FOR_CONSENSUS": 2,
+        "MAX_INLIER_SPREAD_DE": 12,
+    }, sort_keys=True).encode("utf-8")
 
     input_digest = hashlib.sha256(
-        asset_manifest_path.read_bytes()
-        + registration_path.read_bytes()
-        + correspondence_path.read_bytes()
-        + target_signature
-        + reference_signature
-        + model_files_digest
-        + selection_digest
-        + anchor_digest
-        + masks_digest_bytes
-        + policy_thresholds
-        + str(TEXTURE_ALGORITHM_VERSION).encode("ascii")
+        asset_manifest_path.read_bytes() + registration_path.read_bytes() + correspondence_path.read_bytes() +
+        target_signature + reference_signature + model_files_digest + selection_digest + anchor_digest +
+        masks_digest_bytes + policy_thresholds + str(TEXTURE_ALGORITHM_VERSION).encode("ascii")
     ).hexdigest()
 
     audit_path = workspace.path("11_conditioning", "facade_texture_audit.json")
     if audit_path.is_file():
         cached = _read(audit_path)
         cached_textures = cached.get("textures") or []
-        if cached.get("input_digest") == input_digest and cached_textures and all(
-            (workspace.path("11_conditioning") / item["path"]).is_file()
-            for item in cached_textures
-        ):
+        if cached.get("input_digest") == input_digest and cached_textures and all((workspace.path("11_conditioning") / item["path"]).is_file() for item in cached_textures):
             payload["facade_textures"] = cached_textures
             payload["appearance_profile"] = cached.get("appearance") or appearance
             payload["reference_fusion"] = cached
             return cached
 
     sim3 = selection["metrics"]["sim3"]
-    origin_xy = Transformer.from_crs(
-        "EPSG:4326", registration["hypothesis"]["horizontal_crs"], always_xy=True
-    ).transform(
-        float(selection["metrics"]["enu_origin_lon"]),
-        float(selection["metrics"]["enu_origin_lat"]),
-    )
+    origin_xy = Transformer.from_crs("EPSG:4326", registration["hypothesis"]["horizontal_crs"], always_xy=True).transform(float(selection["metrics"]["enu_origin_lon"]), float(selection["metrics"]["enu_origin_lat"]))
     transform = {
         "sim3_rotation": np.asarray(sim3["rotation"], dtype=float),
         "sim3_translation": np.asarray(sim3["translation"], dtype=float),
         "sim3_scale": float(sim3["scale"]),
         "projected_origin_xy": (float(origin_xy[0]), float(origin_xy[1])),
-        "registration_translation": np.asarray(
-            registration["hypothesis"]["translation_projected_m"], dtype=float
-        ),
-        "scene_origin_xyz": np.asarray(
-            registration["hypothesis"]["scene_origin_projected_xyz"], dtype=float
-        ),
+        "registration_translation": np.asarray(registration["hypothesis"]["translation_projected_m"], dtype=float),
+        "scene_origin_xyz": np.asarray(registration["hypothesis"]["scene_origin_projected_xyz"], dtype=float),
     }
 
-    views: list[tuple] = []
-    view_ids: list[str] = []
+    views = []
+    view_ids = []
+    rejected_views = []
     triangles, face_ids = _build_triangles_from_payload(payload)
 
-    for model_image in reconstruction.images.values():
-        resolved = _asset_for_model_image(workspace, asset_manifest.get("assets", []), model_image.name)
-        if resolved is None:
+    image_table = CanonicalImageTable.build(workspace, asset_manifest.get("assets", []), reconstruction, model_path)
+    table_errors = image_table.validate()
+    if table_errors:
+        raise ValueError("table d'identite canonique invalide : " + "; ".join(table_errors))
+    identity_report = {
+        "resolved": sum(1 for record in image_table.records if record.colmap_image_id is not None),
+        "assets_catalogued": len(image_table.records),
+        "unresolved_colmap": list(image_table.unresolved_colmap),
+        "ambiguous_assets": list(image_table.ambiguous_assets),
+    }
+    try:
+        image_table.save(workspace)
+    except OSError as exc:
+        log.warning("table d'identite canonique non persistee : %s", exc)
+
+    for model_image_id, model_image in sorted(reconstruction.images.items(), key=lambda item: int(item[0])):
+        record = image_table.resolve_colmap(int(model_image_id))
+        if record is None:
             continue
-        asset_id, path = resolved
+        path = workspace.root / record.normalized_path
+        if not path.is_file():
+            continue
+        asset_id = record.asset_id
         try:
             rgb = np.asarray(Image.open(path).convert("RGB"))
         except OSError:
             continue
-        camera = _RegisteredCamera(
-            model_image, reconstruction.cameras[model_image.camera_id], transform
-        )
-        mask_info = texture_masks.get(asset_id)
-        building_mask = mask_info.building if mask_info else None
-        occluder_mask = mask_info.occluders if mask_info else None
+        camera = _RegisteredCamera(model_image, reconstruction.cameras[model_image.camera_id], transform)
+
+        prepared = prepare_view_masks(texture_masks.get(asset_id), rgb.shape)
+        if prepared is None:
+            rejected_views.append((asset_id, "no_usable_building_mask"))
+            continue
+        building_mask, occluder_mask = prepared
+        combined_mask = building_mask
+        if occluder_mask is not None:
+            combined_mask = building_mask & ~occluder_mask
 
         proxy = ProxyDepth.render(camera, triangles, face_ids, rgb.shape[1], rgb.shape[0])
         laz_path = workspace.path("06_geo", "site.laz")
-        laz_occ = LidarOcclusion.from_window(
-            None,
-            camera,
-            transform["scene_origin_xyz"],
-            camera.f,
-            rgb.shape[1],
-            rgb.shape[0],
-        )
+        laz_occ = LidarOcclusion.from_window(None, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
         if laz_path.is_file():
             from .laz_cache import read_window
             centre = tuple(float(v) for v in transform["scene_origin_xyz"][:2])
             window = read_window(laz_path, centre, 80.0)
-            laz_occ = LidarOcclusion.from_window(
-                window, camera, transform["scene_origin_xyz"], camera.f,
-                rgb.shape[1], rgb.shape[0],
-            )
-
-        combined_mask = building_mask
-        if occluder_mask is not None and combined_mask is not None:
-            combined_mask = combined_mask & ~occluder_mask
-        elif occluder_mask is not None:
-            combined_mask = ~occluder_mask
+            laz_occ = LidarOcclusion.from_window(window, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
 
         views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ))
         view_ids.append(asset_id)
 
     ring = fp
-    signed_area = 0.5 * sum(
-        ring[index][0] * ring[(index + 1) % len(ring)][1]
-        - ring[(index + 1) % len(ring)][0] * ring[index][1]
-        for index in range(len(ring))
-    )
+    signed_area = 0.5 * sum(ring[index][0] * ring[(index + 1) % len(ring)][1] - ring[(index + 1) % len(ring)][0] * ring[index][1] for index in range(len(ring)))
     outward_factor = 1.0 if signed_area >= 0 else -1.0
 
     textures = []
@@ -560,14 +461,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
         start_h = float(wh[edge_index]) if edge_index < wh_len else float(target.get("h") or 8.0)
         end_h = float(wh[(edge_index + 1) % wh_len]) if (edge_index + 1) % max(wh_len, 1) < wh_len else float(target.get("h") or 8.0)
 
-        plane = plane_from_edge(
-            np.asarray([start[0], start[1], 0.0]),
-            np.asarray([end[0], end[1], 0.0]),
-            max(start_h, end_h),
-            f"EDGE_{edge_index:02d}",
-            top_z_start_m=start_h,
-            top_z_end_m=end_h,
-        )
+        plane = plane_from_edge(np.asarray([start[0], start[1], 0.0]), np.asarray([end[0], end[1], 0.0]), max(start_h, end_h), f"EDGE_{edge_index:02d}", top_z_start_m=start_h, top_z_end_m=end_h)
         plane.normal *= outward_factor
 
         edge_views = []
@@ -592,9 +486,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
         if ortho.image is None or ortho.observed_fraction < 0.01:
             continue
 
-        observed = np.asarray([item.is_observed for item in ortho.support]).reshape(
-            ortho.height_px, ortho.width_px
-        )
+        observed = np.asarray([item.is_observed for item in ortho.support]).reshape(ortho.height_px, ortho.width_px)
         rgb_atlas = np.zeros((ortho.height_px, ortho.width_px, 3), dtype=np.uint8)
         rgb_atlas[observed] = ortho.image[observed]
         alpha = _atlas_alpha(observed)
@@ -633,22 +525,20 @@ def build(workspace: Workspace, payload: dict) -> dict:
         status_images.append(status_name)
 
         report = ortho.as_dict()
-        textures.append(
-            {
-                "edge_index": edge_index,
-                "path": f"facade_textures/{name}",
-                "status_path": f"facade_textures/{status_name}",
-                "width": image.width,
-                "height": image.height,
-                "observed_fraction": report["observed_fraction"],
-                "disagreement_fraction": report["disagreement_fraction"],
-                "views_used": report["provenance"].get("views_used", 0),
-                "top_z_start_m": start_h,
-                "top_z_end_m": end_h,
-                "by_status": report.get("by_status", {}),
-                "rejection_counts": report.get("provenance", {}).get("rejection_counts", {}),
-            }
-        )
+        textures.append({
+            "edge_index": edge_index,
+            "path": f"facade_textures/{name}",
+            "status_path": f"facade_textures/{status_name}",
+            "width": image.width,
+            "height": image.height,
+            "observed_fraction": report["observed_fraction"],
+            "disagreement_fraction": report["disagreement_fraction"],
+            "views_used": report["provenance"].get("views_used", 0),
+            "top_z_start_m": start_h,
+            "top_z_end_m": end_h,
+            "by_status": report.get("by_status", {}),
+            "rejection_counts": report.get("provenance", {}).get("rejection_counts", {}),
+        })
 
     result = {
         "status": "ready" if textures else "unavailable",
@@ -656,6 +546,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
         "method": "visibility-aware registered multi-view orthofacade",
         "registered_images_used": len(views),
         "registered_asset_ids": sorted(view_ids),
+        "views_rejected_no_building_mask": sorted(rejected_views),
+        "canonical_images": identity_report,
         "reference_images_catalogued": len(references),
         "textures": textures,
         "appearance": appearance,

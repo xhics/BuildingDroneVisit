@@ -62,6 +62,10 @@ def _image(colour=(120, 130, 140)):
     return np.full((480, 640, 3), colour, dtype=np.uint8)
 
 
+def _full_mask():
+    return np.ones((480, 640), dtype=bool)
+
+
 class TestPlane:
     def test_the_plane_spans_the_edge(self):
         plane = _wall(length=20.0, height=8.0)
@@ -95,7 +99,7 @@ class TestPlane:
 
 class TestRectify:
     def test_a_facing_view_covers_the_wall(self):
-        found = rectify(_wall(), [("A", _image(), _Camera())])
+        found = rectify(_wall(), [("A", _image(), _Camera(), _full_mask())])
         assert found.observed_fraction > 0.5
         assert found.image is not None
 
@@ -112,7 +116,7 @@ class TestRectify:
 
     def test_a_view_too_far_to_resolve_is_refused(self):
         far = _Camera(position=(0.0, -5000.0, 2.5), focal=400.0)
-        found = rectify(_wall(), [("A", _image(), far)])
+        found = rectify(_wall(), [("A", _image(), far, _full_mask())])
         assert found.provenance["views_too_far"] >= 1
         assert found.provenance["views_used"] == 0
 
@@ -141,8 +145,8 @@ class TestSupport:
     def test_two_views_of_the_same_wall_agree(self):
         plane = _wall()
         views = [
-            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.by_status().get("REJECTED_DISAGREEMENT", 0) == 0
@@ -150,8 +154,8 @@ class TestSupport:
     def test_contradicting_views_are_flagged(self):
         plane = _wall()
         views = [
-            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.by_status().get("REJECTED_DISAGREEMENT", 0) > 0
@@ -159,8 +163,8 @@ class TestSupport:
     def test_disagreeing_views_are_never_fabricated(self):
         plane = _wall()
         views = [
-            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         for texel in found.support:
@@ -171,8 +175,8 @@ class TestSupport:
     def test_agreeing_views_stay_observed(self):
         plane = _wall()
         views = [
-            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((100, 110, 120)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.observed_fraction > 0.5
@@ -186,8 +190,8 @@ class TestSupport:
     def test_alpha_is_zero_on_rejected_texels(self):
         plane = _wall()
         views = [
-            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((0, 0, 0)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((255, 255, 255)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.image is not None
@@ -201,7 +205,7 @@ class TestSupport:
 
 class TestReport:
     def test_report_carries_its_caveats(self):
-        payload = rectify(_wall(), [("A", _image(), _Camera())]).as_dict()
+        payload = rectify(_wall(), [("A", _image(), _Camera(), _full_mask())]).as_dict()
         assert payload["caveats"]
         assert any("extrusion" in c for c in payload["caveats"])
 
@@ -213,7 +217,7 @@ class TestReport:
         assert DISAGREEMENT_LEVEL > 0.0
 
     def test_as_dict_texel_m_is_facade(self):
-        payload = rectify(_wall(), [("A", _image(), _Camera())]).as_dict()
+        payload = rectify(_wall(), [("A", _image(), _Camera(), _full_mask())]).as_dict()
         assert payload["texel_m"] == TEXEL_M_FACADE
 
 
@@ -272,9 +276,9 @@ class TestMadBeforeStd:
     def test_outlier_rejected_by_mad_keeps_inliers(self):
         plane = _wall()
         views = [
-            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5))),
-            ("C", _image((0, 200, 0)), _Camera(position=(0.0, -30.0, 2.5))),
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
+            ("C", _image((0, 200, 0)), _Camera(position=(0.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.observed_fraction > 0.3
@@ -282,8 +286,8 @@ class TestMadBeforeStd:
     def test_consensus_colour_written_to_canvas(self):
         plane = _wall()
         views = [
-            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5))),
-            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5))),
+            ("A", _image((100, 110, 120)), _Camera(position=(-3.0, -30.0, 2.5)), _full_mask()),
+            ("B", _image((102, 108, 118)), _Camera(position=(3.0, -30.0, 2.5)), _full_mask()),
         ]
         found = rectify(plane, views)
         assert found.image is not None
