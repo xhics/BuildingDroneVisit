@@ -166,6 +166,12 @@ class FrameBuffers:
             return float(self.depth_z[y, x])
         return float("inf")
 
+    def hit(self, x: int, y: int) -> tuple[float, int | None]:
+        """Compatibility view used by texture visibility: metric Z + face id."""
+        if 0 <= y < self.height and 0 <= x < self.width:
+            return float(self.depth_z[y, x]), int(self.triangle_id[y, x])
+        return float("inf"), None
+
     def physical_surface_at(self, x: int, y: int) -> str | None:
         if not (0 <= y < self.height and 0 <= x < self.width):
             return None

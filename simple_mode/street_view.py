@@ -46,6 +46,15 @@ class Panorama:
     #: Cap du panorama vers le centre géocodé — dirige la vue vers le
     #: bâtiment plutôt que de photographier au hasard.
     heading_to_center_deg: float
+    #: Détenteur des droits. Sert à distinguer les prises de vue officielles
+    #: de Google, faites depuis la voirie, des contributions privées qui sont
+    #: le plus souvent des **intérieurs** de commerces. Sans ce tri, une
+    #: recherche autour d'un hôtel renvoie surtout ses salons et ses couloirs.
+    copyright: str = ""
+
+    @property
+    def is_official(self) -> bool:
+        return "google" in self.copyright.lower()
 
 
 def _metadata_at(lat: float, lon: float, api_key: str, radius_m: int = 50) -> dict | None:
@@ -104,6 +113,7 @@ def find_panoramas(
                 date=data.get("date"),
                 distance_m=distance,
                 heading_to_center_deg=bearing_deg(p_lat, p_lon, center_lat, center_lon),
+                copyright=str(data.get("copyright", "")),
             )
 
     return sorted(found.values(), key=lambda p: p.distance_m)

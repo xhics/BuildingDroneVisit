@@ -1,0 +1,14 @@
+COMMAND: ['C:\\Users\\admin\\AppData\\Roaming\\npm\\sogni-agent.CMD', '--video', '--workflow', 'v2v', '-m', 'ltx25-v2v', '--ref-video', 'test_orbite\\orbite.mp4', '--controlnet-name', 'inpaint', '--controlnet-strength', '0.95', '--mask', 'cov_test\\orbit_mask.png', '--duration', '10', '-o', 'cov_test\\orbite_inpaint.mp4', '--json', 'Le Château Frontenac à Québec, prise de vue aérienne réelle au drone, fin de journée. Le bâtiment, ses toitures et ses abords immédiats restent exactement tels quels. Compléter ce qui manque au rendu : ciel de fin de journée avec nuages, promeneurs sur la terrasse, quelques véhicules aux abords, bateaux sur le fleuve, végétation animée par le vent, reflets dorés sur les vitrages. Rendu photographique : flou de mouvement naturel, profondeur de champ, grain fin.']
+RETURNCODE: 1
+
+STDOUT:
+{"success":false,"error":"A worker couldn't complete this generation. Please try again.","prompt":"Le ChÃ¢teau Frontenac Ã  QuÃ©bec, prise de vue aÃ©rienne rÃ©elle au drone, fin de journÃ©e. Le bÃ¢timent, ses toitures et ses abords immÃ©diats restent exactement tels quels. ComplÃ©ter ce qui manque au rendu : ciel de fin de journÃ©e avec nuages, promeneurs sur la terrasse, quelques vÃ©hicules aux abords, bateaux sur le fleuve, vÃ©gÃ©tation animÃ©e par le vent, reflets dorÃ©s sur les vitrages. Rendu photographique : flou de mouvement naturel, profondeur de champ, grain fin.","errorType":"UNKNOWN_ERROR","errorCategory":"permanent_failure","retryable":false,"timestamp":"2026-08-27T13:16:51.864Z","node":"22.19.0","cwd":"C:\\Users\\admin\\Development\\x\\BuildingDroneVisit","context":{"video":true,"workflow":"v2v","model":"ltx25-22b-int8_v2v_distilled","width":1920,"height":1024,"strictSize":false,"count":1,"tokenType":"spark","fps":24,"duration":10,"frames":null,"autoResizeVideoAssets":null,"refImage":null,"refImageEnd":null,"refAudio":null,"referenceAudioIdentity":null,"refVideo":"test_orbite\\orbite.mp4","effectiveWidth":null,"effectiveHeight":null,"adjustedVideoDims":null}}
+
+
+STDERR:
+Using prompt-hash seed: 235030806
+Connecting to Sogni...
+Connected.
+Generating video (v2v) with ltx25-22b-int8_v2v_distilled...
+Reference video: test_orbite\orbite.mp4
+

@@ -1,0 +1,31 @@
+subject_definitions:
+<Subject 1> Le Château Frontenac, Québec. Bâtiment en briques rouges avec des détails en pierre grise, possédant une toiture en mansarde ponctuée de clochetons pointus. Les fenêtres sont grandes et à double hauteur, encadrées de volets verts, et le rez-de-chaussée comporte des éléments ornementaux tels que des balcons en fer forgé et des lanternes. Cet édifice présente environ cinq à six étages, avec des arcades au niveau du sol.
+<Picture 1> : vue au sol de la façade
+<Picture 2> : vue au sol de la façade
+<Picture 3> : vue au sol de la façade
+<Picture 4> : vue au sol de la façade
+<Picture 5> : vue au sol de la façade
+<Picture 6> : vue aérienne du site
+
+summary:
+reference generation. Plan aérien continu autour du bâtiment, filmé au drone.
+
+retention_analysis:
+- <Picture 1> : fully_preserved
+- <Picture 2> : fully_preserved
+- <Picture 3> : fully_preserved
+- <Picture 4> : fully_preserved
+- <Picture 5> : fully_preserved
+- <Picture 6> : fully_preserved
+<Subject 1> est fully_preserved sur tout le plan : matériaux, couleurs, toitures, tourelles et rythme des ouvertures restent ceux des références. La composition est partially_preserved — le cadrage évolue avec le mouvement, le bâtiment reste le sujet. Les vues au sol donnent les façades, la vue aérienne donne l'implantation et les abords.
+
+detailed_description:
+[Shot 1] La caméra décrit un arc régulier et continu vers la droite autour du bâtiment, révélant progressivement ses façades sous des angles successifs. Le bâtiment reste le sujet principal pendant tout le mouvement, qui dure 10 secondes sans coupure. La caméra garde une vitesse régulière.
+À faire vivre, absent des références : des promeneurs sur la terrasse; des reflets sur les vitrages; la végétation animée par le vent.
+lumière dorée de fin de journée, ombres longues. Rendu photographique : flou de mouvement naturel, profondeur de champ, matières et reflets réalistes.
+
+overall_soundscape:
+N/A
+
+non_diegetic_music:
+N/A

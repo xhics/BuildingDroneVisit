@@ -265,13 +265,20 @@ def texture_surface(
             if lidar is not None and lidar.valid[py, px] and lidar.depth[py, px] < float(depths[0]) - 1.5:
                 rejection_counts["occluded_by_lidar"] = rejection_counts.get("occluded_by_lidar", 0) + 1
                 continue
-            to_camera = np.asarray(observation.camera.position, dtype=float) - world
+            camera_position = observation.camera.position
+            if callable(camera_position):
+                camera_position = camera_position()
+            to_camera = np.asarray(camera_position, dtype=float) - world
             distance = float(np.linalg.norm(to_camera))
             incidence = abs(float(normal @ _unit(to_camera)))
             if incidence < np.cos(np.radians(65.0)):
                 rejection_counts["grazing_angle"] = rejection_counts.get("grazing_angle", 0) + 1
                 continue
-            focal = float(getattr(observation.camera, "f", 1.0))
+            focal = float(
+                observation.camera.f
+                if hasattr(observation.camera, "f")
+                else observation.camera.focal[0]
+            )
             gsd = distance / max(focal * incidence, 1e-6)
             border = min(px, py, image_width - 1 - px, image_height - 1 - py)
             border_score = float(np.clip(border / 12.0, 0.05, 1.0))

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -178,34 +179,45 @@ def classify_photos(photos: list[SourcePhoto], openai_key: str, *, model: str = 
     client = OpenAI(api_key=openai_key)
     for photo in photos:
         encoded = base64.b64encode(photo.path.read_bytes()).decode()
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": _CLASSIFY_PROMPT},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-                            },
-                        ],
-                    }
-                ],
-            )
-            data = json.loads(response.choices[0].message.content or "{}")
-            photo.category = str(data.get("category", "autre"))
-            photo.description_fr = str(data.get("description", ""))
-            photo.clean_reference = bool(data.get("clean_reference", False))
-        except (AuthenticationError, RateLimitError) as exc:
-            # Ces deux erreurs valent pour tout le lot : les avaler
-            # classerait chaque photo en « autre » et donnerait un parcours
-            # silencieusement vide, sans jamais dire que la clé est morte.
-            raise HotelSourceError(f"classement impossible : {exc}") from exc
-        except Exception:  # noqa: BLE001 — un échec isolé reste exploitable
-            photo.category = "autre"
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": _CLASSIFY_PROMPT},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                                },
+                            ],
+                        }
+                    ],
+                )
+                data = json.loads(response.choices[0].message.content or "{}")
+                photo.category = str(data.get("category", "autre"))
+                photo.description_fr = str(data.get("description", ""))
+                photo.clean_reference = bool(data.get("clean_reference", False))
+                break
+            except RateLimitError as exc:
+                # Plafond de jetons par minute : il suffit d'attendre. Échouer
+                # ici gâcherait le classement de tout un lot pour quelques
+                # secondes d'attente — et un lot de photos le déclenche
+                # facilement, chaque image pesant lourd en jetons.
+                if attempt >= 2:
+                    raise HotelSourceError(f"classement impossible : {exc}") from exc
+                time.sleep(5 * (attempt + 1))
+            except AuthenticationError as exc:
+                # Celle-ci vaut pour tout le lot : l'avaler classerait chaque
+                # photo en « autre » et donnerait un parcours silencieusement
+                # vide, sans jamais dire que la clé est morte.
+                raise HotelSourceError(f"classement impossible : {exc}") from exc
+            except Exception:  # noqa: BLE001 — un échec isolé reste exploitable
+                photo.category = "autre"
+                break
 
 
 def load_site(

@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "<string>", line 12, in <module>
+  File "C:\Users\admin\Development\x\BuildingDroneVisit\simple_mode\sogni_cli.py", line 468, in restyle_video
+    raise SogniCliError(
+simple_mode.sogni_cli.SogniCliError: retexturation v2v échouée (code 1) — détail dans cov_test\orbite_inpaint.log :
+Using prompt-hash seed: 235030806
+Connecting to Sogni...
+Connected.
+Generating video (v2v) with ltx25-22b-int8_v2v_distilled...
+Reference video: test_orbite\orbite.mp4
+

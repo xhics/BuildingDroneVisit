@@ -14,17 +14,17 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from ..canonical_camera import CanonicalCamera
 from ..geo.facade_visibility import LidarOcclusion, ProxyDepth, measure_facade_alignment
 from ..geo.orthofacade import FacadePlane, plane_from_edge, rectify
 from ..logging import get_logger
 from ..workspace import Workspace
 from .canonical_images import CanonicalImageTable
 from .semantic_correspondence import _resolve_model_path
-from .semantic_registered_support import transform_points
 from .texture_masks import TextureViewMask, align_mask_to_image, load_texture_masks
 
 log = get_logger("conditioning-facade-texture")
-TEXTURE_ALGORITHM_VERSION = 11
+TEXTURE_ALGORITHM_VERSION = 12
 REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
 
 
@@ -133,66 +133,40 @@ def _contact_sheet(images: list[tuple[str, Path]], output: Path) -> None:
     sheet.save(output, quality=88)
 
 
-class _RegisteredCamera:
-    def __init__(self, image, camera, transform: dict):
-        self.image = image
-        self.camera = camera
-        self.transform = transform
-        self.f = float(camera.params[0])
-        self.position = transform_points(np.asarray([image.projection_center()], dtype=float), **transform)[0]
-        cam_from_world = image.cam_from_world
-        if callable(cam_from_world):
-            cam_from_world = cam_from_world()
-        self.rotation = np.asarray(cam_from_world.rotation.matrix(), dtype=float)
-        self.translation = np.asarray(cam_from_world.translation, dtype=float)
+def canonical_camera_from_registration(image, camera, transform: dict) -> CanonicalCamera:
+    """Compose COLMAP and accepted Sim(3) into one metric world camera."""
+    cam_from_world = image.cam_from_world
+    if callable(cam_from_world):
+        cam_from_world = cam_from_world()
+    rotation_colmap = np.asarray(cam_from_world.rotation.matrix(), dtype=float)
+    translation_colmap = np.asarray(cam_from_world.translation, dtype=float)
+    rotation_sim3 = np.asarray(transform["sim3_rotation"], dtype=float)
+    scale = float(transform["sim3_scale"])
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("sim3_scale must be finite and strictly positive")
 
-    @property
-    def R(self):
-        return self.rotation
-
-    @property
-    def t(self):
-        return self.translation
-
-    @property
-    def model(self):
-        return str(self.camera.model_name if hasattr(self.camera, "model_name") else self.camera.model)
-
-    @property
-    def params(self):
-        return np.asarray(self.camera.params, dtype=float)
-
-    @property
-    def near_m(self):
-        return 0.05
-
-    def img_from_cam(self, points_cam):
-        return np.asarray(self.camera.img_from_cam(points_cam), dtype=float)
-
-    def _to_colmap(self, points: np.ndarray) -> np.ndarray:
-        tr = self.transform
-        aligned = np.asarray(points, dtype=float) + tr["scene_origin_xyz"] - tr["registration_translation"]
-        aligned[:, :2] -= np.asarray(tr["projected_origin_xy"], dtype=float)
-        aligned -= tr["sim3_translation"]
-        return (aligned @ tr["sim3_rotation"]) / tr["sim3_scale"]
-
-    def project(self, points: np.ndarray):
-        raw = self._to_colmap(points)
-        camera_points = raw @ self.rotation.T + self.translation
-        depth = camera_points[:, 2]
-        normalized = camera_points[:, :2] / np.maximum(depth[:, None], 1e-8)
-        screen = np.asarray(self.camera.img_from_cam(normalized), dtype=float)
-        return screen, depth
-
-
-class _ProjectOnlyCamera:
-    """Force proxy rasterization through the registered world projection."""
-
-    def __init__(self, camera) -> None:
-        self.camera = camera
-
-    def project(self, points: np.ndarray):
-        return self.camera.project(points)
+    # Inverse of transform_points for row vectors:
+    # colmap = (world + offset) @ R_sim3 / scale.
+    offset = (
+        np.asarray(transform["scene_origin_xyz"], dtype=float)
+        - np.asarray(transform["registration_translation"], dtype=float)
+        - np.asarray(transform["sim3_translation"], dtype=float)
+    )
+    offset = offset.copy()
+    offset[:2] -= np.asarray(transform["projected_origin_xy"], dtype=float)
+    rotation_world = rotation_colmap @ rotation_sim3.T
+    translation_world = rotation_world @ offset + scale * translation_colmap
+    model = str(camera.model_name if hasattr(camera, "model_name") else camera.model)
+    return CanonicalCamera(
+        model=model,
+        width=int(camera.width),
+        height=int(camera.height),
+        params=np.asarray(camera.params, dtype=float),
+        rotation=rotation_world,
+        translation=translation_world,
+        near_m=0.05,
+        camera_id=str(getattr(camera, "camera_id", image.camera_id)),
+    )
 
 
 def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray | None] | None:
@@ -210,13 +184,15 @@ def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int
 
 
 def _canonical_mesh_pose_error(
-    proxy: ProxyDepth, building_mask: np.ndarray,
+    proxy, building_mask: np.ndarray,
     first_face: int, face_count: int, focal_px: float,
 ) -> tuple[float, float]:
     """Boundary residual of the exact canonical mesh against image evidence."""
     from scipy.ndimage import binary_erosion, distance_transform_edt
 
-    face_map = proxy.face_id_map
+    face_map = getattr(proxy, "triangle_id", None)
+    if face_map is None:
+        face_map = getattr(proxy, "face_id_map", None)
     if face_map is None:
         return float("inf"), float("inf")
     rendered = (face_map >= first_face) & (face_map < first_face + face_count)
@@ -227,7 +203,10 @@ def _canonical_mesh_pose_error(
     distances = distance_transform_edt(~observed_edge)
     values = distances[rendered_edge]
     error_px = float(np.median(values)) if values.size else float("inf")
-    depths = proxy.depth[rendered]
+    depth_buffer = getattr(proxy, "depth_z", None)
+    if depth_buffer is None:
+        depth_buffer = proxy.depth
+    depths = depth_buffer[rendered]
     depth = float(np.median(depths[np.isfinite(depths)]))
     error_m = error_px * depth / max(float(focal_px), 1e-6)
     return error_px, error_m
@@ -631,8 +610,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
     views: list[tuple] = []
     view_ids: list[str] = []
     rejected_views: list[dict] = []
-    triangles, face_ids, edge_face_ids = _canonical_triangles_with_surfaces(payload)
     from ..reality_contract import require_canonical_mesh
+    from ..render_engine import rasterize_mesh
     from .canonical_mesh import CanonicalSceneMesh
     mesh_receipts = []
     canonical_meshes = []
@@ -640,6 +619,9 @@ def build(workspace: Workspace, payload: dict) -> dict:
         mesh = CanonicalSceneMesh.from_dict(volume.get("solid") or {})
         canonical_meshes.append(mesh)
         mesh_receipts.append(require_canonical_mesh(mesh, "texture_projector"))
+    if not canonical_meshes:
+        raise ValueError("target canonical mesh is required for direct texturing")
+    scene_mesh = CanonicalSceneMesh.merge(canonical_meshes)
 
     target = next((volume for volume in payload.get("volumes", []) if volume.get("target")), None)
     target_volume_index = None
@@ -647,6 +629,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
         if volume.get("target"):
             target_volume_index = volume_index
             break
+    if target_volume_index is None:
+        raise ValueError("target canonical mesh is required for direct texturing")
 
     image_table = CanonicalImageTable.build(workspace, asset_manifest.get("assets", []), reconstruction, model_path)
     table_errors = image_table.validate()
@@ -675,7 +659,12 @@ def build(workspace: Workspace, payload: dict) -> dict:
             rgb = np.asarray(Image.open(path).convert("RGB"))
         except OSError:
             continue
-        camera = _RegisteredCamera(model_image, reconstruction.cameras[model_image.camera_id], transform)
+        camera = canonical_camera_from_registration(
+            model_image, reconstruction.cameras[model_image.camera_id], transform
+        )
+        if (camera.width, camera.height) != (rgb.shape[1], rgb.shape[0]):
+            rejected_views.append((asset_id, "camera_image_size_mismatch"))
+            continue
 
         prepared = prepare_view_masks(texture_masks.get(asset_id), rgb.shape)
         if prepared is None:
@@ -686,30 +675,26 @@ def build(workspace: Workspace, payload: dict) -> dict:
         if occluder_mask is not None:
             combined_mask = building_mask & ~occluder_mask
 
-        proxy = ProxyDepth.render(
-            _ProjectOnlyCamera(camera), triangles, face_ids,
-            rgb.shape[1], rgb.shape[0],
-        )
+        proxy = rasterize_mesh(scene_mesh, camera)
+        focal_px = float(camera.focal[0])
         laz_path = workspace.path("06_geo", "site.laz")
-        laz_occ = LidarOcclusion.from_window(None, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
+        laz_occ = LidarOcclusion.from_window(None, camera, transform["scene_origin_xyz"], focal_px, rgb.shape[1], rgb.shape[0])
         if laz_path.is_file():
             from .laz_cache import read_window
             centre = tuple(float(v) for v in transform["scene_origin_xyz"][:2])
             window = read_window(laz_path, centre, 80.0)
-            laz_occ = LidarOcclusion.from_window(window, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
+            laz_occ = LidarOcclusion.from_window(window, camera, transform["scene_origin_xyz"], focal_px, rgb.shape[1], rgb.shape[0])
 
         target_face_offset = sum(
             len(candidate.faces) for candidate in canonical_meshes[:target_volume_index]
         )
         _pose_px, pose_m = _canonical_mesh_pose_error(
             proxy, building_mask, target_face_offset,
-            len(canonical_meshes[target_volume_index].faces), camera.f,
+            len(canonical_meshes[target_volume_index].faces), focal_px,
         )
         views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ, pose_m))
         view_ids.append(asset_id)
 
-    if target_volume_index is None or not canonical_meshes:
-        raise ValueError("target canonical mesh is required for direct texturing")
     return _build_canonical_surface_atlases(
         workspace, payload, canonical_meshes, target_volume_index, views,
         output_dir, input_digest, appearance, identity_report, references,
