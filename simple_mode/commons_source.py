@@ -17,14 +17,26 @@ les autres, elle ne les remplace pas.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
 API_URL = "https://commons.wikimedia.org/w/api.php"
-USER_AGENT = "simple-mode/0.1 (references video, contact via depot)"
+
+#: Wikimedia exige un en-tête d'identification explicite comportant un moyen
+#: de contact : une valeur vague vaut un rejet en HTTP 429, même sur des
+#: fichiers publics.
+USER_AGENT = (
+    "simple-mode/0.1 (references photo pour generation video; "
+    "https://github.com/xhics/BuildingDroneVisit)"
+)
 TIMEOUT = 30
+
+#: Pause entre deux téléchargements : enchaîner sans délai déclenche aussi
+#: la limitation.
+THROTTLE_S = 1.0
 
 
 @dataclass
@@ -60,6 +72,36 @@ def search(lat: float, lon: float, *, radius_m: int = 400, limit: int = 40) -> l
     return list(pages.values())
 
 
+def search_by_name(name: str, *, limit: int = 40) -> list[dict]:
+    """Fiches d'images correspondant au **nom** du lieu.
+
+    La recherche géographique ne ramène que ce qui a été photographié *au*
+    bâtiment — pour un hôtel, surtout des intérieurs versés par des visiteurs.
+    La recherche par nom atteint au contraire les vues d'ensemble, prises de
+    loin et donc géolocalisées ailleurs, voire pas du tout.
+    """
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": f'filetype:bitmap "{name}"',
+        "gsrnamespace": 6,
+        "gsrlimit": limit,
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata|size",
+        "iiurlwidth": 1600,
+    }
+    try:
+        response = requests.get(
+            API_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return []
+    pages = (response.json().get("query") or {}).get("pages") or {}
+    return list(pages.values())
+
+
 def _is_usable(page: dict, *, min_width: int) -> bool:
     """Écarte ce qui n'est pas une photographie exploitable.
 
@@ -70,10 +112,11 @@ def _is_usable(page: dict, *, min_width: int) -> bool:
     info = (page.get("imageinfo") or [{}])[0]
     if info.get("width", 0) < min_width:
         return False
-    url = str(info.get("url", "")).lower()
-    if not url.endswith((".jpg", ".jpeg", ".png")):
-        return False
     title = str(page.get("title", "")).lower()
+    # L'extension se lit sur le titre : les URL de Commons portent des
+    # paramètres de suivi, si bien qu'aucune ne se termine par « .jpg ».
+    if not title.endswith((".jpg", ".jpeg", ".png")):
+        return False
     excluded = ("map", "carte", "plan", "blason", "coat of arms", "logo", "diagram", "svg")
     return not any(word in title for word in excluded)
 
@@ -86,6 +129,7 @@ def fetch(
     radius_m: int = 400,
     limit: int = 8,
     min_width: int = 1000,
+    name: str | None = None,
 ) -> list[CommonsPhoto]:
     """Télécharge les photographies libres les plus grandes du lieu.
 
@@ -99,7 +143,13 @@ def fetch(
     try:
         pages = search(lat, lon, radius_m=radius_m, limit=40)
     except requests.RequestException:
-        return []
+        pages = []
+
+    # La recherche par nom vient en complément : elle atteint les vues
+    # d'ensemble, prises de loin et donc absentes du rayon géographique.
+    if name:
+        seen = {str(p.get("title")) for p in pages}
+        pages.extend(p for p in search_by_name(name) if str(p.get("title")) not in seen)
 
     usable = [p for p in pages if _is_usable(p, min_width=min_width)]
     usable.sort(key=lambda p: p["imageinfo"][0].get("width", 0), reverse=True)
@@ -107,7 +157,11 @@ def fetch(
     photos: list[CommonsPhoto] = []
     for index, page in enumerate(usable[:limit]):
         info = page["imageinfo"][0]
+        # La vignette suffit et pèse bien moins que l'original, qui atteint
+        # souvent plusieurs milliers de pixels de large.
         url = info.get("thumburl") or info.get("url")
+        if index:
+            time.sleep(THROTTLE_S)
         try:
             image = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
             image.raise_for_status()

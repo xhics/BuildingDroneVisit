@@ -143,6 +143,81 @@ def collect(
     return SubjectReferences(ground=ground, aerial=aerial)
 
 
+def collect_best(
+    lat: float,
+    lon: float,
+    query: str,
+    maps_key: str,
+    out_dir: str | Path,
+    *,
+    openai_key: str | None = None,
+    aerial_images: list[str | Path] | None = None,
+    max_ground: int = 5,
+) -> SubjectReferences:
+    """Réunit les meilleures vues extérieures disponibles, toutes sources.
+
+    L'ordre de préférence vient de ce qu'on a constaté :
+
+    1. **Wikimedia Commons** — des photographies prises intentionnellement,
+       cadrées sur le sujet et dégagées ; c'est le type d'image qui a
+       fonctionné en référence ;
+    2. **Places** — de vraies vues d'ensemble, mais rares : deux exploitables
+       seulement sur dix photos pour le Château Frontenac ;
+    3. **Street View** — dernier recours. C'est de la photographie de voirie,
+       jamais cadrée sur un sujet : de près elle ne montre qu'un pan de mur,
+       d'assez loin le bâtiment se perd derrière les arbres.
+
+    Les vues d'intérieur sont écartées : elles feraient dériver un plan
+    extérieur vers un hall d'hôtel.
+    """
+    out_dir = Path(out_dir)
+    ground: list[Path] = []
+
+    from .commons_source import fetch as fetch_commons
+
+    for photo in fetch_commons(lat, lon, out_dir / "commons", radius_m=350, limit=12, name=query):
+        ground.append(photo.path)
+
+    if openai_key and len(ground) < max_ground:
+        try:
+            from .hotel_sources import classify_photos, fetch_photos, find_place
+
+            place = find_place(query, maps_key)
+            photos = fetch_photos(place, maps_key, out_dir / "places", limit=10)
+            classify_photos(photos, openai_key)
+            ground.extend(
+                p.path for p in photos if p.category == "exterieur" and p.clean_reference
+            )
+        except Exception:  # noqa: BLE001 — source d'appoint, jamais bloquante
+            pass
+
+    references = SubjectReferences(
+        ground=ground[:max_ground],
+        aerial=[Path(a) for a in (aerial_images or []) if Path(a).exists()],
+    )
+
+    # Le tri visuel n'a lieu que si un modèle de vision est disponible : sans
+    # lui, Commons livre autant d'intérieurs que d'extérieurs et le jeu
+    # décrirait un hall plutôt qu'une façade.
+    if openai_key and references.ground:
+        keep_exteriors(references, openai_key)
+    return references
+
+
+def keep_exteriors(references: SubjectReferences, openai_key: str) -> None:
+    """Ne conserve que les vues montrant le bâtiment de l'extérieur."""
+    from .hotel_sources import HotelSourceError, SourcePhoto, classify_photos
+
+    photos = [SourcePhoto(p) for p in references.ground]
+    try:
+        classify_photos(photos, openai_key)
+    except HotelSourceError:
+        return
+    outside = [p.path for p in photos if p.category in ("exterieur", "vue", "jardin")]
+    if outside:
+        references.ground = outside
+
+
 _DESCRIBE_PROMPT = (
     "Décris l'architecture de ce bâtiment pour qu'un modèle de génération "
     "d'images puisse le reproduire fidèlement : matériaux et leurs couleurs, "
@@ -204,6 +279,14 @@ def build_ref2va_prompt(
     """
     images = references.all_images()
     ground_count = min(len(references.ground), len(images))
+    # Les références sont des photographies : leurs passants y sont figés.
+    # Déclarés au même titre que le bâtiment, ils resteraient immobiles dans
+    # la vidéo — d'où un sujet distinct, explicitement non préservé.
+    life = (
+        "<Subject 2> La vie du lieu : passants, véhicules, végétation, "
+        "drapeaux. Présente dans les références sous forme figée, elle doit "
+        "être recomposée en mouvement."
+    )
 
     labels = []
     for index in range(len(images)):
@@ -213,24 +296,37 @@ def build_ref2va_prompt(
         labels.append(f"<Picture {index + 1}> : {kind}")
 
     retention = "\n".join(f"- <Picture {i + 1}> : fully_preserved" for i in range(len(images)))
-    additions = additions_fr or []
+    # Verbes d'action plutôt que noms : « des promeneurs » décrit un décor,
+    # « des promeneurs marchent » décrit un mouvement. La formulation change
+    # le résultat, les modèles animant ce que le texte conjugue.
+    additions = additions_fr or [
+        "des passants marchent et se croisent, chacun d'allure et de tenue différentes",
+        "quelques véhicules roulent lentement aux abords",
+        "les arbres et les drapeaux bougent sous le vent",
+    ]
     additions_clause = (
-        f"\nÀ faire vivre, absent des références : {'; '.join(additions)}."
-        if additions
-        else ""
+        "\nLa scène est vivante et en mouvement continu : "
+        + " ; ".join(additions)
+        + ". Les personnes visibles sur les références sont figées : les "
+        "remplacer par des silhouettes différentes les unes des autres, en "
+        "marche, jamais immobiles."
     )
     light = time_of_day_fr or "lumière naturelle directionnelle"
 
     return (
         "subject_definitions:\n"
         f"<Subject 1> {establishment_fr}. {references.description_fr}\n"
+        f"{life}\n"
         + "\n".join(labels)
         + "\n\nsummary:\n"
         "reference generation. Plan aérien continu autour du bâtiment, filmé au drone.\n\n"
         "retention_analysis:\n"
         f"{retention}\n"
-        "<Subject 1> est fully_preserved sur tout le plan : matériaux, couleurs, "
-        "toitures, tourelles et rythme des ouvertures restent ceux des références. "
+        "<Subject 1> : fully_preserved. Matériaux, couleurs, toitures, tourelles "
+        "et rythme des ouvertures restent exactement ceux des références.\n"
+        "<Subject 2> : weak_reference. La vie du lieu n'est pas reprise des "
+        "références mais recréée en mouvement ; aucune personne figée ne doit "
+        "subsister.\n"
         "La composition est partially_preserved — le cadrage évolue avec le "
         "mouvement, le bâtiment reste le sujet. Les vues au sol donnent les "
         "façades, la vue aérienne donne l'implantation et les abords.\n\n"
@@ -247,6 +343,10 @@ def build_ref2va_prompt(
 
 __all__ = [
     "DEFAULT_SECTORS",
+    "collect_best",
+    "keep_exteriors",
+    "collect_best",
+    "keep_exteriors",
     "MAX_REFERENCES",
     "SubjectReferences",
     "build_ref2va_prompt",

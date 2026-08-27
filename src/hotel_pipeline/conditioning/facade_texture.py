@@ -24,8 +24,10 @@ from .semantic_correspondence import _resolve_model_path
 from .texture_masks import TextureViewMask, align_mask_to_image, load_texture_masks
 
 log = get_logger("conditioning-facade-texture")
-TEXTURE_ALGORITHM_VERSION = 12
+TEXTURE_ALGORITHM_VERSION = 13
 REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
+POSE_MAX_MEDIAN_PX = 3.0
+POSE_MAX_P90_PX = 6.0
 
 
 def _read(path: Path) -> dict:
@@ -186,30 +188,70 @@ def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int
 def _canonical_mesh_pose_error(
     proxy, building_mask: np.ndarray,
     first_face: int, face_count: int, focal_px: float,
-) -> tuple[float, float]:
-    """Boundary residual of the exact canonical mesh against image evidence."""
+) -> dict:
+    """Symmetric silhouette Chamfer residual for the exact target mesh."""
     from scipy.ndimage import binary_erosion, distance_transform_edt
 
     face_map = getattr(proxy, "triangle_id", None)
     if face_map is None:
         face_map = getattr(proxy, "face_id_map", None)
     if face_map is None:
-        return float("inf"), float("inf")
+        return _invalid_pose_metrics()
     rendered = (face_map >= first_face) & (face_map < first_face + face_count)
     if not rendered.any() or not building_mask.any():
-        return float("inf"), float("inf")
+        return _invalid_pose_metrics()
     rendered_edge = rendered ^ binary_erosion(rendered)
     observed_edge = building_mask ^ binary_erosion(building_mask)
-    distances = distance_transform_edt(~observed_edge)
-    values = distances[rendered_edge]
-    error_px = float(np.median(values)) if values.size else float("inf")
+    if not rendered_edge.any() or not observed_edge.any():
+        return _invalid_pose_metrics()
+    rendered_to_observed = distance_transform_edt(~observed_edge)[rendered_edge]
+    observed_to_rendered = distance_transform_edt(~rendered_edge)[observed_edge]
+    values = np.concatenate([rendered_to_observed, observed_to_rendered])
+    median_px = float(np.median(values))
+    p90_px = float(np.percentile(values, 90))
+    robust_max_px = float(np.percentile(values, 99))
     depth_buffer = getattr(proxy, "depth_z", None)
     if depth_buffer is None:
         depth_buffer = proxy.depth
     depths = depth_buffer[rendered]
-    depth = float(np.median(depths[np.isfinite(depths)]))
-    error_m = error_px * depth / max(float(focal_px), 1e-6)
-    return error_px, error_m
+    finite_depths = depths[np.isfinite(depths)]
+    if not finite_depths.size:
+        return _invalid_pose_metrics()
+    depth_m = float(np.median(finite_depths))
+    metres_per_pixel = depth_m / max(float(focal_px), 1e-6)
+    return {
+        "median_px": median_px,
+        "p90_px": p90_px,
+        "robust_max_px": robust_max_px,
+        "median_m": median_px * metres_per_pixel,
+        "p90_m": p90_px * metres_per_pixel,
+        "rendered_edge_pixels": int(rendered_edge.sum()),
+        "observed_edge_pixels": int(observed_edge.sum()),
+    }
+
+
+def _invalid_pose_metrics() -> dict:
+    return {
+        "median_px": float("inf"),
+        "p90_px": float("inf"),
+        "robust_max_px": float("inf"),
+        "median_m": float("inf"),
+        "p90_m": float("inf"),
+        "rendered_edge_pixels": 0,
+        "observed_edge_pixels": 0,
+    }
+
+
+def _pose_reprojection_allowed(metrics: dict) -> tuple[bool, str]:
+    median_px = float(metrics.get("median_px", float("inf")))
+    p90_px = float(metrics.get("p90_px", float("inf")))
+    if not np.isfinite(median_px) or not np.isfinite(p90_px):
+        return False, "pose_reprojection_unmeasurable"
+    if median_px > POSE_MAX_MEDIAN_PX:
+        return False, f"pose_reprojection_median_px={median_px:.3f}"
+    if p90_px > POSE_MAX_P90_PX:
+        return False, f"pose_reprojection_p90_px={p90_px:.3f}"
+    return True, ""
 
 
 def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
@@ -278,6 +320,7 @@ def _build_canonical_surface_atlases(
     views: list[tuple], output_dir: Path, input_digest: str,
     appearance: dict, identity_report: dict, references: list,
     rejected_views: list, view_ids: list, mesh_receipts: list,
+    pose_reprojection_audit: list[dict],
 ) -> dict:
     """Production P0-4 path: exact triangles -> physical-surface UV charts."""
     from .canonical_texture import TextureObservation, texture_surface
@@ -291,7 +334,8 @@ def _build_canonical_surface_atlases(
             lidar_occlusion=lidar_occ, face_id_offset=face_offset,
             pose_error_m=pose_error_m,
         )
-        for asset_id, rgb, camera, combined_mask, proxy, lidar_occ, pose_error_m in views
+        for asset_id, rgb, camera, combined_mask, proxy, lidar_occ, pose_metrics in views
+        for pose_error_m in [float(pose_metrics["median_m"])]
     ]
     textures: list[dict] = []
     for surface_id, surface in sorted(mesh.surface_catalog.items()):
@@ -459,6 +503,8 @@ def _build_canonical_surface_atlases(
         "registered_images_used": len(views),
         "registered_asset_ids": sorted(view_ids),
         "views_rejected_no_building_mask": sorted(rejected_views),
+        "views_rejected": sorted(rejected_views),
+        "pose_reprojection": pose_reprojection_audit,
         "canonical_images": identity_report,
         "reference_images_catalogued": len(references),
         "textures": textures,
@@ -574,6 +620,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
         "LIDAR_CLASSES": [3, 4, 5],
         "LIDAR_OCCLUSION_MARGIN_M": 1.5,
         "POSE_MAX_ERROR_M": 0.5,
+        "POSE_MAX_MEDIAN_PX": POSE_MAX_MEDIAN_PX,
+        "POSE_MAX_P90_PX": POSE_MAX_P90_PX,
         "REGISTRATION_HOLDOUT_MAX_P90_M": 3.0,
         "MAD_OUTLIER_K": 2.5,
         "MIN_INLIERS_FOR_CONSENSUS": 2,
@@ -610,6 +658,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
     views: list[tuple] = []
     view_ids: list[str] = []
     rejected_views: list[dict] = []
+    pose_reprojection_audit: list[dict] = []
     from ..reality_contract import require_canonical_mesh
     from ..render_engine import rasterize_mesh
     from .canonical_mesh import CanonicalSceneMesh
@@ -688,17 +737,27 @@ def build(workspace: Workspace, payload: dict) -> dict:
         target_face_offset = sum(
             len(candidate.faces) for candidate in canonical_meshes[:target_volume_index]
         )
-        _pose_px, pose_m = _canonical_mesh_pose_error(
+        pose_metrics = _canonical_mesh_pose_error(
             proxy, building_mask, target_face_offset,
             len(canonical_meshes[target_volume_index].faces), focal_px,
         )
-        views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ, pose_m))
+        pose_allowed, pose_reason = _pose_reprojection_allowed(pose_metrics)
+        pose_reprojection_audit.append({
+            "image_id": asset_id,
+            "accepted": pose_allowed,
+            "reason": pose_reason or None,
+            **pose_metrics,
+        })
+        if not pose_allowed:
+            rejected_views.append((asset_id, pose_reason))
+            continue
+        views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ, pose_metrics))
         view_ids.append(asset_id)
 
     return _build_canonical_surface_atlases(
         workspace, payload, canonical_meshes, target_volume_index, views,
         output_dir, input_digest, appearance, identity_report, references,
-        rejected_views, view_ids, mesh_receipts,
+        rejected_views, view_ids, mesh_receipts, pose_reprojection_audit,
     )
 
     ring = fp

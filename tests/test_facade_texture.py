@@ -8,6 +8,8 @@ import pytest
 from hotel_pipeline.conditioning import facade_texture as ft
 from hotel_pipeline.conditioning.facade_texture import (
     _build_triangles_from_payload,
+    _canonical_mesh_pose_error,
+    _pose_reprojection_allowed,
     _texture_registration_allowed,
 )
 from hotel_pipeline.geo.orthofacade import plane_from_edge
@@ -74,3 +76,31 @@ def test_build_triangles_from_payload():
     }
     with pytest.raises(ValueError, match="canonical solid mesh"):
         _build_triangles_from_payload(payload)
+
+
+def test_pose_error_is_symmetric_and_reports_tail_metrics():
+    observed = np.zeros((40, 60), dtype=bool)
+    observed[10:30, 15:45] = True
+    rendered = np.zeros_like(observed)
+    rendered[10:30, 17:47] = True
+
+    class Frame:
+        triangle_id = np.where(rendered, 4, -1)
+        depth_z = np.where(rendered, 20.0, np.inf)
+
+    metrics = _canonical_mesh_pose_error(Frame(), observed, 4, 1, 1000.0)
+    assert metrics["median_px"] >= 0.0
+    assert metrics["p90_px"] > 0.0
+    assert metrics["p90_px"] >= metrics["median_px"]
+    assert metrics["robust_max_px"] >= metrics["p90_px"]
+    assert metrics["rendered_edge_pixels"] > 0
+    assert metrics["observed_edge_pixels"] > 0
+
+
+def test_pose_pixel_gate_rejects_bad_median_or_tail():
+    allowed, reason = _pose_reprojection_allowed({"median_px": 2.0, "p90_px": 5.0})
+    assert allowed and reason == ""
+    assert not _pose_reprojection_allowed({"median_px": 3.1, "p90_px": 5.0})[0]
+    allowed, reason = _pose_reprojection_allowed({"median_px": 2.0, "p90_px": 6.1})
+    assert not allowed
+    assert "p90" in reason
