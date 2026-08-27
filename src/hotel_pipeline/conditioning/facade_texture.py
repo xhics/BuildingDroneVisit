@@ -24,7 +24,7 @@ from .semantic_correspondence import _resolve_model_path
 from .texture_masks import TextureViewMask, align_mask_to_image, load_texture_masks
 
 log = get_logger("conditioning-facade-texture")
-TEXTURE_ALGORITHM_VERSION = 13
+TEXTURE_ALGORITHM_VERSION = 14
 REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
 POSE_MAX_MEDIAN_PX = 3.0
 POSE_MAX_P90_PX = 6.0

@@ -3,6 +3,8 @@ import numpy as np
 from hotel_pipeline.conditioning.build_canonical import build_canonical_building_mesh
 from hotel_pipeline.conditioning.canonical_texture import (
     TextureObservation,
+    _bilinear_neighbours,
+    _bilinear_rgb,
     build_surface_chart,
     observation_weight,
     texture_surface,
@@ -45,6 +47,45 @@ def _mesh(split=False):
 
 def _image(colour):
     return np.broadcast_to(np.asarray(colour, np.uint8), (80, 100, 3)).copy()
+
+
+def test_bilinear_rgb_preserves_exact_subpixel_gradient():
+    yy, xx = np.indices((32, 32))
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    image[..., 0] = xx
+    image[..., 1] = yy
+    image[..., 2] = xx + yy
+    neighbours = _bilinear_neighbours(10.25, 20.5, 32, 32)
+    colour = _bilinear_rgb(image, neighbours)
+    np.testing.assert_allclose(colour, [10.25, 20.5, 30.75], atol=1e-12)
+
+
+def test_bilinear_rgb_changes_continuously_across_one_pixel():
+    image = np.zeros((2, 12, 3), dtype=np.uint8)
+    image[..., 0] = np.arange(12)
+    samples = [
+        _bilinear_rgb(image, _bilinear_neighbours(u, 0.0, 12, 2))[0]
+        for u in np.linspace(10.0, 11.0, 11)
+    ]
+    np.testing.assert_allclose(samples, np.linspace(10.0, 11.0, 11), atol=1e-12)
+
+
+def test_bilinear_sampling_refuses_a_semantic_boundary_neighbour():
+    class BoundaryCamera(Camera):
+        def project(self, points):
+            count = len(np.asarray(points))
+            return np.tile([10.5, 20.5], (count, 1)), np.full(count, 10.0)
+
+    valid = np.ones((80, 100), dtype=bool)
+    valid[20, 11] = False
+    atlas = texture_surface(
+        _mesh(),
+        "hotel/main/facade/east-01",
+        [TextureObservation("boundary", _image([90, 100, 110]), BoundaryCamera(), valid_mask=valid)],
+        texel_size_m=1.0,
+    )
+    assert atlas.coverage == 0.0
+    assert atlas.rejection_counts["semantic_or_occluder_mask"] > 0
 
 
 def test_uv_chart_comes_from_exact_canonical_surface_and_survives_retriangulation():

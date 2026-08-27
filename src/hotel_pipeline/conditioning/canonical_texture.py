@@ -217,6 +217,41 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return result
 
 
+def _bilinear_neighbours(
+    u: float, v: float, width: int, height: int,
+) -> list[tuple[int, int, float]]:
+    """Return contributing discrete pixels without clamping outside the image."""
+    if not np.isfinite(u) or not np.isfinite(v):
+        return []
+    if u < 0.0 or v < 0.0 or u > width - 1 or v > height - 1:
+        return []
+    x0, y0 = int(np.floor(u)), int(np.floor(v))
+    x1, y1 = min(x0 + 1, width - 1), min(y0 + 1, height - 1)
+    dx, dy = u - x0, v - y0
+    candidates = (
+        (x0, y0, (1.0 - dx) * (1.0 - dy)),
+        (x1, y0, dx * (1.0 - dy)),
+        (x0, y1, (1.0 - dx) * dy),
+        (x1, y1, dx * dy),
+    )
+    # Exact integer/border samples have zero-weight duplicate neighbours.
+    return [(x, y, weight) for x, y, weight in candidates if weight > 1e-12]
+
+
+def _bilinear_rgb(
+    image: np.ndarray, neighbours: list[tuple[int, int, float]],
+) -> np.ndarray:
+    """Interpolate RGB only after discrete support checks have passed."""
+    if not neighbours:
+        raise ValueError("bilinear sampling requires in-image neighbours")
+    colour = np.zeros(3, dtype=float)
+    total = 0.0
+    for x, y, weight in neighbours:
+        colour += image[y, x, :3].astype(float) * weight
+        total += weight
+    return colour / max(total, 1e-12)
+
+
 def texture_surface(
     mesh, surface_id: str, observations: list[TextureObservation],
     texel_size_m: float = 0.12, depth_tolerance_m: float = 0.25,
@@ -239,6 +274,13 @@ def texture_surface(
     samples_by_texel: dict[tuple[int, int], list[tuple]] = {}
     medians = [float(np.median(obs.image)) for obs in observations if obs.image.size]
     target_median = float(np.median(medians)) if medians else 128.0
+    surface_faces_by_observation = [
+        {
+            observation.face_id_offset + int(surface_face)
+            for surface_face in chart.world_triangles
+        }
+        for observation in observations
+    ]
 
     for x, y, world, face_index in _texel_world_samples(mesh, chart):
         normal = mesh._triangle_normal(face_index)
@@ -247,20 +289,33 @@ def texture_surface(
             if screen is None or float(depths[0]) <= 0:
                 rejection_counts["behind_camera"] = rejection_counts.get("behind_camera", 0) + 1
                 continue
-            px, py = (round(float(value)) for value in screen[0])
+            u, v = (float(value) for value in screen[0])
             image_height, image_width = observation.image.shape[:2]
-            if not (0 <= px < image_width and 0 <= py < image_height):
+            neighbours = _bilinear_neighbours(u, v, image_width, image_height)
+            if not neighbours:
                 rejection_counts["outside_image"] = rejection_counts.get("outside_image", 0) + 1
                 continue
-            if observation.valid_mask is not None and not bool(observation.valid_mask[py, px]):
+            if observation.valid_mask is not None and not all(
+                bool(observation.valid_mask[ny, nx]) for nx, ny, _weight in neighbours
+            ):
                 rejection_counts["semantic_or_occluder_mask"] = rejection_counts.get("semantic_or_occluder_mask", 0) + 1
                 continue
-            expected_face = observation.face_id_offset + face_index
+            surface_faces = surface_faces_by_observation[source_index]
             if observation.proxy_depth is not None:
-                proxy_z, proxy_face = observation.proxy_depth.hit(px, py)
-                if proxy_face != expected_face or abs(proxy_z - float(depths[0])) > depth_tolerance_m:
+                supported = True
+                for nx, ny, _weight in neighbours:
+                    proxy_z, proxy_face = observation.proxy_depth.hit(nx, ny)
+                    if (
+                        proxy_face not in surface_faces
+                        or not np.isfinite(proxy_z)
+                        or abs(proxy_z - float(depths[0])) > depth_tolerance_m
+                    ):
+                        supported = False
+                        break
+                if not supported:
                     rejection_counts["occluded_by_mesh"] = rejection_counts.get("occluded_by_mesh", 0) + 1
                     continue
+            px, py = int(round(u)), int(round(v))
             lidar = observation.lidar_occlusion
             if lidar is not None and lidar.valid[py, px] and lidar.depth[py, px] < float(depths[0]) - 1.5:
                 rejection_counts["occluded_by_lidar"] = rejection_counts.get("occluded_by_lidar", 0) + 1
@@ -280,7 +335,7 @@ def texture_surface(
                 else observation.camera.focal[0]
             )
             gsd = distance / max(focal * incidence, 1e-6)
-            border = min(px, py, image_width - 1 - px, image_height - 1 - py)
+            border = min(u, v, image_width - 1 - u, image_height - 1 - v)
             border_score = float(np.clip(border / 12.0, 0.05, 1.0))
             sharpness = observation.sharpness if observation.sharpness is not None else _sharpness(observation.image)
             weight = observation_weight(
@@ -289,7 +344,7 @@ def texture_surface(
             )
             if weight <= 1e-6:
                 continue
-            colour = observation.image[py, px, :3].astype(float)
+            colour = _bilinear_rgb(observation.image, neighbours)
             image_median = max(float(np.median(observation.image)), 1.0)
             gain = float(np.clip(target_median / image_median, 0.6, 1.6))
             colour = np.clip(colour * gain, 0, 255)
