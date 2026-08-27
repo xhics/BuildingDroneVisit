@@ -28,11 +28,13 @@ Deux garanties structurelles accompagnent le maillage :
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from shapely.geometry import Polygon
 from shapely.ops import triangulate
+
+from ..schemas.canonical_states import MeasurementState
 
 #: Tolérance de soudure des sommets, en mètres. Assez petite pour ne jamais
 #: fusionner deux sommets réellement distincts à la précision des sources,
@@ -148,6 +150,49 @@ class SolidMesh:
     faces: np.ndarray
 
 
+@dataclass(frozen=True)
+class TriangleRecord:
+    triangle_id: int
+    surface_id: str
+    vertices: tuple[int, int, int]
+    measurement_state: MeasurementState
+    confidence: float
+    source_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RayHit:
+    triangle_id: int
+    surface_id: str
+    distance: float
+
+
+@dataclass(frozen=True)
+class SurfaceRecord:
+    surface_id: str
+    building_id: str
+    part_id: str
+    kind: str
+    triangle_ids: tuple[int, ...]
+    centroid: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    bounds: tuple[float, float, float, float, float, float]
+    source_ids: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return {
+            "surface_id": self.surface_id,
+            "building_id": self.building_id,
+            "part_id": self.part_id,
+            "kind": self.kind,
+            "triangle_ids": list(self.triangle_ids),
+            "centroid": list(self.centroid),
+            "normal": list(self.normal),
+            "bounds": list(self.bounds),
+            "source_ids": list(self.source_ids),
+        }
+
+
 class CanonicalSceneMesh:
     """La géométrie unique d'un bâtiment, et son empreinte vérifiable.
 
@@ -167,6 +212,14 @@ class CanonicalSceneMesh:
         faces: np.ndarray,
         face_kind: list[str] | np.ndarray | None = None,
         records: list[FootprintVertex] | None = None,
+        triangle_ids: np.ndarray | None = None,
+        surface_ids: list[str] | None = None,
+        material_ids: list[str] | None = None,
+        measurement_states: list[MeasurementState | str] | None = None,
+        confidence: np.ndarray | None = None,
+        provenance: list[dict] | None = None,
+        uncertainty: list[dict] | None = None,
+        roof_plane_ids: list[str | None] | None = None,
     ) -> None:
         self.vertices = np.asarray(vertices, dtype=np.float64).reshape((-1, 3))
         self.faces = np.asarray(faces, dtype=np.int64).reshape((-1, 3))
@@ -179,10 +232,234 @@ class CanonicalSceneMesh:
         if unknown:
             raise ValueError(f"rôle de face inconnu : {sorted(unknown)}")
         self.face_kind = kinds
+        count = len(self.faces)
+        self.triangle_ids = np.asarray(
+            np.arange(count, dtype=np.uint32) if triangle_ids is None else triangle_ids,
+            dtype=np.uint32,
+        ).reshape(-1)
+        self.roof_plane_ids = list(roof_plane_ids or [None] * count)
+        auto_assign_surfaces = surface_ids is None
+        self.surface_ids = list(surface_ids or ["unassigned"] * count)
+        self.material_ids = list(material_ids or ["material/default"] * count)
+        self.measurement_states = [
+            value if isinstance(value, MeasurementState) else MeasurementState(str(value))
+            for value in (measurement_states or [MeasurementState.UNKNOWN] * count)
+        ]
+        self.confidence = np.asarray(
+            np.zeros(count, dtype=np.float64) if confidence is None else confidence,
+            dtype=np.float64,
+        ).reshape(-1)
+        self.provenance = list(provenance or [{} for _ in range(count)])
+        self.uncertainty = list(uncertainty or [{} for _ in range(count)])
         self.records = list(records or [])
         self.hole_records: list[list[FootprintVertex]] = []
         self.feature_id: str | None = None
         self.provenance_class: str | None = None
+        self.roof_topology: dict | None = None
+        self.surface_catalog: dict[str, SurfaceRecord] = {}
+        self.validate_triangle_metadata()
+        if auto_assign_surfaces:
+            self.assign_surface_ids("building", "main")
+
+    def _triangle_normal(self, index: int) -> np.ndarray:
+        triangle = self.vertices[self.faces[index]]
+        normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+        length = float(np.linalg.norm(normal))
+        return normal / length if length > 1e-12 else np.zeros(3)
+
+    @staticmethod
+    def _compass(vector: np.ndarray) -> str:
+        x, y = (float(v) for v in vector[:2])
+        if np.hypot(x, y) <= 1e-8:
+            return "flat"
+        angle = (np.degrees(np.arctan2(y, x)) + 360.0) % 360.0
+        labels = ("east", "northeast", "north", "northwest", "west", "southwest", "south", "southeast")
+        return labels[int((angle + 22.5) // 45.0) % 8]
+
+    def _physical_surface_groups(self) -> list[tuple[str, list[int]]]:
+        """Group connected coplanar triangles into physical surfaces."""
+        from collections import defaultdict, deque
+
+        by_key: defaultdict[tuple, list[int]] = defaultdict(list)
+        normals: dict[int, np.ndarray] = {}
+        for index, (face, kind) in enumerate(zip(self.faces, self.face_kind)):
+            normal = self._triangle_normal(index)
+            normals[index] = normal
+            centre = self.vertices[face].mean(axis=0)
+            if kind == "wall":
+                label = f"facade/{self._compass(normal)}"
+                key = (label, round(float(normal @ centre), 2))
+            elif kind == "roof":
+                aspect = self._compass(normal[:2])
+                label = f"roof/plane-{aspect}"
+                # Normal + plane offset distinguishes physical roof planes.
+                key = (label, *np.round(normal, 3), round(float(normal @ centre), 2))
+            elif kind == "roof_step":
+                label = "roof-step"
+                key = (label, self._compass(normal), round(float(normal @ centre), 2))
+            elif kind == "base":
+                label = "foundation"
+                key = (label, round(float(centre[2]), 2))
+            else:
+                label = kind.replace("_", "-")
+                key = (label, *np.round(normal, 3), round(float(normal @ centre), 2))
+            by_key[key].append(index)
+
+        groups: list[tuple[str, list[int]]] = []
+        for key, candidates in by_key.items():
+            owners: defaultdict[int, list[int]] = defaultdict(list)
+            for face_index in candidates:
+                for vertex in self.faces[face_index]:
+                    owners[int(vertex)].append(face_index)
+            unseen = set(candidates)
+            while unseen:
+                component: list[int] = []
+                queue = deque([unseen.pop()])
+                while queue:
+                    current = queue.popleft()
+                    component.append(current)
+                    neighbours = {
+                        neighbour
+                        for vertex in self.faces[current]
+                        for neighbour in owners[int(vertex)]
+                    }
+                    for neighbour in sorted(neighbours & unseen):
+                        unseen.remove(neighbour)
+                        queue.append(neighbour)
+                groups.append((str(key[0]), sorted(component)))
+        return groups
+
+    def assign_surface_ids(
+        self, building_id: str, part_id: str = "main",
+        previous_surfaces: dict[str, dict] | None = None,
+    ) -> None:
+        """Assign readable IDs from physical geometry, never array ordering."""
+        groups = self._physical_surface_groups()
+        descriptors: list[dict] = []
+        for label, indices in groups:
+            points = np.vstack([self.vertices[self.faces[index]] for index in indices])
+            normal = np.mean([self._triangle_normal(index) for index in indices], axis=0)
+            norm = float(np.linalg.norm(normal))
+            if norm > 1e-12:
+                normal /= norm
+            descriptors.append({
+                "label": label, "indices": indices,
+                "centroid": points.mean(axis=0), "normal": normal,
+                "bounds": np.r_[points.min(axis=0), points.max(axis=0)],
+            })
+        descriptors.sort(key=lambda row: (
+            row["label"], *np.round(row["centroid"], 4), *np.round(row["normal"], 4)
+        ))
+        counters: dict[str, int] = {}
+        used_previous: set[str] = set()
+        assigned = [""] * len(self.faces)
+        catalog: dict[str, SurfaceRecord] = {}
+        for descriptor in descriptors:
+            label = descriptor["label"]
+            counters[label] = counters.get(label, 0) + 1
+            surface_id = f"{building_id}/{part_id}/{label}-{counters[label]:02d}"
+            matched = self._match_previous_surface(
+                descriptor, previous_surfaces or {}, used_previous
+            )
+            if matched is not None:
+                surface_id = matched
+                used_previous.add(matched)
+            for index in descriptor["indices"]:
+                assigned[index] = surface_id
+            source_ids = sorted({
+                str(source)
+                for index in descriptor["indices"]
+                for source in self.provenance[index].get("source_ids", [])
+            })
+            catalog[surface_id] = SurfaceRecord(
+                surface_id, building_id, part_id, label.split("/")[0],
+                tuple(int(self.triangle_ids[index]) for index in descriptor["indices"]),
+                tuple(float(v) for v in descriptor["centroid"]),
+                tuple(float(v) for v in descriptor["normal"]),
+                tuple(float(v) for v in descriptor["bounds"]), tuple(source_ids),
+            )
+        self.surface_ids = assigned
+        self.surface_catalog = catalog
+        self.validate_triangle_metadata()
+
+    def _rebuild_surface_catalog_from_ids(self) -> None:
+        catalog: dict[str, SurfaceRecord] = {}
+        for surface_id in sorted(set(self.surface_ids)):
+            indices = [i for i, value in enumerate(self.surface_ids) if value == surface_id]
+            points = np.vstack([self.vertices[self.faces[index]] for index in indices])
+            normal = np.mean([self._triangle_normal(index) for index in indices], axis=0)
+            norm = float(np.linalg.norm(normal))
+            if norm > 1e-12:
+                normal /= norm
+            path = surface_id.split("/")
+            source_ids = sorted({
+                str(source) for index in indices
+                for source in self.provenance[index].get("source_ids", [])
+            })
+            catalog[surface_id] = SurfaceRecord(
+                surface_id=surface_id,
+                building_id=path[0] if path else "building",
+                part_id=path[1] if len(path) > 1 else "main",
+                kind=path[2].split("-")[0] if len(path) > 2 else self.face_kind[indices[0]],
+                triangle_ids=tuple(int(self.triangle_ids[index]) for index in indices),
+                centroid=tuple(float(value) for value in points.mean(axis=0)),
+                normal=tuple(float(value) for value in normal),
+                bounds=tuple(float(value) for value in np.r_[points.min(axis=0), points.max(axis=0)]),
+                source_ids=tuple(source_ids),
+            )
+        self.surface_catalog = catalog
+
+    @staticmethod
+    def _match_previous_surface(descriptor: dict, previous: dict, used: set[str]) -> str | None:
+        best_id, best_score = None, 0.0
+        for surface_id, raw in previous.items():
+            if surface_id in used or raw.get("kind") != descriptor["label"].split("/")[0]:
+                continue
+            old_normal = np.asarray(raw.get("normal", [0, 0, 0]), dtype=float)
+            old_centroid = np.asarray(raw.get("centroid", [np.inf] * 3), dtype=float)
+            normal_score = max(0.0, float(np.dot(old_normal, descriptor["normal"])))
+            distance = float(np.linalg.norm(old_centroid - descriptor["centroid"]))
+            centroid_score = float(np.exp(-distance / 5.0))
+            old_bounds = np.asarray(raw.get("bounds", [0] * 6), dtype=float)
+            extent = np.maximum(0.0, np.minimum(old_bounds[3:], descriptor["bounds"][3:]) - np.maximum(old_bounds[:3], descriptor["bounds"][:3]))
+            union = np.maximum(old_bounds[3:], descriptor["bounds"][3:]) - np.minimum(old_bounds[:3], descriptor["bounds"][:3])
+            overlap = float(np.prod(extent + 0.05) / max(np.prod(union + 0.05), 1e-9))
+            score = 0.45 * overlap + 0.30 * normal_score + 0.25 * centroid_score
+            if score > best_score:
+                best_id, best_score = surface_id, score
+        return best_id if best_score >= 0.65 else None
+
+    def validate_triangle_metadata(self) -> None:
+        count = len(self.faces)
+        fields = {
+            "triangle_ids": len(self.triangle_ids),
+            "surface_ids": len(self.surface_ids),
+            "face_kind": len(self.face_kind),
+            "material_ids": len(self.material_ids),
+            "measurement_states": len(self.measurement_states),
+            "confidence": len(self.confidence),
+            "provenance": len(self.provenance),
+            "uncertainty": len(self.uncertainty),
+            "roof_plane_ids": len(self.roof_plane_ids),
+        }
+        invalid = [name for name, length in fields.items() if length != count]
+        if invalid:
+            raise ValueError(f"triangle metadata misaligned: {', '.join(invalid)}")
+        if len(set(int(value) for value in self.triangle_ids)) != count:
+            raise ValueError("triangle_ids must be unique")
+        if np.any(~np.isfinite(self.confidence)) or np.any((self.confidence < 0) | (self.confidence > 1)):
+            raise ValueError("confidence must be finite and within [0, 1]")
+        for surface_id, kind in zip(self.surface_ids, self.face_kind):
+            if not surface_id:
+                raise ValueError("every triangle must reference a physical surface")
+            expected = {
+                "wall": "/facade/", "roof": "/roof/",
+                "roof_step": "/roof-step-", "base": "/foundation-",
+            }.get(kind)
+            if surface_id != "unassigned" and expected and expected not in surface_id:
+                raise ValueError(
+                    f"surface kind mismatch: {surface_id!r} cannot own {kind!r}"
+                )
 
     # ------------------------------------------------------------------
     # Consommation
@@ -192,6 +469,81 @@ class CanonicalSceneMesh:
         return [
             (self.vertices[face], index) for index, face in enumerate(self.faces)
         ]
+
+    def triangle_records(self) -> list[TriangleRecord]:
+        return [
+            TriangleRecord(
+                int(self.triangle_ids[index]), self.surface_ids[index],
+                tuple(int(vertex) for vertex in face),
+                self.measurement_states[index], float(self.confidence[index]),
+                tuple(str(value) for value in self.provenance[index].get("source_ids", [])),
+            )
+            for index, face in enumerate(self.faces)
+        ]
+
+    def triangles_for_surface(self, surface_id: str) -> list[TriangleRecord]:
+        return [record for record in self.triangle_records() if record.surface_id == surface_id]
+
+    def surface(self, surface_id: str) -> SurfaceRecord:
+        try:
+            return self.surface_catalog[surface_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown physical surface: {surface_id}") from exc
+
+    def surface_audit(self) -> dict:
+        counts = {
+            surface_id: len(self.triangles_for_surface(surface_id))
+            for surface_id in sorted(set(self.surface_ids))
+        }
+        unknown = sum(not value or value == "unassigned" for value in self.surface_ids)
+        return {
+            "triangles": len(self.faces),
+            "surfaces": len(counts),
+            "triangles_without_surface_id": unknown,
+            "duplicate_surface_ids": max(0, len(self.surface_catalog) - len(set(self.surface_catalog))),
+            "unknown_surface_count": unknown,
+            "triangles_by_surface": counts,
+            "passed": unknown == 0 and len(counts) == len(self.surface_catalog),
+        }
+
+    @classmethod
+    def merge(cls, meshes: list[CanonicalSceneMesh]) -> CanonicalSceneMesh:
+        """Create the one scene-level mesh without rebuilding any geometry."""
+        if not meshes:
+            raise ValueError("at least one canonical mesh is required")
+        vertices, faces = [], []
+        kinds: list[str] = []
+        surface_ids: list[str] = []
+        materials: list[str] = []
+        states: list[MeasurementState] = []
+        confidence: list[float] = []
+        provenance: list[dict] = []
+        uncertainty: list[dict] = []
+        roof_plane_ids: list[str | None] = []
+        offset = 0
+        for mesh in meshes:
+            mesh.validate_triangle_metadata()
+            vertices.append(mesh.vertices)
+            faces.append(mesh.faces + offset)
+            offset += len(mesh.vertices)
+            kinds.extend(mesh.face_kind)
+            surface_ids.extend(mesh.surface_ids)
+            materials.extend(mesh.material_ids)
+            states.extend(mesh.measurement_states)
+            confidence.extend(float(value) for value in mesh.confidence)
+            provenance.extend(mesh.provenance)
+            uncertainty.extend(mesh.uncertainty)
+            roof_plane_ids.extend(mesh.roof_plane_ids)
+        merged = cls(
+            np.vstack(vertices), np.vstack(faces), kinds,
+            triangle_ids=np.arange(sum(len(mesh.faces) for mesh in meshes), dtype=np.uint32),
+            surface_ids=surface_ids, material_ids=materials,
+            measurement_states=states, confidence=np.asarray(confidence),
+            provenance=provenance, uncertainty=uncertainty,
+            roof_plane_ids=roof_plane_ids,
+        )
+        merged._rebuild_surface_catalog_from_ids()
+        return merged
 
     def raycast(
         self, origin: np.ndarray, direction: np.ndarray, max_distance_m: float = 5e3
@@ -207,8 +559,21 @@ class CanonicalSceneMesh:
         if norm < 1e-12:
             return None
         direction = direction / norm
-        best: float | None = None
-        for face in self.faces:
+        hit = self.raycast_hit(origin, direction, max_distance_m)
+        return None if hit is None else hit.distance
+
+    def raycast_hit(
+        self, origin: np.ndarray, direction: np.ndarray, max_distance_m: float = 5e3
+    ) -> RayHit | None:
+        """Return both triangle and stable physical surface for the first hit."""
+        origin = np.asarray(origin, dtype=np.float64)
+        direction = np.asarray(direction, dtype=np.float64)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-12:
+            return None
+        direction = direction / norm
+        best: tuple[float, int] | None = None
+        for face_index, face in enumerate(self.faces):
             a, b, c = self.vertices[face]
             edge1 = b - a
             edge2 = c - a
@@ -228,9 +593,14 @@ class CanonicalSceneMesh:
             t = float(np.dot(edge2, qvec)) * inv_det
             if t < 1e-6 or t > max_distance_m:
                 continue
-            if best is None or t < best:
-                best = t
-        return best
+            if best is None or t < best[0]:
+                best = (t, face_index)
+        if best is None:
+            return None
+        distance, face_index = best
+        return RayHit(
+            int(self.triangle_ids[face_index]), self.surface_ids[face_index], distance
+        )
 
     # ------------------------------------------------------------------
     # Topologie
@@ -259,9 +629,19 @@ class CanonicalSceneMesh:
         maillage neuf — jamais de mutation silencieuse du maillage publié.
         """
         if len(self.vertices) == 0:
-            return CanonicalSceneMesh(
-                self.vertices.copy(), self.faces.copy(), self.face_kind, self.records
+            welded = CanonicalSceneMesh(
+                self.vertices.copy(), self.faces.copy(), self.face_kind, self.records,
+                triangle_ids=self.triangle_ids.copy(),
+                surface_ids=list(self.surface_ids),
+                material_ids=list(self.material_ids),
+                measurement_states=list(self.measurement_states),
+                confidence=self.confidence.copy(),
+                provenance=list(self.provenance),
+                uncertainty=list(self.uncertainty),
+                roof_plane_ids=list(self.roof_plane_ids),
             )
+            welded._rebuild_surface_catalog_from_ids()
+            return welded
         keys = np.round(self.vertices / tolerance_m).astype(np.int64)
         _, first, inverse = np.unique(
             keys, axis=0, return_index=True, return_inverse=True
@@ -271,12 +651,22 @@ class CanonicalSceneMesh:
         # les faces qu'il faut réindexer, pas le tableau lui-même.
         welded_faces = np.asarray(inverse).reshape(-1)[self.faces]
         keep = np.array([len(set(int(v) for v in face)) == 3 for face in welded_faces])
-        return CanonicalSceneMesh(
+        welded = CanonicalSceneMesh(
             welded_vertices,
             welded_faces[keep] if keep.any() else welded_faces[:0],
             [kind for kind, good in zip(self.face_kind, keep) if good],
             self.records,
+            triangle_ids=self.triangle_ids[keep],
+            surface_ids=[value for value, good in zip(self.surface_ids, keep) if good],
+            material_ids=[value for value, good in zip(self.material_ids, keep) if good],
+            measurement_states=[value for value, good in zip(self.measurement_states, keep) if good],
+            confidence=self.confidence[keep],
+            provenance=[value for value, good in zip(self.provenance, keep) if good],
+            uncertainty=[value for value, good in zip(self.uncertainty, keep) if good],
+            roof_plane_ids=[value for value, good in zip(self.roof_plane_ids, keep) if good],
         )
+        welded._rebuild_surface_catalog_from_ids()
+        return welded
 
     # ------------------------------------------------------------------
     # Empreinte canonique
@@ -301,10 +691,24 @@ class CanonicalSceneMesh:
 
     def mesh_digest(self) -> str:
         """Empreinte SHA-256 de la géométrie, indépendante de la représentation."""
-        vertices, faces = self.canonical_form()
+        self.validate_triangle_metadata()
+        vertices, _faces = self.canonical_form()
         digest = hashlib.sha256()
         digest.update(vertices.astype(np.float64).tobytes())
-        digest.update(np.ascontiguousarray(faces, dtype=np.int64).tobytes())
+        quantized = np.round(self.vertices / DIGEST_QUANTUM_M) * DIGEST_QUANTUM_M
+        records = []
+        for index, face in enumerate(self.faces):
+            coordinates = sorted(tuple(float(v) for v in quantized[vertex]) for vertex in face)
+            records.append((
+                coordinates, self.surface_ids[index], self.face_kind[index],
+                self.material_ids[index], self.measurement_states[index].value,
+                round(float(self.confidence[index]), 8),
+                repr(sorted(self.provenance[index].items())),
+                repr(sorted(self.uncertainty[index].items())),
+                self.roof_plane_ids[index],
+            ))
+        for record in sorted(records, key=repr):
+            digest.update(repr(record).encode("utf-8"))
         return digest.hexdigest()
 
     # ------------------------------------------------------------------
@@ -315,7 +719,18 @@ class CanonicalSceneMesh:
             "vertices": np.round(self.vertices, 4).tolist(),
             "faces": self.faces.astype(int).tolist(),
             "face_kind": list(self.face_kind),
+            "triangle_ids": self.triangle_ids.astype(int).tolist(),
+            "surface_ids": list(self.surface_ids),
+            "material_ids": list(self.material_ids),
+            "measurement_states": [value.value for value in self.measurement_states],
+            "confidence": self.confidence.astype(float).tolist(),
+            "provenance": list(self.provenance),
+            "uncertainty": list(self.uncertainty),
+            "roof_plane_ids": list(self.roof_plane_ids),
             "mesh_digest": self.mesh_digest(),
+            "surface_catalog": {
+                key: value.as_dict() for key, value in sorted(self.surface_catalog.items())
+            },
         }
         if self.records:
             payload["footprint_vertices"] = [
@@ -331,6 +746,8 @@ class CanonicalSceneMesh:
                 }
                 for record in self.records
             ]
+        if self.roof_topology is not None:
+            payload["roof_topology"] = self.roof_topology
         return payload
 
     @classmethod
@@ -339,9 +756,33 @@ class CanonicalSceneMesh:
             np.asarray(payload["vertices"], dtype=np.float64),
             np.asarray(payload["faces"], dtype=np.int64),
             payload.get("face_kind"),
+            triangle_ids=payload.get("triangle_ids"),
+            surface_ids=payload.get("surface_ids"),
+            material_ids=payload.get("material_ids"),
+            measurement_states=payload.get("measurement_states"),
+            confidence=payload.get("confidence"),
+            provenance=payload.get("provenance"),
+            uncertainty=payload.get("uncertainty"),
+            roof_plane_ids=payload.get("roof_plane_ids"),
         )
         mesh.feature_id = payload.get("feature_id")
         mesh.provenance_class = payload.get("provenance_class")
+        mesh.roof_topology = payload.get("roof_topology")
+        mesh.surface_catalog = {
+            surface_id: SurfaceRecord(
+                surface_id=surface_id,
+                building_id=str(raw["building_id"]), part_id=str(raw["part_id"]),
+                kind=str(raw["kind"]),
+                triangle_ids=tuple(int(value) for value in raw.get("triangle_ids", [])),
+                centroid=tuple(float(value) for value in raw["centroid"]),
+                normal=tuple(float(value) for value in raw["normal"]),
+                bounds=tuple(float(value) for value in raw["bounds"]),
+                source_ids=tuple(str(value) for value in raw.get("source_ids", [])),
+            )
+            for surface_id, raw in (payload.get("surface_catalog") or {}).items()
+        }
+        if not mesh.surface_catalog:
+            mesh._rebuild_surface_catalog_from_ids()
         return mesh
 
     def audit(self) -> dict:

@@ -17,15 +17,21 @@ from __future__ import annotations
 import numpy as np
 from shapely.geometry import Polygon
 
+from ..schemas.canonical_states import MeasurementState
 from .canonical_mesh import (
+    WELD_TOLERANCE_M,
     CanonicalSceneMesh,
     FootprintVertex,
-    WELD_TOLERANCE_M,
     footprint_records,
 )
 from .constrained_triangulation import triangulate_constrained
-from .roof_planes import RoofDecomposition
-from .roof_reconstruct import ReconstructedRoof, derive_wall_tops, reconstruct_roof
+from .roof_planes import RoofDecomposition, RoofPlane
+from .roof_reconstruct import (
+    ReconstructedRoof,
+    RoofTopology,
+    derive_wall_tops,
+    reconstruct_roof,
+)
 
 #: Hauteur minimale de mur : un toit reste strictement au-dessus du sol.
 MIN_WALL_M = 0.5
@@ -115,6 +121,8 @@ def build_canonical_building_mesh(
     roof_decomposition: RoofDecomposition | None = None,
     weld_tolerance_m: float = WELD_TOLERANCE_M,
     interiors: list[np.ndarray] | None = None,
+    measured_roof_vertices: np.ndarray | None = None,
+    measured_roof_faces: np.ndarray | None = None,
 ) -> CanonicalSceneMesh:
     """Construit LE maillage du bâtiment — celui que tout le monde consomme.
 
@@ -174,10 +182,11 @@ def build_canonical_building_mesh(
     fallback_tops = np.array([record.top_z for record in records], dtype=np.float64)
 
     roof: ReconstructedRoof | None = None
+    measured_direct = False
     decomposition = roof_decomposition
     if (
         decomposition is not None
-        and len(getattr(decomposition, "planes", [])) >= 2
+        and len(getattr(decomposition, "planes", [])) >= 1
         and len(fallback_tops) >= 3
     ):
         try:
@@ -185,6 +194,43 @@ def build_canonical_building_mesh(
         except (ValueError, TypeError) as exc:  # pragma: no cover - défensive
             log.info("reconstruction du toit impossible (%s) : extrusion", exc)
             roof = None
+
+    # A dense measured roof enters the canonical construction directly.  We
+    # never create a logical cap and replace it afterwards: its boundary also
+    # supplies the wall-top elevations, and the final weld shares the vertices.
+    measured_vertices = np.asarray(
+        measured_roof_vertices if measured_roof_vertices is not None else [],
+        dtype=np.float64,
+    ).reshape((-1, 3))
+    measured_faces = np.asarray(
+        measured_roof_faces if measured_roof_faces is not None else [],
+        dtype=np.int64,
+    ).reshape((-1, 3))
+    if roof is None and len(measured_vertices) >= 3 and len(measured_faces) > 0:
+        cloud = measured_vertices - measured_vertices.mean(axis=0)
+        normal = np.linalg.svd(cloud, full_matrices=False)[2][2]
+        plane = RoofPlane(
+            points=measured_vertices,
+            normal=normal,
+            origin=measured_vertices.mean(axis=0),
+            plane_id="plane_00",
+            polygon_boundary=np.round(ring, 6).tolist(),
+            source_ids=["lidar:measured-roof-surface"],
+        )
+        decomposition = RoofDecomposition(
+            feature_id="measured_roof", planes=[plane], total=len(measured_vertices)
+        )
+        topology = RoofTopology(
+            planes=[plane], boundaries={plane.plane_id: plane.polygon_boundary}
+        )
+        roof = ReconstructedRoof(
+            vertices=measured_vertices,
+            faces=measured_faces,
+            face_plane=[0] * len(measured_faces),
+            plane_polygons={0: polygon_with_holes},
+            topology=topology,
+        )
+        measured_direct = True
 
     vertices: list[np.ndarray] = []
     kinds: list[str] = []
@@ -197,8 +243,52 @@ def build_canonical_building_mesh(
     if roof is not None and len(roof.plane_polygons) > 0:
         # Toit reconstruit : les murs dérivent de SA frontière. Chaque sommet
         # d'emprise interroge le pan propriétaire, pas le voisin le plus haut.
+        # Tout sommet de bord du toit (par exemple l'arrivée d'un faîtage à
+        # l'égout) subdivise également le mur. Sans cela, on crée une jonction
+        # en T : visuellement une fissure et topologiquement une arête libre.
+        original_records = records
+        subdivided: list[FootprintVertex] = []
+        roof_xy_candidates = np.unique(np.round(roof.vertices[:, :2], 8), axis=0)
+        for edge_index, first in enumerate(original_records):
+            second = original_records[(edge_index + 1) % len(original_records)]
+            a = np.array([first.x, first.y], dtype=float)
+            b = np.array([second.x, second.y], dtype=float)
+            direction = b - a
+            length2 = float(direction @ direction)
+            subdivided.append(first)
+            if length2 <= 1e-12:
+                continue
+            additions: list[tuple[float, np.ndarray]] = []
+            for point in roof_xy_candidates:
+                t = float((point - a) @ direction / length2)
+                projected = a + np.clip(t, 0.0, 1.0) * direction
+                if 1e-8 < t < 1.0 - 1e-8 and np.linalg.norm(point - projected) <= weld_tolerance_m:
+                    additions.append((t, point))
+            for position, (_, point) in enumerate(sorted(additions, key=lambda row: row[0])):
+                subdivided.append(FootprintVertex(
+                    vertex_id=f"{first.vertex_id}:roof-boundary:{position}",
+                    x=float(point[0]), y=float(point[1]),
+                    ground_z=_terrain_height(terrain, float(point[0]), float(point[1])),
+                    top_z=0.0,
+                ))
+        records = subdivided
+        boundary_nodes = (
+            [(float(r.x), float(r.y)) for r in records]
+            + [(float(r.x), float(r.y)) for hole in hole_records for r in hole]
+        )
+        cap_polygon = Polygon(
+            [(r.x, r.y) for r in records],
+            [[(r.x, r.y) for r in hole] for hole in hole_records],
+        )
         all_records = records + [r for hole in hole_records for r in hole]
-        tops = derive_wall_tops(all_records, roof, decomposition)
+        if measured_direct:
+            roof_xy = roof.vertices[:, :2]
+            tops = np.asarray([
+                roof.vertices[int(np.argmin(np.linalg.norm(roof_xy - [r.x, r.y], axis=1))), 2]
+                for r in all_records
+            ], dtype=np.float64)
+        else:
+            tops = derive_wall_tops(all_records, roof, decomposition)
         tops = np.maximum(tops, [r.ground_z + MIN_WALL_M for r in all_records])
         for record, top in zip(all_records, tops):
             record.top_z = float(top)
@@ -210,13 +300,15 @@ def build_canonical_building_mesh(
             bottom_nodes[(round(x, 6), round(y, 6))] = add_vertex(
                 np.array([x, y, record.ground_z])
             )
+        for node_index, (x, y) in enumerate(boundary_nodes):
+            record = all_records[node_index]
             top_nodes[(round(x, 6), round(y, 6))] = add_vertex(
                 np.array([x, y, record.top_z])
             )
 
         # Fond posé sur le terrain, cours exclues ; normale vers le bas.
         for face in _cap_faces(
-            polygon_with_holes, boundary_nodes, flip=True, index_offset=0
+            cap_polygon, boundary_nodes, flip=True, index_offset=0
         ):
             faces.append(face)
             kinds.append("base")
@@ -287,15 +379,26 @@ def build_canonical_building_mesh(
             faces.append(face)
             kinds.append("roof")
 
+    roof_plane_ids: list[str | None] = [None] * len(faces)
+    if roof is not None:
+        roof_slots = [index for index, kind in enumerate(kinds) if kind in {"roof", "roof_step"}]
+        for slot, plane_index in zip(roof_slots, roof.face_plane):
+            if plane_index >= 0:
+                roof_plane_ids[slot] = decomposition.planes[plane_index].plane_id
+
     mesh = CanonicalSceneMesh(
         vertices=np.asarray(vertices, dtype=np.float64) if vertices else np.zeros((0, 3)),
         faces=np.asarray(faces, dtype=np.int64),
         face_kind=kinds,
         records=records,
+        roof_plane_ids=roof_plane_ids,
     )
     welded = mesh.weld_vertices(weld_tolerance_m)
     welded.records = records
     welded.hole_records = hole_records
+    welded.roof_topology = (
+        roof.topology.as_dict() if roof is not None and roof.topology is not None else None
+    )
     return welded
 
 
@@ -312,8 +415,55 @@ def attach_canonical_meshes(scene, terrain=None) -> list[dict]:  # noqa: ANN001
             terrain=terrain,
             roof_decomposition=prism.roof_planes,
             interiors=list(getattr(prism, "interior_rings", [])),
+            measured_roof_vertices=(
+                prism.roof_vertices if prism.roof_planes is None else None
+            ),
+            measured_roof_faces=(
+                prism.roof_faces if prism.roof_planes is None else None
+            ),
         )
         prism.canonical_mesh.feature_id = prism.feature_id
+        prism.canonical_mesh.assign_surface_ids(
+            str(prism.parent_building_id or prism.feature_id),
+            "main" if prism.part_index == 0 else f"part-{prism.part_index}",
+        )
+        state = MeasurementState.INFERRED if prism.height_assumed else MeasurementState.MEASURED
+        plane_quality = {
+            plane.get("plane_id"): plane
+            for plane in (prism.canonical_mesh.roof_topology or {}).get("planes", [])
+        }
+        states: list[MeasurementState] = []
+        confidences: list[float] = []
+        for kind, plane_id in zip(
+            prism.canonical_mesh.face_kind, prism.canonical_mesh.roof_plane_ids
+        ):
+            if kind in {"roof", "roof_step"}:
+                quality = plane_quality.get(plane_id or "")
+                if quality and quality.get("support_points", 0) >= 3:
+                    rmse = float(quality.get("rmse_m", float("inf")))
+                    states.append(
+                        MeasurementState.MEASURED
+                        if rmse <= 0.25 else MeasurementState.INFERRED
+                    )
+                    confidences.append(float(quality.get("confidence", 0.0)))
+                else:
+                    states.append(MeasurementState.UNKNOWN)
+                    confidences.append(0.0)
+            else:
+                states.append(state)
+                confidences.append(float(prism.confidence))
+        prism.canonical_mesh.measurement_states = states
+        prism.canonical_mesh.confidence[:] = np.asarray(confidences)
+        prism.canonical_mesh.provenance = [{
+            "source_ids": [] if prism.height_assumed else [prism.height_source],
+            "generation_method": "canonical_scene_builder",
+        } for _ in prism.canonical_mesh.faces]
+        prism.canonical_mesh.material_ids = [
+            "material/roof" if kind in {"roof", "roof_step"}
+            else "material/foundation" if kind == "base"
+            else "material/facade"
+            for kind in prism.canonical_mesh.face_kind
+        ]
         attached.append({
             "feature_id": prism.feature_id,
             "mesh_digest": prism.canonical_mesh.mesh_digest(),

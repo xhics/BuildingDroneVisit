@@ -54,17 +54,41 @@ def _edges(ring: list[list[float]]) -> list[_Edge]:
     return found
 
 
-def _coverage_by_edge(payload: dict) -> dict[int, float]:
+def _coverage_by_edge(payload: dict, edges: list[_Edge]) -> dict[int, float]:
     fusion = payload.get("reference_fusion") or {}
-    coverage: dict[int, float] = {}
+    weighted: dict[int, float] = {}
+    areas: dict[int, float] = {}
     for texture in fusion.get("textures") or []:
-        edge_index = int(texture.get("edge_index", -1))
         observed = float(texture.get("observed_fraction") or 0.0)
-        disagreement = float(texture.get("disagreement_fraction") or 0.0)
-        if edge_index < 0 or observed <= 0.0:
+        if observed <= 0.0:
             continue
-        coverage[edge_index] = observed * (1.0 - min(0.5, disagreement))
-    return coverage
+        # Read-only migration support for payloads produced before P0-4.
+        legacy_edge = texture.get("edge_index")
+        if legacy_edge is not None and not texture.get("render_triangles"):
+            index = int(legacy_edge)
+            weighted[index] = weighted.get(index, 0.0) + observed
+            areas[index] = areas.get(index, 0.0) + 1.0
+            continue
+        # P0-4: derive the facade bearing from the exact canonical triangles.
+        for triangle in texture.get("render_triangles") or []:
+            vertices = triangle.get("vertices") or []
+            if len(vertices) != 3:
+                continue
+            ab = [vertices[1][i] - vertices[0][i] for i in range(3)]
+            ac = [vertices[2][i] - vertices[0][i] for i in range(3)]
+            nx = ab[1] * ac[2] - ab[2] * ac[1]
+            ny = ab[2] * ac[0] - ab[0] * ac[2]
+            horizontal = math.hypot(nx, ny)
+            if horizontal <= 1e-9 or not edges:
+                continue
+            bearing = math.degrees(math.atan2(ny, nx)) % 360.0
+            edge = min(
+                edges,
+                key=lambda item: abs((item.bearing_deg - bearing + 180.0) % 360.0 - 180.0),
+            )
+            weighted[edge.index] = weighted.get(edge.index, 0.0) + observed * horizontal
+            areas[edge.index] = areas.get(edge.index, 0.0) + horizontal
+    return {index: weighted[index] / areas[index] for index in weighted}
 
 
 def _geometry(payload: dict) -> tuple[list[_Edge], float, float, tuple[float, float]]:
@@ -86,7 +110,7 @@ def _geometry(payload: dict) -> tuple[list[_Edge], float, float, tuple[float, fl
         centre_x = centre_y = 0.0
         target_distance = 150.0
     edges = _edges(ring)
-    coverage = _coverage_by_edge(payload)
+    coverage = _coverage_by_edge(payload, edges)
     for edge in edges:
         object.__setattr__(edge, "coverage", coverage.get(edge.index, 0.0))
     return edges, height, target_distance, (centre_x, centre_y)

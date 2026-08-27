@@ -393,6 +393,7 @@ def restyle_video(
     control: str = DEFAULT_CONTROL_MODE,
     control_strength: float = DEFAULT_CONTROL_STRENGTH,
     appearance_image: str | Path | None = None,
+    mask_image: str | Path | None = None,
     duration_s: int | None = None,
     video_model: str = V2V_MODEL,
     timeout: int = REFERENCE_TIMEOUT_S,
@@ -437,6 +438,18 @@ def restyle_video(
         if not appearance_image.exists():
             raise SogniCliError(f"image d'apparence introuvable : {appearance_image}")
         command += ["--ref", str(appearance_image)]
+
+    # Masque de couverture : blanc = zone sans donnée réelle, à régénérer ;
+    # noir = zone couverte par la mesure, à préserver. Voir `coverage.py`.
+    if mask_image is not None:
+        mask_image = Path(mask_image)
+        if not mask_image.exists():
+            raise SogniCliError(f"masque introuvable : {mask_image}")
+        if control != "inpaint":
+            raise SogniCliError(
+                f"un masque n'a de sens qu'en mode inpaint, pas en '{control}'"
+            )
+        command += ["--mask", str(mask_image)]
     # Sans durée explicite, le worker retombe sur sa valeur par défaut et
     # tronque : mesuré à 5 s de sortie pour 13 s de source.
     if duration_s is None:

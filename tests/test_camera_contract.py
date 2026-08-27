@@ -75,6 +75,10 @@ def test_p12_sans_mesure_le_toit_est_une_enveloppe_minimale_inconnue() -> None:
         is_target=True,
     )
 
+    from hotel_pipeline.conditioning.build_canonical import build_canonical_building_mesh
+    prism.canonical_mesh = build_canonical_building_mesh(
+        prism.footprint, top_heights=prism.height_m
+    )
     faces = _prism_faces(prism)
     roof_faces = [tri for tri, is_roof in faces if is_roof]
 

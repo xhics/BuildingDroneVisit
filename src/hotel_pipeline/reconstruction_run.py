@@ -58,6 +58,9 @@ class ReconstructionRunner:
         """
         holdout = set(holdout_asset_ids or [])
         requested = list(selected_asset_ids or input_manifest.selected_asset_ids)
+        unknown_holdouts = sorted(holdout - set(requested))
+        if unknown_holdouts:
+            raise ValueError(f"holdout absent du corpus demandé: {unknown_holdouts}")
         train_ids = [asset_id for asset_id in requested if asset_id not in holdout]
         if holdout and not train_ids:
             raise ValueError("le split train/holdout ne laisse aucune image d'entraînement")
@@ -91,15 +94,62 @@ class ReconstructionRunner:
             )
 
         if holdout:
+            from .independent_holdout import digest_tree
+
             leaked = sorted(holdout & set(train_ids))
             if leaked:
                 raise ReconstructionRefused(f"holdout présent dans les entrées train: {leaked}")
+            stages = {
+                stage: sorted(train_ids) for stage in (
+                    "inventory", "feature_extraction", "matching", "sfm",
+                    "bundle_adjustment", "dense_reconstruction", "texture_fusion",
+                    "roof_fitting",
+                )
+            }
+            model_path = Path(result.output_path) if result.output_path else None
             result.metrics.update({
                 "validation_protocol": "train_only_sfm_then_frozen_model_localization",
                 "train_asset_ids": train_ids,
                 "holdout_asset_ids": sorted(holdout),
                 "holdout_absent_from_train_inputs": True,
+                "split_before_reconstruction": True,
+                "stage_input_asset_ids": stages,
+                "holdout_leakage_count": 0,
+                "frozen_model_digest": (
+                    digest_tree(model_path) if model_path is not None else None
+                ),
             })
+        return result
+
+    def run_independent_holdout(
+        self,
+        input_manifest: ReconstructionInputManifest,
+        spatial_records,
+        backend: ReconstructionBackend = ReconstructionBackend.COLMAP_INCREMENTAL,
+        *,
+        holdout_fraction: float = 0.2,
+    ) -> ReconstructionRun:
+        """Split the inventory first, then reconstruct exclusively from TRAIN."""
+        from .independent_holdout import spatial_train_holdout_split
+
+        split = spatial_train_holdout_split(spatial_records, holdout_fraction)
+        expected = set(input_manifest.selected_asset_ids)
+        actual = set(split.train_ids) | set(split.holdout_ids)
+        if actual != expected:
+            raise ValueError(
+                "spatial inventory does not exactly match reconstruction inputs"
+            )
+        result = self.run(
+            input_manifest, backend,
+            selected_asset_ids=list(split.train_ids + split.holdout_ids),
+            holdout_asset_ids=list(split.holdout_ids),
+        )
+        result.metrics.update({
+            "split_digest": split.digest,
+            "holdout_surface_coverage": split.holdout_surface_coverage,
+            "holdout_azimuth_bins": list(split.azimuth_bins),
+            "holdout_elevation_bins": list(split.elevation_bins),
+        })
         return result
 
 

@@ -1,34 +1,30 @@
-"""Fusion photographique multi-vues pour les façades du viewer.
+"""Direct multi-view photographic fusion onto CanonicalSceneMesh surfaces.
 
-Les images enregistrées par COLMAP sont reprojetées dans chaque plan de mur
-afin de produire des orthofaçades. La visibilité est prouvée pixel par pixel :
-un atlas troué est le résultat attendu, et le proxy mesuré reprend sa place
-sous les trous.
+Production charts and UVs come exclusively from canonical triangles and stable
+surface IDs. Unobserved texels remain UNKNOWN; every measured texel retains its
+source images, GSD, view count, confidence, and photometric variance.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from ..logging import get_logger
-from ..geo.facade_visibility import LidarOcclusion, ProxyDepth
+from ..geo.facade_visibility import LidarOcclusion, ProxyDepth, measure_facade_alignment
 from ..geo.orthofacade import FacadePlane, plane_from_edge, rectify
-from ..geo.facade_visibility import measure_facade_alignment
+from ..logging import get_logger
 from ..workspace import Workspace
 from .canonical_images import CanonicalImageTable
 from .semantic_correspondence import _resolve_model_path
 from .semantic_registered_support import transform_points
-from .texture_masks import align_mask_to_image, load_texture_masks, TextureViewMask
-
+from .texture_masks import TextureViewMask, align_mask_to_image, load_texture_masks
 
 log = get_logger("conditioning-facade-texture")
-TEXTURE_ALGORITHM_VERSION = 10
+TEXTURE_ALGORITHM_VERSION = 11
 REGISTRATION_HOLDOUT_MAX_P90_M = 3.0
 
 
@@ -104,7 +100,7 @@ def _appearance_profile(images: list[tuple[str, Path]]) -> dict:
                 target.append(np.median(pixels[mask], axis=0))
     def colour(samples, fallback):
         value = np.median(np.asarray(samples), axis=0) if samples else np.asarray(fallback)
-        return "#" + "".join(f"{int(round(channel)):02x}" for channel in value)
+        return "#" + "".join(f"{round(channel):02x}" for channel in value)
     return {
         "method": "robust colour consensus across every readable exterior reference",
         "images_catalogued": len(images),
@@ -189,6 +185,16 @@ class _RegisteredCamera:
         return screen, depth
 
 
+class _ProjectOnlyCamera:
+    """Force proxy rasterization through the registered world projection."""
+
+    def __init__(self, camera) -> None:
+        self.camera = camera
+
+    def project(self, points: np.ndarray):
+        return self.camera.project(points)
+
+
 def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray | None] | None:
     if mask_info is None or mask_info.building is None:
         return None
@@ -201,6 +207,30 @@ def prepare_view_masks(mask_info: TextureViewMask | None, image_shape: tuple[int
         if occluders is None and mask_info.transform is None:
             occluders = None
     return building, occluders
+
+
+def _canonical_mesh_pose_error(
+    proxy: ProxyDepth, building_mask: np.ndarray,
+    first_face: int, face_count: int, focal_px: float,
+) -> tuple[float, float]:
+    """Boundary residual of the exact canonical mesh against image evidence."""
+    from scipy.ndimage import binary_erosion, distance_transform_edt
+
+    face_map = proxy.face_id_map
+    if face_map is None:
+        return float("inf"), float("inf")
+    rendered = (face_map >= first_face) & (face_map < first_face + face_count)
+    if not rendered.any() or not building_mask.any():
+        return float("inf"), float("inf")
+    rendered_edge = rendered ^ binary_erosion(rendered)
+    observed_edge = building_mask ^ binary_erosion(building_mask)
+    distances = distance_transform_edt(~observed_edge)
+    values = distances[rendered_edge]
+    error_px = float(np.median(values)) if values.size else float("inf")
+    depths = proxy.depth[rendered]
+    depth = float(np.median(depths[np.isfinite(depths)]))
+    error_m = error_px * depth / max(float(focal_px), 1e-6)
+    return error_px, error_m
 
 
 def _texture_registration_allowed(registration: dict) -> tuple[bool, str]:
@@ -227,7 +257,7 @@ def _facade_polygon_mask(camera, plane: FacadePlane, width: int, height: int):
     return mask.astype(bool)
 
 
-def _build_triangles_with_edges(payload: dict) -> tuple[list[np.ndarray], list[int], dict[str, list[int]]]:
+def _canonical_triangles_with_surfaces(payload: dict) -> tuple[list[np.ndarray], list[int], dict[str, list[int]]]:
     """Read only authoritative canonical meshes; never re-extrude payload fields."""
     triangles: list[np.ndarray] = []
     face_ids: list[int] = []
@@ -238,6 +268,7 @@ def _build_triangles_with_edges(payload: dict) -> tuple[list[np.ndarray], list[i
         sv = solid.get("vertices") or []
         sf = solid.get("faces") or []
         kinds = solid.get("face_kind") or ["wall"] * len(sf)
+        surface_ids = solid.get("surface_ids") or []
         if not sv or not sf:
             raise ValueError(f"volume {volume_index} has no canonical solid mesh")
         for face_index, face in enumerate(sf):
@@ -246,15 +277,226 @@ def _build_triangles_with_edges(payload: dict) -> tuple[list[np.ndarray], list[i
                 continue
             triangles.append(tri)
             face_ids.append(fid)
+            if face_index < len(surface_ids):
+                edge_face_ids.setdefault(str(surface_ids[face_index]), []).append(fid)
             if face_index < len(kinds) and kinds[face_index] == "wall":
                 edge_face_ids.setdefault(f"{volume_index}:walls", []).append(fid)
             fid += 1
     return triangles, face_ids, edge_face_ids
 
 
+def canonical_texture_triangles(mesh):
+    """Strict texture-projector entry point for the One Reality Model."""
+    from ..reality_contract import require_canonical_mesh
+
+    receipt = require_canonical_mesh(mesh, "texture_projector")
+    triangles = [triangle for triangle, _face_id in mesh.triangles()]
+    return triangles, mesh.triangle_ids.copy(), receipt
+
+
+def _build_canonical_surface_atlases(
+    workspace: Workspace, payload: dict, meshes: list, target_index: int,
+    views: list[tuple], output_dir: Path, input_digest: str,
+    appearance: dict, identity_report: dict, references: list,
+    rejected_views: list, view_ids: list, mesh_receipts: list,
+) -> dict:
+    """Production P0-4 path: exact triangles -> physical-surface UV charts."""
+    from .canonical_texture import TextureObservation, texture_surface
+
+    mesh = meshes[target_index]
+    face_offset = sum(len(candidate.faces) for candidate in meshes[:target_index])
+    observations = [
+        TextureObservation(
+            image_id=asset_id, image=rgb, camera=camera,
+            valid_mask=combined_mask, proxy_depth=proxy,
+            lidar_occlusion=lidar_occ, face_id_offset=face_offset,
+            pose_error_m=pose_error_m,
+        )
+        for asset_id, rgb, camera, combined_mask, proxy, lidar_occ, pose_error_m in views
+    ]
+    textures: list[dict] = []
+    for surface_id, surface in sorted(mesh.surface_catalog.items()):
+        if surface.kind not in {"facade", "roof", "roof_step"}:
+            continue
+        atlas = texture_surface(mesh, surface_id, observations, texel_size_m=0.12)
+        safe_name = hashlib.sha256(surface_id.encode("utf-8")).hexdigest()[:16]
+        image_name = f"surface_{safe_name}.png"
+        provenance_name = f"surface_{safe_name}_provenance.npz"
+        Image.fromarray(np.flipud(atlas.rgba), "RGBA").save(
+            output_dir / image_name, optimize=True
+        )
+        np.savez_compressed(
+            output_dir / provenance_name,
+            state=atlas.state,
+            best_source=atlas.best_source,
+            effective_gsd=atlas.effective_gsd,
+            incidence_deg=atlas.incidence_deg,
+            sharpness=atlas.sharpness,
+            view_count=atlas.view_count,
+            confidence=atlas.confidence,
+            variance=atlas.variance,
+            source_mask=atlas.source_mask,
+            source_image_ids=np.asarray(atlas.source_image_ids),
+            uv_vertices=atlas.chart.uv_vertices,
+            uv_triangles=atlas.chart.uv_triangles,
+            triangle_ids=np.asarray(atlas.chart.triangle_ids),
+        )
+        measured = atlas.state == "MEASURED"
+        finite_gsd = atlas.effective_gsd[measured]
+        from ..texture_reality import (
+            CameraTextureDemand,
+            TextureEvidence,
+            TextureRealityLevel,
+            evaluate_texture_reality,
+        )
+
+        median_sharpness = float(np.median(atlas.sharpness[measured])) if measured.any() else 0.0
+        median_confidence = float(np.median(atlas.confidence[measured])) if measured.any() else 0.0
+        median_variance = float(np.median(atlas.variance[measured])) if measured.any() else float("inf")
+        pose_confidence = float(np.median([
+            observation.pose_confidence
+            * np.exp(-((max(0.0, observation.pose_error_m) / 0.22) ** 2))
+            for observation in observations
+        ])) if observations else 0.0
+        evidence = TextureEvidence(
+            float(np.median(finite_gsd)) if finite_gsd.size else None,
+            atlas.coverage, median_sharpness,
+            float(np.median(atlas.view_count[measured])) if measured.any() else 0.0,
+            pose_confidence,
+            float(np.median(atlas.incidence_deg[measured])) if measured.any() else 90.0,
+            float(np.exp(-median_variance / 400.0)) if np.isfinite(median_variance) else 0.0,
+            1.0 - atlas.coverage,
+        )
+        reality_tiles = []
+        tile_px = 64
+        for y0 in range(0, atlas.chart.height_px, tile_px):
+            for x0 in range(0, atlas.chart.width_px, tile_px):
+                ys = slice(y0, min(y0 + tile_px, atlas.chart.height_px))
+                xs = slice(x0, min(x0 + tile_px, atlas.chart.width_px))
+                tile_measured = measured[ys, xs]
+                tile_coverage = float(np.mean(tile_measured))
+                tile_gsd = atlas.effective_gsd[ys, xs][tile_measured]
+                tile_incidence = atlas.incidence_deg[ys, xs][tile_measured]
+                tile_variance = atlas.variance[ys, xs][tile_measured]
+                centre_uv = np.array([
+                    (x0 + (xs.stop - x0) / 2.0) * atlas.chart.texel_size_m,
+                    (y0 + (ys.stop - y0) / 2.0) * atlas.chart.texel_size_m,
+                ])
+                centre_world = (
+                    atlas.chart.origin_world
+                    + centre_uv[0] * atlas.chart.basis_u
+                    + centre_uv[1] * atlas.chart.basis_v
+                )
+                reality_tiles.append({
+                    "tile": [x0 // tile_px, y0 // tile_px],
+                    "centre_world": centre_world.tolist(),
+                    "normal": atlas.chart.normal.tolist(),
+                    "effective_gsd_m": float(np.median(tile_gsd)) if tile_gsd.size else None,
+                    "coverage": tile_coverage,
+                    "sharpness": float(np.median(atlas.sharpness[ys, xs][tile_measured])) if tile_measured.any() else 0.0,
+                    "view_count": float(np.median(atlas.view_count[ys, xs][tile_measured])) if tile_measured.any() else 0.0,
+                    "pose_confidence": pose_confidence,
+                    "incidence_deg": float(np.median(tile_incidence)) if tile_incidence.size else 90.0,
+                    "photometric_consistency": float(np.exp(-np.median(tile_variance) / 400.0)) if tile_variance.size else 0.0,
+                    "unknown_fraction": 1.0 - tile_coverage,
+                })
+        reality_profiles = {}
+        for label, width_px in (("1080p_60deg", 1920), ("4k_60deg", 3840)):
+            reality_profiles[label] = {
+                level.value: evaluate_texture_reality(
+                    evidence, CameraTextureDemand(100.0, 60.0, width_px),
+                    required_level=level,
+                ).min_safe_distance_m
+                for level in (
+                    TextureRealityLevel.SAFE_FOR_CLOSEUP,
+                    TextureRealityLevel.SAFE_FOR_NOVEL_VIEW,
+                )
+            }
+        render_triangles = []
+        for local_face, mesh_face_index, triangle_id in zip(
+            atlas.chart.uv_triangles,
+            atlas.chart.world_triangles,
+            atlas.chart.triangle_ids,
+        ):
+            uv_m = atlas.chart.uv_vertices[local_face]
+            render_triangles.append({
+                "triangle_id": int(triangle_id),
+                "vertices": mesh.vertices[mesh.faces[int(mesh_face_index)]].tolist(),
+                # PNG rows are flipped when the atlas is written above.
+                "uv_px": [
+                    [
+                        float(uv[0] / atlas.chart.texel_size_m),
+                        float(
+                            atlas.chart.height_px - 1
+                            - uv[1] / atlas.chart.texel_size_m
+                        ),
+                    ]
+                    for uv in uv_m
+                ],
+            })
+        textures.append({
+            "surface_id": surface_id,
+            "path": f"facade_textures/{image_name}",
+            "provenance_path": f"facade_textures/{provenance_name}",
+            "width": atlas.chart.width_px,
+            "height": atlas.chart.height_px,
+            "texel_size_m": atlas.chart.texel_size_m,
+            "triangle_ids": list(atlas.chart.triangle_ids),
+            "render_triangles": render_triangles,
+            "observed_fraction": atlas.coverage,
+            "unknown_fraction": 1.0 - atlas.coverage,
+            "median_effective_gsd_m": (
+                float(np.median(finite_gsd)) if finite_gsd.size else None
+            ),
+            "p90_effective_gsd_m": (
+                float(np.percentile(finite_gsd, 90)) if finite_gsd.size else None
+            ),
+            "median_view_count": (
+                float(np.median(atlas.view_count[measured])) if measured.any() else 0.0
+            ),
+            "median_incidence_deg": (
+                float(np.median(atlas.incidence_deg[measured])) if measured.any() else None
+            ),
+            "median_sharpness": median_sharpness,
+            "median_confidence": median_confidence,
+            "median_variance": median_variance if np.isfinite(median_variance) else None,
+            "pose_confidence": pose_confidence,
+            "photometric_consistency": evidence.photometric_consistency,
+            "texture_reality": reality_profiles,
+            "reality_tile_size_px": tile_px,
+            "reality_tiles": reality_tiles,
+            "low_confidence_fraction": float(np.mean(atlas.confidence < 0.4)),
+            "best_sources": sorted({
+                atlas.source_image_ids[int(index)]
+                for index in np.unique(atlas.best_source[atlas.best_source >= 0])
+            }),
+            "rejection_counts": atlas.rejection_counts,
+        })
+    result = {
+        "status": "ready" if textures else "unavailable",
+        "input_digest": input_digest,
+        "method": "direct CanonicalSceneMesh surface UV multi-view robust fusion",
+        "facade_plane_proxy_usage": 0,
+        "registered_images_used": len(views),
+        "registered_asset_ids": sorted(view_ids),
+        "views_rejected_no_building_mask": sorted(rejected_views),
+        "canonical_images": identity_report,
+        "reference_images_catalogued": len(references),
+        "textures": textures,
+        "appearance": appearance,
+        "input_mesh_digests": [receipt.input_mesh_digest for receipt in mesh_receipts],
+        "legacy_geometry_paths_used": 0,
+    }
+    payload["facade_textures"] = textures
+    payload["appearance_profile"] = appearance
+    payload["reference_fusion"] = result
+    workspace.write_json("11_conditioning/facade_texture_audit.json", result)
+    return result
+
+
 def _build_triangles_from_payload(payload: dict) -> tuple[list[np.ndarray], list[int]]:
     """Backward-compatible public helper; edge ownership stays internal."""
-    triangles, face_ids, _ = _build_triangles_with_edges(payload)
+    triangles, face_ids, _ = _canonical_triangles_with_surfaces(payload)
     return triangles, face_ids
 
 
@@ -389,7 +631,15 @@ def build(workspace: Workspace, payload: dict) -> dict:
     views: list[tuple] = []
     view_ids: list[str] = []
     rejected_views: list[dict] = []
-    triangles, face_ids, edge_face_ids = _build_triangles_with_edges(payload)
+    triangles, face_ids, edge_face_ids = _canonical_triangles_with_surfaces(payload)
+    from ..reality_contract import require_canonical_mesh
+    from .canonical_mesh import CanonicalSceneMesh
+    mesh_receipts = []
+    canonical_meshes = []
+    for volume in payload.get("volumes", []):
+        mesh = CanonicalSceneMesh.from_dict(volume.get("solid") or {})
+        canonical_meshes.append(mesh)
+        mesh_receipts.append(require_canonical_mesh(mesh, "texture_projector"))
 
     target = next((volume for volume in payload.get("volumes", []) if volume.get("target")), None)
     target_volume_index = None
@@ -436,7 +686,10 @@ def build(workspace: Workspace, payload: dict) -> dict:
         if occluder_mask is not None:
             combined_mask = building_mask & ~occluder_mask
 
-        proxy = ProxyDepth.render(camera, triangles, face_ids, rgb.shape[1], rgb.shape[0])
+        proxy = ProxyDepth.render(
+            _ProjectOnlyCamera(camera), triangles, face_ids,
+            rgb.shape[1], rgb.shape[0],
+        )
         laz_path = workspace.path("06_geo", "site.laz")
         laz_occ = LidarOcclusion.from_window(None, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
         if laz_path.is_file():
@@ -445,8 +698,23 @@ def build(workspace: Workspace, payload: dict) -> dict:
             window = read_window(laz_path, centre, 80.0)
             laz_occ = LidarOcclusion.from_window(window, camera, transform["scene_origin_xyz"], camera.f, rgb.shape[1], rgb.shape[0])
 
-        views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ))
+        target_face_offset = sum(
+            len(candidate.faces) for candidate in canonical_meshes[:target_volume_index]
+        )
+        _pose_px, pose_m = _canonical_mesh_pose_error(
+            proxy, building_mask, target_face_offset,
+            len(canonical_meshes[target_volume_index].faces), camera.f,
+        )
+        views.append((asset_id, rgb, camera, combined_mask, proxy, laz_occ, pose_m))
         view_ids.append(asset_id)
+
+    if target_volume_index is None or not canonical_meshes:
+        raise ValueError("target canonical mesh is required for direct texturing")
+    return _build_canonical_surface_atlases(
+        workspace, payload, canonical_meshes, target_volume_index, views,
+        output_dir, input_digest, appearance, identity_report, references,
+        rejected_views, view_ids, mesh_receipts,
+    )
 
     ring = fp
     signed_area = 0.5 * sum(ring[index][0] * ring[(index + 1) % len(ring)][1] - ring[(index + 1) % len(ring)][0] * ring[index][1] for index in range(len(ring)))
@@ -480,7 +748,7 @@ def build(workspace: Workspace, payload: dict) -> dict:
             vis = facade_mask & combined_mask
             if not vis.any():
                 continue
-            pose_px, pose_m, cols_used = _pose_error_for_view(
+            _pose_px, pose_m, _cols_used = _pose_error_for_view(
                 camera, plane, combined_mask, facade_face_ids=facade_face_ids
             )
             if pose_m > 0.5:
@@ -561,6 +829,8 @@ def build(workspace: Workspace, payload: dict) -> dict:
         "appearance": appearance,
         "contact_sheet": "facade_textures/reference_inventory_sheet.jpg",
         "status_images": status_images,
+        "input_mesh_digests": [receipt.input_mesh_digest for receipt in mesh_receipts],
+        "legacy_geometry_paths_used": 0,
     }
     payload["facade_textures"] = textures
     payload["appearance_profile"] = appearance

@@ -82,6 +82,7 @@ def _restyle_flight(
     courts.
     """
     from .production_plan import TIMES_OF_DAY
+    from .references import build_aerial_references
     from .sogni_cli import MAX_V2V_SECONDS, restyle_video, split_video
 
     chunks = split_video(rendered, out_dir / f"tronçons_{label}", chunk_seconds=MAX_V2V_SECONDS)
@@ -92,16 +93,8 @@ def _restyle_flight(
     # conditionnement : à prompt générique, le modèle produit *un* bâtiment du
     # même genre plutôt que *celui-là*. La description vient du classement
     # visuel des photos réelles quand il est disponible.
-    materials = _describe_materials(args, geocoded, out_dir)
-    prompt = (
-        f"{establishment}, vue aérienne réelle filmée au drone. "
-        "Conserver exactement l'architecture, la silhouette et les matériaux du "
-        f"bâtiment de la vidéo source{materials}. Ne rien ajouter ni retirer à "
-        "sa structure. "
-        f"{look.look_fr if look else 'lumière naturelle directionnelle'}. "
-        "Rendu photographique de caméra : flou de mouvement naturel, profondeur "
-        "de champ, reflets et matières réalistes, grain fin."
-    )
+    materials, appearance = _exterior_reference(args, geocoded, out_dir)
+    street_views = sorted(out_dir.glob("streetview_*.jpg"))
 
     print(
         f"  {label} : {len(chunks)} tronçon(s) retexturés "
@@ -109,11 +102,34 @@ def _restyle_flight(
     )
     produced: list[Path] = []
     for index, chunk in enumerate(chunks):
+        references = build_aerial_references(
+            rendered_chunk=chunk,
+            exterior_photos=[appearance] if appearance else [],
+            street_view_photos=street_views,
+        )
+        # Le rôle des images est énoncé dans le prompt : sans cela le moteur
+        # peut traiter une référence comme un plan à insérer, et en recopier
+        # le cadrage ou les inscriptions.
+        prompt = (
+            f"{establishment}, vue aérienne réelle filmée au drone. "
+            "Conserver exactement l'architecture, la silhouette et les matériaux du "
+            f"bâtiment de la vidéo source{materials}. Ne rien ajouter ni retirer à "
+            "sa structure. "
+            f"{references.prompt_clause_fr()} "
+            f"{look.look_fr if look else 'lumière naturelle directionnelle'}. "
+            "Rendu photographique de caméra : flou de mouvement naturel, profondeur "
+            "de champ, reflets et matières réalistes, grain fin."
+        )
+        if index == 0:
+            print(f"    {references.describe_fr()}")
+
+        hidden = references.reference_only()
         produced.append(
             restyle_video(
                 chunk, prompt,
                 out_path=out_dir / f"ia_{label}_{index:02d}.mp4",
                 control=args.control_mode, control_strength=args.control_strength,
+                appearance_image=hidden[0].path if hidden else None,
             )
         )
         print(f"    tronçon {index + 1}/{len(chunks)}", flush=True)
@@ -126,35 +142,52 @@ def _possessive(name: str) -> str:
     return possessive_fr(name)
 
 
-def _describe_materials(args, geocoded: dict, out_dir: Path) -> str:  # noqa: ANN001
-    """Description de la façade, tirée d'une vraie photo de l'établissement.
+def _exterior_reference(args, geocoded: dict, out_dir: Path) -> tuple[str, Path | None]:  # noqa: ANN001
+    """Description de la façade et photo utilisable comme référence d'apparence.
 
-    Le conditionnement structurel impose la forme, pas la matière : sans
-    mention explicite de la brique, de la pierre ou du cuivre, le modèle
-    choisit lui-même et produit un bâtiment plausible mais différent. On
-    reprend donc la photo d'extérieur déjà téléchargée et sa description.
+    Le conditionnement structurel impose la forme, jamais la matière : sans
+    référence, le modèle choisit lui-même et produit un bâtiment plausible
+    mais différent.
+
+    La photo doit être **propre**. Une vue chargée de texte ou d'un premier
+    plan massif contamine la génération : essayée avec une photo à massif
+    floral « UNESCO », le modèle en a recopié le lettrage dans le plan
+    aérien. On ne retient donc qu'une photo signalée exploitable par le
+    classement visuel — sinon la description seule, sans image.
     """
     sources = out_dir / "sources"
-    if not sources.exists():
-        return ""
     openai_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_key:
-        return ""
+    if not sources.exists() or not openai_key:
+        return "", None
 
     from .hotel_sources import HotelSourceError, SourcePhoto, classify_photos
 
-    photos = [SourcePhoto(p) for p in sorted(sources.glob("*.jpg"))[:4]]
+    photos = [SourcePhoto(p) for p in sorted(sources.glob("*.jpg"))[:6]]
     if not photos:
-        return ""
+        return "", None
     try:
         classify_photos(photos, openai_key)
     except HotelSourceError:
-        return ""
+        return "", None
 
-    for photo in photos:
-        if photo.category == "exterieur" and photo.description_fr:
-            return f" — {photo.description_fr.rstrip('.').lower()}"
-    return ""
+    exteriors = [p for p in photos if p.category == "exterieur"]
+    if not exteriors:
+        return "", None
+
+    description = ""
+    for photo in exteriors:
+        if photo.description_fr:
+            description = f" — {photo.description_fr.rstrip('.').lower()}"
+            break
+
+    clean = next((p for p in exteriors if p.clean_reference), None)
+    if clean is None:
+        print(
+            "  (aucune photo de façade exploitable comme référence : "
+            "description seule, sans image)",
+            file=sys.stderr,
+        )
+    return description, clean.path if clean else None
 
 
 def _interior_stops(args, geocoded: dict, out_dir: Path) -> list:  # noqa: ANN001
@@ -320,6 +353,7 @@ def _render_traverse(
                 poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
                 out_path=out_dir / f"vol_{name}.mp4", width=width, height=height,
                 fps=args.render_3d_fps, keep_frames=True, progress=progress,
+                tile_detail=args.tile_detail, supersample=args.supersample,
             )
     except CesiumRenderError as exc:
         print(f"Rendu du vol échoué : {exc}", file=sys.stderr)
@@ -448,6 +482,22 @@ def main(argv: list[str] | None = None) -> int:
         "--render-3d-duration", type=float, default=15.0, help="Durée du vol 3D en secondes (défaut: 15)"
     )
     parser.add_argument("--render-3d-fps", type=int, default=12, help="Images par seconde du vol 3D (défaut: 12)")
+    parser.add_argument(
+        "--tile-detail",
+        type=float,
+        default=4.0,
+        help=(
+            "Erreur d'écran tolérée sur les tuiles 3D (défaut: 4). Cesium utilise 16 "
+            "pour la navigation interactive ; abaisser charge des tuiles plus fines "
+            "— netteté mesurée +31%%, rendu ~3x plus long."
+        ),
+    )
+    parser.add_argument(
+        "--supersample",
+        type=float,
+        default=2.0,
+        help="Facteur de suréchantillonnage avant réduction (défaut: 2.0, lisse les arêtes)",
+    )
     parser.add_argument(
         "--cruise-speed",
         type=float,
@@ -728,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
                     poses, maps_key, centre=(geocoded["lat"], geocoded["lon"]),
                     out_path=out_dir / "flight_3d.mp4", width=width, height=height,
                     fps=args.render_3d_fps, progress=_progress,
+                    tile_detail=args.tile_detail, supersample=args.supersample,
                 )
             except CesiumRenderError as exc:
                 print(f"Rendu 3D échoué : {exc}", file=sys.stderr)

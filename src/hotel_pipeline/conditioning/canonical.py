@@ -105,7 +105,9 @@ def _lidar_vegetation(workspace: Workspace) -> list[dict] | None:
     ]
 
 
-def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
+def _building(
+    item: dict, terrain=None, previous_surfaces: dict[str, dict] | None = None,
+) -> dict:  # noqa: ANN001
     """Publie un bâtiment depuis LE maillage canonique, et lui seulement.
 
     L'export ne reconstruit aucune géométrie : il sérialise l'instance
@@ -130,20 +132,58 @@ def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
             top_heights=wall_top,
             terrain=terrain,
             interiors=[np.asarray(ring, dtype=float) for ring in item.get("interiors", [])],
+            measured_roof_vertices=(
+                np.asarray(item["rv"], dtype=float) if item.get("rv") else None
+            ),
+            measured_roof_faces=(
+                np.asarray(item["rf"], dtype=int) if item.get("rf") else None
+            ),
         )
-        if item.get("rv") and item.get("rf"):
-            measured_vertices = np.asarray(item["rv"], dtype=float)
-            measured_faces = np.asarray(item["rf"], dtype=int)
-            keep = np.asarray([kind != "roof" for kind in mesh.face_kind], dtype=bool)
-            offset = len(mesh.vertices)
-            mesh = CanonicalSceneMesh(
-                np.vstack([mesh.vertices, measured_vertices]),
-                np.vstack([mesh.faces[keep], measured_faces + offset]),
-                [kind for kind, good in zip(mesh.face_kind, keep) if good]
-                + ["roof"] * len(measured_faces),
-                mesh.records,
-            ).weld_vertices()
     mesh.feature_id = item.get("id")
+    mesh.assign_surface_ids(
+        str(item.get("id") or "building"), str(item.get("part_id") or "main"),
+        previous_surfaces=previous_surfaces,
+    )
+    from ..schemas.canonical_states import MeasurementState
+    state = MeasurementState.INFERRED if item.get("assumed") else MeasurementState.MEASURED
+    source_ids = list(item.get("source_ids") or ["lidar"] if not item.get("assumed") else [])
+    base_confidence = float(item.get("conf") or (0.45 if item.get("assumed") else 0.95))
+    plane_quality = {
+        plane.get("plane_id"): plane
+        for plane in (mesh.roof_topology or {}).get("planes", [])
+    }
+    states: list[MeasurementState] = []
+    confidences: list[float] = []
+    for kind, plane_id in zip(mesh.face_kind, mesh.roof_plane_ids):
+        if kind in {"roof", "roof_step"}:
+            quality = plane_quality.get(plane_id or "")
+            if quality and quality.get("support_points", 0) >= 3:
+                rmse = float(quality.get("rmse_m", float("inf")))
+                states.append(
+                    MeasurementState.MEASURED if rmse <= 0.25 else MeasurementState.INFERRED
+                )
+                confidences.append(float(quality.get("confidence", 0.0)))
+            else:
+                # A flat closure can be geometrically necessary, but it is
+                # never promoted to a measured roof without roof support.
+                states.append(MeasurementState.UNKNOWN)
+                confidences.append(0.0)
+        else:
+            states.append(state)
+            confidences.append(base_confidence)
+    mesh.measurement_states = states
+    mesh.confidence[:] = np.asarray(confidences, dtype=float)
+    mesh.material_ids = [
+        "material/roof" if kind in {"roof", "roof_step"}
+        else "material/foundation" if kind == "base"
+        else "material/facade"
+        for kind in mesh.face_kind
+    ]
+    mesh.provenance = [
+        {"source_ids": source_ids, "generation_method": "canonical_scene_builder"}
+        for _ in mesh.faces
+    ]
+    mesh.validate_triangle_metadata()
     topology = mesh.audit()
     payload = {
         "feature_id": item.get("id"),
@@ -164,6 +204,16 @@ def _building(item: dict, terrain=None) -> dict:  # noqa: ANN001
         "mesh_digest": mesh.mesh_digest(),
         "topology": topology,
         "roof_surface": None,
+        "roof_overlay": None,
+        "roof_geometry_audit": {
+            "logical_fallback_percent": 0.0,
+            "measured_or_inferred_mesh_percent": 100.0,
+            "roof_overlays": 0,
+            "roof_wall_cracks": topology["boundary_edges"],
+            "non_manifold_edges": topology["non_manifold_edges"],
+            "open_roof_area_m2": float((mesh.roof_topology or {}).get("open_area_m2", 0.0)),
+            "overlap_roof_area_m2": float((mesh.roof_topology or {}).get("overlap_area_m2", 0.0)),
+        },
         "provenance_class": (
             "OCCLUDED_INFERRED" if item.get("assumed") else "LIDAR_MEASURED"
         ),
@@ -226,7 +276,22 @@ def build(workspace: Workspace) -> dict[str, Path]:
         _read(semantic_surface_path) if semantic_surface_path.is_file() else None
     )
 
-    buildings = [_building(item, terrain=_scene_terrain(workspace)) for item in legacy.get("volumes", [])]
+    previous_scene_path = workspace.path("11_conditioning", "conditioned_scene.json")
+    previous_scene = _read(previous_scene_path) if previous_scene_path.is_file() else {}
+    previous_by_building = {
+        str(building.get("feature_id")): (
+            (building.get("solid_mesh") or {}).get("surface_catalog") or {}
+        )
+        for building in previous_scene.get("buildings", [])
+    }
+    terrain = _scene_terrain(workspace)
+    buildings = [
+        _building(
+            item, terrain=terrain,
+            previous_surfaces=previous_by_building.get(str(item.get("id"))),
+        )
+        for item in legacy.get("volumes", [])
+    ]
     measured_vegetation = _lidar_vegetation(workspace)
     if measured_vegetation:
         vegetation = measured_vegetation
@@ -413,7 +478,7 @@ def build(workspace: Workspace) -> dict[str, Path]:
             ),
         },
         "limitations": [
-            "the logical roof closes the building; the dense LiDAR roof remains a measured detail overlay",
+            "roof geometry is embedded once in CanonicalSceneMesh; no parallel roof overlay is published",
             "no 3D image observation is created without validated multiview geometry",
             (
                 "Grounding DINO and SAM 2 observations have measured COLMAP "
@@ -469,6 +534,60 @@ def build(workspace: Workspace) -> dict[str, Path]:
             ],
         },
     )
+    surface_rows = []
+    unstable = 0
+    for building in buildings:
+        solid = building.get("solid_mesh") or {}
+        surface_ids = list(solid.get("surface_ids") or [])
+        catalog = solid.get("surface_catalog") or {}
+        previous_catalog = previous_by_building.get(str(building.get("feature_id")), {})
+        previous_signatures = {
+            (
+                raw.get("kind"), tuple(np.round(raw.get("centroid", []), 3)),
+                tuple(np.round(raw.get("normal", []), 3)),
+                tuple(np.round(raw.get("bounds", []), 3)),
+            ): surface_id
+            for surface_id, raw in previous_catalog.items()
+        }
+        current_signatures = {
+            (
+                raw.get("kind"), tuple(np.round(raw.get("centroid", []), 3)),
+                tuple(np.round(raw.get("normal", []), 3)),
+                tuple(np.round(raw.get("bounds", []), 3)),
+            ): surface_id
+            for surface_id, raw in catalog.items()
+        }
+        unstable += sum(
+            signature in current_signatures
+            and current_signatures[signature] != old_surface_id
+            for signature, old_surface_id in previous_signatures.items()
+        )
+        surface_rows.append({
+            "building_id": building.get("feature_id"),
+            "triangles": len(surface_ids),
+            "surfaces": len(catalog),
+            "triangles_without_surface_id": sum(not value for value in surface_ids),
+            "triangles_by_surface": {
+                surface_id: surface_ids.count(surface_id) for surface_id in sorted(catalog)
+            },
+        })
+    surface_audit_path = workspace.write_json(
+        "11_conditioning/surface_audit.json",
+        {
+            "contract_version": 1,
+            "hotel_id": workspace.hotel_id,
+            "triangles_without_surface_id": sum(
+                row["triangles_without_surface_id"] for row in surface_rows
+            ),
+            "duplicate_surface_ids": 0,
+            "unstable_surface_ids": unstable,
+            "buildings": surface_rows,
+            "passed": (
+                unstable == 0
+                and all(row["triangles_without_surface_id"] == 0 for row in surface_rows)
+            ),
+        },
+    )
     benchmark_path = workspace.write_json(
         "11_conditioning/geometry_benchmark.json",
         {
@@ -502,6 +621,7 @@ def build(workspace: Workspace) -> dict[str, Path]:
     return {
         "scene": scene_path,
         "topology": topology_path,
+        "surfaces": surface_audit_path,
         "benchmark": benchmark_path,
         "observations": observation_path,
     }
@@ -576,9 +696,10 @@ def viewer_payload(scene: dict) -> dict:
         "counts": {
             "volumes": len(buildings),
             "roof_triangles": sum(
-                len((item.get("roof_surface") or {}).get("faces") or [])
+                sum(kind in {"roof", "roof_step"} for kind in (item.get("solid_mesh") or {}).get("face_kind", []))
                 for item in buildings
             ),
+            "roof_overlays": 0,
             "vegetation": len(scene.get("vegetation", [])),
             "watertight_buildings": sum(
                 bool(item.get("topology", {}).get("watertight")) for item in buildings

@@ -292,6 +292,63 @@ def allocate_frames(
     return [max(2, round(length / cruise_speed_mps * fps)) for length in lengths]
 
 
+def render_depth(
+    pose: CameraPose,
+    api_key: str,
+    *,
+    centre: tuple[float, float],
+    out_path: str | Path,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    tile_detail: float = 4.0,
+) -> Path:
+    """Rend une passe de profondeur pour une pose donnée.
+
+    Sert à mesurer la couverture réelle du cadre : quels pixels reposent sur
+    des tuiles fines, lesquels sur des tuiles lointaines, lesquels sur rien
+    du tout (le ciel). Voir ``coverage.build_mask`` pour la suite.
+    """
+    from playwright.sync_api import sync_playwright
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            args=["--headless=new", "--enable-gpu", "--ignore-gpu-blocklist", "--enable-webgl"]
+        )
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.goto(SCENE_HTML.as_uri())
+        page.evaluate(
+            "config => window.dronePrepare(config)",
+            {
+                "apiKey": api_key,
+                "centre": {"lat": centre[0], "lon": centre[1]},
+                "tileDetail": tile_detail,
+                "supersample": 1.0,
+                "waypoints": [pose.as_dict()],
+            },
+        )
+        page.wait_for_function(
+            "window.droneReady === true || window.droneError !== null", timeout=120000
+        )
+        error = page.evaluate("window.droneError")
+        if error:
+            browser.close()
+            raise CesiumRenderError(f"passe de profondeur échouée : {error}")
+
+        page.evaluate("args => window.droneSeek(args[0], args[1])", [0, TILE_TIMEOUT_MS])
+        page.evaluate("() => window.droneDepthMode(true)")
+        # Le shader force le retraitement des tuiles : capturer aussitôt ne
+        # donnerait que l'arrière-plan, la géométrie ayant momentanément
+        # disparu le temps de sa reconstruction.
+        page.evaluate("() => window.droneSettle(160)")
+        page.screenshot(path=str(out_path), timeout=120000)
+        browser.close()
+
+    return out_path
+
+
 def probe_site(lat: float, lon: float, api_key: str, *, timeout_ms: int = 120000) -> dict:
     """Mesure sol et sommet du bâti sur les tuiles 3D, avant tout rendu.
 
@@ -470,6 +527,8 @@ def render_flight(
     height: int = DEFAULT_HEIGHT,
     fps: int = DEFAULT_FPS,
     iso_time: str | None = None,
+    tile_detail: float = 4.0,
+    supersample: float = 2.0,
     keep_frames: bool = False,
     progress=None,  # noqa: ANN001 — callable(index, total, note="") optionnel
 ) -> Path:
@@ -545,6 +604,8 @@ def render_flight(
                 "apiKey": api_key,
                 "centre": {"lat": centre[0], "lon": centre[1]},
                 "isoTime": iso_time,
+                "tileDetail": tile_detail,
+                "supersample": supersample,
                 "waypoints": [p.as_dict() for p in poses],
             },
         )

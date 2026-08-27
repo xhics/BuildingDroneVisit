@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from hotel_pipeline.conditioning import load_scene, render_sequence
+from hotel_pipeline.conditioning.build_canonical import attach_canonical_meshes
 from hotel_pipeline.conditioning.png import write_png
 from hotel_pipeline.conditioning.render import Camera, render_frame
 from hotel_pipeline.conditioning.scene import ASSUMED_HEIGHT_M
@@ -55,12 +56,14 @@ def _entry(feature_id: str, role: str, wkt: str, **kw) -> dict:
 
 @pytest.fixture()
 def simple_scene(tmp_path: Path):
-    return load_scene(
+    scene = load_scene(
         _manifest(
             tmp_path,
             [_entry("TARGET_BUILDING", "target_building", _square(0, 0, 10))],
         )
     )
+    attach_canonical_meshes(scene)
+    return scene
 
 
 def test_une_hauteur_absente_est_supposee_et_declaree(tmp_path: Path) -> None:
@@ -142,6 +145,7 @@ def test_le_plus_proche_occulte_le_plus_lointain(tmp_path: Path) -> None:
             ],
         )
     )
+    attach_canonical_meshes(scene)
     camera = Camera(
         position=np.array([0.0, -120.0, 8.0]),
         target=np.array([0.0, 0.0, 6.0]),
@@ -202,6 +206,7 @@ def test_une_cible_trop_petite_rend_la_main_au_generateur(tmp_path: Path) -> Non
             [_entry("TARGET_BUILDING", "target_building", _square(0, 0, 10))],
         )
     )
+    attach_canonical_meshes(scene)
     result = render_sequence(
         scene,
         tmp_path / "out",
@@ -289,6 +294,7 @@ def test_le_png_relit_ce_qu_il_ecrit(tmp_path: Path) -> None:
 def test_le_pilote_reel_produit_une_sequence_exploitable(tmp_path: Path) -> None:
     """Le harnais doit tenir sur la vraie géométrie, pas seulement sur un carré."""
     scene = load_scene(PILOT)
+    attach_canonical_meshes(scene)
     assert scene.crs == "EPSG:2950"
     assert scene.target is not None
     result = render_sequence(

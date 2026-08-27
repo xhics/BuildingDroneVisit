@@ -24,13 +24,13 @@ from pathlib import Path
 
 import numpy as np
 
-from .sparse_reprojection import measure_held_out
 from .schemas.reconstruction import (
     HoldoutPlan,
     HoldoutStrategy,
     NovelViewCriteria,
     NovelViewValidationGate,
 )
+from .sparse_reprojection import measure_held_out
 from .workspace import Workspace
 
 
@@ -135,6 +135,28 @@ def _dense_renderer_available() -> bool:
     return False
 
 
+def _dense_holdout_evidence(
+    workspace: Workspace, run_id: str, train_ids: list[str], held_out_ids: list[str],
+    frozen_model_digest: str,
+) -> dict | None:
+    """Load only evidence rendered from the frozen independent train model."""
+    path = workspace.path("07_reconstruction", "validation", f"{run_id}-dense-holdout.json")
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    valid = (
+        payload.get("renderer") == "dense_holdout_renderer"
+        and payload.get("independent") is True
+        and set(payload.get("train_asset_ids") or []) == set(train_ids)
+        and set(payload.get("holdout_asset_ids") or []) == set(held_out_ids)
+        and payload.get("frozen_model_digest") == frozen_model_digest
+    )
+    return payload if valid else None
+
+
 def build_novel_view_gate(
     workspace: Workspace,
     reconstruction_run_id: str,
@@ -158,13 +180,67 @@ def build_novel_view_gate(
     if selected_asset_ids is None:
         selected_asset_ids = sorted(registered)
 
-    train_ids, held_out_ids = _select_held_out(
-        workspace, reconstruction_run_id, holdout_plan, selected_asset_ids, registered
+    protocol = run.metrics or {}
+    protocol_train = set(protocol.get("train_asset_ids") or [])
+    protocol_holdout = set(protocol.get("holdout_asset_ids") or [])
+    stage_inputs = protocol.get("stage_input_asset_ids") or {}
+    stage_leaks = {
+        stage: sorted(protocol_holdout & set(asset_ids))
+        for stage, asset_ids in stage_inputs.items()
+        if protocol_holdout & set(asset_ids)
+    }
+    independent = (
+        protocol.get("validation_protocol")
+        == "train_only_sfm_then_frozen_model_localization"
+        and protocol.get("holdout_absent_from_train_inputs") is True
+        and protocol.get("split_before_reconstruction") is True
+        and protocol.get("holdout_leakage_count") == 0
+        and not (protocol_train & protocol_holdout)
+        and not stage_leaks
+        and bool(protocol.get("frozen_model_digest"))
     )
+    if independent:
+        train_ids = list(protocol.get("train_asset_ids") or [])
+        held_out_ids = list(protocol.get("holdout_asset_ids") or [])
+    else:
+        # A split invented after reconstruction is leakage, not a holdout.
+        train_ids, held_out_ids = list(selected_asset_ids), []
 
     criteria = NovelViewCriteria()
 
-    if not registered:
+    dense_evidence = (
+        _dense_holdout_evidence(
+            workspace, reconstruction_run_id, train_ids, held_out_ids,
+            str(protocol.get("frozen_model_digest")),
+        )
+        if independent and held_out_ids else None
+    )
+    if dense_evidence is not None:
+        return NovelViewValidationGate(
+            holdout_plan=holdout_plan,
+            feature_inliers=_clamp(float(dense_evidence.get("feature_inliers", 0.0))),
+            edge_alignment=_clamp(float(dense_evidence.get("edge_alignment", 0.0))),
+            silhouette_iou=dense_evidence.get("silhouette_iou"),
+            lpips=_clamp(float(dense_evidence.get("lpips", 1.0))),
+            ssim=_clamp(float(dense_evidence.get("ssim", 0.0))),
+            reprojection_px=max(0.0, float(dense_evidence.get("reprojection_px", 0.0))),
+            structural_similarity=dense_evidence.get("structural_similarity"),
+            pass_criteria=criteria,
+            metrics_measured=True,
+            metric_status={"dense_holdout": "measured_on_frozen_train_only_model"},
+            held_out_asset_ids=held_out_ids,
+            train_asset_ids=train_ids,
+            frozen_model_digest=str(protocol.get("frozen_model_digest")),
+            holdout_results=list(dense_evidence.get("holdout_results") or []),
+            surface_scores=dict(dense_evidence.get("surface_scores") or {}),
+        )
+
+    if not independent:
+        reason = (
+            "run non indépendant: reconstruire avec holdout_asset_ids, puis "
+            "localiser ces vues sur le modèle train-only figé"
+        )
+    elif not registered:
         reason = (
             "aucune caméra enregistrée pour ce run : aucune pose de vue cachée "
             "à rendre"
@@ -174,7 +250,7 @@ def build_novel_view_gate(
             "aucune vue cachée retenue : le corpus est trop petit pour en "
             "retirer une sans le rendre non reconstructible"
         )
-    elif not _dense_renderer_available():
+    elif dense_evidence is None:
         reason = (
             "aucun moteur de rendu dense raccordé : SSIM, LPIPS, inliers et IoU "
             "de silhouette exigent un rendu comparé aux vues cachées"
@@ -211,6 +287,8 @@ def build_novel_view_gate(
                     "SSIM et LPIPS exigent un rendu dense"
                 ),
                 held_out_asset_ids=held_out_ids,
+                train_asset_ids=train_ids,
+                frozen_model_digest=str(protocol.get("frozen_model_digest")),
             )
         reason = (
             "reprojection creuse impossible : ni observations 2D ni "
@@ -225,6 +303,9 @@ def build_novel_view_gate(
         metrics_measured=False,
         unmeasured_reason=reason,
         held_out_asset_ids=held_out_ids,
+        train_asset_ids=train_ids,
+        holdout_leakage_count=sum(len(ids) for ids in stage_leaks.values()),
+        frozen_model_digest=protocol.get("frozen_model_digest"),
     )
 
 

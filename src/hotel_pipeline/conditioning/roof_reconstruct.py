@@ -72,6 +72,7 @@ class ReconstructedRoof:
     face_plane: list[int]
     #: Polygone final de chaque pan, en XY, après toutes les découpes.
     plane_polygons: dict[int, Polygon] = field(default_factory=dict)
+    topology: RoofTopology | None = None
 
     @property
     def step_faces(self) -> list[int]:
@@ -164,6 +165,55 @@ STEP_CONTACT_M = 4.0
 STEP_MIN_CONTACT_POINTS = 5
 
 
+@dataclass(frozen=True)
+class RoofTopologyEdge:
+    """Finite exact plane/plane intersection used by the canonical roof."""
+
+    edge_id: str
+    kind: str
+    plane_ids: tuple[str, str]
+    start: np.ndarray
+    end: np.ndarray
+
+    def as_dict(self) -> dict:
+        return {
+            "edge_id": self.edge_id,
+            "kind": self.kind,
+            "plane_ids": list(self.plane_ids),
+            "start": np.round(self.start, 6).tolist(),
+            "end": np.round(self.end, 6).tolist(),
+            "length_m": round(float(np.linalg.norm(self.end - self.start)), 6),
+        }
+
+
+@dataclass
+class RoofTopology:
+    """Roof planes and their physical junctions, not a display overlay."""
+
+    planes: list[RoofPlane]
+    boundaries: dict[str, list[list[float]]] = field(default_factory=dict)
+    ridges: list[RoofTopologyEdge] = field(default_factory=list)
+    valleys: list[RoofTopologyEdge] = field(default_factory=list)
+    hips: list[RoofTopologyEdge] = field(default_factory=list)
+    steps: list[RoofTopologyEdge] = field(default_factory=list)
+    parapets: list[RoofTopologyEdge] = field(default_factory=list)
+    open_area_m2: float = 0.0
+    overlap_area_m2: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            "planes": [plane.as_dict() for plane in self.planes],
+            "boundaries": self.boundaries,
+            "ridges": [edge.as_dict() for edge in self.ridges],
+            "valleys": [edge.as_dict() for edge in self.valleys],
+            "hips": [edge.as_dict() for edge in self.hips],
+            "steps": [edge.as_dict() for edge in self.steps],
+            "parapets": [edge.as_dict() for edge in self.parapets],
+            "open_area_m2": round(float(self.open_area_m2), 6),
+            "overlap_area_m2": round(float(self.overlap_area_m2), 6),
+        }
+
+
 def _adjacency(
     decomposition: RoofDecomposition,
     contact_m: float,
@@ -222,6 +272,37 @@ def _triangulate_with_z(polygon: Polygon, plane: RoofPlane, registry: _VertexReg
     return faces
 
 
+def _finite_intersection_edge(
+    pair: tuple[int, int], line: tuple[np.ndarray, np.ndarray],
+    footprint: Polygon, decomposition: RoofDecomposition,
+) -> RoofTopologyEdge | None:
+    """Clip an exact infinite plane intersection to the physical roof extent."""
+    i, j = pair
+    point, direction = line
+    span = max(100.0, float(np.hypot(*(np.ptp(np.asarray(footprint.exterior.coords), axis=0)[:2]))) * 4.0)
+    candidate = LineString([point[:2] - direction[:2] * span, point[:2] + direction[:2] * span])
+    clipped = candidate.intersection(footprint)
+    pieces = list(clipped.geoms) if hasattr(clipped, "geoms") else [clipped]
+    pieces = [piece for piece in pieces if isinstance(piece, LineString) and piece.length > 1e-6]
+    if not pieces:
+        return None
+    segment = max(pieces, key=lambda piece: piece.length)
+    xy = np.asarray([segment.coords[0], segment.coords[-1]], dtype=float)
+    first, second = decomposition.planes[i], decomposition.planes[j]
+    start = np.array([xy[0, 0], xy[0, 1], first.height_at(*xy[0])])
+    end = np.array([xy[1, 0], xy[1, 1], first.height_at(*xy[1])])
+    mid_z = float((start[2] + end[2]) * 0.5)
+    reference_z = float((first.origin[2] + second.origin[2]) * 0.5)
+    if abs(end[2] - start[2]) <= 0.05:
+        kind = "ridge" if mid_z >= reference_z else "valley"
+    else:
+        kind = "hip"
+    return RoofTopologyEdge(
+        edge_id=f"{kind}_{i:02d}_{j:02d}", kind=kind,
+        plane_ids=(first.plane_id, second.plane_id), start=start, end=end,
+    )
+
+
 def reconstruct_roof(
     decomposition: RoofDecomposition,
     footprint: Polygon,
@@ -232,6 +313,11 @@ def reconstruct_roof(
     Retourne None quand il n'y a rien à reconstruire ensemble : moins de
     deux pans exploitables, ou aucun découpage productif.
     """
+    seen_plane_ids: set[str] = set()
+    for index, plane in enumerate(decomposition.planes):
+        if plane.plane_id == "plane_unassigned" or plane.plane_id in seen_plane_ids:
+            plane.plane_id = f"plane_{index:02d}"
+        seen_plane_ids.add(plane.plane_id)
     usable = [
         (index, plane)
         for index, plane in enumerate(decomposition.planes)
@@ -289,6 +375,12 @@ def reconstruct_roof(
             steps.append((i, j))
 
     # Coupe de chaque pan par les faîtages qui le bordent.
+    ridge_plane_indices = {index for pair in ridges for index in pair}
+    if len(usable) == 1:
+        ridge_plane_indices.add(usable[0][0])
+    for index in ridge_plane_indices:
+        polygons[index] = footprint
+
     for (i, j), (start, direction) in ridges.items():
         for owner, other in ((i, j), (j, i)):
             polygon = polygons.get(owner)
@@ -365,6 +457,7 @@ def reconstruct_roof(
 
     # Faces verticales franches le long des frontières de découpe : le toit
     # haut et le toit bas sont joints par un mur, jamais par une pente.
+    topology_step_edges: list[RoofTopologyEdge] = []
     for low_index, high_index in step_pairs:
         low_polygon = polygons.get(low_index)
         if low_polygon is None or low_polygon.is_empty or not isinstance(low_polygon, Polygon):
@@ -374,7 +467,6 @@ def reconstruct_roof(
             continue
         low_plane = decomposition.planes[low_index]
         high_plane = decomposition.planes[high_index]
-        boundary = LineString(low_polygon.exterior.coords)
         coords = np.asarray(low_polygon.exterior.coords[:-1], dtype=np.float64)
         count = len(coords)
         for k in range(count):
@@ -397,9 +489,46 @@ def reconstruct_roof(
             ita = registry.index(np.array([a[0], a[1], ta]))
             faces.extend([[ia, ib, itb], [ia, itb, ita]])
             face_plane.extend([-1, -1])
+            topology_step_edges.append(RoofTopologyEdge(
+                edge_id=f"step_{low_index:02d}_{high_index:02d}_{k:03d}",
+                kind="step",
+                plane_ids=(low_plane.plane_id, high_plane.plane_id),
+                start=np.array([a[0], a[1], za]),
+                end=np.array([b[0], b[1], zb]),
+            ))
 
     if not faces:
         return None
+
+    topology = RoofTopology(planes=[plane for _, plane in usable])
+    topology.boundaries = {
+        decomposition.planes[index].plane_id: np.round(
+            np.asarray(poly.exterior.coords[:-1], dtype=float), 6
+        ).tolist()
+        for index, poly in polygons.items()
+        if isinstance(poly, Polygon) and not poly.is_empty
+    }
+    for index, poly in polygons.items():
+        if isinstance(poly, Polygon) and not poly.is_empty:
+            decomposition.planes[index].polygon_boundary = topology.boundaries[
+                decomposition.planes[index].plane_id
+            ]
+    for pair, line in sorted(ridges.items()):
+        edge = _finite_intersection_edge(pair, line, footprint, decomposition)
+        if edge is None:
+            continue
+        getattr(topology, f"{edge.kind}s").append(edge)
+    topology.steps = topology_step_edges
+    roof_polygons = [
+        poly for poly in polygons.values()
+        if isinstance(poly, Polygon) and not poly.is_empty
+    ]
+    if roof_polygons:
+        covered = unary_union(roof_polygons)
+        topology.open_area_m2 = float(max(0.0, footprint.area - covered.intersection(footprint).area))
+        topology.overlap_area_m2 = float(max(
+            0.0, sum(poly.area for poly in roof_polygons) - covered.area
+        ))
 
     roof = ReconstructedRoof(
         vertices=np.asarray(registry.vertices, dtype=np.float64),
@@ -408,6 +537,7 @@ def reconstruct_roof(
         plane_polygons={
             index: poly for index, poly in polygons.items() if isinstance(poly, Polygon)
         },
+        topology=topology,
     )
     log.info(
         "%s : toit reconstruit — %d sommets partagés, %d faces dont %d décrochement(s)",

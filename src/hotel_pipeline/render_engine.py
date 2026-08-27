@@ -158,11 +158,18 @@ class FrameBuffers:
     width: int
     height: int
     camera: object = None               # CanonicalCamera
+    input_mesh_digest: str | None = None
+    surface_id_lookup: dict[int, str] = field(default_factory=dict)
 
     def depth_at(self, x: int, y: int) -> float:
         if 0 <= y < self.height and 0 <= x < self.width:
             return float(self.depth_z[y, x])
         return float("inf")
+
+    def physical_surface_at(self, x: int, y: int) -> str | None:
+        if not (0 <= y < self.height and 0 <= x < self.width):
+            return None
+        return self.surface_id_lookup.get(int(self.surface_id[y, x]))
 
     def visible(
         self,
@@ -207,6 +214,9 @@ def rasterize_mesh(
     Une seule source de triangles : le CanonicalSceneMesh. Aucun mur ou toit
     reconstruit séparément ne peut doubler une surface dans le z-buffer.
     """
+    from .reality_contract import require_canonical_mesh
+
+    receipt = require_canonical_mesh(mesh, "renderer")
     width = int(width or camera.width)
     height = int(height or camera.height)
     near = float(near_m or camera.near_m)
@@ -219,8 +229,12 @@ def rasterize_mesh(
 
     faces = mesh.faces
     vertices = mesh.vertices
+    physical_surface_lookup: dict[int, str] = {}
     if surface_ids is None:
-        surface_ids = np.arange(len(faces), dtype=np.int32)
+        semantic_surfaces = sorted(set(mesh.surface_ids))
+        encoded = {surface_id: index for index, surface_id in enumerate(semantic_surfaces)}
+        surface_ids = np.asarray([encoded[value] for value in mesh.surface_ids], dtype=np.int32)
+        physical_surface_lookup = {value: key for key, value in encoded.items()}
     if semantic_ids is None:
         semantic_ids = np.full(len(faces), -1, dtype=np.int32)
 
@@ -263,6 +277,8 @@ def rasterize_mesh(
         width=width,
         height=height,
         camera=camera,
+        input_mesh_digest=receipt.input_mesh_digest,
+        surface_id_lookup=physical_surface_lookup,
     )
 
 
@@ -318,7 +334,11 @@ def _rasterise_polygon(
     ys = np.arange(min_y, max_y + 1, dtype=np.float64) + 0.5
     grid_x, grid_y = np.meshgrid(xs, ys)
     candidates = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    inside = shapely.contains_xy(
+    # `contains_xy` exclut la frontière. Sur l'arête commune de deux
+    # triangles, cela créait une fissure d'un pixel et rendait le résultat
+    # dépendant de la triangulation. `intersects_xy` applique la fermeture du
+    # polygone : une arête partagée est couverte, puis le z-buffer départage.
+    inside = shapely.intersects_xy(
         path_polygon, grid_x.ravel(), grid_y.ravel()
     ).reshape(grid_x.shape)
     if not inside.any():
@@ -337,13 +357,11 @@ def _rasterise_polygon(
         return
     normal_cam /= norm_len
 
-    fx, fy = camera.focal
-    cx, cy = camera.principal
-    rays_cam = np.column_stack([
-        (candidates[:, 0] - cx) / fx,
-        (candidates[:, 1] - cy) / fy,
-        np.ones(len(candidates)),
+    rays_world = np.asarray([
+        camera.ray_from_pixel(u, v) for u, v in candidates
     ])
+    rays_cam = rays_world @ camera.R.T
+    rays_cam /= np.maximum(rays_cam[:, 2:3], 1e-12)
     denom = rays_cam @ normal_cam
     safe_denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
     tt = float(normal_cam @ tri_cam[0]) / safe_denom
@@ -382,25 +400,9 @@ def _undistort_pixels(pixels: np.ndarray, camera) -> np.ndarray:  # noqa: ANN001
     pour poser des rayons, la profondeur écrite reste issue du vrai
     triangle, la distorsion ne sert qu'à choisir le pixel.
     """
-    if camera.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
-        fx = fy = float(camera.params[0])
-        cx, cy = camera.principal
-    else:
-        fx, fy = float(camera.params[0]), float(camera.params[1])
-        cx, cy = camera.principal
-
-    u = pixels[:, 0].copy()
-    v = pixels[:, 1].copy()
-    if camera.model not in ("SIMPLE_PINHOLE", "PINHOLE"):
-        for _ in range(3):
-            xn = (u - cx) / fx
-            yn = (v - cy) / fy
-            ud, vd = camera._distort(xn, yn)
-            u += (pixels[:, 0] - (fx * ud + cx))
-            v += (pixels[:, 1] - (fy * vd + cy))
-    xn = (u - cx) / fx
-    yn = (v - cy) / fy
-    return np.column_stack([xn, yn])
+    return np.asarray(
+        [camera.undistort_pixel(u, v) for u, v in pixels], dtype=float
+    )
 
 
 # ----------------------------------------------------------------------

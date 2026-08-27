@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+
 from .schemas.canonical_states import MeasurementState, SurfaceType
 
 
@@ -32,6 +33,11 @@ def triangle_provenance(payload: dict) -> list[dict]:
     for vi, volume in enumerate(payload.get("volumes", [])):
         mesh = volume.get("solid") or volume.get("solid_mesh") or {}
         kinds = mesh.get("face_kind") or ["wall"] * len(mesh.get("faces") or [])
+        surface_ids = mesh.get("surface_ids") or []
+        triangle_ids = mesh.get("triangle_ids") or []
+        states = mesh.get("measurement_states") or []
+        confidences = mesh.get("confidence") or []
+        provenance = mesh.get("provenance") or []
         building_id = str(volume.get("building_id") or volume.get("feature_id") or f"building-{vi}")
         part_id = str(volume.get("part_id") or "main")
         for face_index, face in enumerate(mesh.get("faces") or []):
@@ -42,11 +48,25 @@ def triangle_provenance(payload: dict) -> list[dict]:
                 "roof_step": SurfaceType.ROOF,
                 "base": SurfaceType.TERRAIN,
             }.get(kind, SurfaceType.UNKNOWN)
+            owner = dict(volume)
+            if face_index < len(provenance):
+                owner.update(provenance[face_index])
+            if face_index < len(states):
+                owner["measurement_state"] = states[face_index]
+            if face_index < len(confidences):
+                owner["confidence"] = confidences[face_index]
             for _ in range(1, len(face)-1):
                 records.append(_evidence(
-                    volume,
-                    triangle_id=len(records),
-                    surface_id=f"{building_id}/{part_id}/{kind}/{face_index}",
+                    owner,
+                    triangle_id=(
+                        int(triangle_ids[face_index])
+                        if face_index < len(triangle_ids) else len(records)
+                    ),
+                    surface_id=(
+                        str(surface_ids[face_index])
+                        if face_index < len(surface_ids)
+                        else f"{building_id}/{part_id}/unknown-surface"
+                    ),
                     surface_type=surface_type,
                 ))
     terrain = payload.get("terrain") or {}
@@ -139,6 +159,15 @@ def export_canonical_gltf(payload: dict, path: Path) -> dict:
         "reextruded": False,
         "opening_count": len(payload.get("openings", [])),
         "triangle_provenance": triangle_provenance(payload),
+        "surface_catalog": {
+            surface_id: surface
+            for volume in payload.get("volumes", [])
+            for surface_id, surface in (
+                (volume.get("solid") or volume.get("solid_mesh") or {})
+                .get("surface_catalog", {})
+                .items()
+            )
+        },
         "vertical_reference": payload.get("vertical_reference") or payload.get("spatial_reference", {}).get("vertical"),
         "floating_origin_world": render_origin.tolist(),
         "render_coordinates": "float32 local; add floating_origin_world for canonical world coordinates",
@@ -168,4 +197,30 @@ def export_canonical_gltf(payload: dict, path: Path) -> dict:
     return metadata
 
 
-__all__ = ["canonical_mesh_arrays", "export_canonical_gltf", "mesh_digest"]
+def export_canonical_mesh_gltf(mesh, path: Path) -> dict:  # noqa: ANN001
+    """Production exporter: accepts CanonicalSceneMesh and records its digest."""
+    from .reality_contract import require_canonical_mesh
+
+    receipt = require_canonical_mesh(mesh, "gltf_export")
+    payload = {"volumes": [{
+        "solid": mesh.as_dict(),
+        "source_ids": sorted({
+            str(source)
+            for row in mesh.provenance
+            for source in row.get("source_ids", [])
+        }),
+    }]}
+    metadata = export_canonical_gltf(payload, path)
+    metadata["input_mesh_digest"] = receipt.input_mesh_digest
+    metadata["mesh_digest"] = receipt.input_mesh_digest
+    stored = json.loads(path.read_text("utf-8"))
+    stored["extras"].update(metadata)
+    stored["meshes"][0]["extras"].update(metadata)
+    path.write_text(json.dumps(stored, separators=(",", ":")), "utf-8")
+    return metadata
+
+
+__all__ = [
+    "canonical_mesh_arrays", "export_canonical_gltf", "export_canonical_mesh_gltf",
+    "mesh_digest",
+]

@@ -7,7 +7,6 @@ contrats d'entrée et de sortie du pipeline de reconstruction.
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from enum import Enum, StrEnum
 from typing import Literal
@@ -15,7 +14,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import ReconstructionRole
-
 
 # ---------------------------------------------------------------------------
 # P0 — Promotion-driven criticality (remplace les littéraux PRIMARY/SECONDARY)
@@ -781,6 +779,18 @@ class CameraFeasibilityField(BaseModel):
     proxy_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     reconstructed_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     minimum_distance_violation: bool = False
+    texture_reality_safe: bool | None = None
+    texture_reality_level: str | None = None
+    texture_reality_violations: list[str] = Field(default_factory=list)
+    requested_output_width_px: int | None = Field(default=None, gt=0)
+    visible_surfaces: list[dict] = Field(default_factory=list)
+    target_pixel_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    unknown_visible_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    minimum_clearance_m: float | None = Field(default=None, ge=0.0)
+    subject_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    accepted: bool = False
+    rejection_reasons: list[str] = Field(default_factory=list)
+    feasibility_mesh_digest: str | None = None
     collision: bool = False
     distance_to_scene_m: float | None = Field(default=None, ge=0.0)
     framing_quality: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -882,6 +892,11 @@ class NovelViewValidationGate(BaseModel):
     unmeasured_reason: str | None = None
     #: Identifiants des vues effectivement retenues comme cachées.
     held_out_asset_ids: list[str] = Field(default_factory=list)
+    train_asset_ids: list[str] = Field(default_factory=list)
+    holdout_leakage_count: int = Field(default=0, ge=0)
+    frozen_model_digest: str | None = None
+    holdout_results: list[dict] = Field(default_factory=list)
+    surface_scores: dict[str, dict] = Field(default_factory=dict)
 
 
 class StabilityRun(BaseModel):

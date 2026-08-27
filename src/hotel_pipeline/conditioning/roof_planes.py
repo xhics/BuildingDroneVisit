@@ -54,6 +54,30 @@ class RoofPlane:
     points: np.ndarray
     normal: np.ndarray
     origin: np.ndarray
+    plane_id: str = ""
+    polygon_boundary: list[list[float]] = field(default_factory=list)
+    rmse: float | None = None
+    confidence: float | None = None
+    source_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.points = np.asarray(self.points, dtype=np.float64).reshape((-1, 3))
+        self.normal = np.asarray(self.normal, dtype=np.float64).reshape(3)
+        self.origin = np.asarray(self.origin, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(self.normal))
+        if norm <= 1e-12:
+            raise ValueError("roof plane normal must be non-zero")
+        self.normal = self.normal / norm
+        if self.normal[2] < 0:
+            self.normal = -self.normal
+        if not self.plane_id:
+            self.plane_id = "plane_unassigned"
+        if self.rmse is None:
+            residuals = (self.points - self.origin) @ self.normal
+            self.rmse = float(np.sqrt(np.mean(residuals ** 2))) if len(residuals) else float("inf")
+        if self.confidence is None:
+            # 10 cm is excellent airborne support; 25 cm remains usable.
+            self.confidence = float(np.clip(1.0 - self.rmse / 0.35, 0.0, 1.0))
 
     @property
     def slope_deg(self) -> float:
@@ -83,7 +107,17 @@ class RoofPlane:
 
     def as_dict(self) -> dict:
         return {
+            "plane_id": self.plane_id,
+            "equation": [
+                *np.round(self.normal, 9).tolist(),
+                round(-float(np.dot(self.normal, self.origin)), 9),
+            ],
+            "polygon_boundary": self.polygon_boundary,
             "points": int(len(self.points)),
+            "support_points": int(len(self.points)),
+            "rmse_m": round(float(self.rmse), 4),
+            "confidence": round(float(self.confidence), 4),
+            "source_ids": list(self.source_ids),
             "slope_deg": round(self.slope_deg, 1),
             "area_m2": round(self.area_m2, 1),
             "z_min": round(float(self.points[:, 2].min()), 2),
@@ -212,11 +246,14 @@ def segment(
         fitted = np.linalg.svd(normal, full_matrices=False)[2][2]
         fitted *= np.sign(fitted[2]) if fitted[2] != 0 else 1.0
         labels[members] = len(result.planes)
+        plane_index = len(result.planes)
         result.planes.append(
             RoofPlane(
                 points=selected,
                 normal=fitted,
                 origin=selected.mean(axis=0),
+                plane_id=f"plane_{plane_index:02d}",
+                source_ids=["lidar:roof-points"],
             )
         )
 

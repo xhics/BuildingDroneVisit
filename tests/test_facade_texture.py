@@ -37,7 +37,7 @@ def test_texture_registration_allows_a_precise_accept() -> None:
     assert reason == ""
 
 
-def test_build_triangles_from_payload():
+def test_build_triangles_from_payload_refuses_noncanonical_geometry():
     class _Cam:
         position = np.array([0.0, -30.0, 2.5], dtype=float)
         f = 400.0
@@ -72,9 +72,5 @@ def test_build_triangles_from_payload():
             }
         ]
     }
-    triangles, face_ids = _build_triangles_from_payload(payload)
-    assert len(triangles) > 0
-    assert len(face_ids) == len(triangles)
-    for tri in triangles:
-        assert len(tri) == 3
-        assert len(tri[0]) == 3
+    with pytest.raises(ValueError, match="canonical solid mesh"):
+        _build_triangles_from_payload(payload)

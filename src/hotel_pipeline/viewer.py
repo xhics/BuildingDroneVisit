@@ -212,8 +212,8 @@ const PAYLOAD = {payload_json};
 const MANIFEST = {manifest_json};
 const cv=document.getElementById('cv'),ctx=cv.getContext('2d');let W=0,H=0,D=1,renderCx=0;
 const CAMERA=PAYLOAD.camera||{{}};
-const APPEARANCE=PAYLOAD.appearance_profile||{{}},TEXTURE_BY_EDGE=new Map((PAYLOAD.facade_textures||[]).map(t=>[t.edge_index,t]));
-const TEXTURE_IMAGES=new Map();for(const texture of PAYLOAD.facade_textures||[]){{const image=new Image();image.onload=()=>draw();image.src=texture.path;TEXTURE_IMAGES.set(texture.edge_index,image);}}
+const APPEARANCE=PAYLOAD.appearance_profile||{{}},TEXTURE_BY_SURFACE=new Map((PAYLOAD.facade_textures||[]).map(t=>[t.surface_id,t]));
+const TEXTURE_IMAGES=new Map();for(const texture of PAYLOAD.facade_textures||[]){{const image=new Image();image.onload=()=>draw();image.src=texture.path;TEXTURE_IMAGES.set(texture.surface_id,image);}}
 function volumeBounds(targetOnly=false){{const pts=[];for(const v of PAYLOAD.volumes||[]){{if(targetOnly&&!v.target)continue;for(const p of v.fp||[])pts.push(p);}}if(!pts.length&&targetOnly)return volumeBounds(false);if(!pts.length)return{{focus:[0,0,8],span:120}};const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]),zs=(PAYLOAD.volumes||[]).filter(v=>!targetOnly||v.target).map(v=>v.h||8);const dx=Math.max(...xs)-Math.min(...xs),dy=Math.max(...ys)-Math.min(...ys);return{{focus:[(Math.min(...xs)+Math.max(...xs))/2,(Math.min(...ys)+Math.max(...ys))/2,(Math.max(...zs,8))*.42],span:Math.max(25,Math.hypot(dx,dy))}};}}
 const TARGET=volumeBounds(true),CONTEXT=volumeBounds(false);let focus=CAMERA.focus||TARGET.focus;
 let az=(CAMERA.facade_azimuth_deg??210)*Math.PI/180,alt=(CAMERA.facade_altitude_deg??1)*Math.PI/180,dist=(CAMERA.target_distance_m??Math.max(35,TARGET.span*1.15)),spin=false,wire=false,activeView='1';
@@ -230,11 +230,12 @@ function faces(){{const out=[];
 const base=sitePlane();if(show.ground&&base)out.push({{p:base,k:'site'}});
 if(show.ground)for(const g of PAYLOAD.ground||[])out.push({{p:g.ring.map(v=>[v[0],v[1],0]),k:g.kind==='vegetal'?'grass':'road'}});
 if(show.vol)for(const v of PAYLOAD.volumes||[]){{const fp=v.fp||[],wh=v.wh||[],area=fp.reduce((s,p,i)=>s+p[0]*fp[(i+1)%fp.length][1]-fp[(i+1)%fp.length][0]*p[1],0),side=area>=0?1:-1;for(let i=0;i<fp.length;i++){{const j=(i+1)%fp.length,dx=fp[j][0]-fp[i][0],dy=fp[j][1]-fp[i][1];
-out.push({{p:[[...fp[i],0],[...fp[j],0],[...fp[j],wh[j]??v.h],[...fp[i],wh[i]??v.h]],k:v.target?'target':'other',tex:v.target?TEXTURE_BY_EDGE.get(i):null,edge:i,normal:[side*dy,-side*dx,0]}});}}
+out.push({{p:[[...fp[i],0],[...fp[j],0],[...fp[j],wh[j]??v.h],[...fp[i],wh[i]??v.h]],k:v.target?'target':'other',normal:[side*dy,-side*dx,0]}});}}
 if(show.roof&&v.rv&&v.rf)for(const f of v.rf)out.push({{p:f.map(i=>v.rv[i]),k:'roof'}});
 else if(show.roof&&v.solid?.vertices&&v.solid?.faces){{const n=fp.length;for(const f of v.solid.faces)if(f.every(i=>i>=n))out.push({{p:f.map(i=>v.solid.vertices[i]),k:'roof'}});}}}}
 if(PAYLOAD.mesh)for(const f of PAYLOAD.mesh.faces||[])out.push({{p:f.map(i=>PAYLOAD.mesh.vertices[i]),k:'mesh'}});
-for(const f of PAYLOAD.facade_features||[]){{const texture=f.edge_index==null?null:TEXTURE_BY_EDGE.get(f.edge_index),covered=texture?.covered_by_photo;if((f.vertices||[]).length>=3&&!covered)out.push({{p:f.vertices,k:f.kind||'target',detail:true}});}}
+for(const texture of PAYLOAD.facade_textures||[])for(const triangle of texture.render_triangles||[])out.push({{p:triangle.vertices,k:'target',tex:texture,surface:texture.surface_id,uv:triangle.uv_px}});
+for(const f of PAYLOAD.facade_features||[])if((f.vertices||[]).length>=3)out.push({{p:f.vertices,k:f.kind||'target',detail:true}});
 if(show.ai)for(const s of PAYLOAD.semantic_surfaces||[]){{const g=s.surface||{{}};for(const f of g.faces||[])out.push({{p:f.map(i=>g.vertices[i]),k:'semantic'}});}}
 if(show.veg)for(const v of PAYLOAD.vegetation||[]){{let rings=v.rings||[];if(rings.length<2){{const n=12,profile=[.38,.72,1,.94,.7,.34];rings=profile.map((s,l)=>Array.from({{length:n}},(_,i)=>{{const a=i*Math.PI*2/n,q=s*(1+.09*Math.sin(3*a+(v.c[0]+v.c[1])));return[v.c[0]+Math.cos(a)*v.r*q,v.c[1]+Math.sin(a)*v.r*q,v.h*(.12+.84*l/(profile.length-1))]}}));}}
 for(let l=0;l<rings.length-1;l++){{const a=rings[l],z=rings[l+1],n=Math.min(a.length,z.length);for(let i=0;i<n;i++)out.push({{p:[a[i],a[(i+1)%n],z[(i+1)%n],z[i]],k:'veg'}});}}if(rings.length){{out.push({{p:[...rings[0]].reverse(),k:'veg'}});out.push({{p:rings[rings.length-1],k:'veg'}});}}}}
@@ -246,7 +247,7 @@ function texturedQuad(image,q){{const w=image.naturalWidth,h=image.naturalHeight
 function frontFacing(face,b){{if(!face.p||face.p.length<3)return true;const a=face.p[0],z=face.p[1],u=face.p[2],ab=[z[0]-a[0],z[1]-a[1],z[2]-a[2]],au=[u[0]-a[0],u[1]-a[1],u[2]-a[2]],n=face.normal||[ab[1]*au[2]-ab[2]*au[1],ab[2]*au[0]-ab[0]*au[2],ab[0]*au[1]-ab[1]*au[0]],c=face.p.reduce((s,p)=>[s[0]+p[0]/face.p.length,s[1]+p[1]/face.p.length,s[2]+p[2]/face.p.length],[0,0,0]);return n[0]*(b.eye[0]-c[0])+n[1]*(b.eye[1]-c[1])+n[2]*(b.eye[2]-c[2])>0;}}
 function facadeHeight(c){{let best=Infinity,height=null;for(const v of PAYLOAD.volumes||[]){{const fp=v.fp||[],wh=v.wh||[];for(let i=0;i<fp.length;i++){{const j=(i+1)%fp.length,a=fp[i],z=fp[j],dx=z[0]-a[0],dy=z[1]-a[1],den=dx*dx+dy*dy||1,t=Math.max(0,Math.min(1,((c[0]-a[0])*dx+(c[1]-a[1])*dy)/den)),qx=a[0]+t*dx,qy=a[1]+t*dy,d=(c[0]-qx)**2+(c[1]-qy)**2;if(d<best){{best=d;const ha=wh[i]??v.h??8,hb=wh[j]??v.h??ha;height=ha+t*(hb-ha);}}}}}}return Math.max(.5,height??8);}}
 function draw(){{const hidden=document.body.classList.contains('ui-hidden'),hudRight=document.getElementById('hud').getBoundingClientRect().right;renderCx=W>=700&&!hidden?(hudRight+W-14)/2:W/2;const sky=ctx.createLinearGradient(0,0,0,H);sky.addColorStop(0,'#152334');sky.addColorStop(.58,'#253747');sky.addColorStop(1,'#101722');ctx.fillStyle=sky;ctx.fillRect(0,0,W,H);const b=basis(),fs=[];for(const f of faces()){{const q=f.p.map(p=>project(p,b));if(q.some(x=>!x))continue;fs.push({{...f,q,z:q.reduce((s,x)=>s+x[2],0)/q.length}});}}
-fs.sort((a,b)=>b.z-a.z);for(const f of fs){{ctx.beginPath();ctx.moveTo(f.q[0][0],f.q[0][1]);for(const q of f.q.slice(1))ctx.lineTo(q[0],q[1]);ctx.closePath();ctx.fillStyle=C[f.k]||C.other;ctx.globalAlpha=f.k==='site'?.82:(f.k==='grass'||f.k==='road')?.88:f.k==='veg'?.28:f.k==='pole'?.58:1;ctx.fill();ctx.globalAlpha=1;const texture=f.tex&&TEXTURE_IMAGES.get(f.edge);if(texture?.complete&&texture.naturalWidth&&f.q.length===4&&frontFacing(f,b))texturedQuad(texture,f.q);if(f.k==='target'||f.k==='roof'||f.detail||wire){{ctx.strokeStyle=f.k==='target'?'#a86652':f.k==='roof'?C.roof:f.k==='window'?'#8aa8b5':'#1116';ctx.lineWidth=f.k==='target'?1.05:f.k==='roof'?.85:f.k==='window'?.55:.45;ctx.stroke();}}}}
+fs.sort((a,b)=>b.z-a.z);for(const f of fs){{ctx.beginPath();ctx.moveTo(f.q[0][0],f.q[0][1]);for(const q of f.q.slice(1))ctx.lineTo(q[0],q[1]);ctx.closePath();ctx.fillStyle=C[f.k]||C.other;ctx.globalAlpha=f.k==='site'?.82:(f.k==='grass'||f.k==='road')?.88:f.k==='veg'?.28:f.k==='pole'?.58:1;ctx.fill();ctx.globalAlpha=1;const texture=f.tex&&TEXTURE_IMAGES.get(f.surface);if(texture?.complete&&texture.naturalWidth&&f.q.length===3&&f.uv?.length===3&&frontFacing(f,b))texturedTriangle(texture,f.uv,f.q);if(f.k==='target'||f.k==='roof'||f.detail||wire){{ctx.strokeStyle=f.k==='target'?'#a86652':f.k==='roof'?C.roof:f.k==='window'?'#8aa8b5':'#1116';ctx.lineWidth=f.k==='target'?1.05:f.k==='roof'?.85:f.k==='window'?.55:.45;ctx.stroke();}}}}
 if(show.obs)for(const o of PAYLOAD.observation?.cells||[]){{const a=project([o.c[0],o.c[1],.2],b),z=project([o.c[0],o.c[1],Math.max(.35,facadeHeight(o.c)-.12)],b);if(a&&z)line(a,z,o.views>=3?'#52b86c':o.views===2?'#e2a23f':o.views===1?'#d8893c':'#dc5960',2);}}
 if(show.plan)for(const p of PAYLOAD.observation?.missing||[]){{const a=project([p.c[0],p.c[1],0],b),z=project([p.c[0],p.c[1],8],b);if(a&&z)line(a,z,'#4c9ee8',2,p.bridge?[5,4]:[]);}}
 if(show.ridge)for(const r of PAYLOAD.ridges||[]){{const a=project(r.a,b),z=project(r.b,b);if(a&&z)line(a,z,r.views>=2?'#b585e8':'#7f668f',r.views>=2?2.5:1.2,r.views?[]:[4,4]);}}
@@ -334,11 +335,18 @@ def build(workspace: Workspace) -> ViewerOutputs:
     payload_path = workspace.write_json(
         "11_conditioning/viewer_payload.json", payload
     )
-    from .canonical_gltf import export_canonical_gltf
+    from .canonical_gltf import export_canonical_mesh_gltf
+    from .conditioning.canonical_mesh import CanonicalSceneMesh
     gltf_path = workspace.path("11_conditioning", "canonical_scene.gltf")
     try:
-        gltf_metadata = export_canonical_gltf(payload, gltf_path)
-    except ValueError:
+        meshes = [
+            CanonicalSceneMesh.from_dict(volume["solid"])
+            for volume in payload.get("volumes", [])
+        ]
+        gltf_metadata = export_canonical_mesh_gltf(
+            CanonicalSceneMesh.merge(meshes), gltf_path
+        )
+    except (KeyError, ValueError):
         gltf_metadata = None
     facade_audit_path = workspace.write_json(
         "11_conditioning/facade_similarity_audit.json",

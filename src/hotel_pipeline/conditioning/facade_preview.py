@@ -15,7 +15,6 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-
 PALETTE = {
     "background_top": "#152334",
     "background_bottom": "#101722",
@@ -44,7 +43,7 @@ def _normalise(vector: list[float]) -> list[float]:
     return [value / length for value in vector]
 
 
-def _basis(focus: list[float], azimuth_deg: float, altitude_deg: float, distance: float):  # noqa: ANN201
+def _basis(focus: list[float], azimuth_deg: float, altitude_deg: float, distance: float):
     azimuth, altitude = math.radians(azimuth_deg), math.radians(altitude_deg)
     ca, sa = math.cos(altitude), math.sin(altitude)
     eye = [
@@ -64,7 +63,7 @@ def _basis(focus: list[float], azimuth_deg: float, altitude_deg: float, distance
 
 def _faces(payload: dict, *, include_vegetation: bool = False) -> list[dict]:
     faces: list[dict] = []
-    textures = {item["edge_index"]: item for item in payload.get("facade_textures") or []}
+    textures = payload.get("facade_textures") or []
     for ground in payload.get("ground") or []:
         ring = [[float(point[0]), float(point[1]), 0.0] for point in ground.get("ring") or []]
         if len(ring) >= 3:
@@ -86,7 +85,6 @@ def _faces(payload: dict, *, include_vegetation: bool = False) -> list[dict]:
             faces.append({
                 "vertices": [[point[0], point[1], 0.0], [neighbour[0], neighbour[1], 0.0], [neighbour[0], neighbour[1], h1], [point[0], point[1], h0]],
                 "kind": "target" if volume.get("target") else "other",
-                "texture": textures.get(index) if volume.get("target") else None,
                 "normal": [side * float(neighbour[1] - point[1]), side * float(point[0] - neighbour[0]), 0.0],
             })
         vertices, triangles = volume.get("rv") or [], volume.get("rf") or []
@@ -94,10 +92,16 @@ def _faces(payload: dict, *, include_vegetation: bool = False) -> list[dict]:
             faces.append({"vertices": [vertices[index] for index in triangle], "kind": "roof"})
     for feature in payload.get("facade_features") or []:
         vertices = feature.get("vertices") or []
-        texture = textures.get(feature.get("edge_index"))
-        covered = texture and texture.get("covered_by_photo")
-        if len(vertices) >= 3 and not covered:
+        if len(vertices) >= 3:
             faces.append({"vertices": vertices, "kind": str(feature.get("kind") or "target")})
+    for texture in textures:
+        for triangle in texture.get("render_triangles") or []:
+            faces.append({
+                "vertices": triangle["vertices"],
+                "kind": "target",
+                "texture": texture,
+                "uv_px": triangle["uv_px"],
+            })
     for vegetation in ((payload.get("vegetation") or []) if include_vegetation else []):
         rings = vegetation.get("rings") or []
         for level in range(max(0, len(rings) - 1)):
@@ -174,7 +178,7 @@ def render(
     eye, forward, right, up = _basis(focus, azimuth_deg, altitude_deg, distance)
     focal = height_hi * 0.5 / math.tan(math.pi / 6)
 
-    def project(point: list[float]):  # noqa: ANN202
+    def project(point: list[float]):
         delta = [float(point[i]) - eye[i] for i in range(3)]
         depth = sum(delta[i] * forward[i] for i in range(3))
         if depth <= 0.5:
@@ -202,9 +206,9 @@ def render(
         centre = [sum(float(vertex[i]) for vertex in vertices) / len(vertices) for i in range(3)]
         normal = face.get("normal")
         facing = normal is None or sum(normal[i] * (eye[i] - centre[i]) for i in range(3)) > 0
-        area = abs(sum(points[i][0] * points[(i + 1) % 4][1] - points[(i + 1) % 4][0] * points[i][1] for i in range(4))) * 0.5 if len(points) == 4 else 0
+        area = abs(sum(points[i][0] * points[(i + 1) % len(points)][1] - points[(i + 1) % len(points)][0] * points[i][1] for i in range(len(points)))) * 0.5
         stable = area >= 25 and all(-width_hi <= x <= width_hi * 2 and -height_hi <= y <= height_hi * 2 for x, y in points)
-        if texture and texture_root is not None and len(points) == 4 and facing and stable:
+        if texture and texture_root is not None and len(points) == 3 and facing and stable:
             texture_path = texture_root / texture["path"]
             if texture_path.is_file():
                 import cv2
@@ -212,12 +216,11 @@ def render(
 
                 source_rgba = np.asarray(Image.open(texture_path).convert("RGBA"))
                 source = source_rgba[:, :, :3]
-                sh, sw = source.shape[:2]
-                src = np.float32([[0, sh - 1], [sw - 1, sh - 1], [sw - 1, 0], [0, 0]])
+                src = np.float32(face["uv_px"])
                 dst = np.float32(points)
-                matrix = cv2.getPerspectiveTransform(src, dst)
-                warped = cv2.warpPerspective(source, matrix, (width_hi, height_hi))
-                mask = cv2.warpPerspective(source_rgba[:, :, 3], matrix, (width_hi, height_hi))
+                matrix = cv2.getAffineTransform(src, dst)
+                warped = cv2.warpAffine(source, matrix, (width_hi, height_hi))
+                mask = cv2.warpAffine(source_rgba[:, :, 3], matrix, (width_hi, height_hi))
                 base = np.asarray(image).copy()
                 alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
                 base = np.clip(base.astype(np.float32) * (1.0 - alpha) + warped.astype(np.float32) * alpha, 0, 255).astype(np.uint8)

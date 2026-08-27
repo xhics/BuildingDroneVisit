@@ -121,6 +121,7 @@ class RenderedFrame:
     #: Fraction de pixels dont la géométrie repose sur une hauteur supposée.
     assumed_fraction: float
     hit_any: bool
+    input_mesh_digest: str | None = None
 
     def stats(self) -> dict:
         finite = self.depth[np.isfinite(self.depth)]
@@ -281,11 +282,15 @@ def _prism_faces(prism: Prism) -> list[tuple[np.ndarray, bool]]:
     conservée que pour un prisme qui n'a pas encore reçu son maillage.
     """
     mesh = getattr(prism, "canonical_mesh", None)
-    if mesh is not None:
-        return [
-            (mesh.vertices[face], mesh.face_kind[index] in ("roof", "roof_step"))
-            for index, face in enumerate(mesh.faces)
-        ]
+    from ..reality_contract import require_canonical_mesh
+
+    require_canonical_mesh(mesh, "renderer")
+    return [
+        (mesh.vertices[face], mesh.face_kind[index] in ("roof", "roof_step"))
+        for index, face in enumerate(mesh.faces)
+    ]
+
+    # Legacy implementation retained below for offline migration only.
 
     faces: list[tuple[np.ndarray, bool]] = []
     fp = prism.footprint
@@ -841,8 +846,15 @@ def render_frame(
     normal = np.zeros((h, w, 3), dtype=np.float64)
     silhouette = np.zeros((h, w), dtype=np.uint8)
     confidence = np.zeros((h, w), dtype=np.float64)
+    mesh_digests: list[str] = []
 
     for prism in scene.prisms:
+        from ..reality_contract import require_canonical_mesh
+        mesh_digests.append(
+            require_canonical_mesh(
+                getattr(prism, "canonical_mesh", None), "renderer"
+            ).input_mesh_digest
+        )
         if not _visible(_prism_bounds(prism), camera):
             continue
         base_conf = prism.confidence
@@ -917,6 +929,11 @@ def render_frame(
     total = float(w * h)
     target_px = int((silhouette == 2).sum())
     assumed_px = int(((confidence > 0) & (confidence < 0.5)).sum())
+    import hashlib
+    input_mesh_digest = (
+        mesh_digests[0] if len(mesh_digests) == 1
+        else hashlib.sha256("".join(sorted(mesh_digests)).encode("ascii")).hexdigest()
+    )
 
     return RenderedFrame(
         depth=depth,
@@ -926,4 +943,5 @@ def render_frame(
         target_coverage=target_px / total,
         assumed_fraction=assumed_px / total,
         hit_any=bool(hit.any()),
+        input_mesh_digest=input_mesh_digest,
     )

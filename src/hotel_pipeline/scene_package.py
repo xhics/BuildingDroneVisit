@@ -658,9 +658,17 @@ def build(workspace) -> dict[str, Path]:  # noqa: ANN001
         raise ValueError(f"staging antérieur à examiner avant reprise : {folder}")
     folder.mkdir(parents=True, exist_ok=False)
 
-    from .canonical_gltf import export_canonical_gltf
+    from .canonical_gltf import export_canonical_mesh_gltf
+    from .conditioning.canonical_mesh import CanonicalSceneMesh
 
-    export_canonical_gltf(_json(canonical_scene_path), folder / "canonical_scene.gltf")
+    canonical_payload = _json(canonical_scene_path)
+    canonical_mesh = CanonicalSceneMesh.merge([
+        CanonicalSceneMesh.from_dict(building["solid_mesh"])
+        for building in canonical_payload.get("buildings", [])
+    ])
+    gltf_metadata = export_canonical_mesh_gltf(
+        canonical_mesh, folder / "canonical_scene.gltf"
+    )
 
     # Legacy/debug only; no production consumer references this proxy.
     obj_path = folder / "environment.obj"

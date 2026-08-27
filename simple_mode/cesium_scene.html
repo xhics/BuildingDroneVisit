@@ -19,6 +19,10 @@
     let viewer = null;
     let waypoints = [];
 
+    //: Doit rester égal à `coverage.DEPTH_SCALE_M` : c'est l'échelle qui
+    //: permet de relire la profondeur encodée en niveaux de gris.
+    const DEPTH_SCALE_M = 800;
+
     window.droneReady = false;
     window.droneError = null;
 
@@ -68,8 +72,24 @@
           `https://tile.googleapis.com/v1/3dtiles/root.json?key=${config.apiKey}`,
           { showCreditsOnScreen: false }
         );
+        // Niveau de détail des tuiles. Cesium tolère par défaut une erreur de
+        // 16 pixels à l'écran, ce qui charge des tuiles allégées : c'est une
+        // valeur pensée pour la navigation interactive, pas pour un rendu
+        // image par image. L'abaisser force les tuiles fines — plus lent à
+        // charger, nettement plus net, et sans la moindre invention puisqu'il
+        // s'agit des mêmes données à une résolution supérieure.
+        tileset.maximumScreenSpaceError = config.tileDetail || 4;
+        tileset.preloadWhenHidden = true;
+        tileset.skipLevelOfDetail = false;  // pas de raccourci : on veut le niveau fin
         viewer.scene.primitives.add(tileset);
         window.droneTileset = tileset;
+
+        // Suréchantillonnage et anticrénelage : le rendu se fait à une
+        // résolution supérieure puis est réduit, ce qui lisse les arêtes que
+        // la photogrammétrie rend hachées.
+        viewer.resolutionScale = config.supersample || 2.0;
+        viewer.scene.msaaSamples = 4;
+        viewer.scene.postProcessStages.fxaa.enabled = true;
 
         // Altitude du sol mesurée sur les tuiles elles-mêmes. L'API Google
         // Elevation renverrait une altitude au-dessus du géoïde (niveau de la
@@ -143,10 +163,18 @@
             .sort((x, y) => x - y);
 
           if (ringH.length) {
-            // Le sol est la surface basse : une médiane mêlerait toitures et
-            // arbres au terrain. Un quantile bas isole le sol réel.
-            groundHeight = ringH[Math.floor(ringH.length * 0.2)];
-            window.droneGroundSource = `quantile 20% de ${ringH.length} points`;
+            // Sol de référence pris **près du sujet**. Sur un site en relief,
+            // une couronne large mêle deux niveaux de terrain (ici, haute et
+            // basse ville séparées d'une falaise) : un quantile bas y désigne
+            // la ville basse, et le vol se retrouvait sous la falaise.
+            const closeH = sampled
+              .slice(0, 1 + 8)  // centre + première couronne (60 m)
+              .filter((c) => c && Number.isFinite(c.height))
+              .map((c) => c.height)
+              .sort((x, y) => x - y);
+            const basis = closeH.length >= 3 ? closeH : ringH;
+            groundHeight = basis[Math.floor(basis.length * 0.35)];
+            window.droneGroundSource = `quantile 35% de ${basis.length} points proches`;
           } else {
             window.droneGroundSource = "echec echantillonnage";
           }
@@ -159,18 +187,41 @@
         window.droneGroundHeight = groundHeight;
         window.droneTopHeight = topHeight;
 
-        // Sol mesuré **sous chaque pose**, et non une fois pour tout le site.
-        // Un datum unique suppose un terrain plat : sur un relief marqué (une
-        // falaise, par exemple) il place la caméra sous la roche, qui filme
-        // alors l'envers du maillage. Les poses sans mesure retombent sur le
-        // datum global.
+        // Altitude de vol : un **datum unique**, comme l'altimètre
+        // barométrique d'un vrai drone. Calculer la hauteur pose par pose
+        // rendrait la caméra suiveuse de terrain : mesuré ici, le sol varie
+        // de 29 m en dents de scie sous la trajectoire, et la caméra montait
+        // et descendait d'autant — un mouvement parasite très visible.
+        //
+        // Le sol est mesuré **près du sujet** plutôt que sur une large
+        // couronne : sur un site en relief, une couronne large mêle deux
+        // niveaux de ville et donne un datum qui ne correspond à aucun des
+        // deux.
+        window.droneGroundHeight = groundHeight;
+        window.droneAltitudeDatum = groundHeight;
+
         if (waypoints.length) {
           try {
             const along = waypoints.map((w) => Cesium.Cartographic.fromDegrees(w.lon, w.lat));
             const sampledPath = await viewer.scene.sampleHeightMostDetailed(along);
-            window.droneGroundPerPose = sampledPath.map((c) =>
+            const perPose = sampledPath.map((c) =>
               c && Number.isFinite(c.height) ? c.height : groundHeight
             );
+            window.droneGroundPerPose = perPose;
+
+            // Garde-fou : si l'altitude choisie ferait passer une pose sous le
+            // relief, on relève **tout** le vol d'un même montant. Corriger
+            // pose par pose réintroduirait exactement le mouvement parasite
+            // qu'on cherche à supprimer.
+            let lift = 0;
+            const clearance = 12;
+            waypoints.forEach((w, i) => {
+              const needed = perPose[i] + clearance;
+              const planned = groundHeight + w.agl;
+              if (planned < needed) lift = Math.max(lift, needed - planned);
+            });
+            window.droneAltitudeDatum = groundHeight + lift;
+            window.droneLift = lift;
           } catch (e) {
             window.droneGroundPerPose = null;
           }
@@ -206,14 +257,50 @@
       });
     }
 
+    // Passe de profondeur : le même cadrage, mais chaque pixel encodé par sa
+    // distance à la caméra. Elle sert à mesurer où l'on possède de la donnée
+    // exploitable — le ciel n'ayant aucune géométrie, il ressort blanc, donc
+    // libre. Voir `coverage.py` pour la règle appliquée ensuite.
+    window.droneDepthMode = function (on) {
+      if (!window.droneTileset) return false;
+      if (on) {
+        window.droneTileset.customShader = new Cesium.CustomShader({
+          lightingModel: Cesium.LightingModel.UNLIT,
+          fragmentShaderText: `
+            void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
+              float d = length(fsInput.attributes.positionEC);
+              float n = clamp(d / ${DEPTH_SCALE_M}.0, 0.0, 1.0);
+              material.diffuse = vec3(n);
+            }
+          `,
+        });
+        viewer.scene.skyAtmosphere.show = false;
+        viewer.scene.backgroundColor = Cesium.Color.WHITE;
+      } else {
+        window.droneTileset.customShader = undefined;
+        viewer.scene.skyAtmosphere.show = true;
+      }
+      return true;
+    };
+
+    // Appliquer un shader personnalisé force Cesium à retraiter les tuiles
+    // déjà chargées : elles disparaissent le temps de leur reconstruction.
+    // Rendre quelques images tout de suite ne suffit donc pas — il faut
+    // laisser ce travail asynchrone se terminer, sans quoi la capture ne
+    // montre que l'arrière-plan.
+    window.droneSettle = async function (frames) {
+      for (let i = 0; i < (frames || 120); i++) {
+        viewer.scene.render();
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return true;
+    };
+
     window.droneSeek = async function (index, timeoutMs) {
       const w = waypoints[index];
-      // `agl` = hauteur au-dessus du sol, mesuré sous cette pose précise.
-      const localGround =
-        window.droneGroundPerPose && Number.isFinite(window.droneGroundPerPose[index])
-          ? window.droneGroundPerPose[index]
-          : window.droneGroundHeight;
-      const height = localGround + w.agl;
+      // Altitude absolue, identique pour tout le vol : la caméra ne suit pas
+      // le relief, elle le survole — comme un drone tenant son altitude.
+      const height = window.droneAltitudeDatum + w.agl;
       viewer.camera.setView({
         destination: Cesium.Cartesian3.fromDegrees(w.lon, w.lat, height),
         orientation: {

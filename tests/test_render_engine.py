@@ -201,6 +201,11 @@ def test_p23_une_facade_a_moitié_hors_champ_ne_colle_pas_de_bande() -> None:
     ids = buffers.triangle_id[:, border_column]
     valid_ids = ids[ids >= 0]
     assert set(np.unique(valid_ids)).issubset({0, 1})
+    hit_rows = np.where(ids >= 0)[0]
+    assert hit_rows.size
+    surface_name = buffers.physical_surface_at(border_column, int(hit_rows[0]))
+    assert surface_name in set(mesh.surface_ids)
+    assert "/facade/" in surface_name
 
 
 # ----------------------------------------------------------------------
@@ -460,6 +465,9 @@ def test_p28_le_renderer_consomme_prism_canonical_mesh_sans_doublon() -> None:
         height_assumed=False,
         height_source="test",
         is_target=True,
+    )
+    prism.canonical_mesh = build_canonical_building_mesh(
+        prism.footprint, top_heights=8.0
     )
     legacy_faces = _prism_faces(prism)
 

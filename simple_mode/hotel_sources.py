@@ -71,6 +71,12 @@ class SourcePhoto:
     category: str = "autre"
     #: Description courte, réutilisée dans les prompts de transition.
     description_fr: str = ""
+    #: La photo convient-elle comme **référence d'apparence** pour un rendu ?
+    #: Une vue encombrée de texte, d'enseignes ou d'un premier plan massif
+    #: contamine la génération : le modèle en recopie les lettrages dans la
+    #: vidéo. Constaté sur une photo à massif floral « UNESCO », dont le
+    #: lettrage s'est retrouvé incrusté dans le plan aérien.
+    clean_reference: bool = False
 
     @property
     def label_fr(self) -> str:
@@ -148,9 +154,14 @@ def fetch_photos(
 _CLASSIFY_PROMPT = (
     "Classe cette photo d'établissement hôtelier dans exactement une catégorie parmi : "
     + ", ".join(JOURNEY_ORDER)
-    + ", autre. Réponds en JSON strict : "
+    + ", autre. Indique aussi si elle conviendrait comme référence visuelle pour "
+    "générer une image du lieu : elle ne convient PAS si elle contient du texte, un "
+    "logo, une enseigne, un massif floral écrit, un panneau, un filigrane, des "
+    "personnes au premier plan, ou si le sujet est masqué par un avant-plan encombré. "
+    "Réponds en JSON strict : "
     '{"category": "<catégorie>", "description": "<une phrase en français décrivant '
-    'le lieu, son style et son ambiance>"}'
+    'le lieu, ses matériaux, ses couleurs et son ambiance>", '
+    '"clean_reference": true|false}'
 )
 
 
@@ -187,6 +198,7 @@ def classify_photos(photos: list[SourcePhoto], openai_key: str, *, model: str = 
             data = json.loads(response.choices[0].message.content or "{}")
             photo.category = str(data.get("category", "autre"))
             photo.description_fr = str(data.get("description", ""))
+            photo.clean_reference = bool(data.get("clean_reference", False))
         except (AuthenticationError, RateLimitError) as exc:
             # Ces deux erreurs valent pour tout le lot : les avaler
             # classerait chaque photo en « autre » et donnerait un parcours
